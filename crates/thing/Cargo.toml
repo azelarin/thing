@@ -1,0 +1,17 @@
+[package]
+name = "thing"
+description = "a programmable wayland shell framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thing-runtime = { path = "../thing-runtime" }
+thing-wayland = { path = "../thing-wayland" }
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[lints]
+workspace = true
