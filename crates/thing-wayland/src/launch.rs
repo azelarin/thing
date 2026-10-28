@@ -176,8 +176,8 @@ impl Launcher {
         activation_token: Option<&str>,
     ) -> io::Result<u32> {
         if self.children.len() >= self.limit {
-            // SIGCHLD may have been inherited as ignored, in which case the
-            // kernel reaps children without making signalfd readable.
+            // An exited child may still be waiting for the next SIGCHLD
+            // dispatch, so reap once before rejecting at capacity.
             let _ = self.reap();
         }
         if self.children.len() >= self.limit {
