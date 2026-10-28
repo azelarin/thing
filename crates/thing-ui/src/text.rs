@@ -94,4 +94,30 @@ mod tests {
         node.text = "Hello world".into();
         assert!(text.measure(&node, Some(10.0)).height > size.height);
     }
+
+    #[test]
+    fn separates_layouts_for_colliding_ids_from_different_roots() {
+        let mut text = TextSystem::default();
+        let mut first = Node::new(NodeId(1), Kind::Row);
+        let mut first_label = Node::new(NodeId(2), Kind::Text);
+        first_label.text = "short".into();
+        first_label.style.font_size = 12.0;
+        first.children.push(first_label);
+
+        let mut second = Node::new(NodeId(1), Kind::Row);
+        let mut second_label = Node::new(NodeId(2), Kind::Text);
+        second_label.text = "a much longer label for another output".into();
+        second_label.style.font_size = 24.0;
+        second_label.style.font_weight = 700.0;
+        second.children.push(second_label);
+
+        text.retain(&first);
+        let first_size = text.measure(&first.children[0], None);
+        text.retain(&second);
+        let second_size = text.measure(&second.children[0], Some(40.0));
+        assert!(second_size.height > first_size.height);
+
+        text.retain(&first);
+        assert_eq!(text.measure(&first.children[0], None), first_size);
+    }
 }
