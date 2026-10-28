@@ -662,9 +662,12 @@ launch failures are reported in the terminal running thing.
 
 ## managed processes
 
-use `services.process` when a configuration needs the output and lifetime of a
-child it starts itself. declare each handle while the configuration loads, then
-start or stop it from an event handler:
+use `services.process` when a configuration needs to read a child process or
+keep it within the shell's lifetime. there are two forms: a manual process that
+event handlers start and stop, and a scheduled command that thing runs for you.
+
+declare a manual process while the configuration loads, then control it from an
+event handler:
 
 ```luau
 local updates = services.process('updates')
@@ -686,9 +689,9 @@ return ui.button {
 ```
 
 a key names one process across all output runtimes. repeated declarations must
-use the same `shutdown_signal`; conflicting declarations reject the candidate
-configuration. `terminate` is the default, while `interrupt` is useful for a
-program that treats `SIGINT` as a request to finish its current work.
+match exactly; conflicting declarations reject the candidate configuration.
+`terminate` is the default shutdown signal. `interrupt` is useful for a program
+that treats `SIGINT` as a request to finish its current work.
 
 the handle exposes read-only `status`, `running`, `stdout`, `stderr`,
 `stdout_truncated`, `stderr_truncated`, `exit_code`, `exit_signal`, and `error`
@@ -703,20 +706,78 @@ and desktop activation variables are removed. use `services.launch` for ordinary
 applications that should receive compositor activation and outlive the panel
 configuration.
 
-each output tail retains at most 64 kib, on utf-8 boundaries, and reports when
-older text was discarded. updates are coalesced to at most 20 per second, with
-exit and end-of-file changes delivered immediately. one process-wide supervisor
-limits the shell to 32 declared keys, 32 unreaped child incarnations, 128 queued
-starts, and 4 mib of retained or reserved capture buffers across current and
-retiring runs. current bounded strings are also projected into each output
-runtime that declares the key; the 4 mib figure is not a total heap limit. a key
-cannot start again until its previous incarnation has been reaped.
+for a finite query that should run at startup or on a regular cadence, put its
+command in the declaration:
 
-a failed reload leaves the current processes and widgets alone. a successful
-reload retires the previous generation and gives the replacement configuration
-idle handles. adding or removing an output keeps a process for as long as any
-output declares its key. stopping first sends the configured signal and, after
-five seconds, escalates to `SIGKILL`. thing also retires managed children during
+```luau
+local weather = services.process {
+    key = 'weather',
+    command = {
+        'curl', '--fail', '--silent', '--max-time', '30',
+        'https://wttr.in/?format=1',
+    },
+    interval = 15 * 60 * 1000,
+}
+
+return ui.row {
+    children = {
+        ui.text { text = function() return weather.stdout:get() end },
+        ui.button {
+            on_click = function() weather.refresh() end,
+            children = { ui.text { text = 'refresh' } },
+        },
+    },
+}
+```
+
+`command` is the same direct argument array accepted by `start`. an optional
+`working_directory` applies to every run. `interval` is a whole number of
+milliseconds from 1,000 through 31,536,000,000. without an interval, the command
+runs once when its declaration becomes active.
+
+scheduled commands are intended for finite work such as system statistics,
+update counts, or weather. while a new run is active, the public output and exit
+signals keep the last completed result. stdout, stderr, truncation flags, and
+exit values change together only after the child has been reaped, so a widget
+does not briefly see an empty or half-written sample. status, running, and
+supervisor errors still describe the current run. use the manual form when live
+streaming output is the point of the process.
+
+`refresh()` asks for the declared command to run now. repeated requests
+coalesce: a queued or starting run already satisfies the request, and a running
+child can leave at most one follow-up run. `cancel()` cancels queued or active
+work and discards its partial capture. it does not disable the declaration; a
+recurring command receives a new deadline at least one interval later. durable
+pause and resume are not part of this api.
+
+the scheduler is shared by every output and uses monotonic time. there is no
+overlap or catch-up burst. a late idle command runs once and starts a fresh
+interval, while an ordinary deadline reached during an active run is skipped.
+adding another output with the same declaration does not rerun startup work.
+nonzero exits do not disable a recurring command. a spawn failure waits for the
+next interval; a one-shot command stays failed until `refresh()`.
+
+each stdout or stderr tail retains at most 64 kib, on utf-8 boundaries, and
+reports when older text was discarded. manual stream updates are coalesced to
+at most 20 per second, with exit and end-of-file changes delivered immediately.
+one process-wide supervisor limits the shell to 32 declared keys, 32 unreaped child
+incarnations, 128 queued starts, and 8 mib of retained or reserved capture
+buffers across manual and scheduled work, including retiring generations.
+current bounded strings are also projected into each output runtime that
+declares the key; this is not a total heap limit. a key cannot start again until
+its previous incarnation has been reaped.
+
+a failed reload leaves processes, results, deadlines, and widgets alone. a
+successful reload preserves an exactly matching scheduled declaration,
+including its current run, last result, pending refresh, and deadline. changing
+any scheduled option retires the old incarnation and activates a new one after
+commit. manual processes keep their existing generation lifetime: a successful
+reload retires them and gives the replacement configuration an idle handle.
+adding or removing an output keeps either form alive for as long as another
+output declares its key.
+
+stopping or canceling first sends the configured signal and, after five
+seconds, escalates to `SIGKILL`. thing also retires managed children during
 shutdown, using a shorter grace period so ordinary killable children do not
 survive the host.
 

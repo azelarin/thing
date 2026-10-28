@@ -36,7 +36,7 @@ const MAX_ARGUMENT_BYTES: usize = 4096;
 const MAX_ARGUMENT_TOTAL_BYTES: usize = 64 * 1024;
 const MAX_WORKING_DIRECTORY_BYTES: usize = 4096;
 const MAX_STREAM_BYTES: usize = 64 * 1024;
-const MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 const RUN_BUFFER_RESERVATION: usize = MAX_STREAM_BYTES * 4;
 const MAX_ERROR_BYTES: usize = 4096;
 const MAX_PROC_MOUNTINFO_BYTES: u64 = 1024 * 1024;
@@ -52,6 +52,8 @@ const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(5);
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 const DEFAULT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 const DEFAULT_DROP_WAIT: Duration = Duration::from_secs(1);
+const MIN_SCHEDULE_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_SCHEDULE_INTERVAL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const XDG_ACTIVATION_TOKEN: &str = "XDG_ACTIVATION_TOKEN";
 const DESKTOP_STARTUP_ID: &str = "DESKTOP_STARTUP_ID";
 
@@ -98,6 +100,14 @@ impl ShutdownSignal {
 pub(crate) struct Definition {
     pub key: String,
     pub shutdown_signal: ShutdownSignal,
+    pub command: Option<ScheduledCommand>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScheduledCommand {
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    pub interval: Option<Duration>,
 }
 
 impl From<&ManagedProcessDefinition> for Definition {
@@ -108,6 +118,11 @@ impl From<&ManagedProcessDefinition> for Definition {
                 ManagedProcessShutdownSignal::Terminate => ShutdownSignal::Terminate,
                 ManagedProcessShutdownSignal::Interrupt => ShutdownSignal::Interrupt,
             },
+            command: definition.command.as_ref().map(|command| ScheduledCommand {
+                argv: command.argv.clone(),
+                cwd: command.cwd.clone(),
+                interval: command.interval_ms.map(Duration::from_millis),
+            }),
         }
     }
 }
@@ -156,17 +171,19 @@ impl State {
         }
     }
 
-    fn clear_for_start(&mut self, token: RunToken) {
+    fn prepare_for_start(&mut self, token: RunToken, retain_result: bool) {
         self.status = Status::Starting;
-        self.stdout = Arc::from("");
-        self.stderr = Arc::from("");
-        self.stdout_truncated = false;
-        self.stderr_truncated = false;
-        self.exit_code = None;
-        self.exit_signal = None;
+        if !retain_result {
+            self.stdout = Arc::from("");
+            self.stderr = Arc::from("");
+            self.stdout_truncated = false;
+            self.stderr_truncated = false;
+            self.exit_code = None;
+            self.exit_signal = None;
+            self.retained_bytes = 0;
+        }
         self.error = Arc::from("");
         self.token = Some(token);
-        self.retained_bytes = 0;
         self.terminal_failure = false;
     }
 
@@ -223,12 +240,28 @@ struct RunToken {
 struct Registered {
     definition: Definition,
     incarnation: u64,
+    schedule: Option<Schedule>,
+}
+
+#[derive(Clone)]
+struct Schedule {
+    deadline: ScheduleDeadline,
+    pending_refresh: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ScheduleDeadline {
+    Disarmed,
+    Next(Instant),
+    DueBlocked(u64),
+    None,
 }
 
 struct Occupied {
     key: String,
     shutdown_signal: ShutdownSignal,
     reserved_bytes: usize,
+    scheduled: bool,
 }
 
 struct Start {
@@ -236,6 +269,7 @@ struct Start {
     key: String,
     argv: Vec<String>,
     cwd: Option<String>,
+    scheduled: bool,
 }
 
 #[derive(Default)]
@@ -249,12 +283,56 @@ struct Shared {
     latest: Option<Snapshot>,
     next_key_incarnation: u64,
     next_run_incarnation: u64,
+    capacity_epoch: u64,
     reserved_bytes: usize,
     shutdown: bool,
     #[cfg(test)]
     before_dequeue: Option<Arc<SpawnGate>>,
     #[cfg(test)]
     before_spawn: Option<Arc<SpawnGate>>,
+}
+
+#[derive(Clone, Copy)]
+enum ScopeChange {
+    Replace,
+    Reconcile,
+}
+
+pub(crate) struct PreparedScope {
+    expected_generation: u64,
+    expected_next_key_incarnation: u64,
+    expected_preserved_states: BTreeMap<String, State>,
+    next_generation: u64,
+    next_key_incarnation: u64,
+    definitions: BTreeMap<String, Definition>,
+    preserved: BTreeSet<String>,
+    incarnations: BTreeMap<String, u64>,
+    snapshot: Snapshot,
+}
+
+pub(crate) struct ScopeActivation {
+    generation: u64,
+    keys: Vec<String>,
+}
+
+impl PreparedScope {
+    pub(crate) fn runtime(&self) -> ManagedProcessSnapshot {
+        self.snapshot.runtime()
+    }
+}
+
+pub(crate) fn initial_scope_snapshot(
+    definitions: Vec<Definition>,
+) -> io::Result<ManagedProcessSnapshot> {
+    let definitions = validate_definitions(definitions)?;
+    let states = definitions
+        .into_iter()
+        .map(|definition| (definition.key.clone(), State::idle(definition.key)))
+        .collect::<BTreeMap<_, _>>();
+    Ok(Snapshot {
+        states: states.values().cloned().collect::<Vec<_>>().into(),
+    }
+    .runtime())
 }
 
 #[cfg(test)]
@@ -419,45 +497,49 @@ impl Manager {
         })
     }
 
-    pub(crate) fn replace_scope(&self, definitions: Vec<Definition>) -> io::Result<Snapshot> {
-        let definitions = validate_definitions(definitions)?;
-        let snapshot = {
-            let mut shared = lock(&self.shared);
-            ensure_active(&shared)?;
-            let generation = advance(shared.generation)?;
-            let incarnations = allocate_many(&mut shared.next_key_incarnation, definitions.len())?;
-            shared.generation = generation;
-            retire_all(&mut shared);
-            shared.registrations.clear();
-            shared.states.clear();
-            for (definition, incarnation) in definitions.into_iter().zip(incarnations) {
-                shared
-                    .states
-                    .insert(definition.key.clone(), State::idle(definition.key.clone()));
-                shared.registrations.insert(
-                    definition.key.clone(),
-                    Registered {
-                        definition,
-                        incarnation,
-                    },
-                );
-            }
-            publish_locked(&mut shared)
-        };
-        self.ping.ping();
-        let _ = wake(&self.wake);
-        Ok(snapshot)
+    pub(crate) fn prepare_replace_scope(
+        &self,
+        definitions: Vec<Definition>,
+    ) -> io::Result<PreparedScope> {
+        self.prepare_scope(definitions, ScopeChange::Replace)
     }
 
-    pub(crate) fn reconcile_scope(&self, definitions: Vec<Definition>) -> io::Result<Snapshot> {
+    pub(crate) fn prepare_reconcile_scope(
+        &self,
+        definitions: Vec<Definition>,
+    ) -> io::Result<PreparedScope> {
+        self.prepare_scope(definitions, ScopeChange::Reconcile)
+    }
+
+    pub(crate) fn project_replace_scope(
+        &self,
+        definitions: Vec<Definition>,
+    ) -> io::Result<ManagedProcessSnapshot> {
+        self.prepare_scope(definitions, ScopeChange::Replace)
+            .map(|prepared| prepared.runtime())
+    }
+
+    pub(crate) fn project_reconcile_scope(
+        &self,
+        definitions: Vec<Definition>,
+    ) -> io::Result<ManagedProcessSnapshot> {
+        self.prepare_scope(definitions, ScopeChange::Reconcile)
+            .map(|prepared| prepared.runtime())
+    }
+
+    fn prepare_scope(
+        &self,
+        definitions: Vec<Definition>,
+        change: ScopeChange,
+    ) -> io::Result<PreparedScope> {
         let definitions = validate_definitions(definitions)?;
         let definitions = definitions
             .into_iter()
             .map(|definition| (definition.key.clone(), definition))
             .collect::<BTreeMap<_, _>>();
-        let snapshot = {
-            let mut shared = lock(&self.shared);
-            ensure_active(&shared)?;
+        let shared = lock(&self.shared);
+        ensure_active(&shared)?;
+        if matches!(change, ScopeChange::Reconcile) {
             for (key, registered) in &shared.registrations {
                 if let Some(definition) = definitions.get(key)
                     && definition != &registered.definition
@@ -468,43 +550,174 @@ impl Manager {
                     ));
                 }
             }
-            let added = definitions
-                .keys()
-                .filter(|key| !shared.registrations.contains_key(*key))
-                .count();
-            let incarnations = allocate_many(&mut shared.next_key_incarnation, added)?;
-            let mut incarnations = incarnations.into_iter();
-            let removed = shared
-                .registrations
-                .keys()
-                .filter(|key| !definitions.contains_key(*key))
-                .cloned()
-                .collect::<Vec<_>>();
-            for key in removed {
-                retire_key(&mut shared, &key);
-                shared.registrations.remove(&key);
-                shared.states.remove(&key);
+        }
+        let preserved = definitions
+            .iter()
+            .filter_map(|(key, definition)| {
+                let registered = shared.registrations.get(key)?;
+                (registered.definition == *definition
+                    && (matches!(change, ScopeChange::Reconcile) || definition.command.is_some()))
+                .then(|| key.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let new_count = definitions.len().saturating_sub(preserved.len());
+        let mut next_key_incarnation = shared.next_key_incarnation;
+        let values = allocate_many(&mut next_key_incarnation, new_count)?;
+        let mut values = values.into_iter();
+        let incarnations = definitions
+            .keys()
+            .filter(|key| !preserved.contains(*key))
+            .map(|key| {
+                (
+                    key.clone(),
+                    values
+                        .next()
+                        .expect("every new process key must have an incarnation"),
+                )
+            })
+            .collect();
+        let expected_preserved_states = preserved
+            .iter()
+            .map(|key| {
+                (
+                    key.clone(),
+                    shared
+                        .states
+                        .get(key)
+                        .cloned()
+                        .expect("every registered process must have state"),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let states = definitions
+            .keys()
+            .map(|key| {
+                expected_preserved_states
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| State::idle(key.clone()))
+            })
+            .collect::<Vec<_>>()
+            .into();
+        Ok(PreparedScope {
+            expected_generation: shared.generation,
+            expected_next_key_incarnation: shared.next_key_incarnation,
+            expected_preserved_states,
+            next_generation: advance(shared.generation)?,
+            next_key_incarnation,
+            definitions,
+            preserved,
+            incarnations,
+            snapshot: Snapshot { states },
+        })
+    }
+
+    pub(crate) fn commit_scope(&self, prepared: PreparedScope) -> io::Result<ScopeActivation> {
+        let mut shared = lock(&self.shared);
+        ensure_active(&shared)?;
+        if shared.generation != prepared.expected_generation
+            || shared.next_key_incarnation != prepared.expected_next_key_incarnation
+            || prepared
+                .expected_preserved_states
+                .iter()
+                .any(|(key, state)| shared.states.get(key) != Some(state))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "managed process scope changed after preflight",
+            ));
+        }
+        shared.generation = prepared.next_generation;
+        shared.next_key_incarnation = prepared.next_key_incarnation;
+        let retired = shared
+            .registrations
+            .keys()
+            .filter(|key| !prepared.preserved.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in retired {
+            retire_key(&mut shared, &key);
+            shared.registrations.remove(&key);
+            shared.states.remove(&key);
+        }
+        let mut keys = Vec::new();
+        for (key, definition) in prepared.definitions {
+            if prepared.preserved.contains(&key) {
+                continue;
             }
-            for (key, definition) in definitions {
-                if shared.registrations.contains_key(&key) {
-                    continue;
-                }
-                let incarnation = incarnations
-                    .next()
-                    .expect("every added process key must have an incarnation");
-                shared.states.insert(key.clone(), State::idle(key.clone()));
-                shared.registrations.insert(
-                    key,
-                    Registered {
-                        definition,
-                        incarnation,
-                    },
-                );
+            let incarnation = prepared.incarnations[&key];
+            let schedule = definition.command.as_ref().map(|_| Schedule {
+                deadline: ScheduleDeadline::Disarmed,
+                pending_refresh: false,
+            });
+            if schedule.is_some() {
+                keys.push(key.clone());
             }
-            publish_locked(&mut shared)
-        };
+            shared.states.insert(key.clone(), State::idle(key.clone()));
+            shared.registrations.insert(
+                key,
+                Registered {
+                    definition,
+                    incarnation,
+                    schedule,
+                },
+            );
+        }
+        shared.capacity_epoch = shared.capacity_epoch.wrapping_add(1);
+        publish_locked(&mut shared);
         self.ping.ping();
-        let _ = wake(&self.wake);
+        Ok(ScopeActivation {
+            generation: prepared.next_generation,
+            keys,
+        })
+    }
+
+    pub(crate) fn arm_scope(&self, activation: ScopeActivation) {
+        let now = Instant::now();
+        let changed = {
+            let mut shared = lock(&self.shared);
+            if shared.generation != activation.generation || shared.shutdown {
+                return;
+            }
+            let mut changed = false;
+            for key in activation.keys {
+                let Some(schedule) = shared
+                    .registrations
+                    .get_mut(&key)
+                    .and_then(|registered| registered.schedule.as_mut())
+                else {
+                    continue;
+                };
+                if matches!(schedule.deadline, ScheduleDeadline::Disarmed) {
+                    schedule.deadline = ScheduleDeadline::Next(now);
+                    changed = true;
+                }
+            }
+            if changed {
+                shared.capacity_epoch = shared.capacity_epoch.wrapping_add(1);
+            }
+            changed
+        };
+        if changed {
+            let _ = wake(&self.wake);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_scope(&self, definitions: Vec<Definition>) -> io::Result<Snapshot> {
+        let prepared = self.prepare_replace_scope(definitions)?;
+        let snapshot = prepared.snapshot.clone();
+        let activation = self.commit_scope(prepared)?;
+        self.arm_scope(activation);
+        Ok(snapshot)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reconcile_scope(&self, definitions: Vec<Definition>) -> io::Result<Snapshot> {
+        let prepared = self.prepare_reconcile_scope(definitions)?;
+        let snapshot = prepared.snapshot.clone();
+        let activation = self.commit_scope(prepared)?;
+        self.arm_scope(activation);
         Ok(snapshot)
     }
 
@@ -515,83 +728,22 @@ impl Manager {
         cwd: Option<String>,
     ) -> io::Result<()> {
         validate_command(&argv, cwd.as_deref())?;
-        let mut shared = lock(&self.shared);
-        ensure_active(&shared)?;
-        let registered =
-            shared.registrations.get(key).cloned().ok_or_else(|| {
+        let token = {
+            let mut shared = lock(&self.shared);
+            ensure_active(&shared)?;
+            let registered = shared.registrations.get(key).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "unknown managed process")
             })?;
-        let state = shared
-            .states
-            .get(key)
-            .expect("every registration must have state");
-        if state.running() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "managed process is already active",
-            ));
-        }
-        if shared.occupied.values().any(|occupied| occupied.key == key) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "the previous managed process incarnation has not been reaped",
-            ));
-        }
-        if shared.occupied.len() >= MAX_UNREAPED {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "too many managed process incarnations remain unreaped",
-            ));
-        }
-        if shared.starts.len() >= MAX_STARTS {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "managed process start queue is full",
-            ));
-        }
-        let retained = shared.states[key].retained_bytes;
-        let reservation = RUN_BUFFER_RESERVATION;
-        let next_retained = shared
-            .reserved_bytes
-            .saturating_sub(retained)
-            .checked_add(reservation)
-            .ok_or_else(|| io::Error::other("managed process buffer accounting overflow"))?;
-        if next_retained > MAX_RETAINED_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "managed process output buffer limit reached",
-            ));
-        }
-        let run_incarnation = allocate(&mut shared.next_run_incarnation)?;
-        let token = RunToken {
-            generation: shared.generation,
-            key_incarnation: registered.incarnation,
-            run_incarnation,
+            if registered.definition.command.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "scheduled processes use refresh instead of start",
+                ));
+            }
+            queue_start_locked(&mut shared, key, argv, cwd, false)?
         };
-        shared.reserved_bytes = next_retained;
-        shared.occupied.insert(
-            token,
-            Occupied {
-                key: key.to_owned(),
-                shutdown_signal: registered.definition.shutdown_signal,
-                reserved_bytes: reservation,
-            },
-        );
-        shared
-            .states
-            .get_mut(key)
-            .expect("every registration must have state")
-            .clear_for_start(token);
-        shared.starts.push_back(Start {
-            token,
-            key: key.to_owned(),
-            argv,
-            cwd,
-        });
-        shared.latest = Some(snapshot_locked(&shared));
         #[cfg(test)]
-        let before_spawn = shared.before_spawn.clone();
-        drop(shared);
+        let before_spawn = lock(&self.shared).before_spawn.clone();
         self.ping.ping();
         #[cfg(test)]
         if let Some(gate) = before_spawn {
@@ -600,6 +752,103 @@ impl Manager {
         if let Err(error) = wake(&self.wake) {
             retire_failed_start(&self.shared, token, &error.to_string(), &self.ping);
             return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn refresh_process(&self, key: &str) -> io::Result<()> {
+        let changed = {
+            let mut shared = lock(&self.shared);
+            ensure_active(&shared)?;
+            let status = shared
+                .states
+                .get(key)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown managed process"))?
+                .status;
+            let schedule = shared
+                .registrations
+                .get_mut(key)
+                .and_then(|registered| registered.schedule.as_mut())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "managed process is not scheduled",
+                    )
+                })?;
+            match status {
+                Status::Starting => false,
+                Status::Running | Status::Stopping => {
+                    let changed = !schedule.pending_refresh;
+                    schedule.pending_refresh = true;
+                    changed
+                }
+                Status::Idle | Status::Exited | Status::Failed => {
+                    let changed = !schedule.pending_refresh;
+                    schedule.pending_refresh = true;
+                    changed
+                }
+            }
+        };
+        if changed {
+            let _ = wake(&self.wake);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_process(&self, key: &str) -> io::Result<()> {
+        let now = Instant::now();
+        let changed = {
+            let mut shared = lock(&self.shared);
+            ensure_active(&shared)?;
+            let registered = shared.registrations.get(key).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "unknown managed process")
+            })?;
+            let interval = registered
+                .definition
+                .command
+                .as_ref()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "managed process is not scheduled",
+                    )
+                })?
+                .interval;
+            let token = shared.states[key].token;
+            let schedule = shared
+                .registrations
+                .get_mut(key)
+                .and_then(|registered| registered.schedule.as_mut())
+                .expect("scheduled definitions must have schedule state");
+            schedule.pending_refresh = false;
+            schedule.deadline = interval.map_or(ScheduleDeadline::None, |interval| {
+                let next = now.checked_add(interval).unwrap_or(now);
+                match schedule.deadline {
+                    ScheduleDeadline::Next(current) if current > next => {
+                        ScheduleDeadline::Next(current)
+                    }
+                    _ => ScheduleDeadline::Next(next),
+                }
+            });
+            if let Some(token) = token {
+                let signal = shared
+                    .occupied
+                    .get(&token)
+                    .map(|occupied| occupied.shutdown_signal)
+                    .unwrap_or(ShutdownSignal::Terminate);
+                shared.stops.insert(token, signal);
+                if let Some(state) = shared.states.get_mut(key)
+                    && state.token == Some(token)
+                {
+                    state.status = Status::Stopping;
+                }
+            }
+            shared.latest = Some(snapshot_locked(&shared));
+            true
+        };
+        if changed {
+            self.ping.ping();
+            let _ = wake(&self.wake);
         }
         Ok(())
     }
@@ -648,6 +897,94 @@ impl Manager {
     }
 }
 
+fn queue_start_locked(
+    shared: &mut Shared,
+    key: &str,
+    argv: Vec<String>,
+    cwd: Option<String>,
+    scheduled: bool,
+) -> io::Result<RunToken> {
+    let registered = shared
+        .registrations
+        .get(key)
+        .cloned()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown managed process"))?;
+    let state = shared
+        .states
+        .get(key)
+        .expect("every registration must have state");
+    if state.running() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "managed process is already active",
+        ));
+    }
+    if shared.occupied.values().any(|occupied| occupied.key == key) {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "the previous managed process incarnation has not been reaped",
+        ));
+    }
+    if shared.occupied.len() >= MAX_UNREAPED {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "too many managed process incarnations remain unreaped",
+        ));
+    }
+    if shared.starts.len() >= MAX_STARTS {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "managed process start queue is full",
+        ));
+    }
+    let retained = shared.states[key].retained_bytes;
+    let reservation = RUN_BUFFER_RESERVATION;
+    let base = if scheduled {
+        shared.reserved_bytes
+    } else {
+        shared.reserved_bytes.saturating_sub(retained)
+    };
+    let next_retained = base
+        .checked_add(reservation)
+        .ok_or_else(|| io::Error::other("managed process buffer accounting overflow"))?;
+    if next_retained > MAX_RETAINED_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "managed process output buffer limit reached",
+        ));
+    }
+    let run_incarnation = allocate(&mut shared.next_run_incarnation)?;
+    let token = RunToken {
+        generation: shared.generation,
+        key_incarnation: registered.incarnation,
+        run_incarnation,
+    };
+    shared.reserved_bytes = next_retained;
+    shared.occupied.insert(
+        token,
+        Occupied {
+            key: key.to_owned(),
+            shutdown_signal: registered.definition.shutdown_signal,
+            reserved_bytes: reservation,
+            scheduled,
+        },
+    );
+    shared
+        .states
+        .get_mut(key)
+        .expect("every registration must have state")
+        .prepare_for_start(token, scheduled);
+    shared.starts.push_back(Start {
+        token,
+        key: key.to_owned(),
+        argv,
+        cwd,
+        scheduled,
+    });
+    shared.latest = Some(snapshot_locked(shared));
+    Ok(token)
+}
+
 impl Drop for Manager {
     fn drop(&mut self) {
         {
@@ -676,6 +1013,7 @@ impl Drop for Manager {
 struct Run {
     token: RunToken,
     key: String,
+    scheduled: bool,
     child: Child,
     pid: u32,
     stdout: Option<std::fs::File>,
@@ -773,7 +1111,8 @@ fn run_worker(
                 owners.push((*token, stream));
             }
         }
-        let timeout = poll_timeout(&runs, Instant::now());
+        let now = Instant::now();
+        let timeout = poll_timeout(&runs, next_schedule_deadline(&shared), now);
         if poll(&mut descriptors, timeout).is_err() {
             mark_worker_failure(&shared, &mut runs, &ping, "managed process poll failed");
             listen_wake = false;
@@ -817,6 +1156,7 @@ fn maintain(
     setup: ChildSetup,
     limits: Limits,
 ) {
+    apply_schedules(shared, ping, Instant::now());
     apply_starts(shared, runs, ping, setup, limits);
     apply_stops(shared, runs, ping, limits);
     let now = Instant::now();
@@ -930,6 +1270,212 @@ fn maintain(
             finish_run(shared, &mut run, ping);
         }
     }
+    apply_schedules(shared, ping, Instant::now());
+    apply_starts(shared, runs, ping, setup, limits);
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ScheduledCapacity {
+    Ready,
+    Wait,
+    Buffers,
+}
+
+fn apply_schedules(shared: &Mutex<Shared>, ping: &Ping, now: Instant) {
+    let mut shared = lock(shared);
+    let keys = shared.registrations.keys().cloned().collect::<Vec<_>>();
+    let capacity_epoch = shared.capacity_epoch;
+    let mut changed = false;
+    for key in keys {
+        let Some(registered) = shared.registrations.get(&key) else {
+            continue;
+        };
+        let Some(command) = registered.definition.command.clone() else {
+            continue;
+        };
+        let schedule = registered
+            .schedule
+            .as_ref()
+            .expect("scheduled definitions must have schedule state");
+        let deadline_due = match schedule.deadline {
+            ScheduleDeadline::Next(deadline) => deadline <= now,
+            ScheduleDeadline::DueBlocked(epoch) => epoch != capacity_epoch,
+            ScheduleDeadline::Disarmed | ScheduleDeadline::None => false,
+        };
+        if !deadline_due && !schedule.pending_refresh {
+            continue;
+        }
+        let status = shared.states[&key].status;
+        if matches!(status, Status::Starting) {
+            if schedule.pending_refresh {
+                shared
+                    .registrations
+                    .get_mut(&key)
+                    .and_then(|registered| registered.schedule.as_mut())
+                    .expect("scheduled definitions must have schedule state")
+                    .pending_refresh = false;
+                changed = true;
+            }
+            if deadline_due {
+                advance_schedule_deadline(&mut shared, &key, &command, now);
+            }
+            continue;
+        }
+        if matches!(status, Status::Running | Status::Stopping) {
+            if deadline_due {
+                advance_schedule_deadline(&mut shared, &key, &command, now);
+            }
+            continue;
+        }
+        match scheduled_capacity(&shared, &key) {
+            ScheduledCapacity::Wait => {
+                let schedule = shared
+                    .registrations
+                    .get_mut(&key)
+                    .and_then(|registered| registered.schedule.as_mut())
+                    .expect("scheduled definitions must have schedule state");
+                schedule.pending_refresh = false;
+                schedule.deadline = ScheduleDeadline::DueBlocked(capacity_epoch);
+            }
+            ScheduledCapacity::Buffers => {
+                let schedule = shared
+                    .registrations
+                    .get_mut(&key)
+                    .and_then(|registered| registered.schedule.as_mut())
+                    .expect("scheduled definitions must have schedule state");
+                schedule.pending_refresh = false;
+                schedule.deadline = command.interval.map_or(ScheduleDeadline::None, |interval| {
+                    ScheduleDeadline::Next(now + interval)
+                });
+                let state = shared
+                    .states
+                    .get_mut(&key)
+                    .expect("every registration must have state");
+                state.status = Status::Failed;
+                state.error = Arc::from("managed process output buffer limit reached");
+                changed = true;
+            }
+            ScheduledCapacity::Ready => {
+                match queue_start_locked(
+                    &mut shared,
+                    &key,
+                    command.argv.clone(),
+                    command.cwd.clone(),
+                    true,
+                ) {
+                    Ok(_) => {
+                        let schedule = shared
+                            .registrations
+                            .get_mut(&key)
+                            .and_then(|registered| registered.schedule.as_mut())
+                            .expect("scheduled definitions must have schedule state");
+                        schedule.pending_refresh = false;
+                        schedule.deadline =
+                            command.interval.map_or(ScheduleDeadline::None, |interval| {
+                                ScheduleDeadline::Next(now + interval)
+                            });
+                        changed = true;
+                    }
+                    Err(error) => {
+                        let schedule = shared
+                            .registrations
+                            .get_mut(&key)
+                            .and_then(|registered| registered.schedule.as_mut())
+                            .expect("scheduled definitions must have schedule state");
+                        schedule.pending_refresh = false;
+                        schedule.deadline =
+                            command.interval.map_or(ScheduleDeadline::None, |interval| {
+                                ScheduleDeadline::Next(now + interval)
+                            });
+                        let state = shared
+                            .states
+                            .get_mut(&key)
+                            .expect("every registration must have state");
+                        state.status = Status::Failed;
+                        state.error = Arc::from(bounded(&error.to_string(), MAX_ERROR_BYTES));
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    if changed {
+        shared.latest = Some(snapshot_locked(&shared));
+        drop(shared);
+        ping.ping();
+    }
+}
+
+fn scheduled_capacity(shared: &Shared, key: &str) -> ScheduledCapacity {
+    if shared.occupied.values().any(|occupied| occupied.key == key)
+        || shared.occupied.len() >= MAX_UNREAPED
+        || shared.starts.len() >= MAX_STARTS
+    {
+        return ScheduledCapacity::Wait;
+    }
+    let Some(bytes) = shared.reserved_bytes.checked_add(RUN_BUFFER_RESERVATION) else {
+        return ScheduledCapacity::Buffers;
+    };
+    if bytes <= MAX_RETAINED_BYTES {
+        return ScheduledCapacity::Ready;
+    }
+    let active_reservations = shared
+        .occupied
+        .values()
+        .map(|occupied| occupied.reserved_bytes)
+        .sum::<usize>();
+    let retained = shared.reserved_bytes.saturating_sub(active_reservations);
+    if retained.saturating_add(RUN_BUFFER_RESERVATION) <= MAX_RETAINED_BYTES {
+        ScheduledCapacity::Wait
+    } else {
+        ScheduledCapacity::Buffers
+    }
+}
+
+fn advance_schedule_deadline(
+    shared: &mut Shared,
+    key: &str,
+    command: &ScheduledCommand,
+    now: Instant,
+) {
+    let schedule = shared
+        .registrations
+        .get_mut(key)
+        .and_then(|registered| registered.schedule.as_mut())
+        .expect("scheduled definitions must have schedule state");
+    schedule.deadline = command.interval.map_or(ScheduleDeadline::None, |interval| {
+        let ScheduleDeadline::Next(deadline) = schedule.deadline else {
+            return ScheduleDeadline::Next(now + interval);
+        };
+        let steps = now
+            .saturating_duration_since(deadline)
+            .as_nanos()
+            .checked_div(interval.as_nanos())
+            .and_then(|steps| steps.checked_add(1));
+        let offset = steps
+            .and_then(|steps| interval.as_nanos().checked_mul(steps))
+            .and_then(|nanos| u64::try_from(nanos).ok())
+            .map(Duration::from_nanos);
+        offset
+            .and_then(|offset| deadline.checked_add(offset))
+            .map_or(
+                ScheduleDeadline::Next(now + interval),
+                ScheduleDeadline::Next,
+            )
+    });
+}
+
+fn next_schedule_deadline(shared: &Mutex<Shared>) -> Option<Instant> {
+    lock(shared)
+        .registrations
+        .values()
+        .filter_map(|registered| match registered.schedule.as_ref()?.deadline {
+            ScheduleDeadline::Next(deadline) => Some(deadline),
+            ScheduleDeadline::Disarmed
+            | ScheduleDeadline::DueBlocked(_)
+            | ScheduleDeadline::None => None,
+        })
+        .min()
 }
 
 fn apply_starts(
@@ -1085,6 +1631,7 @@ fn spawn(start: Start, setup: ChildSetup) -> Result<(Run, Option<String>), (RunT
         Run {
             token,
             key: start.key,
+            scheduled: start.scheduled,
             child,
             pid,
             stdout,
@@ -1205,6 +1752,9 @@ fn read_stream(shared: &Mutex<Shared>, run: &mut Run, stream: Stream, ping: &Pin
 }
 
 fn publish_run(shared: &Mutex<Shared>, run: &Run, ping: &Ping) {
+    if run.scheduled {
+        return;
+    }
     let changed = {
         let mut shared = lock(shared);
         let Some(state) = shared.states.get_mut(&run.key) else {
@@ -1242,7 +1792,7 @@ fn finish_run(shared: &Mutex<Shared>, run: &mut Run, ping: &Ping) {
         .expect("finished run must have a wait status");
     let mut shared = lock(shared);
     let occupied = shared.occupied.remove(&run.token);
-    shared.stops.remove(&run.token);
+    let cancelled = shared.stops.remove(&run.token).is_some();
     let current = shared
         .states
         .get(&run.key)
@@ -1251,36 +1801,54 @@ fn finish_run(shared: &Mutex<Shared>, run: &mut Run, ping: &Ping) {
         let reserved = occupied
             .as_ref()
             .map_or(RUN_BUFFER_RESERVATION, |occupied| occupied.reserved_bytes);
-        let stdout: Arc<str> = Arc::from(run.stdout_tail.as_str());
-        let stderr: Arc<str> = Arc::from(run.stderr_tail.as_str());
-        let retained = stdout.len().saturating_add(stderr.len());
-        shared.reserved_bytes = shared
-            .reserved_bytes
-            .saturating_sub(reserved)
-            .saturating_add(retained);
-        let state = shared
-            .states
-            .get_mut(&run.key)
-            .expect("current run must retain state");
-        state.status = if state.terminal_failure {
-            Status::Failed
+        shared.reserved_bytes = shared.reserved_bytes.saturating_sub(reserved);
+        if run.scheduled && cancelled {
+            let state = shared
+                .states
+                .get_mut(&run.key)
+                .expect("current run must retain state");
+            state.status = if state.terminal_failure {
+                Status::Failed
+            } else {
+                Status::Exited
+            };
+            state.token = None;
+            state.terminal_failure = false;
         } else {
-            Status::Exited
-        };
-        state.stdout = stdout;
-        state.stderr = stderr;
-        state.stdout_truncated = run.stdout_tail.truncated();
-        state.stderr_truncated = run.stderr_tail.truncated();
-        state.exit_code = status.code();
-        state.exit_signal = status.signal();
-        state.token = None;
-        state.retained_bytes = retained;
-        state.terminal_failure = false;
+            let stdout: Arc<str> = Arc::from(run.stdout_tail.as_str());
+            let stderr: Arc<str> = Arc::from(run.stderr_tail.as_str());
+            let retained = stdout.len().saturating_add(stderr.len());
+            if run.scheduled {
+                shared.reserved_bytes = shared
+                    .reserved_bytes
+                    .saturating_sub(shared.states[&run.key].retained_bytes);
+            }
+            shared.reserved_bytes = shared.reserved_bytes.saturating_add(retained);
+            let state = shared
+                .states
+                .get_mut(&run.key)
+                .expect("current run must retain state");
+            state.status = if state.terminal_failure {
+                Status::Failed
+            } else {
+                Status::Exited
+            };
+            state.stdout = stdout;
+            state.stderr = stderr;
+            state.stdout_truncated = run.stdout_tail.truncated();
+            state.stderr_truncated = run.stderr_tail.truncated();
+            state.exit_code = status.code();
+            state.exit_signal = status.signal();
+            state.token = None;
+            state.retained_bytes = retained;
+            state.terminal_failure = false;
+        }
     } else if let Some(occupied) = occupied {
         shared.reserved_bytes = shared
             .reserved_bytes
             .saturating_sub(occupied.reserved_bytes);
     }
+    shared.capacity_epoch = shared.capacity_epoch.wrapping_add(1);
     shared.latest = Some(snapshot_locked(&shared));
     drop(shared);
     ping.ping();
@@ -1360,9 +1928,12 @@ fn fail_start(shared: &Mutex<Shared>, token: RunToken, error: &str, ping: &Ping)
             state.status = Status::Failed;
             state.error = Arc::from(bounded(error, MAX_ERROR_BYTES));
             state.token = None;
-            state.retained_bytes = 0;
+            if !occupied.scheduled {
+                state.retained_bytes = 0;
+            }
         }
     }
+    shared.capacity_epoch = shared.capacity_epoch.wrapping_add(1);
     shared.latest = Some(snapshot_locked(&shared));
     drop(shared);
     ping.ping();
@@ -1407,10 +1978,13 @@ fn cancel_start(shared: &Mutex<Shared>, token: RunToken, ping: &Ping) {
                 Status::Exited
             };
             state.token = None;
-            state.retained_bytes = 0;
+            if !occupied.scheduled {
+                state.retained_bytes = 0;
+            }
             state.terminal_failure = false;
         }
     }
+    shared.capacity_epoch = shared.capacity_epoch.wrapping_add(1);
     shared.latest = Some(snapshot_locked(&shared));
     drop(shared);
     ping.ping();
@@ -1475,15 +2049,9 @@ fn should_finish(shared: &Mutex<Shared>, runs: &BTreeMap<RunToken, Run>) -> bool
     shared.shutdown && runs.is_empty() && shared.starts.is_empty() && shared.occupied.is_empty()
 }
 
-fn retire_all(shared: &mut Shared) {
-    let keys = shared.registrations.keys().cloned().collect::<Vec<_>>();
-    for key in keys {
-        retire_key(shared, &key);
-    }
-}
-
 fn retire_key(shared: &mut Shared, key: &str) {
     if let Some(state) = shared.states.get(key) {
+        shared.reserved_bytes = shared.reserved_bytes.saturating_sub(state.retained_bytes);
         if let Some(token) = state.token {
             let signal = shared
                 .occupied
@@ -1491,8 +2059,6 @@ fn retire_key(shared: &mut Shared, key: &str) {
                 .map(|occupied| occupied.shutdown_signal)
                 .unwrap_or(ShutdownSignal::Terminate);
             shared.stops.insert(token, signal);
-        } else {
-            shared.reserved_bytes = shared.reserved_bytes.saturating_sub(state.retained_bytes);
         }
     }
 }
@@ -1519,6 +2085,17 @@ fn validate_definitions(definitions: Vec<Definition>) -> io::Result<Vec<Definiti
     let mut keys = BTreeSet::new();
     for definition in &definitions {
         validate_key(&definition.key)?;
+        if let Some(command) = &definition.command {
+            validate_command(&command.argv, command.cwd.as_deref())?;
+            if command.interval.is_some_and(|interval| {
+                !(MIN_SCHEDULE_INTERVAL..=MAX_SCHEDULE_INTERVAL).contains(&interval)
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid managed process interval",
+                ));
+            }
+        }
         if !keys.insert(definition.key.as_str()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1825,7 +2402,7 @@ fn nonblocking(fd: OwnedFd) -> io::Result<std::fs::File> {
     Ok(std::fs::File::from(fd))
 }
 
-fn poll_timeout(runs: &BTreeMap<RunToken, Run>, now: Instant) -> i32 {
+fn poll_timeout(runs: &BTreeMap<RunToken, Run>, schedule: Option<Instant>, now: Instant) -> i32 {
     let deadline = runs
         .values()
         .flat_map(|run| {
@@ -1840,6 +2417,7 @@ fn poll_timeout(runs: &BTreeMap<RunToken, Run>, now: Instant) -> i32 {
             ]
         })
         .flatten()
+        .chain(schedule)
         .min()
         .unwrap_or(now + POLL_INTERVAL)
         .min(now + POLL_INTERVAL);
@@ -2000,6 +2578,24 @@ mod tests {
         Definition {
             key: key.into(),
             shutdown_signal: ShutdownSignal::Terminate,
+            command: None,
+        }
+    }
+
+    fn scheduled_definition(
+        key: &str,
+        mode: &str,
+        cwd: Option<String>,
+        interval: Option<Duration>,
+    ) -> Definition {
+        Definition {
+            key: key.into(),
+            shutdown_signal: ShutdownSignal::Terminate,
+            command: Some(ScheduledCommand {
+                argv: helper(mode),
+                cwd,
+                interval,
+            }),
         }
     }
 
@@ -2025,6 +2621,8 @@ mod tests {
             "group" => "managed_process::tests::fake_child_group",
             "escape-group" => "managed_process::tests::fake_child_escape_group",
             "report-ignore-term" => "managed_process::tests::fake_child_report_ignore_term",
+            "staged-output" => "managed_process::tests::fake_child_staged_output",
+            "counted-output" => "managed_process::tests::fake_child_counted_output",
             _ => panic!("unknown fake child mode"),
         };
         vec![
@@ -2039,16 +2637,41 @@ mod tests {
     }
 
     fn wait_for(manager: &Manager, mut predicate: impl FnMut(&State) -> bool) -> State {
+        wait_for_key(manager, None, |state| predicate(state))
+    }
+
+    fn wait_for_key(
+        manager: &Manager,
+        key: Option<&str>,
+        mut predicate: impl FnMut(&State) -> bool,
+    ) -> State {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let snapshot = manager.snapshot();
-            let state = snapshot.states[0].clone();
+            let state = key.map_or_else(
+                || snapshot.states[0].clone(),
+                |key| {
+                    snapshot
+                        .states
+                        .iter()
+                        .find(|state| state.key == key)
+                        .unwrap_or_else(|| panic!("missing managed process {key:?}"))
+                        .clone()
+                },
+            );
             if predicate(&state) {
                 return state;
             }
             assert!(Instant::now() < deadline, "timed out with {state:?}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn read_run_count(directory: &std::path::Path) -> u32 {
+        std::fs::read_to_string(directory.join("runs"))
+            .unwrap()
+            .parse()
+            .unwrap()
     }
 
     fn fixture(test: &str) -> Command {
@@ -2141,6 +2764,7 @@ mod tests {
                 key: "child".into(),
                 argv: helper("output"),
                 cwd: None,
+                scheduled: false,
             },
             ChildSetup::capture().unwrap(),
         )
@@ -2152,7 +2776,7 @@ mod tests {
 
         let mut runs = BTreeMap::new();
         runs.insert(token, run);
-        assert!(poll_timeout(&runs, Instant::now()) > 1);
+        assert!(poll_timeout(&runs, None, Instant::now()) > 1);
 
         let mut shared = Shared::default();
         shared.stops.insert(token, ShutdownSignal::Terminate);
@@ -2182,6 +2806,474 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.states.len(), 2);
         assert!(manager.take_snapshot().is_some());
+    }
+
+    #[test]
+    fn scheduled_scope_stays_disarmed_until_publication_completes() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = manager();
+        let definition = scheduled_definition(
+            "query",
+            "counted-output",
+            Some(directory.path().to_string_lossy().into_owned()),
+            None,
+        );
+        let prepared = manager.prepare_replace_scope(vec![definition]).unwrap();
+        assert_eq!(
+            prepared.runtime().states[0].status,
+            ManagedProcessStatus::Idle
+        );
+        let activation = manager.commit_scope(prepared).unwrap();
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(!directory.path().join("runs").exists());
+        assert_eq!(manager.snapshot().states[0].status, Status::Idle);
+
+        manager.arm_scope(activation);
+        let state = wait_for(&manager, |state| state.status == Status::Exited);
+        assert_eq!(read_run_count(directory.path()), 1);
+        assert!(state.stdout.contains("complete=1"));
+        thread::sleep(Duration::from_millis(350));
+        assert_eq!(read_run_count(directory.path()), 1);
+    }
+
+    #[test]
+    fn scheduled_refresh_keeps_the_completed_result_and_cancel_discards_capture() {
+        let manager = manager();
+        manager
+            .replace_scope(vec![scheduled_definition(
+                "query",
+                "staged-output",
+                None,
+                None,
+            )])
+            .unwrap();
+        let completed = wait_for(&manager, |state| state.status == Status::Exited);
+        assert!(completed.stdout.contains("first"));
+        assert!(completed.stdout.contains("second"));
+
+        let gate = Arc::new(SpawnGate::default());
+        lock(&manager.shared).before_spawn = Some(gate.clone());
+        manager.refresh_process("query").unwrap();
+        gate.wait_until_reached();
+        let starting = manager.snapshot().states[0].clone();
+        assert_eq!(starting.status, Status::Starting);
+        assert_eq!(starting.stdout, completed.stdout);
+        assert_eq!(starting.exit_code, completed.exit_code);
+
+        manager.refresh_process("query").unwrap();
+        gate.release();
+        wait_for(&manager, |state| state.status == Status::Running);
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(manager.snapshot().states[0].stdout, completed.stdout);
+
+        manager.cancel_process("query").unwrap();
+        let cancelled = wait_for(&manager, |state| state.status == Status::Exited);
+        assert_eq!(cancelled.stdout, completed.stdout);
+        assert_eq!(cancelled.stderr, completed.stderr);
+        assert_eq!(cancelled.exit_code, completed.exit_code);
+        assert_eq!(cancelled.exit_signal, completed.exit_signal);
+    }
+
+    #[test]
+    fn refresh_during_a_running_job_coalesces_to_one_follow_up() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = manager();
+        manager
+            .replace_scope(vec![scheduled_definition(
+                "query",
+                "counted-output",
+                Some(directory.path().to_string_lossy().into_owned()),
+                None,
+            )])
+            .unwrap();
+        wait_for(&manager, |state| state.status == Status::Exited);
+        assert_eq!(read_run_count(directory.path()), 1);
+
+        manager.refresh_process("query").unwrap();
+        wait_for(&manager, |state| {
+            state.status == Status::Running && read_run_count(directory.path()) == 2
+        });
+        manager.refresh_process("query").unwrap();
+        manager.refresh_process("query").unwrap();
+
+        wait_for(&manager, |state| {
+            state.status == Status::Exited && read_run_count(directory.path()) == 3
+        });
+        thread::sleep(Duration::from_millis(350));
+        assert_eq!(read_run_count(directory.path()), 3);
+    }
+
+    #[test]
+    fn recurring_jobs_use_one_monotonic_deadline_without_catch_up() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = manager();
+        manager
+            .replace_scope(vec![scheduled_definition(
+                "query",
+                "counted-output",
+                Some(directory.path().to_string_lossy().into_owned()),
+                Some(Duration::from_secs(1)),
+            )])
+            .unwrap();
+        wait_for(&manager, |state| state.status == Status::Exited);
+        let first_completed = Instant::now();
+        wait_for(&manager, |_| read_run_count(directory.path()) == 2);
+        assert!(first_completed.elapsed() >= Duration::from_millis(500));
+
+        manager.cancel_process("query").unwrap();
+        wait_for(&manager, |state| state.status == Status::Exited);
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(read_run_count(directory.path()), 2);
+    }
+
+    #[test]
+    fn exact_scheduled_reloads_preserve_the_live_incarnation_and_result() {
+        let definition = scheduled_definition("query", "staged-output", None, None);
+        let manager = manager();
+        manager.replace_scope(vec![definition.clone()]).unwrap();
+        let running = wait_for(&manager, |state| state.status == Status::Running);
+        let (token, incarnation) = {
+            let shared = lock(&manager.shared);
+            (
+                shared.states["query"].token,
+                shared.registrations["query"].incarnation,
+            )
+        };
+
+        let prepared = manager
+            .prepare_replace_scope(vec![definition.clone()])
+            .unwrap();
+        assert_eq!(
+            prepared.runtime().states[0].status,
+            ManagedProcessStatus::Running
+        );
+        let activation = manager.commit_scope(prepared).unwrap();
+        manager.arm_scope(activation);
+        let shared = lock(&manager.shared);
+        assert_eq!(shared.states["query"].token, token);
+        assert_eq!(shared.states["query"].stdout, running.stdout);
+        assert_eq!(shared.registrations["query"].incarnation, incarnation);
+        drop(shared);
+
+        let completed = wait_for(&manager, |state| state.status == Status::Exited);
+        let prepared = manager.prepare_replace_scope(vec![definition]).unwrap();
+        let projected = &prepared.runtime().states[0];
+        assert_eq!(projected.status, ManagedProcessStatus::Exited);
+        assert_eq!(projected.stdout, completed.stdout);
+    }
+
+    #[test]
+    fn a_stale_prepared_scope_cannot_replace_the_committed_scope() {
+        let manager = manager();
+        let stale = manager
+            .prepare_replace_scope(vec![scheduled_definition("stale", "output", None, None)])
+            .unwrap();
+        let current = manager
+            .prepare_replace_scope(vec![scheduled_definition("current", "output", None, None)])
+            .unwrap();
+        let _activation = manager.commit_scope(current).unwrap();
+
+        let error = match manager.commit_scope(stale) {
+            Ok(_) => panic!("stale managed process scope was committed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let shared = lock(&manager.shared);
+        assert!(shared.registrations.contains_key("current"));
+        assert!(!shared.registrations.contains_key("stale"));
+        assert!(matches!(
+            shared.registrations["current"]
+                .schedule
+                .as_ref()
+                .unwrap()
+                .deadline,
+            ScheduleDeadline::Disarmed
+        ));
+    }
+
+    #[test]
+    fn a_preserved_state_change_invalidates_a_prepared_scope() {
+        let manager = manager();
+        manager.replace_scope(vec![definition("current")]).unwrap();
+        let prepared = manager
+            .prepare_reconcile_scope(vec![definition("current")])
+            .unwrap();
+        let gate = Arc::new(SpawnGate::default());
+        lock(&manager.shared).before_dequeue = Some(gate.clone());
+        gate.wait_until_reached();
+
+        manager
+            .start_process("current", helper("output"), None)
+            .unwrap();
+        let result = manager.commit_scope(prepared);
+        let (has_current, status) = {
+            let shared = lock(&manager.shared);
+            (
+                shared.registrations.contains_key("current"),
+                shared.states["current"].status,
+            )
+        };
+        gate.release();
+
+        let error = match result {
+            Ok(_) => panic!("scope preflight survived a process state change"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(has_current);
+        assert_eq!(status, Status::Starting);
+    }
+
+    #[test]
+    fn a_non_preserved_manual_state_change_does_not_block_replacement() {
+        let manager = manager();
+        manager.replace_scope(vec![definition("current")]).unwrap();
+        let prepared = manager
+            .prepare_replace_scope(vec![definition("replacement")])
+            .unwrap();
+        let gate = Arc::new(SpawnGate::default());
+        lock(&manager.shared).before_dequeue = Some(gate.clone());
+        gate.wait_until_reached();
+
+        manager
+            .start_process("current", helper("output"), None)
+            .unwrap();
+        let result = manager.commit_scope(prepared);
+        let (has_current, has_replacement) = {
+            let shared = lock(&manager.shared);
+            (
+                shared.registrations.contains_key("current"),
+                shared.registrations.contains_key("replacement"),
+            )
+        };
+        gate.release();
+
+        let activation = result.expect("unrelated manual state rejected a replacement scope");
+        manager.arm_scope(activation);
+        assert!(!has_current);
+        assert!(has_replacement);
+    }
+
+    #[test]
+    fn due_blocked_waits_for_a_capacity_epoch_change() {
+        let definition = scheduled_definition("query", "output", None, None);
+        let token = RunToken {
+            generation: 0,
+            key_incarnation: 0,
+            run_incarnation: 0,
+        };
+        let mut state = Shared::default();
+        state
+            .states
+            .insert("query".into(), State::idle("query".into()));
+        state.registrations.insert(
+            "query".into(),
+            Registered {
+                definition,
+                incarnation: 1,
+                schedule: Some(Schedule {
+                    deadline: ScheduleDeadline::Next(Instant::now()),
+                    pending_refresh: false,
+                }),
+            },
+        );
+        state.occupied.insert(
+            token,
+            Occupied {
+                key: "query".into(),
+                shutdown_signal: ShutdownSignal::Terminate,
+                reserved_bytes: RUN_BUFFER_RESERVATION,
+                scheduled: false,
+            },
+        );
+        state.reserved_bytes = RUN_BUFFER_RESERVATION;
+        let state = Mutex::new(state);
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+
+        apply_schedules(&state, &ping, Instant::now());
+        {
+            let state = lock(&state);
+            assert!(state.starts.is_empty());
+            assert!(matches!(
+                state.registrations["query"]
+                    .schedule
+                    .as_ref()
+                    .unwrap()
+                    .deadline,
+                ScheduleDeadline::DueBlocked(0)
+            ));
+        }
+        apply_schedules(&state, &ping, Instant::now() + Duration::from_secs(10));
+        assert!(lock(&state).starts.is_empty());
+
+        {
+            let mut state = lock(&state);
+            state.occupied.remove(&token);
+            state.reserved_bytes = 0;
+            state.capacity_epoch += 1;
+        }
+        apply_schedules(&state, &ping, Instant::now());
+        let state = lock(&state);
+        assert_eq!(state.starts.len(), 1);
+        assert_eq!(state.states["query"].status, Status::Starting);
+    }
+
+    #[test]
+    fn missed_active_deadlines_advance_to_one_future_slot() {
+        let start = Instant::now();
+        let command = ScheduledCommand {
+            argv: helper("output"),
+            cwd: None,
+            interval: Some(Duration::from_secs(1)),
+        };
+        let mut shared = Shared::default();
+        shared.registrations.insert(
+            "query".into(),
+            Registered {
+                definition: Definition {
+                    key: "query".into(),
+                    shutdown_signal: ShutdownSignal::Terminate,
+                    command: Some(command.clone()),
+                },
+                incarnation: 1,
+                schedule: Some(Schedule {
+                    deadline: ScheduleDeadline::Next(start),
+                    pending_refresh: false,
+                }),
+            },
+        );
+
+        advance_schedule_deadline(
+            &mut shared,
+            "query",
+            &command,
+            start + Duration::from_millis(3400),
+        );
+        let deadline = match shared.registrations["query"]
+            .schedule
+            .as_ref()
+            .unwrap()
+            .deadline
+        {
+            ScheduleDeadline::Next(deadline) => deadline,
+            _ => panic!("active recurring job lost its next deadline"),
+        };
+        assert_eq!(deadline, start + Duration::from_secs(4));
+    }
+
+    #[test]
+    fn scheduled_results_leave_room_for_sixteen_active_captures() {
+        let mut shared = Shared {
+            reserved_bytes: MAX_KEYS * MAX_STREAM_BYTES * 2,
+            ..Shared::default()
+        };
+        for _ in 0..16 {
+            assert!(matches!(
+                scheduled_capacity(&shared, "query"),
+                ScheduledCapacity::Ready
+            ));
+            shared.reserved_bytes += RUN_BUFFER_RESERVATION;
+        }
+        assert_eq!(shared.reserved_bytes, MAX_RETAINED_BYTES);
+        assert!(matches!(
+            scheduled_capacity(&shared, "query"),
+            ScheduledCapacity::Buffers
+        ));
+
+        for run_incarnation in 0..16 {
+            shared.occupied.insert(
+                RunToken {
+                    generation: 1,
+                    key_incarnation: run_incarnation,
+                    run_incarnation,
+                },
+                Occupied {
+                    key: format!("active-{run_incarnation}"),
+                    shutdown_signal: ShutdownSignal::Terminate,
+                    reserved_bytes: RUN_BUFFER_RESERVATION,
+                    scheduled: true,
+                },
+            );
+        }
+        assert!(matches!(
+            scheduled_capacity(&shared, "query"),
+            ScheduledCapacity::Wait
+        ));
+    }
+
+    #[test]
+    fn one_shot_spawn_failure_waits_for_an_explicit_refresh() {
+        let mut definition = scheduled_definition("query", "output", None, None);
+        definition.command.as_mut().unwrap().argv =
+            vec!["/thing/scheduled-process-fixture-does-not-exist".into()];
+        let manager = manager();
+        manager.replace_scope(vec![definition]).unwrap();
+        wait_for(&manager, |state| state.status == Status::Failed);
+        let attempts = lock(&manager.shared).next_run_incarnation;
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(lock(&manager.shared).next_run_incarnation, attempts);
+
+        manager.refresh_process("query").unwrap();
+        wait_for(&manager, |state| {
+            state.status == Status::Failed && lock(&manager.shared).next_run_incarnation > attempts
+        });
+    }
+
+    #[test]
+    fn changing_a_scheduled_command_retires_before_the_replacement_runs() {
+        let manager = manager();
+        manager
+            .replace_scope(vec![scheduled_definition(
+                "query",
+                "staged-output",
+                None,
+                None,
+            )])
+            .unwrap();
+        wait_for(&manager, |state| state.status == Status::Running);
+        let previous_incarnation = lock(&manager.shared).registrations["query"].incarnation;
+
+        let replacement = scheduled_definition("query", "output", None, None);
+        let prepared = manager.prepare_replace_scope(vec![replacement]).unwrap();
+        assert_eq!(
+            prepared.runtime().states[0].status,
+            ManagedProcessStatus::Idle
+        );
+        let activation = manager.commit_scope(prepared).unwrap();
+        assert_ne!(
+            lock(&manager.shared).registrations["query"].incarnation,
+            previous_incarnation
+        );
+        manager.arm_scope(activation);
+
+        let completed = wait_for(&manager, |state| {
+            state.status == Status::Exited && state.stdout.contains("hello from child")
+        });
+        assert_eq!(completed.exit_code, Some(0));
+    }
+
+    #[test]
+    fn reconciling_a_matching_scheduled_key_does_not_rerun_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let definition = scheduled_definition(
+            "query",
+            "counted-output",
+            Some(directory.path().to_string_lossy().into_owned()),
+            None,
+        );
+        let manager = manager();
+        manager.replace_scope(vec![definition.clone()]).unwrap();
+        wait_for(&manager, |state| state.status == Status::Exited);
+        assert_eq!(read_run_count(directory.path()), 1);
+
+        manager.reconcile_scope(vec![definition]).unwrap();
+        thread::sleep(Duration::from_millis(350));
+        assert_eq!(read_run_count(directory.path()), 1);
+        assert_eq!(manager.snapshot().states[0].status, Status::Exited);
+
+        manager.reconcile_scope(Vec::new()).unwrap();
+        assert!(manager.snapshot().states.is_empty());
     }
 
     #[test]
@@ -2318,6 +3410,7 @@ mod tests {
             .replace_scope(vec![Definition {
                 key: "interruptible".into(),
                 shutdown_signal: ShutdownSignal::Interrupt,
+                command: None,
             }])
             .unwrap();
         manager
@@ -2382,8 +3475,11 @@ mod tests {
     }
 
     #[test]
-    fn retiring_generation_still_counts_toward_the_global_buffer_cap() {
-        let manager = manager();
+    fn retiring_generation_keeps_its_buffer_reservations_until_reap() {
+        let mut limits = test_limits();
+        limits.stop_grace = Duration::from_secs(5);
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let manager = Manager::start_with_limits(ping, limits).unwrap();
         let definitions = (0..16)
             .map(|index| definition(&format!("old-{index}")))
             .collect::<Vec<_>>();
@@ -2406,12 +3502,22 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out with {snapshot:?}");
             thread::sleep(Duration::from_millis(10));
         }
+        let gate = Arc::new(SpawnGate::default());
+        lock(&manager.shared).before_dequeue = Some(gate.clone());
+        gate.wait_until_reached();
         manager.replace_scope(vec![definition("new")]).unwrap();
-        let error = manager
+        assert_eq!(
+            lock(&manager.shared).reserved_bytes,
+            16 * RUN_BUFFER_RESERVATION
+        );
+        manager
             .start_process("new", helper("output"), None)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert!(error.to_string().contains("output buffer limit"));
+            .unwrap();
+        assert_eq!(
+            lock(&manager.shared).reserved_bytes,
+            17 * RUN_BUFFER_RESERVATION
+        );
+        gate.release();
     }
 
     #[test]
@@ -2541,6 +3647,31 @@ mod tests {
     fn fake_child_output() {
         println!("hello from child");
         eprintln!("child warning");
+    }
+
+    #[test]
+    #[ignore = "managed process fixture"]
+    fn fake_child_staged_output() {
+        println!("first");
+        std::io::stdout().flush().unwrap();
+        thread::sleep(Duration::from_millis(250));
+        println!("second");
+    }
+
+    #[test]
+    #[ignore = "managed process fixture"]
+    fn fake_child_counted_output() {
+        let path = env::current_dir().unwrap().join("runs");
+        let count = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0)
+            + 1;
+        std::fs::write(path, count.to_string()).unwrap();
+        println!("run={count}");
+        std::io::stdout().flush().unwrap();
+        thread::sleep(Duration::from_millis(250));
+        println!("complete={count}");
     }
 
     #[test]

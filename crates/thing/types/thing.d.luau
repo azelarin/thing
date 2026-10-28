@@ -48,6 +48,14 @@ export type ThingManagedProcessOptions = {
     shutdown_signal: ("terminate" | "interrupt")?,
 }
 
+export type ThingScheduledProcessOptions = {
+    key: string,
+    command: { string },
+    working_directory: string?,
+    interval: number?,
+    shutdown_signal: ("terminate" | "interrupt")?,
+}
+
 export type ThingPointerPhase = "press" | "move" | "release" | "cancel"
 export type ThingPointerButton = "primary" | "middle" | "secondary"
 export type ThingScrollSource = "wheel" | "finger" | "continuous" | "wheel_tilt" | "unknown"
@@ -706,6 +714,20 @@ declare extern type ThingManagedProcess with
     read stop: () -> ()
 end
 
+declare extern type ThingScheduledProcess with
+    read status: ThingSignal<ThingManagedProcessStatus>
+    read running: ThingSignal<boolean>
+    read stdout: ThingSignal<string>
+    read stderr: ThingSignal<string>
+    read stdout_truncated: ThingSignal<boolean>
+    read stderr_truncated: ThingSignal<boolean>
+    read exit_code: ThingSignal<number?>
+    read exit_signal: ThingSignal<number?>
+    read error: ThingSignal<string>
+    read refresh: () -> ()
+    read cancel: () -> ()
+end
+
 declare extern type ThingServices with
     read audio: ThingAudioService
     read clipboard: ThingClipboardService
@@ -718,6 +740,7 @@ declare extern type ThingServices with
     read system_tray: ThingSystemTrayService
     read process: (
         ((key: string) -> ThingManagedProcess)
+        & ((options: ThingScheduledProcessOptions) -> ThingScheduledProcess)
         & ((options: ThingManagedProcessOptions) -> ThingManagedProcess)
     )
     read launch: (arguments: { string }, working_directory: string?) -> ()

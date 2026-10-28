@@ -184,15 +184,29 @@ fn system_tray_is_explicit_and_run_only() {
 fn check_validates_managed_processes_without_starting_the_host_service() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("panel.luau");
+    let marker = directory.path().join("scheduled-command-ran");
+    let touch = ["/usr/bin/touch", "/bin/touch"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).is_file())
+        .unwrap();
     fs::write(
         &path,
-        r#"
+        format!(
+            r#"
         local query = services.process('query')
-        return ui.panel { children = {
-            ui.text { text = function() return query.status:get() end },
-            ui.button { on_click = function() query.start({ 'never-run-by-check' }) end },
-        } }
+        local scheduled = services.process {{
+            key = 'scheduled',
+            command = {{ {touch:?}, {marker:?} }},
+            interval = 1000,
+        }}
+        return ui.panel {{ children = {{
+            ui.text {{ text = function() return query.status:get() end }},
+            ui.button {{ on_click = function() query.start({{ 'never-run-by-check' }}) end }},
+            ui.button {{ on_click = function() scheduled.refresh() end }},
+        }} }}
         "#,
+            marker = marker.to_string_lossy(),
+        ),
     )
     .unwrap();
 
@@ -206,4 +220,5 @@ fn check_validates_managed_processes_without_starting_the_host_service() {
         .unwrap();
 
     assert!(output.status.success(), "{output:?}");
+    assert!(!marker.exists());
 }

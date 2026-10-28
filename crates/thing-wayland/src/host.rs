@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    io,
     path::Path,
     rc::Rc,
     time::{Duration, Instant},
@@ -43,11 +44,11 @@ use thing_core::{
     SurfaceLayer,
 };
 use thing_runtime::{
-    Action, Event, KeyInput, ManagedProcessAction, ManagedProcessDefinition, OutputContext,
-    PointerButton as RuntimePointerButton, PointerEvent as RuntimePointerEvent, PointerPhase,
-    Scalar, ScrollInput as RuntimeScrollInput, ScrollSource as RuntimeScrollSource,
-    ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTrayAction, SystemTrayMenuAction, UiAction,
-    UiTarget,
+    Action, Event, KeyInput, ManagedProcessAction, ManagedProcessDefinition,
+    ManagedProcessSnapshot, OutputContext, PointerButton as RuntimePointerButton,
+    PointerEvent as RuntimePointerEvent, PointerPhase, Scalar, ScrollInput as RuntimeScrollInput,
+    ScrollSource as RuntimeScrollSource, ServiceSnapshot, SurfaceKey, SurfaceTree,
+    SystemTrayAction, SystemTrayMenuAction, UiAction, UiTarget,
 };
 use thing_ui::{
     Interaction, Layout, PaintFrame, ScrollState, Size, TextInputCheckpoint, TextInputEditor,
@@ -112,7 +113,12 @@ use crate::{
         Done as InputMethodDone, InputMethod, TextState as InputMethodTextState,
     },
     launch::{self, LaunchRequest, Launcher, PendingLaunches},
-    managed_process::{Definition as ManagedProcessDefinitionInternal, Manager as ProcessManager},
+    managed_process::{
+        Definition as ManagedProcessDefinitionInternal, Manager as ProcessManager,
+        PreparedScope as PreparedManagedProcessSupervisorScope,
+        ScopeActivation as ManagedProcessSupervisorActivation,
+        initial_scope_snapshot as initial_managed_process_snapshot,
+    },
     media::Media,
     niri::Niri,
     notifications::Server as NotificationServer,
@@ -290,18 +296,36 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
     let layer_shell_version = app.layer_shell_version;
     let managed_processes = &mut app.managed_processes;
     let loop_handle = app.loop_handle.clone();
-    app.configurations.reload_for_checked_with_processes(
-        outputs.clone(),
-        |_, runtime| validate_surface_capabilities(runtime.surfaces(), layer_shell_version),
-        |definitions| {
-            configure_managed_processes(
-                managed_processes,
-                &loop_handle,
-                definitions,
-                ManagedProcessScopeChange::Replace,
-            )
+    let mut prepared_configurations = app
+        .configurations
+        .prepare_reload_for_checked(outputs.clone(), |_, runtime| {
+            validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+        })?;
+    let process_definitions = prepared_configurations
+        .managed_process_definitions()
+        .to_vec();
+    let projected_processes = project_managed_processes(
+        managed_processes.as_ref(),
+        &process_definitions,
+        ManagedProcessScopeChange::Replace,
+    )?;
+    prepared_configurations.set_managed_processes(projected_processes.clone(), |_, runtime| {
+        validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+    })?;
+    let activation = prepare_and_commit_managed_processes(
+        managed_processes,
+        &loop_handle,
+        &process_definitions,
+        ManagedProcessScopeChange::Replace,
+        projected_processes,
+        |snapshot| {
+            prepared_configurations.set_managed_processes(snapshot, |_, runtime| {
+                validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+            })
         },
     )?;
+    app.configurations.commit_reload(prepared_configurations);
+    arm_managed_processes(managed_processes.as_ref(), activation);
     for (output, _) in outputs {
         app.sync_output_surfaces(&output, false, &qh)?;
     }
@@ -421,46 +445,148 @@ enum ManagedProcessScopeChange {
     Reconcile,
 }
 
+enum PreparedManagedProcessScope {
+    Empty,
+    Scope(PreparedManagedProcessSupervisorScope),
+}
+
+impl PreparedManagedProcessScope {
+    fn runtime(&self) -> ManagedProcessSnapshot {
+        match self {
+            Self::Empty => ManagedProcessSnapshot::default(),
+            Self::Scope(scope) => scope.runtime(),
+        }
+    }
+}
+
+enum ManagedProcessScopeActivation {
+    Empty,
+    Scope(ManagedProcessSupervisorActivation),
+}
+
+const MAX_MANAGED_PROCESS_PREFLIGHT_ATTEMPTS: usize = 8;
+
+fn project_managed_processes(
+    manager: Option<&ProcessManager>,
+    definitions: &[ManagedProcessDefinition],
+    change: ManagedProcessScopeChange,
+) -> Result<ManagedProcessSnapshot, String> {
+    let definitions = definitions
+        .iter()
+        .map(ManagedProcessDefinitionInternal::from)
+        .collect();
+    let snapshot = match (manager, change) {
+        (Some(manager), ManagedProcessScopeChange::Replace) => {
+            manager.project_replace_scope(definitions)
+        }
+        (Some(manager), ManagedProcessScopeChange::Reconcile) => {
+            manager.project_reconcile_scope(definitions)
+        }
+        (None, _) => initial_managed_process_snapshot(definitions),
+    }
+    .map_err(|error| format!("cannot configure managed processes: {error}"))?;
+    Ok(snapshot)
+}
+
+fn prepare_managed_processes(
+    manager: &mut Option<ProcessManager>,
+    loop_handle: &LoopHandle<'static, App>,
+    definitions: &[ManagedProcessDefinition],
+    change: ManagedProcessScopeChange,
+) -> Result<PreparedManagedProcessScope, String> {
+    if manager.is_none() && definitions.is_empty() {
+        return Ok(PreparedManagedProcessScope::Empty);
+    }
+    let definitions = definitions
+        .iter()
+        .map(ManagedProcessDefinitionInternal::from)
+        .collect();
+    if manager.is_none() {
+        let (ping, source) = calloop::ping::make_ping().map_err(|error| error.to_string())?;
+        let candidate = ProcessManager::start(ping)
+            .map_err(|error| format!("cannot start managed process service: {error}"))?;
+        loop_handle
+            .insert_source(source, |_, _, app| app.update_managed_processes())
+            .map_err(|error| format!("cannot monitor managed process service: {error}"))?;
+        *manager = Some(candidate);
+    }
+    let manager = manager
+        .as_ref()
+        .expect("the managed process manager was initialized above");
+    let prepared = match change {
+        ManagedProcessScopeChange::Replace => manager.prepare_replace_scope(definitions),
+        ManagedProcessScopeChange::Reconcile => manager.prepare_reconcile_scope(definitions),
+    }
+    .map_err(|error| format!("cannot configure managed processes: {error}"))?;
+    Ok(PreparedManagedProcessScope::Scope(prepared))
+}
+
+fn commit_managed_processes(
+    manager: Option<&ProcessManager>,
+    prepared: PreparedManagedProcessScope,
+) -> io::Result<ManagedProcessScopeActivation> {
+    match prepared {
+        PreparedManagedProcessScope::Empty => Ok(ManagedProcessScopeActivation::Empty),
+        PreparedManagedProcessScope::Scope(prepared) => manager
+            .expect("a prepared managed process scope has a manager")
+            .commit_scope(prepared)
+            .map(ManagedProcessScopeActivation::Scope),
+    }
+}
+
+fn prepare_and_commit_managed_processes(
+    manager: &mut Option<ProcessManager>,
+    loop_handle: &LoopHandle<'static, App>,
+    definitions: &[ManagedProcessDefinition],
+    change: ManagedProcessScopeChange,
+    mut projected: ManagedProcessSnapshot,
+    mut apply_snapshot: impl FnMut(ManagedProcessSnapshot) -> Result<(), String>,
+) -> Result<ManagedProcessScopeActivation, String> {
+    for _ in 0..MAX_MANAGED_PROCESS_PREFLIGHT_ATTEMPTS {
+        let prepared = prepare_managed_processes(manager, loop_handle, definitions, change)?;
+        let current = prepared.runtime();
+        if current != projected {
+            apply_snapshot(current.clone())?;
+            projected = current;
+            continue;
+        }
+        match commit_managed_processes(manager.as_ref(), prepared) {
+            Ok(activation) => return Ok(activation),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) => return Err(format!("cannot configure managed processes: {error}")),
+        }
+    }
+    Err("cannot configure managed processes: process state kept changing during preflight".into())
+}
+
+fn arm_managed_processes(
+    manager: Option<&ProcessManager>,
+    activation: ManagedProcessScopeActivation,
+) {
+    if let ManagedProcessScopeActivation::Scope(activation) = activation {
+        manager
+            .expect("a managed process activation has a manager")
+            .arm_scope(activation);
+    }
+}
+
 fn configure_managed_processes(
     manager: &mut Option<ProcessManager>,
     loop_handle: &LoopHandle<'static, App>,
     definitions: &[ManagedProcessDefinition],
     change: ManagedProcessScopeChange,
 ) -> Result<(), String> {
-    if manager.is_none() && definitions.is_empty() {
-        return Ok(());
-    }
-    let definitions = definitions
-        .iter()
-        .map(ManagedProcessDefinitionInternal::from)
-        .collect();
-    if let Some(manager) = manager {
-        apply_managed_process_scope(manager, definitions, change)?;
-        return Ok(());
-    }
-
-    let (ping, source) = calloop::ping::make_ping().map_err(|error| error.to_string())?;
-    let candidate = ProcessManager::start(ping)
-        .map_err(|error| format!("cannot start managed process service: {error}"))?;
-    apply_managed_process_scope(&candidate, definitions, change)?;
-    loop_handle
-        .insert_source(source, |_, _, app| app.update_managed_processes())
-        .map_err(|error| format!("cannot monitor managed process service: {error}"))?;
-    *manager = Some(candidate);
+    let projected = project_managed_processes(manager.as_ref(), definitions, change)?;
+    let activation = prepare_and_commit_managed_processes(
+        manager,
+        loop_handle,
+        definitions,
+        change,
+        projected,
+        |_| Ok(()),
+    )?;
+    arm_managed_processes(manager.as_ref(), activation);
     Ok(())
-}
-
-fn apply_managed_process_scope(
-    manager: &ProcessManager,
-    definitions: Vec<ManagedProcessDefinitionInternal>,
-    change: ManagedProcessScopeChange,
-) -> Result<(), String> {
-    match change {
-        ManagedProcessScopeChange::Replace => manager.replace_scope(definitions),
-        ManagedProcessScopeChange::Reconcile => manager.reconcile_scope(definitions),
-    }
-    .map(|_| ())
-    .map_err(|error| format!("cannot configure managed processes: {error}"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1256,18 +1382,38 @@ impl App {
         let retired_consumers = self.configurations.consumers();
         let managed_processes = &mut self.managed_processes;
         let loop_handle = self.loop_handle.clone();
-        if let Err(error) = self.configurations.reload_for_checked_with_processes(
-            outputs,
-            |_, runtime| validate_surface_capabilities(runtime.surfaces(), layer_shell_version),
-            |definitions| {
-                configure_managed_processes(
-                    managed_processes,
-                    &loop_handle,
-                    definitions,
-                    ManagedProcessScopeChange::Replace,
-                )
-            },
-        ) {
+        let replacement = (|| {
+            let mut configurations = self
+                .configurations
+                .prepare_reload_for_checked(outputs, |_, runtime| {
+                    validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+                })?;
+            let process_definitions = configurations.managed_process_definitions().to_vec();
+            let projected_processes = project_managed_processes(
+                managed_processes.as_ref(),
+                &process_definitions,
+                ManagedProcessScopeChange::Replace,
+            )?;
+            configurations.set_managed_processes(projected_processes.clone(), |_, runtime| {
+                validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+            })?;
+            let activation = prepare_and_commit_managed_processes(
+                managed_processes,
+                &loop_handle,
+                &process_definitions,
+                ManagedProcessScopeChange::Replace,
+                projected_processes,
+                |snapshot| {
+                    configurations.set_managed_processes(snapshot, |_, runtime| {
+                        validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+                    })
+                },
+            )?;
+            self.configurations.commit_reload(configurations);
+            arm_managed_processes(managed_processes.as_ref(), activation);
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = replacement {
             eprintln!("thing: reload failed; keeping the previous surfaces: {error}");
             return Ok(());
         }
@@ -1337,19 +1483,37 @@ impl App {
             let layer_shell_version = self.layer_shell_version;
             let managed_processes = &mut self.managed_processes;
             let loop_handle = self.loop_handle.clone();
-            self.configurations.add_checked_with_processes(
-                output.clone(),
-                context,
-                |runtime| validate_surface_capabilities(runtime.surfaces(), layer_shell_version),
-                |definitions| {
-                    configure_managed_processes(
-                        managed_processes,
-                        &loop_handle,
-                        definitions,
-                        ManagedProcessScopeChange::Reconcile,
-                    )
+            let Some(mut configuration) =
+                self.configurations
+                    .prepare_add_checked(output.clone(), context, |runtime| {
+                        validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+                    })?
+            else {
+                return Ok(());
+            };
+            let process_definitions = configuration.managed_process_definitions().to_vec();
+            let projected_processes = project_managed_processes(
+                managed_processes.as_ref(),
+                &process_definitions,
+                ManagedProcessScopeChange::Reconcile,
+            )?;
+            configuration.set_managed_processes(projected_processes.clone(), |runtime| {
+                validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+            })?;
+            let activation = prepare_and_commit_managed_processes(
+                managed_processes,
+                &loop_handle,
+                &process_definitions,
+                ManagedProcessScopeChange::Reconcile,
+                projected_processes,
+                |snapshot| {
+                    configuration.set_managed_processes(snapshot, |runtime| {
+                        validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+                    })
                 },
             )?;
+            self.configurations.commit_add(configuration);
+            arm_managed_processes(managed_processes.as_ref(), activation);
         }
         self.sync_output_surfaces(&output, false, qh)?;
         self.update_watch();
@@ -5084,6 +5248,8 @@ fn send_managed_process_action(
     match action {
         ManagedProcessAction::Start { argv, cwd } => manager.start_process(key, argv, cwd),
         ManagedProcessAction::Stop => manager.stop_process(key),
+        ManagedProcessAction::Refresh => manager.refresh_process(key),
+        ManagedProcessAction::Cancel => manager.cancel_process(key),
     }
     .map_err(|error| format!("managed process {key:?}: {error}"))
 }
@@ -5149,17 +5315,19 @@ mod output_tests {
     };
 
     use super::{
-        App, ManagedProcessScopeChange, PanelState, configure_managed_processes,
-        configured_panel_size, earliest_deadline, fallback_logical_size, find_automatic_popup,
-        find_manual_popup, interactive_path, panel_size, release_system_tray_consumer,
-        send_managed_process_action, send_system_tray_action, send_system_tray_menu_action,
-        valid_dimensions, validate_surface_capabilities,
+        App, ManagedProcessScopeChange, PanelState, arm_managed_processes,
+        configure_managed_processes, configured_panel_size, earliest_deadline,
+        fallback_logical_size, find_automatic_popup, find_manual_popup, interactive_path,
+        panel_size, prepare_and_commit_managed_processes, project_managed_processes,
+        release_system_tray_consumer, send_managed_process_action, send_system_tray_action,
+        send_system_tray_menu_action, valid_dimensions, validate_surface_capabilities,
     };
     use crate::{configuration::Configurations, panel};
     use tempfile::tempdir;
     use thing_core::{KeyboardMode, Kind, Node, NodeId, PanelEdge, PanelMargins, Scale};
     use thing_runtime::{
-        Event, ManagedProcessAction, OutputContext, ServiceSnapshot, SurfaceKey, SurfaceTree,
+        Event, ManagedProcessAction, ManagedProcessDefinition, ManagedProcessShutdownSignal,
+        ManagedProcessStatus, OutputContext, ServiceSnapshot, SurfaceKey, SurfaceTree,
         SystemTrayAction, SystemTrayMenuAction,
     };
 
@@ -5198,6 +5366,61 @@ mod output_tests {
         assert_eq!(
             send_managed_process_action(None, "query", ManagedProcessAction::Stop),
             Err("managed process service is unavailable".into())
+        );
+    }
+
+    #[test]
+    fn process_preflight_reprojects_a_preserved_state_change() {
+        let event_loop = calloop::EventLoop::<App>::try_new().unwrap();
+        let mut manager = None;
+        let definitions = vec![ManagedProcessDefinition {
+            key: "query".into(),
+            shutdown_signal: ManagedProcessShutdownSignal::Terminate,
+            command: None,
+        }];
+        configure_managed_processes(
+            &mut manager,
+            &event_loop.handle(),
+            &definitions,
+            ManagedProcessScopeChange::Replace,
+        )
+        .unwrap();
+        let projected = project_managed_processes(
+            manager.as_ref(),
+            &definitions,
+            ManagedProcessScopeChange::Reconcile,
+        )
+        .unwrap();
+        assert_eq!(projected.states[0].status, ManagedProcessStatus::Idle);
+        manager
+            .as_ref()
+            .unwrap()
+            .start_process(
+                "query",
+                vec!["/thing/preflight-fixture-does-not-exist".into()],
+                None,
+            )
+            .unwrap();
+
+        let mut applied = Vec::new();
+        let activation = prepare_and_commit_managed_processes(
+            &mut manager,
+            &event_loop.handle(),
+            &definitions,
+            ManagedProcessScopeChange::Reconcile,
+            projected,
+            |snapshot| {
+                applied.push(snapshot);
+                Ok(())
+            },
+        )
+        .unwrap();
+        arm_managed_processes(manager.as_ref(), activation);
+
+        assert!(!applied.is_empty());
+        assert_ne!(
+            applied.last().unwrap().states[0].status,
+            ManagedProcessStatus::Idle
         );
     }
 

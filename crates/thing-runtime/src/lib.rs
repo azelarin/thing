@@ -13,11 +13,12 @@ mod transition;
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
 pub use services::{
     Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, ClipboardSnapshot,
-    ManagedProcessAction, ManagedProcessDefinition, ManagedProcessShutdownSignal,
-    ManagedProcessSnapshot, ManagedProcessState, ManagedProcessStatus, MediaAction, MediaPlayer,
-    MediaSnapshot, Notification, NotificationButton, NotificationSnapshot, NotificationUrgency,
-    PowerDevice, PowerSnapshot, ServiceSnapshot, SystemTrayAction, SystemTrayItem, SystemTrayMenu,
-    SystemTrayMenuAction, SystemTrayMenuItem, SystemTraySnapshot,
+    ManagedProcessAction, ManagedProcessCommand, ManagedProcessDefinition,
+    ManagedProcessShutdownSignal, ManagedProcessSnapshot, ManagedProcessState,
+    ManagedProcessStatus, MediaAction, MediaPlayer, MediaSnapshot, Notification,
+    NotificationButton, NotificationSnapshot, NotificationUrgency, PowerDevice, PowerSnapshot,
+    ServiceSnapshot, SystemTrayAction, SystemTrayItem, SystemTrayMenu, SystemTrayMenuAction,
+    SystemTrayMenuItem, SystemTraySnapshot,
 };
 
 use mlua::{Error, Function, Lua, Result, Table, Value, VmState};
@@ -2631,6 +2632,7 @@ mod managed_process_tests {
             vec![ManagedProcessDefinition {
                 key: "query".into(),
                 shutdown_signal: ManagedProcessShutdownSignal::Terminate,
+                command: None,
             }]
         );
         assert_eq!(runtime.root().unwrap().children[0].text, "running:ready");

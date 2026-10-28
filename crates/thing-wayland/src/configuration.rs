@@ -21,6 +21,20 @@ struct Instance<K> {
     runtime: Runtime,
 }
 
+pub(crate) struct PreparedConfigurations<K> {
+    services: ServiceSnapshot,
+    instances: Vec<Instance<K>>,
+    next_consumer: u64,
+    process_definitions: Vec<ManagedProcessDefinition>,
+}
+
+pub(crate) struct PreparedOutput<K> {
+    services: ServiceSnapshot,
+    instance: Instance<K>,
+    next_consumer: u64,
+    process_definitions: Vec<ManagedProcessDefinition>,
+}
+
 /// loaded configurations and desktop state shared by every output.
 pub(crate) struct Configurations<K> {
     entry: PathBuf,
@@ -86,6 +100,59 @@ impl PointerHandlerOutcome {
     }
 }
 
+impl<K> PreparedConfigurations<K> {
+    pub(crate) fn managed_process_definitions(&self) -> &[ManagedProcessDefinition] {
+        &self.process_definitions
+    }
+
+    pub(crate) fn set_managed_processes(
+        &mut self,
+        processes: ManagedProcessSnapshot,
+        mut validate: impl FnMut(&K, &Runtime) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.services
+            .set_managed_processes(processes.clone())
+            .map_err(|error| error.to_string())?;
+        for instance in &mut self.instances {
+            instance
+                .runtime
+                .set_managed_processes(processes.clone())
+                .map_err(|error| error.to_string())?;
+            instance
+                .runtime
+                .refresh()
+                .map_err(|error| error.to_string())?;
+            validate(&instance.key, &instance.runtime)?;
+        }
+        Ok(())
+    }
+}
+
+impl<K> PreparedOutput<K> {
+    pub(crate) fn managed_process_definitions(&self) -> &[ManagedProcessDefinition] {
+        &self.process_definitions
+    }
+
+    pub(crate) fn set_managed_processes(
+        &mut self,
+        processes: ManagedProcessSnapshot,
+        validate: impl Fn(&Runtime) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.services
+            .set_managed_processes(processes.clone())
+            .map_err(|error| error.to_string())?;
+        self.instance
+            .runtime
+            .set_managed_processes(processes)
+            .map_err(|error| error.to_string())?;
+        self.instance
+            .runtime
+            .refresh()
+            .map_err(|error| error.to_string())?;
+        validate(&self.instance.runtime)
+    }
+}
+
 impl<K: Clone + Eq> Configurations<K> {
     pub(crate) fn new(entry: PathBuf, services: ServiceSnapshot) -> Self {
         Self {
@@ -104,6 +171,50 @@ impl<K: Clone + Eq> Configurations<K> {
         &self.entry
     }
 
+    pub(crate) fn prepare_add_checked(
+        &self,
+        key: K,
+        output: OutputContext,
+        validate: impl Fn(&Runtime) -> Result<(), String>,
+    ) -> Result<Option<PreparedOutput<K>>, String> {
+        if self.contains(&key) {
+            return Ok(None);
+        }
+        let runtime = Runtime::load_for_output(&self.entry, output.clone(), &self.services)
+            .map_err(|error| error.to_string())?;
+        validate(&runtime)?;
+        let definitions = collect_managed_process_definitions(
+            self.instances
+                .iter()
+                .map(|instance| &instance.runtime)
+                .chain(std::iter::once(&runtime)),
+        )?;
+        let mut services = self.services.clone();
+        let snapshot = reconciled_managed_processes(services.managed_processes(), &definitions);
+        services
+            .set_managed_processes(snapshot)
+            .map_err(|error| error.to_string())?;
+        let mut next_consumer = self.next_consumer;
+        let consumer = allocate_consumer(&mut next_consumer)?;
+        Ok(Some(PreparedOutput {
+            services,
+            instance: Instance {
+                key,
+                consumer,
+                output,
+                runtime,
+            },
+            next_consumer,
+            process_definitions: definitions,
+        }))
+    }
+
+    pub(crate) fn commit_add(&mut self, prepared: PreparedOutput<K>) {
+        self.services = prepared.services;
+        self.next_consumer = prepared.next_consumer;
+        self.instances.push(prepared.instance);
+    }
+
     #[cfg(test)]
     pub(crate) fn add(&mut self, key: K, output: OutputContext) -> Result<(), String> {
         self.add_checked(key, output, |_| Ok(()))
@@ -119,6 +230,7 @@ impl<K: Clone + Eq> Configurations<K> {
         self.add_checked_with_processes(key, output, validate, |_| Ok(()))
     }
 
+    #[cfg(test)]
     pub(crate) fn add_checked_with_processes(
         &mut self,
         key: K,
@@ -734,6 +846,52 @@ impl<K: Clone + Eq> Configurations<K> {
         }))
     }
 
+    pub(crate) fn prepare_reload_for_checked(
+        &self,
+        outputs: Vec<(K, OutputContext)>,
+        validate: impl Fn(&K, &Runtime) -> Result<(), String>,
+    ) -> Result<PreparedConfigurations<K>, String> {
+        let mut candidates = Vec::with_capacity(outputs.len());
+        let mut next_consumer = self.next_consumer;
+        let mut services = self.services.clone();
+        services
+            .set_managed_processes(ManagedProcessSnapshot::default())
+            .map_err(|error| error.to_string())?;
+        for (key, output) in outputs {
+            if candidates
+                .iter()
+                .any(|instance: &Instance<K>| instance.key == key)
+            {
+                return Err("duplicate output while reloading configuration".into());
+            }
+            let runtime = Runtime::load_for_output(&self.entry, output.clone(), &services)
+                .map_err(|error| error.to_string())?;
+            validate(&key, &runtime)?;
+            let consumer = allocate_consumer(&mut next_consumer)?;
+            candidates.push(Instance {
+                key,
+                consumer,
+                output,
+                runtime,
+            });
+        }
+        let definitions = collect_managed_process_definitions(
+            candidates.iter().map(|instance| &instance.runtime),
+        )?;
+        Ok(PreparedConfigurations {
+            services,
+            instances: candidates,
+            next_consumer,
+            process_definitions: definitions,
+        })
+    }
+
+    pub(crate) fn commit_reload(&mut self, prepared: PreparedConfigurations<K>) {
+        self.services = prepared.services;
+        self.next_consumer = prepared.next_consumer;
+        self.instances = prepared.instances;
+    }
+
     #[cfg(test)]
     fn reload(&mut self) -> Result<(), String> {
         let outputs = self
@@ -758,6 +916,7 @@ impl<K: Clone + Eq> Configurations<K> {
         self.reload_for_checked_with_processes(outputs, validate, |_| Ok(()))
     }
 
+    #[cfg(test)]
     pub(crate) fn reload_for_checked_with_processes(
         &mut self,
         outputs: Vec<(K, OutputContext)>,
@@ -2389,6 +2548,78 @@ mod tests {
             ["shared"]
         );
         assert_eq!(text(&configurations, 1), "shared:running:ready");
+    }
+
+    #[test]
+    fn scheduled_reload_projects_completed_results_into_every_candidate() {
+        fn runtime_text(runtime: &Runtime) -> &str {
+            fn find(node: &Node) -> Option<&str> {
+                if node.kind == Kind::Text {
+                    return Some(&node.text);
+                }
+                node.children.iter().find_map(find)
+            }
+            find(runtime.root().unwrap()).unwrap()
+        }
+
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            local process = services.process {
+                key = 'shared',
+                command = { 'query' },
+                interval = 3000,
+            }
+            return ui.panel { children = { ui.text { text = function()
+                return process.status:get() .. ':' .. process.stdout:get()
+            end } } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        configurations.add(2, output("DP-2", 2560)).unwrap();
+        let completed = ManagedProcessSnapshot {
+            states: vec![managed_process_state(
+                "shared",
+                thing_runtime::ManagedProcessStatus::Exited,
+                "complete",
+            )],
+        };
+        configurations
+            .set_managed_processes(completed.clone())
+            .unwrap();
+        assert_eq!(configurations.refresh(), vec![1, 2]);
+
+        let mut replacement = configurations
+            .prepare_reload_for_checked(
+                vec![(1, output("DP-1", 1920)), (2, output("DP-2", 2560))],
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(replacement.managed_process_definitions().len(), 1);
+        assert!(
+            replacement.managed_process_definitions()[0]
+                .command
+                .is_some()
+        );
+        let mut validated = Vec::new();
+        replacement
+            .set_managed_processes(completed, |key, runtime| {
+                validated.push(*key);
+                if runtime_text(runtime) != "exited:complete" {
+                    return Err("scheduled result was not projected".into());
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(validated, vec![1, 2]);
+
+        configurations.commit_reload(replacement);
+        assert_eq!(text(&configurations, 1), "exited:complete");
+        assert_eq!(text(&configurations, 2), "exited:complete");
     }
 
     #[test]
