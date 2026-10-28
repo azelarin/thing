@@ -754,4 +754,29 @@ mod tests {
         assert_eq!(left.offset(NodeId(2)), 20.0);
         assert_eq!(right.offset(NodeId(2)), 0.0);
     }
+
+    #[test]
+    fn overlapping_scrolls_use_frontmost_paint_order() {
+        let mut root = Node::new(NodeId(1), Kind::Stack);
+        for (scroll_id, child_id) in [(2, 3), (4, 5)] {
+            let mut scroll = fixed(scroll_id, Kind::Scroll, 100.0, 40.0);
+            scroll
+                .children
+                .push(fixed(child_id, Kind::Button, 100.0, 80.0));
+            root.children.push(scroll);
+        }
+        let mut state = ScrollState::default();
+        let layout = scrolled(
+            &root,
+            Size {
+                width: 100.0,
+                height: 40.0,
+            },
+            &mut state,
+        );
+
+        assert!(layout.scroll_y(Point { x: 10.0, y: 10.0 }, 20.0, &mut state));
+        assert_eq!(state.offset(NodeId(2)), 0.0);
+        assert_eq!(state.offset(NodeId(4)), 20.0);
+    }
 }
