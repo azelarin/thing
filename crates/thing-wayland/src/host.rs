@@ -47,11 +47,17 @@ use thing_runtime::{
 };
 use thing_ui::{Interaction, Layout, PaintFrame, ScrollState, Size};
 use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
+    Connection, Dispatch, Proxy, QueueHandle, delegate_noop, event_created_child,
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
 };
 use wayland_protocols::{
+    ext::data_control::v1::client::{
+        ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
+        ext_data_control_manager_v1::ExtDataControlManagerV1,
+        ext_data_control_offer_v1::{self, ExtDataControlOfferV1},
+        ext_data_control_source_v1::{self, ExtDataControlSourceV1},
+    },
     wp::{
         fractional_scale::v1::client::{
             wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
@@ -67,11 +73,18 @@ use wayland_protocols::{
         shell::client::xdg_positioner,
     },
 };
+use wayland_protocols_wlr::data_control::v1::client::{
+    zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1},
+    zwlr_data_control_manager_v1::ZwlrDataControlManagerV1,
+    zwlr_data_control_offer_v1::{self, ZwlrDataControlOfferV1},
+    zwlr_data_control_source_v1::{self, ZwlrDataControlSourceV1},
+};
 use xkbcommon::xkb;
 
 use crate::{
     Renderer, RunOptions, SystemTray,
     audio::Audio,
+    clipboard::{Clipboard, OfferData as ClipboardOfferData, SourceData as ClipboardSourceData},
     configuration::Configurations,
     hover::{Command as HoverCommand, HoverKey, HoverStates, HoverTarget},
     launch::{self, LaunchRequest, Launcher, PendingLaunches},
@@ -166,6 +179,14 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
     } else {
         (None, None)
     };
+    let (clipboard, clipboard_source) = if options.clipboard {
+        let (ping, source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
+        let clipboard = Clipboard::bind(&globals, &qh, ping)
+            .map_err(|error| format!("cannot start clipboard service: {error}"))?;
+        (Some(clipboard), Some(source))
+    } else {
+        (None, None)
+    };
     let mut event_loop: EventLoop<'static, App> =
         EventLoop::try_new().map_err(|error| error.to_string())?;
     let (system_tray, system_tray_source) = match options.system_tray {
@@ -191,6 +212,7 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         niri,
         notifications,
         system_tray,
+        clipboard,
         launcher,
         pending_launches: PendingLaunches::new(),
         surfaces: Vec::new(),
@@ -222,6 +244,7 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
     queue
         .roundtrip(&mut app)
         .map_err(|error| error.to_string())?;
+    app.update_clipboard();
     let outputs: Vec<_> = app
         .outputs
         .outputs()
@@ -271,6 +294,12 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         event_loop
             .handle()
             .insert_source(source, |_, _, app| app.update_system_tray())
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(source) = clipboard_source {
+        event_loop
+            .handle()
+            .insert_source(source, |_, _, app| app.update_clipboard())
             .map_err(|e| e.to_string())?;
     }
     WaylandSource::new(connection.clone(), queue)
@@ -607,7 +636,7 @@ impl Drop for Surface {
     }
 }
 
-struct App {
+pub(crate) struct App {
     render: Render,
     image_ping: calloop::ping::Ping,
     configurations: Configurations<wl_output::WlOutput>,
@@ -617,6 +646,7 @@ struct App {
     niri: Niri,
     notifications: Option<NotificationServer>,
     system_tray: Option<SystemTray>,
+    clipboard: Option<Clipboard>,
     launcher: Launcher,
     pending_launches: PendingLaunches<XdgActivationTokenV1>,
     watch: Rc<Watch>,
@@ -743,6 +773,15 @@ impl App {
             return;
         };
         if let Err(error) = self.configurations.set_system_tray(snapshot) {
+            eprintln!("thing: {error}");
+        }
+        self.refresh();
+    }
+    fn update_clipboard(&mut self) {
+        let Some(snapshot) = self.clipboard.as_mut().and_then(Clipboard::take_snapshot) else {
+            return;
+        };
+        if let Err(error) = self.configurations.set_clipboard(snapshot) {
             eprintln!("thing: {error}");
         }
         self.refresh();
@@ -1502,6 +1541,18 @@ impl App {
                     .as_ref()
                     .ok_or("notification server is disabled")
                     .and_then(|server| server.invoke(key, action))
+                    .map_err(str::to_owned),
+                Action::SetClipboardText(text) => self
+                    .clipboard
+                    .as_mut()
+                    .ok_or("clipboard service is disabled")
+                    .and_then(|clipboard| clipboard.set_text(text, &self.queue))
+                    .map_err(str::to_owned),
+                Action::ClearClipboard => self
+                    .clipboard
+                    .as_ref()
+                    .ok_or("clipboard service is disabled")
+                    .and_then(Clipboard::clear)
                     .map_err(str::to_owned),
                 action @ (Action::SetVolume(_)
                 | Action::SetMuted(_)
@@ -3211,6 +3262,9 @@ impl SeatHandler for App {
             return;
         }
         self.seat = Some(seat.clone());
+        if let Some(clipboard) = &mut self.clipboard {
+            clipboard.attach_seat(&seat, qh);
+        }
         match capability {
             Capability::Pointer if self.pointer.is_none() => {
                 match self.seats.get_pointer(qh, &seat) {
@@ -3259,6 +3313,9 @@ impl SeatHandler for App {
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
         if self.seat.as_ref() == Some(&seat) {
             self.seat = None;
+            if let Some(clipboard) = &mut self.clipboard {
+                clipboard.detach_seat();
+            }
             if let Some(pointer) = self.pointer.take() {
                 pointer.release();
             }
@@ -3822,6 +3879,138 @@ impl Dispatch<XdgActivationTokenV1, u64> for App {
     }
 }
 
+impl Dispatch<ExtDataControlDeviceV1, ()> for App {
+    event_created_child!(App, ExtDataControlDeviceV1, [
+        0 => (ExtDataControlOfferV1, ClipboardOfferData::default())
+    ]);
+
+    fn event(
+        app: &mut Self,
+        device: &ExtDataControlDeviceV1,
+        event: ext_data_control_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(clipboard) = &mut app.clipboard else {
+            return;
+        };
+        match event {
+            ext_data_control_device_v1::Event::DataOffer { .. } => {}
+            ext_data_control_device_v1::Event::Selection { id } => clipboard.ext_offer(id),
+            ext_data_control_device_v1::Event::PrimarySelection { id } => {
+                clipboard.ext_primary_offer(id);
+            }
+            ext_data_control_device_v1::Event::Finished => clipboard.ext_finished(device),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtDataControlOfferV1, ClipboardOfferData> for App {
+    fn event(
+        _: &mut Self,
+        _: &ExtDataControlOfferV1,
+        event: ext_data_control_offer_v1::Event,
+        data: &ClipboardOfferData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let ext_data_control_offer_v1::Event::Offer { mime_type } = event {
+            data.offer(mime_type);
+        }
+    }
+}
+
+impl Dispatch<ExtDataControlSourceV1, ClipboardSourceData> for App {
+    fn event(
+        app: &mut Self,
+        source: &ExtDataControlSourceV1,
+        event: ext_data_control_source_v1::Event,
+        data: &ClipboardSourceData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(clipboard) = &mut app.clipboard else {
+            source.destroy();
+            return;
+        };
+        match event {
+            ext_data_control_source_v1::Event::Send { mime_type, fd } => {
+                clipboard.send(data, &mime_type, fd);
+            }
+            ext_data_control_source_v1::Event::Cancelled => clipboard.cancelled(data.key()),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwlrDataControlDeviceV1, ()> for App {
+    event_created_child!(App, ZwlrDataControlDeviceV1, [
+        0 => (ZwlrDataControlOfferV1, ClipboardOfferData::default())
+    ]);
+
+    fn event(
+        app: &mut Self,
+        device: &ZwlrDataControlDeviceV1,
+        event: zwlr_data_control_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(clipboard) = &mut app.clipboard else {
+            return;
+        };
+        match event {
+            zwlr_data_control_device_v1::Event::DataOffer { .. } => {}
+            zwlr_data_control_device_v1::Event::Selection { id } => clipboard.wlr_offer(id),
+            zwlr_data_control_device_v1::Event::PrimarySelection { id } => {
+                clipboard.wlr_primary_offer(id);
+            }
+            zwlr_data_control_device_v1::Event::Finished => clipboard.wlr_finished(device),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwlrDataControlOfferV1, ClipboardOfferData> for App {
+    fn event(
+        _: &mut Self,
+        _: &ZwlrDataControlOfferV1,
+        event: zwlr_data_control_offer_v1::Event,
+        data: &ClipboardOfferData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwlr_data_control_offer_v1::Event::Offer { mime_type } = event {
+            data.offer(mime_type);
+        }
+    }
+}
+
+impl Dispatch<ZwlrDataControlSourceV1, ClipboardSourceData> for App {
+    fn event(
+        app: &mut Self,
+        source: &ZwlrDataControlSourceV1,
+        event: zwlr_data_control_source_v1::Event,
+        data: &ClipboardSourceData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(clipboard) = &mut app.clipboard else {
+            source.destroy();
+            return;
+        };
+        match event {
+            zwlr_data_control_source_v1::Event::Send { mime_type, fd } => {
+                clipboard.send(data, &mime_type, fd);
+            }
+            zwlr_data_control_source_v1::Event::Cancelled => clipboard.cancelled(data.key()),
+            _ => {}
+        }
+    }
+}
+
 delegate_compositor!(App);
 delegate_output!(App);
 delegate_layer!(App);
@@ -3835,6 +4024,8 @@ delegate_noop!(App: ignore WpFractionalScaleManagerV1);
 delegate_noop!(App: ignore WpViewporter);
 delegate_noop!(App: ignore WpViewport);
 delegate_noop!(App: ignore XdgActivationV1);
+delegate_noop!(App: ignore ExtDataControlManagerV1);
+delegate_noop!(App: ignore ZwlrDataControlManagerV1);
 delegate_noop!(App: ignore xdg_positioner::XdgPositioner);
 
 impl ProvidesRegistryState for App {

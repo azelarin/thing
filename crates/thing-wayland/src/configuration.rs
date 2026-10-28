@@ -1236,6 +1236,48 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_updates_reach_existing_and_later_outputs_together() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            return ui.panel { children = { ui.text { text = function()
+                return `{services.clipboard.available:get()}:{services.clipboard.loading:get()}:{services.clipboard.text:get() or 'none'}:{services.clipboard.error:get()}`
+            end } } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        configurations
+            .set_clipboard(ClipboardSnapshot {
+                available: true,
+                text: Some("copied".into()),
+                ..ClipboardSnapshot::default()
+            })
+            .unwrap();
+        assert_eq!(configurations.refresh(), vec![1]);
+        assert_eq!(text(&configurations, 1), "true:false:copied:");
+
+        configurations.add(2, output("DP-2", 2560)).unwrap();
+        assert_eq!(text(&configurations, 2), "true:false:copied:");
+        assert!(
+            configurations
+                .set_clipboard(ClipboardSnapshot {
+                    available: false,
+                    text: Some("stale".into()),
+                    ..ClipboardSnapshot::default()
+                })
+                .is_err()
+        );
+        assert!(configurations.refresh().is_empty());
+        for key in [1, 2] {
+            assert_eq!(text(&configurations, key), "true:false:copied:");
+        }
+    }
+
+    #[test]
     fn watched_files_are_the_union_of_output_specific_imports() {
         let directory = tempdir().unwrap();
         let entry = directory.path().join("panel.luau");
