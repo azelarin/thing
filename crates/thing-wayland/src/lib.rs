@@ -19,6 +19,7 @@ mod managed_process;
 mod media;
 mod niri;
 mod notifications;
+mod output;
 mod panel;
 mod popup;
 mod power;

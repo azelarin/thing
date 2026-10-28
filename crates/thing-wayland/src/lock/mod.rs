@@ -19,7 +19,7 @@ use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_keyboard, delegate_output, delegate_registry, delegate_seat,
     delegate_session_lock,
-    output::{OutputHandler, OutputInfo, OutputState},
+    output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
@@ -66,6 +66,7 @@ use crate::{
     keyboard::{
         RepeatSession, RepeatTimerAction, TextKeyAction, repeat_action_is_current, text_key_action,
     },
+    output::output_context,
     render::{FrameResult, Render, Window},
     watch::Watch,
 };
@@ -1689,47 +1690,6 @@ fn count_kind(node: &Node, kind: Kind) -> usize {
             .iter()
             .map(|child| count_kind(child, kind))
             .sum::<usize>()
-}
-
-fn output_context(info: OutputInfo) -> Option<OutputContext> {
-    let integer_scale = info.scale_factor.clamp(1, 16) as u32;
-    let scale = Scale::from_120ths(integer_scale * 120).unwrap_or_default();
-    let logical_size = info.logical_size.and_then(valid_dimensions).or_else(|| {
-        let dimensions = info
-            .modes
-            .iter()
-            .find(|mode| mode.current)
-            .map(|mode| mode.dimensions)?;
-        let rotated = matches!(
-            info.transform,
-            wl_output::Transform::_90
-                | wl_output::Transform::_270
-                | wl_output::Transform::Flipped90
-                | wl_output::Transform::Flipped270
-        );
-        fallback_logical_size(dimensions, integer_scale, rotated)
-    })?;
-    Some(OutputContext {
-        name: info.name,
-        width: logical_size.0,
-        height: logical_size.1,
-        scale,
-    })
-}
-
-fn valid_dimensions((width, height): (i32, i32)) -> Option<(u32, u32)> {
-    Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
-        .filter(|(width, height)| *width > 0 && *height > 0)
-}
-
-fn fallback_logical_size(dimensions: (i32, i32), scale: u32, rotated: bool) -> Option<(u32, u32)> {
-    let (width, height) = valid_dimensions(dimensions)?;
-    let (width, height) = if rotated {
-        (height, width)
-    } else {
-        (width, height)
-    };
-    Some((width / scale, height / scale)).filter(|(width, height)| *width > 0 && *height > 0)
 }
 
 #[cfg(test)]
