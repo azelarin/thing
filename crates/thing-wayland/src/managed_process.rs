@@ -35,10 +35,14 @@ const MAX_STREAM_BYTES: usize = 64 * 1024;
 const MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
 const RUN_BUFFER_RESERVATION: usize = MAX_STREAM_BYTES * 4;
 const MAX_ERROR_BYTES: usize = 4096;
+const MAX_PROC_MOUNTINFO_BYTES: u64 = 1024 * 1024;
 const READ_CHUNK_BYTES: usize = 8192;
 const MAX_READ_BYTES_PER_TURN: usize = 64 * 1024;
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const GROUP_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+const STUCK_GROUP_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_STUCK_GROUP_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(5);
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 const DEFAULT_DRAIN_GRACE: Duration = Duration::from_millis(250);
@@ -335,6 +339,7 @@ impl Manager {
     }
 
     fn start_inner(ping: Ping, limits: Limits, lease: Option<ManagerLease>) -> io::Result<Self> {
+        ensure_authoritative_procfs()?;
         let setup = ChildSetup::capture()?;
         let (wake, reader) = UnixStream::pair()?;
         wake.set_nonblocking(true)?;
@@ -625,6 +630,8 @@ struct Run {
     stderr_tail: Utf8Tail,
     exit_observed: bool,
     identity_lost: bool,
+    next_group_check: Instant,
+    group_scan_delay: Duration,
     wait_status: Option<ExitStatus>,
     drain_deadline: Option<Instant>,
     stop_deadline: Option<Instant>,
@@ -764,66 +771,80 @@ fn maintain(
         let Some(run) = runs.get_mut(&token) else {
             continue;
         };
-        if run.wait_status.is_none() && !run.identity_lost {
-            if !run.exit_observed {
-                match exit_observed(run.pid) {
-                    Ok(true) => {
-                        run.exit_observed = true;
-                        run.drain_deadline = Some(now + limits.drain_grace);
-                        if run.stop_deadline.is_none() {
-                            signal_owned(run, shutdown_for(shared, run.token).raw());
-                            run.stop_deadline = Some(now + stop_grace(shared, limits));
-                            mark_stopping(shared, run, ping);
-                        }
+        if run.wait_status.is_none() && !run.identity_lost && !run.exit_observed {
+            match exit_observed(run.pid) {
+                Ok(true) => {
+                    run.exit_observed = true;
+                    run.next_group_check = now;
+                    run.drain_deadline = Some(now + limits.drain_grace);
+                    if run.stop_deadline.is_none() {
+                        signal_owned(run, shutdown_for(shared, run.token).raw());
+                        run.stop_deadline = Some(now + stop_grace(shared, limits));
+                        mark_stopping(shared, run, ping);
                     }
-                    Ok(false) => {}
-                    Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
-                        lose_child_identity(shared, run, ping, limits.drain_grace);
-                    }
-                    Err(error) => set_run_error(
-                        shared,
-                        run,
-                        &format!("cannot inspect managed process: {error}"),
-                        ping,
-                    ),
                 }
+                Ok(false) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                    lose_child_identity(shared, run, ping, limits.drain_grace);
+                }
+                Err(error) => set_run_error(
+                    shared,
+                    run,
+                    &format!("cannot inspect managed process: {error}"),
+                    ping,
+                ),
             }
-            if run.exit_observed {
-                match initial_group_has_other_members(run.pid) {
-                    Ok(true) => {}
-                    Ok(false) => match run.child.try_wait() {
-                        Ok(Some(status)) => run.wait_status = Some(status),
-                        Ok(None) => set_run_error(
+        }
+        if escalation_due(run, now) {
+            signal_owned(run, libc::SIGKILL);
+            run.kill_sent = true;
+        }
+        if run.wait_status.is_none()
+            && !run.identity_lost
+            && run.exit_observed
+            && now >= run.next_group_check
+        {
+            match initial_group_has_other_members(run.pid) {
+                Ok(true) => {
+                    defer_group_scan(run, now, GROUP_SCAN_INTERVAL);
+                }
+                Ok(false) => match run.child.try_wait() {
+                    Ok(Some(status)) => {
+                        run.wait_status = Some(status);
+                        run.stop_deadline = None;
+                    }
+                    Ok(None) => {
+                        defer_group_scan(run, now, GROUP_SCAN_INTERVAL);
+                        set_run_error(
                             shared,
                             run,
                             "managed process exit observation changed unexpectedly",
                             ping,
-                        ),
-                        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
-                            lose_child_identity(shared, run, ping, limits.drain_grace);
-                        }
-                        Err(error) => set_run_error(
+                        );
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                        lose_child_identity(shared, run, ping, limits.drain_grace);
+                    }
+                    Err(error) => {
+                        defer_group_scan(run, now, STUCK_GROUP_SCAN_INTERVAL);
+                        set_run_error(
                             shared,
                             run,
                             &format!("cannot reap managed process: {error}"),
                             ping,
-                        ),
-                    },
-                    Err(error) => set_run_error(
+                        );
+                    }
+                },
+                Err(error) => {
+                    defer_group_scan(run, now, STUCK_GROUP_SCAN_INTERVAL);
+                    set_run_error(
                         shared,
                         run,
                         &format!("cannot inspect managed process group: {error}"),
                         ping,
-                    ),
+                    );
                 }
             }
-        }
-        if run
-            .stop_deadline
-            .is_some_and(|deadline| deadline <= now && !run.kill_sent && !run.identity_lost)
-        {
-            signal_owned(run, libc::SIGKILL);
-            run.kill_sent = true;
         }
         if run
             .drain_deadline
@@ -921,7 +942,7 @@ fn apply_stops(
         let Some(run) = runs.get_mut(&token) else {
             continue;
         };
-        if run.identity_lost {
+        if run.identity_lost || run.wait_status.is_some() {
             continue;
         }
         let deadline = Instant::now() + grace;
@@ -941,6 +962,27 @@ fn stop_grace(shared: &Mutex<Shared>, limits: Limits) -> Duration {
     } else {
         limits.stop_grace
     }
+}
+
+fn escalation_due(run: &Run, now: Instant) -> bool {
+    run.wait_status.is_none()
+        && !run.identity_lost
+        && !run.kill_sent
+        && run.stop_deadline.is_some_and(|deadline| deadline <= now)
+}
+
+fn defer_group_scan(run: &mut Run, now: Instant, ordinary_delay: Duration) {
+    let delay = if run.kill_sent {
+        let delay = run.group_scan_delay;
+        run.group_scan_delay = run
+            .group_scan_delay
+            .saturating_mul(2)
+            .min(MAX_STUCK_GROUP_SCAN_INTERVAL);
+        delay
+    } else {
+        ordinary_delay
+    };
+    run.next_group_check = now + delay;
 }
 
 #[cfg(test)]
@@ -992,6 +1034,8 @@ fn spawn(start: Start, setup: ChildSetup) -> Result<(Run, Option<String>), (RunT
             stderr_tail: Utf8Tail::new(MAX_STREAM_BYTES),
             exit_observed: false,
             identity_lost: false,
+            next_group_check: Instant::now(),
+            group_scan_delay: STUCK_GROUP_SCAN_INTERVAL,
             wait_status: None,
             drain_deadline: None,
             stop_deadline: None,
@@ -1333,7 +1377,7 @@ fn mark_worker_failure(
         }
     }
     for run in runs.values_mut() {
-        if !run.identity_lost {
+        if !run.identity_lost && run.wait_status.is_none() {
             signal_owned(run, libc::SIGKILL);
             run.kill_sent = true;
         }
@@ -1563,7 +1607,113 @@ fn exit_observed(pid: u32) -> io::Result<bool> {
     Ok(unsafe { info.assume_init().si_pid() } != 0)
 }
 
+fn ensure_authoritative_procfs() -> io::Result<()> {
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: the path is NUL-terminated and statfs initializes stats on
+    // success.
+    if unsafe { libc::statfs(c"/proc".as_ptr(), stats.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: statfs initialized stats after returning success.
+    let stats = unsafe { stats.assume_init() };
+    if stats.f_type != libc::PROC_SUPER_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "managed processes require procfs mounted at /proc",
+        ));
+    }
+    let mut path_stats = std::mem::MaybeUninit::<libc::statx>::uninit();
+    // SAFETY: the path is NUL-terminated and statx initializes path_stats on
+    // success.
+    if unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            c"/proc".as_ptr(),
+            libc::AT_STATX_SYNC_AS_STAT,
+            libc::STATX_MNT_ID,
+            path_stats.as_mut_ptr(),
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: statx initialized path_stats after returning success.
+    let path_stats = unsafe { path_stats.assume_init() };
+    if path_stats.stx_mask & libc::STATX_MNT_ID == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "managed processes require procfs mount identity",
+        ));
+    }
+    let mut mountinfo = String::new();
+    fs::File::open("/proc/self/mountinfo")?
+        .take(MAX_PROC_MOUNTINFO_BYTES + 1)
+        .read_to_string(&mut mountinfo)?;
+    if mountinfo.len() as u64 > MAX_PROC_MOUNTINFO_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "procfs mount information is too large",
+        ));
+    }
+    if !procfs_mount_is_authoritative(&mountinfo, path_stats.stx_mnt_id)? {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "managed process groups require unrestricted procfs visibility",
+        ));
+    }
+    Ok(())
+}
+
+fn procfs_mount_is_authoritative(mountinfo: &str, mount_id: u64) -> io::Result<bool> {
+    for line in mountinfo.lines() {
+        let Some((mount, filesystem)) = line.split_once(" - ") else {
+            continue;
+        };
+        let fields = mount.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.get(4) != Some(&"/proc") {
+            continue;
+        }
+        if fields.len() < 6 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid /proc mount information",
+            ));
+        }
+        let id = fields[0]
+            .parse::<u64>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid /proc mount id"))?;
+        if id != mount_id {
+            continue;
+        }
+        let filesystem = filesystem.split_ascii_whitespace().collect::<Vec<_>>();
+        if filesystem.len() < 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid /proc filesystem information",
+            ));
+        }
+        return Ok(fields[3] == "/"
+            && filesystem[0] == "proc"
+            && !hidepid_restricts(fields[5])
+            && !hidepid_restricts(filesystem[2]));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "cannot identify the active /proc mount",
+    ))
+}
+
+fn hidepid_restricts(options: &str) -> bool {
+    options.split(',').any(|option| {
+        option == "hidepid"
+            || option
+                .strip_prefix("hidepid=")
+                .is_some_and(|value| value != "0" && value != "off")
+    })
+}
+
 fn initial_group_has_other_members(pgid: u32) -> io::Result<bool> {
+    ensure_authoritative_procfs()?;
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
         let Some(pid) = entry
@@ -1620,9 +1770,11 @@ fn poll_timeout(runs: &BTreeMap<RunToken, Run>, now: Instant) -> i32 {
         .values()
         .flat_map(|run| {
             [
-                (!run.kill_sent && !run.identity_lost)
+                (run.wait_status.is_none() && !run.kill_sent && !run.identity_lost)
                     .then_some(run.stop_deadline)
                     .flatten(),
+                (run.wait_status.is_none() && run.exit_observed && !run.identity_lost)
+                    .then_some(run.next_group_check),
                 (!run.drained()).then_some(run.drain_deadline).flatten(),
                 run.dirty.then_some(run.next_publish),
             ]
@@ -1899,6 +2051,64 @@ mod tests {
             19
         );
         assert!(process_group_from_stat("42 broken").is_err());
+    }
+
+    #[test]
+    fn procfs_mount_parser_rejects_hidden_or_partial_process_views() {
+        let mountinfo = concat!(
+            "10 1 0:1 / /proc rw - proc proc rw,hidepid=0\n",
+            "20 1 0:2 / /proc rw - proc proc rw,hidepid=2\n",
+            "30 1 0:3 /123 /proc rw - proc proc rw\n",
+        );
+        assert!(procfs_mount_is_authoritative(mountinfo, 10).unwrap());
+        assert!(!procfs_mount_is_authoritative(mountinfo, 20).unwrap());
+        assert!(!procfs_mount_is_authoritative(mountinfo, 30).unwrap());
+        assert!(procfs_mount_is_authoritative(mountinfo, 40).is_err());
+        assert!(hidepid_restricts("rw,hidepid=invisible"));
+        assert!(!hidepid_restricts("rw,hidepid=off"));
+    }
+
+    #[test]
+    fn expired_stop_does_not_resignal_a_reaped_identity_and_scans_back_off() {
+        let token = RunToken {
+            generation: 1,
+            key_incarnation: 1,
+            run_incarnation: 1,
+        };
+        let (mut run, _) = spawn(
+            Start {
+                token,
+                key: "child".into(),
+                argv: helper("output"),
+                cwd: None,
+            },
+            ChildSetup::capture().unwrap(),
+        )
+        .unwrap();
+        run.wait_status = Some(run.child.wait().unwrap());
+        run.stop_deadline = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!escalation_due(&run, Instant::now()));
+        run.stop_deadline = None;
+
+        let mut runs = BTreeMap::new();
+        runs.insert(token, run);
+        assert!(poll_timeout(&runs, Instant::now()) > 1);
+
+        let mut shared = Shared::default();
+        shared.stops.insert(token, ShutdownSignal::Terminate);
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        apply_stops(&Mutex::new(shared), &mut runs, &ping, test_limits());
+        assert!(runs[&token].stop_deadline.is_none());
+
+        let run = runs.get_mut(&token).unwrap();
+        run.kill_sent = true;
+        let now = Instant::now();
+        defer_group_scan(run, now, GROUP_SCAN_INTERVAL);
+        assert_eq!(run.next_group_check, now + STUCK_GROUP_SCAN_INTERVAL);
+        assert_eq!(run.group_scan_delay, Duration::from_secs(2));
+        let next = run.next_group_check;
+        defer_group_scan(run, next, GROUP_SCAN_INTERVAL);
+        assert_eq!(run.group_scan_delay, Duration::from_secs(4));
     }
 
     #[test]
