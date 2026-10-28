@@ -662,6 +662,27 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_retargets_a_stationary_pointer_after_layout() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut scroll = fixed(2, Kind::Scroll, 100.0, 40.0);
+        scroll.children.push(fixed(3, Kind::Button, 100.0, 40.0));
+        scroll.children.push(fixed(4, Kind::Button, 100.0, 40.0));
+        root.children.push(scroll);
+        let size = Size {
+            width: 100.0,
+            height: 40.0,
+        };
+        let point = Point { x: 10.0, y: 10.0 };
+        let mut state = ScrollState::default();
+        let layout = scrolled(&root, size, &mut state);
+        assert_eq!(layout.hit_test(point), Some(NodeId(3)));
+
+        assert!(layout.scroll_y(point, 40.0, &mut state));
+        let layout = scrolled(&root, size, &mut state);
+        assert_eq!(layout.hit_test(point), Some(NodeId(4)));
+    }
+
+    #[test]
     fn scroll_limit_includes_gap_and_padding() {
         let mut root = Node::new(NodeId(1), Kind::Panel);
         let mut scroll = fixed(2, Kind::Scroll, 100.0, 50.0);
