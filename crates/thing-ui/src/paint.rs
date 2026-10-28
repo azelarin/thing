@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use femtovg::{Canvas, Color, FontId, Paint, Path, PositionedGlyph, TextContext, renderer::OpenGl};
+use femtovg::{
+    Canvas, Color, FontId, Paint, Path, PositionedGlyph, TextContext,
+    renderer::{OpenGl, Renderer},
+};
 use parley::PositionedLayoutItem;
 use thing_core::{Kind, Node, NodeId, Rect};
 
@@ -31,17 +34,26 @@ impl Interaction {
     }
 }
 
-/// an opengl es painter. the host must keep its context current during use and drop.
-pub struct Painter {
-    canvas: Canvas<OpenGl>,
+/// renderer-independent inputs for one frame.
+pub struct PaintFrame<'a> {
+    pub root: &'a Node,
+    pub layout: &'a Layout,
+    pub physical: (u32, u32),
+    pub scale: f32,
+    pub input: Interaction,
+}
+
+/// renders a widget tree through femtovg.
+pub struct Painter<R: Renderer = OpenGl> {
+    canvas: Canvas<R>,
     text_context: TextContext,
     fonts: BTreeMap<(u64, u32), FontId>,
     pub text: TextSystem,
     images: crate::images::Images,
 }
 
-impl Painter {
-    pub fn new(renderer: OpenGl, wake: impl Fn() + Send + 'static) -> Result<Self, String> {
+impl<R: Renderer> Painter<R> {
+    pub fn new(renderer: R, wake: impl Fn() + Send + 'static) -> Result<Self, String> {
         let text_context = TextContext::default();
         let canvas = Canvas::new_with_text_context(renderer, text_context.clone())
             .map_err(|e| e.to_string())?;
@@ -54,14 +66,25 @@ impl Painter {
         })
     }
 
-    pub fn paint(
+    /// records and submits one frame.
+    pub fn paint_to_output(
         &mut self,
-        root: &Node,
-        layout: &Layout,
-        physical: (u32, u32),
-        scale: f32,
-        input: Interaction,
+        frame: PaintFrame<'_>,
+        output: impl Into<R::RenderOutput>,
+        submit: impl FnOnce(R::CommandBuffer),
     ) -> Result<(), String> {
+        let result = self.draw(frame);
+        self.finish_output(result, output, submit)
+    }
+
+    fn draw(&mut self, frame: PaintFrame<'_>) -> Result<(), String> {
+        let PaintFrame {
+            root,
+            layout,
+            physical,
+            scale,
+            input,
+        } = frame;
         self.canvas.set_size(physical.0, physical.1, scale);
         self.images.collect(&mut self.canvas);
         self.canvas
@@ -128,8 +151,19 @@ impl Painter {
             }
         }
         self.canvas.reset_scissor();
-        self.canvas.flush();
         Ok(())
+    }
+
+    fn finish_output(
+        &mut self,
+        result: Result<(), String>,
+        output: impl Into<R::RenderOutput>,
+        submit: impl FnOnce(R::CommandBuffer),
+    ) -> Result<(), String> {
+        let commands = self.canvas.flush_to_output(output);
+        submit(commands);
+        self.images.release(&mut self.canvas);
+        result
     }
 
     pub fn layout(&mut self, root: &Node, size: Size) -> Result<Layout, String> {
@@ -201,8 +235,7 @@ impl Painter {
             width: (bounds.width - 2.0 * padding_x).max(0.0),
             height: (bounds.height - 2.0 * padding_y).max(0.0),
         };
-        let Some((id, width, height)) = self.images.get(&mut self.canvas, &node.image, area, scale)
-        else {
+        let Some((id, width, height)) = self.images.get(&node.image, area, scale) else {
             return;
         };
         let factor = (area.width / width as f32).min(area.height / height as f32);
@@ -217,6 +250,29 @@ impl Painter {
     }
 }
 
+impl Painter<OpenGl> {
+    pub fn paint(
+        &mut self,
+        root: &Node,
+        layout: &Layout,
+        physical: (u32, u32),
+        scale: f32,
+        input: Interaction,
+    ) -> Result<(), String> {
+        self.paint_to_output(
+            PaintFrame {
+                root,
+                layout,
+                physical,
+                scale,
+                input,
+            },
+            (),
+            |_| {},
+        )
+    }
+}
+
 fn color(value: thing_core::Color) -> Color {
     let [r, g, b, a] = value.0;
     Color::rgba(r, g, b, a)
@@ -224,6 +280,10 @@ fn color(value: thing_core::Color) -> Color {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use femtovg::renderer::Void;
+
     use super::*;
 
     #[test]
@@ -243,5 +303,18 @@ mod tests {
         interaction.focus_from_keyboard(NodeId(3));
         assert_eq!(interaction.focused, Some(NodeId(3)));
         assert!(interaction.focus_visible);
+    }
+
+    #[test]
+    fn failed_frame_still_runs_submission_cleanup() {
+        let mut painter = Painter::new(Void, || {}).unwrap();
+        let submitted = Cell::new(false);
+
+        let result = painter.finish_output(Err("paint failed".into()), (), |_| {
+            submitted.set(true);
+        });
+
+        assert!(submitted.get());
+        assert_eq!(result.unwrap_err(), "paint failed");
     }
 }

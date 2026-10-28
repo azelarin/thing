@@ -9,7 +9,7 @@ use std::{
     thread,
 };
 
-use femtovg::{Canvas, ImageFlags, ImageId, ImageSource, renderer::OpenGl, rgb::FromSlice};
+use femtovg::{Canvas, ImageFlags, ImageId, ImageSource, renderer::Renderer, rgb::FromSlice};
 use thing_core::{Image, Rect};
 
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -57,10 +57,17 @@ struct Entry {
     touched: u64,
 }
 
+struct Retired {
+    id: ImageId,
+    bytes: usize,
+}
+
 pub(super) struct Images {
     shared: Arc<Shared>,
     cache: BTreeMap<Key, Entry>,
+    retired: Vec<Retired>,
     bytes: usize,
+    retired_bytes: usize,
     tick: u64,
 }
 
@@ -101,12 +108,14 @@ impl Images {
         Ok(Self {
             shared,
             cache: BTreeMap::new(),
+            retired: Vec::new(),
             bytes: 0,
+            retired_bytes: 0,
             tick: 0,
         })
     }
 
-    pub fn collect(&mut self, canvas: &mut Canvas<OpenGl>) {
+    pub fn collect<R: Renderer>(&mut self, canvas: &mut Canvas<R>) {
         let result = lock(&self.shared.inbox).result.take();
         let Some((key, result)) = result else {
             return;
@@ -116,10 +125,13 @@ impl Images {
             return;
         }
         let state = match result.and_then(|pixels| {
-            while self.bytes + pixels.rgba.len() > CACHE_BYTES {
-                if !self.evict(canvas, Some(&key)) {
+            while self.resident_bytes().saturating_add(pixels.rgba.len()) > CACHE_BYTES {
+                if !self.evict(Some(&key)) {
                     return Err("image exceeds GPU cache budget".into());
                 }
+                // collect runs before this frame records drawing commands, so
+                // images evicted here can be released immediately.
+                self.release(canvas);
             }
             let source = ImageSource::Rgba(femtovg::imgref::Img::new(
                 pixels.rgba.as_rgba(),
@@ -135,6 +147,7 @@ impl Images {
                 .create_image(source, flags)
                 .map_err(|e| e.to_string())?;
             self.bytes += pixels.rgba.len();
+            debug_assert!(self.resident_bytes() <= CACHE_BYTES);
             Ok(State::Ready {
                 id,
                 width: pixels.width,
@@ -152,13 +165,7 @@ impl Images {
         }
     }
 
-    pub fn get(
-        &mut self,
-        canvas: &mut Canvas<OpenGl>,
-        image: &Image,
-        bounds: Rect,
-        scale: f32,
-    ) -> Option<(ImageId, u32, u32)> {
+    pub fn get(&mut self, image: &Image, bounds: Rect, scale: f32) -> Option<(ImageId, u32, u32)> {
         if image.source.is_none() && image.icon.is_none() && image.app_id.is_none() {
             return None;
         }
@@ -182,7 +189,7 @@ impl Images {
             return None;
         }
         while self.cache.len() >= 128 {
-            if !self.evict(canvas, None) {
+            if !self.evict(None) {
                 return None;
             }
         }
@@ -198,7 +205,7 @@ impl Images {
         None
     }
 
-    fn evict(&mut self, canvas: &mut Canvas<OpenGl>, except: Option<&Key>) -> bool {
+    fn evict(&mut self, except: Option<&Key>) -> bool {
         let key = self
             .cache
             .iter()
@@ -211,13 +218,27 @@ impl Images {
         if let Some(entry) = self.cache.remove(&key)
             && let State::Ready { id, width, height } = entry.state
         {
-            // cached images may already be referenced by this frame's queued
-            // draw commands. submit those commands before deleting the texture.
-            canvas.flush();
-            canvas.delete_image(id);
-            self.bytes -= width as usize * height as usize * 4;
+            // queued draw commands may still refer to this image. the painter
+            // deletes it after submitting the frame.
+            let bytes = width as usize * height as usize * 4;
+            self.retired.push(Retired { id, bytes });
+            self.bytes -= bytes;
+            self.retired_bytes += bytes;
         }
+        debug_assert!(self.resident_bytes() <= CACHE_BYTES);
         true
+    }
+
+    pub fn release<R: Renderer>(&mut self, canvas: &mut Canvas<R>) {
+        for retired in self.retired.drain(..) {
+            canvas.delete_image(retired.id);
+            self.retired_bytes -= retired.bytes;
+        }
+        debug_assert_eq!(self.retired_bytes, 0);
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.bytes.saturating_add(self.retired_bytes)
     }
 }
 
@@ -315,6 +336,50 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use femtovg::{PixelFormat, renderer::Void};
+
+    #[test]
+    fn eviction_keeps_retired_bytes_resident_until_release() {
+        let mut canvas = Canvas::new(Void).unwrap();
+        let id = canvas
+            .create_image_empty(2, 2, PixelFormat::Rgba8, ImageFlags::empty())
+            .unwrap();
+        let key = Key {
+            image: Image::default(),
+            width: 2,
+            height: 2,
+        };
+        let mut cache = BTreeMap::new();
+        cache.insert(
+            key,
+            Entry {
+                state: State::Ready {
+                    id,
+                    width: 2,
+                    height: 2,
+                },
+                touched: 0,
+            },
+        );
+        let mut images = Images {
+            shared: Arc::new(Shared::default()),
+            cache,
+            retired: Vec::new(),
+            bytes: 16,
+            retired_bytes: 0,
+            tick: 0,
+        };
+
+        assert!(images.evict(None));
+        assert_eq!(images.bytes, 0);
+        assert_eq!(images.retired_bytes, 16);
+        assert_eq!(images.resident_bytes(), 16);
+        assert!(canvas.image_info(id).is_ok());
+
+        images.release(&mut canvas);
+        assert_eq!(images.resident_bytes(), 0);
+        assert!(canvas.image_info(id).is_err());
+    }
 
     #[test]
     fn svg_uses_requested_size_preserves_aspect_ratio_and_premultiplies_alpha() {
