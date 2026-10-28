@@ -37,7 +37,7 @@ use smithay_client_toolkit::{
 };
 use thing_core::{Kind, Node, NodeId, Point, Rect, Scale};
 use thing_runtime::{Action, Event, OutputContext, Scalar, ServiceSnapshot};
-use thing_ui::{Interaction, Layout, Painter, ScrollState, Size};
+use thing_ui::{Interaction, Layout, PaintFrame, ScrollState, Size};
 use wayland_client::{
     Connection, Dispatch, QueueHandle, delegate_noop,
     globals::registry_queue_init,
@@ -55,17 +55,23 @@ use wayland_protocols::{
 };
 
 use crate::{
+    Renderer,
     audio::Audio,
     configuration::Configurations,
-    egl::{Graphics, Window},
     hover::{Command as HoverCommand, HoverKey, HoverState, HoverTarget},
     niri::Niri,
+    render::{FrameResult, Render, Window},
     watch::Watch,
 };
 
 /// run one panel per output. the loop sleeps until input, configuration, or a
 /// compositor frame callback arrives; an unchanged panel does not request frames.
-pub fn run(entry: &Path) -> Result<(), String> {
+pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
+    if renderer == Renderer::Vulkan && !cfg!(feature = "vulkan") {
+        return Err(
+            "vulkan support is not included in this build; rebuild with --features vulkan".into(),
+        );
+    }
     let entry = entry
         .canonicalize()
         .map_err(|error| format!("{}: {error}", entry.display()))?;
@@ -90,18 +96,28 @@ pub fn run(entry: &Path) -> Result<(), String> {
     let layer_shell = LayerShell::bind(&globals, &qh)
         .map_err(|error| format!("the compositor must support wlr-layer-shell: {error}"))?;
     let xdg_shell = XdgShell::bind(&globals, &qh).map_err(|error| error.to_string())?;
-    let graphics = Graphics::new(&connection)?;
     let (image_ping, image_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let wake = image_ping.clone();
-    let painter = Painter::new(graphics.renderer()?, move || wake.ping())?;
+    let gpu_wake = image_ping.clone();
+    let probe = (renderer == Renderer::Vulkan).then(|| compositor.create_surface(&qh));
+    let render = Render::new(
+        renderer,
+        &connection,
+        probe.as_ref(),
+        move || wake.ping(),
+        move || gpu_wake.ping(),
+    );
+    if let Some(probe) = probe {
+        probe.destroy();
+    }
+    let render = render?;
     let (audio_ping, audio_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let audio = Audio::start(audio_ping).map_err(|e| format!("cannot start audio worker: {e}"))?;
     let (niri_ping, niri_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let niri = Niri::start(niri_ping).map_err(|e| format!("cannot start niri worker: {e}"))?;
     let mut app = App {
-        painter: Some(painter),
+        render,
         image_ping,
-        graphics,
         configurations: Configurations::new(entry, services),
         watch: watch.clone(),
         reload_at: None,
@@ -199,12 +215,11 @@ pub fn run(entry: &Path) -> Result<(), String> {
         app.draw(&qh)?;
         app.process_hover(&qh);
         connection.flush().map_err(|error| error.to_string())?;
+        let timeout = app
+            .next_deadline()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
         event_loop
-            .dispatch(
-                app.next_deadline()
-                    .map(|deadline| deadline.saturating_duration_since(Instant::now())),
-                &mut app,
-            )
+            .dispatch(timeout, &mut app)
             .map_err(|error| error.to_string())?;
         if let Some(error) = app.error.take() {
             return Err(error);
@@ -241,7 +256,7 @@ impl Role {
 }
 
 struct Surface {
-    // release egl before the wayland role and its underlying surface.
+    // release graphics state before the Wayland role and its underlying surface.
     window: Option<Window>,
     role: Role,
     output: wl_output::WlOutput,
@@ -261,6 +276,7 @@ struct Surface {
     configured: bool,
     dirty: bool,
     waiting: bool,
+    retry_at: Option<Instant>,
 }
 
 impl Drop for Surface {
@@ -275,9 +291,8 @@ impl Drop for Surface {
 }
 
 struct App {
-    painter: Option<Painter>,
+    render: Render,
     image_ping: calloop::ping::Ping,
-    graphics: Graphics,
     configurations: Configurations<wl_output::WlOutput>,
     audio: Audio,
     niri: Niri,
@@ -305,10 +320,7 @@ struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        // gl-owned resources must be destroyed with a current context, including
-        // when all outputs have been unplugged or startup failed partway through.
-        let _ = self.graphics.park();
-        self.painter.take();
+        self.render.prepare_drop();
         // popups are appended after their parents and must be released first.
         while self.surfaces.pop().is_some() {}
     }
@@ -316,10 +328,11 @@ impl Drop for App {
 
 impl App {
     fn next_deadline(&self) -> Option<Instant> {
-        [self.reload_at, self.hover.next_deadline()]
-            .into_iter()
-            .flatten()
-            .min()
+        earliest_deadline(
+            self.reload_at,
+            self.hover.next_deadline(),
+            self.surfaces.iter().filter_map(|surface| surface.retry_at),
+        )
     }
 
     fn update_niri(&mut self) {
@@ -371,12 +384,9 @@ impl App {
             eprintln!("thing: reload failed; keeping the previous panel: {error}");
             return Ok(());
         }
-        self.graphics.park()?;
         // release the previous configuration's glyph atlas and text layouts.
         let wake = self.image_ping.clone();
-        self.painter = Some(Painter::new(self.graphics.renderer()?, move || {
-            wake.ping()
-        })?);
+        self.render.reset_painter(move || wake.ping())?;
         self.hover.clear();
         self.surfaces
             .retain(|surface| matches!(surface.role, Role::Panel(_)));
@@ -521,6 +531,7 @@ impl App {
             configured: false,
             dirty: true,
             waiting: false,
+            retry_at: None,
         }
     }
 
@@ -595,14 +606,18 @@ impl App {
     }
 
     fn draw(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
-        let Some(painter) = self.painter.as_mut() else {
-            return Ok(());
-        };
+        self.render.check_error()?;
         let configurations = &self.configurations;
-        for surface in &mut self.surfaces {
+        let now = Instant::now();
+        let mut presented = Vec::new();
+        for (index, surface) in self.surfaces.iter_mut().enumerate() {
             if !surface.configured || !surface.dirty || surface.waiting {
                 continue;
             }
+            if surface.retry_at.is_some_and(|deadline| deadline > now) {
+                continue;
+            }
+            surface.retry_at = None;
             let Some(root) = configurations
                 .root(&surface.output)
                 .and_then(|root| root.find(surface.root))
@@ -619,19 +634,8 @@ impl App {
                     .physical_size(surface.size.1)
                     .ok_or("invalid surface height")?,
             );
-            if let Some(viewport) = &surface.viewport {
-                surface.role.surface().set_buffer_scale(1);
-                viewport.set_destination(surface.size.0 as i32, surface.size.1 as i32);
-            } else {
-                surface
-                    .role
-                    .surface()
-                    .set_buffer_scale(surface.scale.factor().round() as i32);
-            }
-            if let Some(window) = &surface.window {
-                window.resize(physical.0, physical.1)?;
-            } else {
-                surface.window = Some(self.graphics.window(
+            if surface.window.is_none() {
+                surface.window = Some(self.render.create_window(
                     surface.role.surface(),
                     physical.0,
                     physical.1,
@@ -639,10 +643,9 @@ impl App {
             }
             let window = surface
                 .window
-                .as_ref()
-                .ok_or("EGL window was not initialized")?;
-            self.graphics.make_current(window)?;
-            let layout = painter.layout(
+                .as_mut()
+                .ok_or("render surface was not initialized")?;
+            let layout = self.render.layout(
                 root,
                 Size {
                     width: surface.size.0 as f32,
@@ -650,23 +653,45 @@ impl App {
                 },
                 &mut surface.scroll,
             )?;
-            painter.paint(
-                root,
-                &layout,
-                physical,
-                surface.scale.factor(),
-                surface.input,
+            let wl = surface.role.surface().clone();
+            let viewport = surface.viewport.clone();
+            let logical = surface.size;
+            let buffer_scale = surface.scale.factor().round() as i32;
+            let result = self.render.draw(
+                window,
+                PaintFrame {
+                    root,
+                    layout: &layout,
+                    physical,
+                    scale: surface.scale.factor(),
+                    input: surface.input,
+                },
+                || {
+                    if let Some(viewport) = &viewport {
+                        wl.set_buffer_scale(1);
+                        viewport.set_destination(logical.0 as i32, logical.1 as i32);
+                    } else {
+                        wl.set_buffer_scale(buffer_scale);
+                    }
+                    wl.frame(qh, wl.clone());
+                },
             )?;
-            surface
-                .role
-                .surface()
-                .frame(qh, surface.role.surface().clone());
-            surface.waiting = true;
-            window.present()?;
-            surface.layout = Some(layout);
-            surface.dirty = false;
+            match result {
+                FrameResult::Presented { redraw } => {
+                    surface.waiting = true;
+                    surface.layout = Some(layout);
+                    surface.dirty = redraw;
+                    presented.push(index);
+                }
+                #[cfg(feature = "vulkan")]
+                FrameResult::RetryAfter(delay) => {
+                    surface.waiting = false;
+                    surface.dirty = true;
+                    surface.retry_at = Some(Instant::now() + delay);
+                }
+            }
         }
-        self.reconcile_pointer();
+        self.reconcile_presented_pointers(&presented);
         Ok(())
     }
 
@@ -743,7 +768,7 @@ impl App {
         let wl = self.surfaces[index].role.surface().clone();
         let mode = self.surfaces[index].role.popup_mode().cloned();
         let hovered = std::mem::take(&mut self.surfaces[index].hover_path);
-        if let Err(error) = self.graphics.park() {
+        if let Err(error) = self.render.park() {
             self.error = Some(error);
         }
         self.surfaces.remove(index);
@@ -1070,9 +1095,22 @@ impl App {
     }
 
     fn reconcile_pointer(&mut self) {
+        self.reconcile_pointers(None);
+    }
+
+    fn reconcile_presented_pointers(&mut self, presented: &[usize]) {
+        if !presented.is_empty() {
+            self.reconcile_pointers(Some(presented));
+        }
+    }
+
+    fn reconcile_pointers(&mut self, selected: Option<&[usize]>) {
         let mut leaving = Vec::new();
         let mut entering = Vec::new();
-        for surface in &mut self.surfaces {
+        for (index, surface) in self.surfaces.iter_mut().enumerate() {
+            if selected.is_some_and(|selected| !selected.contains(&index)) {
+                continue;
+            }
             let Some(root) = self
                 .configurations
                 .root(&surface.output)
@@ -1301,6 +1339,14 @@ fn panel_height(root: &Node) -> u32 {
     root.style.height.unwrap_or(36.0).round().clamp(1.0, 4096.0) as u32
 }
 
+fn earliest_deadline(
+    reload: Option<Instant>,
+    hover: Option<Instant>,
+    retries: impl IntoIterator<Item = Instant>,
+) -> Option<Instant> {
+    reload.into_iter().chain(hover).chain(retries).min()
+}
+
 fn output_context(info: OutputInfo) -> Option<OutputContext> {
     let integer_scale = info.scale_factor.clamp(1, 16) as u32;
     let scale = Scale::from_120ths(integer_scale * 120).unwrap_or_default();
@@ -1342,11 +1388,32 @@ fn fallback_logical_size(dimensions: (i32, i32), scale: u32, rotated: bool) -> O
 
 #[cfg(test)]
 mod output_tests {
+    use std::time::{Duration, Instant};
+
     use super::{
-        fallback_logical_size, find_automatic_popup, find_manual_popup, interactive_path,
-        valid_dimensions,
+        earliest_deadline, fallback_logical_size, find_automatic_popup, find_manual_popup,
+        interactive_path, valid_dimensions,
     };
     use thing_core::{Kind, Node, NodeId};
+
+    #[test]
+    fn renderer_retry_can_wake_before_hover_and_configuration_deadlines() {
+        let now = Instant::now();
+        let retry = now + Duration::from_millis(16);
+        let hover = now + Duration::from_millis(50);
+        let reload = now + Duration::from_millis(80);
+
+        assert_eq!(
+            earliest_deadline(Some(reload), Some(hover), [retry]),
+            Some(retry)
+        );
+        assert_eq!(
+            earliest_deadline(Some(reload), Some(hover), []),
+            Some(hover)
+        );
+        assert_eq!(earliest_deadline(Some(reload), None, []), Some(reload));
+        assert_eq!(earliest_deadline(None, None, [retry]), Some(retry));
+    }
 
     #[test]
     fn mode_fallback_applies_scale_and_rotation() {
@@ -1606,7 +1673,7 @@ impl OutputHandler for App {
         }) {
             self.remove_popup(index, true, false);
         }
-        if let Err(error) = self.graphics.park() {
+        if let Err(error) = self.render.park() {
             self.error = Some(error);
         }
         self.surfaces.retain(|surface| surface.output != output);
@@ -1633,7 +1700,7 @@ impl LayerShellHandler for App {
             }) {
                 self.remove_popup(index, true, false);
             }
-            if let Err(error) = self.graphics.park() {
+            if let Err(error) = self.render.park() {
                 self.error = Some(error);
             }
             self.surfaces.retain(|surface| surface.output != output);

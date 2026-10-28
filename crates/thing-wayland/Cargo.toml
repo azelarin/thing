@@ -6,10 +6,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+vulkan = [
+    "thing-ui/wgpu",
+    "dep:pollster",
+    "dep:raw-window-handle",
+    "dep:wgpu",
+]
+
 [dependencies]
 thing-core = { path = "../thing-core" }
 thing-runtime = { path = "../thing-runtime" }
 thing-ui = { path = "../thing-ui" }
+pollster = { version = "1.0.1", optional = true, default-features = false }
+raw-window-handle = { version = "0.6.2", optional = true }
+wgpu = { version = "30.0.1", optional = true, default-features = false, features = ["std", "vulkan", "wgsl"] }
 smithay-client-toolkit = "0.20.0"
 wayland-client = { version = "0.31.15", features = ["system"] }
 wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }

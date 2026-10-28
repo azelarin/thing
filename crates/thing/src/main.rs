@@ -1,7 +1,8 @@
-use std::{env, path::PathBuf, process::ExitCode};
+use std::{env, ffi::OsStr, path::PathBuf, process::ExitCode};
 use thing_runtime::Runtime;
+use thing_wayland::Renderer;
 
-const HELP: &str = "thing — a programmable Wayland shell\n\nUsage: thing <command> <entry.luau>\n\nCommands:\n  run    Open a panel on each Wayland output\n  check  Evaluate a configuration and validate its widget tree\n\nOptions:\n  -h, --help     Show this help\n  -V, --version  Show the version\n";
+const HELP: &str = "thing — a programmable Wayland shell\n\nUsage:\n  thing run [--renderer <opengl|vulkan>] <entry.luau>\n  thing check <entry.luau>\n\nCommands:\n  run    Open a panel on each Wayland output\n  check  Evaluate a configuration and validate its widget tree\n\nOptions:\n      --renderer  Select the graphics backend for run (default: opengl)\n  -h, --help      Show this help\n  -V, --version   Show the version\n";
 
 fn main() -> ExitCode {
     match run() {
@@ -32,20 +33,47 @@ fn run() -> Result<(), (u8, String)> {
             format!("unknown command {command:?}; see 'thing --help'"),
         ));
     }
-    let first = args.next();
-    let argument = if first.as_deref() == Some(std::ffi::OsStr::new("--")) {
-        args.next()
-    } else {
-        first
-    };
-    let path = argument
-        .map(PathBuf::from)
-        .ok_or_else(|| (2, "expected an entry file; see 'thing --help'".into()))?;
-    if args.next().is_some() {
-        return Err((2, "expected exactly one entry file".into()));
+    let mut renderer = Renderer::default();
+    let mut path = None;
+    let mut positional_only = false;
+    while let Some(argument) = args.next() {
+        if !positional_only && argument == OsStr::new("--") {
+            positional_only = true;
+            continue;
+        }
+        if !positional_only && (argument == OsStr::new("--help") || argument == OsStr::new("-h")) {
+            print!("{HELP}");
+            return Ok(());
+        }
+        if command == "run" && !positional_only && argument == OsStr::new("--renderer") {
+            let value = args
+                .next()
+                .ok_or_else(|| (2, "expected a value after --renderer".into()))?;
+            renderer = parse_renderer(&value)?;
+            continue;
+        }
+        if command == "run"
+            && !positional_only
+            && let Some(value) = argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--renderer="))
+        {
+            renderer = value.parse().map_err(|error| (2, error))?;
+            continue;
+        }
+        if !positional_only && argument.to_string_lossy().starts_with('-') {
+            return Err((
+                2,
+                format!("unknown option {argument:?}; see 'thing --help'"),
+            ));
+        }
+        if path.replace(PathBuf::from(argument)).is_some() {
+            return Err((2, "expected exactly one entry file".into()));
+        }
     }
+    let path = path.ok_or_else(|| (2, "expected an entry file; see 'thing --help'".into()))?;
     if command == "run" {
-        return thing_wayland::run(&path).map_err(|error| (1, error));
+        return thing_wayland::run(&path, renderer).map_err(|error| (1, error));
     }
     let runtime = Runtime::load(&path).map_err(|error| (1, error.to_string()))?;
     println!(
@@ -54,4 +82,12 @@ fn run() -> Result<(), (u8, String)> {
         runtime.files().len()
     );
     Ok(())
+}
+
+fn parse_renderer(value: &OsStr) -> Result<Renderer, (u8, String)> {
+    value
+        .to_str()
+        .ok_or_else(|| (2, "renderer name must be valid UTF-8".into()))?
+        .parse()
+        .map_err(|error| (2, error))
 }
