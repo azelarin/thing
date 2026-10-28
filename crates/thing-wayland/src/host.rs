@@ -54,7 +54,13 @@ use thing_ui::{
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop, event_created_child,
     globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
+    protocol::{
+        wl_data_device::{self, WlDataDevice},
+        wl_data_device_manager::WlDataDeviceManager,
+        wl_data_offer::{self, WlDataOffer},
+        wl_data_source::{self, WlDataSource},
+        wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface,
+    },
 };
 use wayland_protocols::{
     ext::data_control::v1::client::{
@@ -95,6 +101,7 @@ use crate::{
     audio::Audio,
     clipboard::{Clipboard, OfferData as ClipboardOfferData, SourceData as ClipboardSourceData},
     configuration::{Configurations, DispatchOutcome, PointerHandlerOutcome, RemovedConfiguration},
+    focused_clipboard::{FocusedClipboard, PasteId},
     hover::{Command as HoverCommand, HoverKey, HoverStates, HoverTarget},
     input_method::{
         ChangeCause as InputMethodChangeCause, CursorRectangle as InputMethodCursorRectangle,
@@ -201,6 +208,10 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
     } else {
         (None, None)
     };
+    let (focused_clipboard_ping, focused_clipboard_source) =
+        calloop::ping::make_ping().map_err(|e| e.to_string())?;
+    let focused_clipboard = FocusedClipboard::bind(&globals, &qh, focused_clipboard_ping)
+        .map_err(|error| format!("cannot start text field clipboard support: {error}"))?;
     let input_method = InputMethod::bind(&globals, &qh);
     let mut event_loop: EventLoop<'static, App> =
         EventLoop::try_new().map_err(|error| error.to_string())?;
@@ -228,6 +239,8 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         notifications,
         system_tray,
         clipboard,
+        focused_clipboard,
+        pending_paste: None,
         input_method,
         launcher,
         managed_processes: None,
@@ -332,6 +345,12 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
             .insert_source(source, |_, _, app| app.update_clipboard())
             .map_err(|e| e.to_string())?;
     }
+    event_loop
+        .handle()
+        .insert_source(focused_clipboard_source, |_, _, app| {
+            app.update_focused_clipboard()
+        })
+        .map_err(|e| e.to_string())?;
     WaylandSource::new(connection.clone(), queue)
         .insert(event_loop.handle())
         .map_err(|error| error.to_string())?;
@@ -574,6 +593,14 @@ struct ScopedUiTarget {
     target: UiTarget,
 }
 
+struct PendingPaste {
+    id: PasteId,
+    surface: wl_surface::WlSurface,
+    target: ScopedUiTarget,
+    generation: u64,
+    revision: u64,
+}
+
 #[derive(Clone)]
 enum HostUiAction {
     Focus(ScopedUiTarget),
@@ -639,6 +666,13 @@ enum RootKeyDispatch {
     Unhandled,
     Handled,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextClipboardAction {
+    Copy,
+    Cut,
+    Paste,
 }
 
 impl WidgetKeyAction {
@@ -945,6 +979,8 @@ pub(crate) struct App {
     notifications: Option<NotificationServer>,
     system_tray: Option<SystemTray>,
     clipboard: Option<Clipboard>,
+    focused_clipboard: FocusedClipboard,
+    pending_paste: Option<PendingPaste>,
     input_method: InputMethod,
     launcher: Launcher,
     managed_processes: Option<ProcessManager>,
@@ -1105,6 +1141,79 @@ impl App {
         }
         self.refresh();
     }
+    fn update_focused_clipboard(&mut self) {
+        let Some(outcome) = self.focused_clipboard.take_paste_outcome() else {
+            return;
+        };
+        let Some(pending) = self.pending_paste.take() else {
+            return;
+        };
+        if outcome.id != pending.id {
+            self.pending_paste = Some(pending);
+            return;
+        }
+        let text = match outcome.result {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("thing: cannot paste text: {error}");
+                return;
+            }
+        };
+        let Some(surface) = self.index(&pending.surface) else {
+            return;
+        };
+        let id = pending.target.target.node();
+        let surface_has_keyboard_focus = self.keyboard_surface.as_ref() == Some(&pending.surface);
+        let target_is_current = self.surface_target_is_current(surface, &pending.target);
+        let Some((node, bounds)) = self
+            .text_input_node_and_bounds(surface, id, LayoutSnapshot::Input)
+            .filter(|_| surface_has_keyboard_focus && target_is_current)
+        else {
+            return;
+        };
+        let focused = self.surfaces[surface].input.focused;
+        if focused != Some(id) {
+            return;
+        }
+        let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
+        let width = (bounds.width - 2.0 * padding_x).max(0.0);
+        let active = self.surfaces[surface]
+            .text_input
+            .as_mut()
+            .filter(|active| active.id == id && active.generation == pending.generation)
+            .map(|active| {
+                active.editor.prepare(&node, width);
+                (active.id, active.generation, active.editor.revision())
+            });
+        if !pending_paste_is_current(
+            surface_has_keyboard_focus,
+            target_is_current,
+            focused,
+            (id, pending.generation, pending.revision),
+            active,
+        ) {
+            return;
+        }
+
+        self.cancel_input_method_composition(&pending.surface);
+        if !self.reset_input_method_generation(surface, id, pending.generation) {
+            self.reconcile_input_method(InputMethodChangeCause::Other);
+            return;
+        }
+        let generation = self.surfaces[surface]
+            .text_input
+            .as_ref()
+            .expect("the paste target survived its generation reset")
+            .generation;
+        self.apply_text_clipboard_edit(surface, id, generation, &text, None);
+        self.reconcile_input_method(InputMethodChangeCause::Other);
+    }
+
+    fn cancel_pending_text_paste(&mut self) {
+        self.pending_paste = None;
+        self.focused_clipboard.cancel_pending_paste();
+    }
+
     fn refresh(&mut self) {
         let layer_shell_version = self.layer_shell_version;
         let configured_outputs: Vec<_> = self.configurations.keys().cloned().collect();
@@ -1158,6 +1267,7 @@ impl App {
             eprintln!("thing: reload failed; keeping the previous surfaces: {error}");
             return Ok(());
         }
+        self.cancel_pending_text_paste();
         // the replacement runtimes never inherit an in-flight pointer sequence.
         if let Some(capture) = self.pointer_capture.take() {
             self.clear_pressed_for_capture(&capture);
@@ -3354,6 +3464,150 @@ impl App {
         repeats
     }
 
+    fn text_clipboard_key(
+        &mut self,
+        surface: usize,
+        action: TextClipboardAction,
+        serial: u32,
+    ) -> bool {
+        let Some(id) = self.surfaces[surface].input.focused else {
+            return false;
+        };
+        let Some(target) = self.surfaces[surface]
+            .focus_target
+            .clone()
+            .filter(|target| target.target.node() == id)
+        else {
+            return false;
+        };
+        if !self.surface_target_is_current(surface, &target) {
+            return false;
+        }
+        let output = self.surfaces[surface].output.clone();
+        let key = self.surfaces[surface].key.clone();
+        if self
+            .configurations
+            .surface_root(&output, &key)
+            .and_then(|root| root.find(id))
+            .is_none_or(|node| node.kind != Kind::TextInput)
+            || !self.focus_text_input(surface, id, None, false)
+        {
+            return false;
+        }
+
+        self.cancel_pending_text_paste();
+        let wl = self.surfaces[surface].role.surface().clone();
+        self.cancel_input_method_composition(&wl);
+        let generation = self.surfaces[surface]
+            .text_input
+            .as_ref()
+            .expect("the focused text input was initialized")
+            .generation;
+        if !self.reset_input_method_generation(surface, id, generation) {
+            self.reconcile_input_method(InputMethodChangeCause::Other);
+            return true;
+        }
+        let surface_state = &mut self.surfaces[surface];
+        reveal_text_input_focus(&mut surface_state.input, &mut surface_state.dirty);
+        let active = surface_state
+            .text_input
+            .as_ref()
+            .expect("the focused text input survived its generation reset");
+        let generation = active.generation;
+        let revision = active.editor.revision();
+        let selection = active.editor.selected_text().map(str::to_owned);
+
+        match action {
+            TextClipboardAction::Copy => {
+                if let Some(text) = selection
+                    && let Err(error) = self.focused_clipboard.set_text(text, serial, &self.queue)
+                {
+                    eprintln!("thing: cannot copy text: {error}");
+                }
+            }
+            TextClipboardAction::Cut => {
+                if let Some(text) = selection {
+                    match self.focused_clipboard.set_text(text, serial, &self.queue) {
+                        Ok(()) => {
+                            let origin = self.input_origin(wl.clone(), serial);
+                            self.apply_text_clipboard_edit(surface, id, generation, "", origin);
+                        }
+                        Err(error) => eprintln!("thing: cannot cut text: {error}"),
+                    }
+                }
+            }
+            TextClipboardAction::Paste => match self.focused_clipboard.start_paste() {
+                Ok(paste) => {
+                    self.pending_paste = Some(PendingPaste {
+                        id: paste,
+                        surface: wl,
+                        target,
+                        generation,
+                        revision,
+                    });
+                }
+                Err(error) => eprintln!("thing: cannot paste text: {error}"),
+            },
+        }
+        self.reconcile_input_method(InputMethodChangeCause::Other);
+        true
+    }
+
+    fn apply_text_clipboard_edit(
+        &mut self,
+        surface: usize,
+        id: NodeId,
+        generation: u64,
+        text: &str,
+        origin: Option<InputOrigin>,
+    ) {
+        let output = self.surfaces[surface].output.clone();
+        let wl = self.surfaces[surface].role.surface().clone();
+        let Some(active) = self.surfaces[surface]
+            .text_input
+            .as_mut()
+            .filter(|active| active.id == id && active.generation == generation)
+        else {
+            return;
+        };
+        let checkpoint = active.editor.checkpoint();
+        let before_revision = active.editor.revision();
+        let before = active.editor.value().into_owned();
+        active.editor.replace_selection(text);
+        let proposed = active.editor.value().into_owned();
+        let editor_changed = active.editor.revision() != before_revision;
+        self.surfaces[surface].dirty |= editor_changed || proposed != before;
+        if proposed == before {
+            return;
+        }
+
+        self.dispatch(output, id, Event::TextChange(proposed.clone()), origin);
+        let Some(surface) = self.index(&wl) else {
+            return;
+        };
+        let Some((node, bounds)) =
+            self.text_input_node_and_bounds(surface, id, LayoutSnapshot::Input)
+        else {
+            self.surfaces[surface].text_input = None;
+            return;
+        };
+        let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
+        let width = (bounds.width - 2.0 * padding_x).max(0.0);
+        let Some(active) = self.surfaces[surface]
+            .text_input
+            .as_mut()
+            .filter(|active| active.id == id && active.generation == generation)
+        else {
+            return;
+        };
+        let rejected =
+            reconcile_controlled_text_edit(&mut active.editor, &node, width, &proposed, checkpoint);
+        self.surfaces[surface].dirty = true;
+        if rejected {
+            self.reset_input_method_generation(surface, id, generation);
+        }
+    }
+
     fn remove_popup(&mut self, index: usize, notify_runtime: bool, suppress_hover: bool) {
         let wl = self.surfaces[index].role.surface().clone();
         let captured = self
@@ -4005,6 +4259,9 @@ impl App {
     fn set_keyboard_surface(&mut self, next: Option<wl_surface::WlSurface>) {
         self.clear_key_repeat();
         let previous = std::mem::replace(&mut self.keyboard_surface, next);
+        if keyboard_surface_changed(previous.as_ref(), self.keyboard_surface.as_ref()) {
+            self.cancel_pending_text_paste();
+        }
         if let Some(previous) = previous.as_ref()
             && self.keyboard_surface.as_ref() != Some(previous)
         {
@@ -4198,6 +4455,11 @@ impl App {
         let Some(index) = self.index(&event_surface) else {
             return false;
         };
+        if let Some(action) = text_clipboard_action(&event, self.modifiers, direct)
+            && self.text_clipboard_key(index, action, serial)
+        {
+            return false;
+        }
         if direct && event.keysym == Keysym::Escape {
             let owner = self.surfaces[index].owner();
             if self.surfaces[index].role.popup_mode().is_some() {
@@ -4326,6 +4588,35 @@ fn root_key_input(event: &KeyEvent, modifiers: Modifiers, repeated: bool) -> Key
         logo: modifiers.logo,
         repeated,
     }
+}
+
+fn text_clipboard_action(
+    event: &KeyEvent,
+    modifiers: Modifiers,
+    direct: bool,
+) -> Option<TextClipboardAction> {
+    if !direct || !modifiers.ctrl || modifiers.alt || modifiers.logo {
+        return None;
+    }
+    match event.keysym {
+        Keysym::c | Keysym::C => Some(TextClipboardAction::Copy),
+        Keysym::x | Keysym::X => Some(TextClipboardAction::Cut),
+        Keysym::v | Keysym::V => Some(TextClipboardAction::Paste),
+        _ => None,
+    }
+}
+
+fn pending_paste_is_current(
+    surface_has_keyboard_focus: bool,
+    target_is_current: bool,
+    focused: Option<NodeId>,
+    expected: (NodeId, u64, u64),
+    active: Option<(NodeId, u64, u64)>,
+) -> bool {
+    surface_has_keyboard_focus
+        && target_is_current
+        && focused == Some(expected.0)
+        && active == Some(expected)
 }
 
 fn widget_key_action(kind: Kind, keysym: Keysym, direct: bool) -> Option<WidgetKeyAction> {
@@ -4505,6 +4796,10 @@ fn keyboard_focus_transition_affects<T: PartialEq>(
     candidate: &T,
 ) -> bool {
     previous == Some(candidate) || next == Some(candidate)
+}
+
+fn keyboard_surface_changed<T: PartialEq>(previous: Option<&T>, next: Option<&T>) -> bool {
+    previous != next
 }
 
 fn keyboard_leave_matches<T: PartialEq>(current: Option<&T>, leaving: &T) -> bool {
@@ -5428,6 +5723,7 @@ impl SeatHandler for App {
         if let Some(clipboard) = &mut self.clipboard {
             clipboard.attach_seat(&seat, qh);
         }
+        self.focused_clipboard.attach_seat(&seat, qh);
         match capability {
             Capability::Pointer if self.pointer.is_none() => {
                 match self.seats.get_pointer(qh, &seat) {
@@ -5484,6 +5780,8 @@ impl SeatHandler for App {
             if let Some(clipboard) = &mut self.clipboard {
                 clipboard.detach_seat();
             }
+            self.focused_clipboard.detach_seat();
+            self.pending_paste = None;
             if let Some(pointer) = self.pointer.take() {
                 pointer.release();
             }
@@ -5875,15 +6173,17 @@ mod input_tests {
     use super::{
         ActiveTextInput, GenerationReset, MissingSurfacePolicy, PointerPhase, RepeatSession,
         RepeatTimerAction, RuntimePointerButton, SliderKeyAction, SurfaceActionRoute,
-        SurfaceLayouts, TextKeyAction, WidgetKeyAction, active_text_input_is_current,
-        allocate_text_input_generation, cancel_active_text_input_composition, claim_autofocus,
-        direct_input_serial, focused_widget_is_interactive, input_method_cursor_rectangle,
+        SurfaceLayouts, TextClipboardAction, TextKeyAction, WidgetKeyAction,
+        active_text_input_is_current, allocate_text_input_generation,
+        cancel_active_text_input_composition, claim_autofocus, direct_input_serial,
+        focused_widget_is_interactive, input_method_cursor_rectangle,
         input_method_surface_has_keyboard_focus, keyboard_focus_transition_affects,
-        keyboard_leave_matches, paint_interaction, prepare_text_input_submit,
-        reconcile_controlled_text_edit, repeat_action_is_current,
-        reset_active_text_input_generation, retain_non_focus_actions, reveal_text_input_focus,
-        root_key_input, runtime_pointer_event, scroll_distance, semantic_pointer_target,
-        surface_action_route, text_key_action, widget_key_action,
+        keyboard_leave_matches, keyboard_surface_changed, paint_interaction,
+        pending_paste_is_current, prepare_text_input_submit, reconcile_controlled_text_edit,
+        repeat_action_is_current, reset_active_text_input_generation, retain_non_focus_actions,
+        reveal_text_input_focus, root_key_input, runtime_pointer_event, scroll_distance,
+        semantic_pointer_target, surface_action_route, text_clipboard_action, text_key_action,
+        widget_key_action,
     };
 
     struct FixedMeasurer;
@@ -6396,6 +6696,110 @@ mod input_tests {
     }
 
     #[test]
+    fn clipboard_shortcuts_are_direct_ctrl_actions_without_alt_or_logo() {
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        for (keysym, expected) in [
+            (Keysym::c, TextClipboardAction::Copy),
+            (Keysym::C, TextClipboardAction::Copy),
+            (Keysym::x, TextClipboardAction::Cut),
+            (Keysym::X, TextClipboardAction::Cut),
+            (Keysym::v, TextClipboardAction::Paste),
+            (Keysym::V, TextClipboardAction::Paste),
+        ] {
+            let event = key_event(30, keysym);
+            assert_eq!(text_clipboard_action(&event, ctrl, true), Some(expected));
+            assert_eq!(text_clipboard_action(&event, ctrl, false), None);
+        }
+
+        let event = key_event(30, Keysym::c);
+        assert_eq!(
+            text_clipboard_action(
+                &event,
+                Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Modifiers::default()
+                },
+                true,
+            ),
+            Some(TextClipboardAction::Copy)
+        );
+        assert_eq!(
+            text_clipboard_action(&event, Modifiers::default(), true),
+            None
+        );
+        for modifiers in [
+            Modifiers {
+                ctrl: true,
+                alt: true,
+                ..Modifiers::default()
+            },
+            Modifiers {
+                ctrl: true,
+                logo: true,
+                ..Modifiers::default()
+            },
+        ] {
+            assert_eq!(text_clipboard_action(&event, modifiers, true), None);
+        }
+        assert_eq!(
+            text_clipboard_action(&key_event(30, Keysym::a), ctrl, true),
+            None
+        );
+    }
+
+    #[test]
+    fn paste_requires_the_original_surface_target_focus_generation_and_revision() {
+        let id = NodeId(7);
+        let expected = (id, 11, 13);
+        assert!(pending_paste_is_current(
+            true,
+            true,
+            Some(id),
+            expected,
+            Some(expected),
+        ));
+        assert!(!pending_paste_is_current(
+            false,
+            true,
+            Some(id),
+            expected,
+            Some(expected),
+        ));
+        assert!(!pending_paste_is_current(
+            true,
+            false,
+            Some(id),
+            expected,
+            Some(expected),
+        ));
+        assert!(!pending_paste_is_current(
+            true,
+            true,
+            Some(NodeId(8)),
+            expected,
+            Some(expected),
+        ));
+        assert!(!pending_paste_is_current(
+            true,
+            true,
+            Some(id),
+            expected,
+            Some((id, 12, 13)),
+        ));
+        assert!(!pending_paste_is_current(
+            true,
+            true,
+            Some(id),
+            expected,
+            Some((id, 11, 14)),
+        ));
+    }
+
+    #[test]
     fn controlled_edits_keep_only_the_runtime_value() {
         let mut node = Node::new(NodeId(1), Kind::TextInput);
         node.text = "old".into();
@@ -6606,6 +7010,15 @@ mod input_tests {
         assert!(keyboard_leave_matches(Some(&1), &1));
         assert!(!keyboard_leave_matches(Some(&1), &2));
         assert!(!keyboard_leave_matches::<u8>(None, &1));
+    }
+
+    #[test]
+    fn keyboard_focus_leave_and_reentry_are_two_paste_cancelling_transitions() {
+        assert!(keyboard_surface_changed(Some(&1), None));
+        assert!(keyboard_surface_changed(None, Some(&1)));
+        assert!(keyboard_surface_changed(Some(&1), Some(&2)));
+        assert!(!keyboard_surface_changed(Some(&1), Some(&1)));
+        assert!(!keyboard_surface_changed::<u8>(None, None));
     }
 
     #[test]
@@ -6859,6 +7272,73 @@ impl Dispatch<XdgActivationTokenV1, u64> for App {
         };
         completed.token.destroy();
         app.spawn_launch(completed.request, completed.fresh.then_some(token.as_str()));
+    }
+}
+
+delegate_noop!(App: ignore WlDataDeviceManager);
+
+impl Dispatch<WlDataDevice, ()> for App {
+    event_created_child!(App, WlDataDevice, [
+        0 => (WlDataOffer, ClipboardOfferData::default())
+    ]);
+
+    fn event(
+        app: &mut Self,
+        device: &WlDataDevice,
+        event: wl_data_device::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_data_device::Event::DataOffer { .. } => {}
+            wl_data_device::Event::Enter { serial, id, .. } => {
+                app.focused_clipboard.drag_enter(device, serial, id);
+            }
+            wl_data_device::Event::Leave | wl_data_device::Event::Drop => {
+                app.focused_clipboard.drag_finished(device);
+            }
+            wl_data_device::Event::Selection { id } => {
+                app.focused_clipboard.selection(device, id);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlDataOffer, ClipboardOfferData> for App {
+    fn event(
+        _: &mut Self,
+        _: &WlDataOffer,
+        event: wl_data_offer::Event,
+        data: &ClipboardOfferData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_data_offer::Event::Offer { mime_type } = event {
+            data.offer(mime_type);
+        }
+    }
+}
+
+impl Dispatch<WlDataSource, ClipboardSourceData> for App {
+    fn event(
+        app: &mut Self,
+        _: &WlDataSource,
+        event: wl_data_source::Event,
+        data: &ClipboardSourceData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_data_source::Event::Send { mime_type, fd } => {
+                app.focused_clipboard.send(data, &mime_type, fd);
+            }
+            wl_data_source::Event::Cancelled => {
+                app.focused_clipboard.cancelled(data.key());
+            }
+            _ => {}
+        }
     }
 }
 
