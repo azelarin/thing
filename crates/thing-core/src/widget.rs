@@ -218,6 +218,47 @@ pub struct PopupOptions {
     pub open_on_click: bool,
     pub open_delay_ms: u32,
     pub close_delay_ms: u32,
+    pub anchor: PopupAnchor,
+    pub alignment: PopupAlignment,
+    pub offset: PopupOffset,
+    /// `None` lets the host choose adjustments for the resolved anchor side.
+    pub constraints: Option<PopupConstraints>,
+}
+
+/// the side of a trigger where a popup is placed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PopupAnchor {
+    #[default]
+    Auto,
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// physical alignment along a popup's anchor side.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PopupAlignment {
+    Start,
+    Center,
+    #[default]
+    End,
+}
+
+/// an offset from the popup's anchored position in logical pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PopupOffset {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// ways a compositor may keep a popup inside its constraint boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PopupConstraints {
+    pub flip_x: bool,
+    pub flip_y: bool,
+    pub slide_x: bool,
+    pub slide_y: bool,
 }
 
 impl Default for PopupOptions {
@@ -227,6 +268,10 @@ impl Default for PopupOptions {
             open_on_click: false,
             open_delay_ms: 300,
             close_delay_ms: 250,
+            anchor: PopupAnchor::Auto,
+            alignment: PopupAlignment::End,
+            offset: PopupOffset::default(),
+            constraints: None,
         }
     }
 }
@@ -234,6 +279,22 @@ impl Default for PopupOptions {
 impl PopupOptions {
     pub fn is_automatic(self) -> bool {
         self.open_on_hover || self.open_on_click
+    }
+
+    fn validate(self) -> Result<(), TreeError> {
+        const LIMIT: i32 = 100_000;
+        if self.open_delay_ms > 60_000 || self.close_delay_ms > 60_000 {
+            return Err(TreeError(
+                "popup delays must be between 0 and 60,000 milliseconds".into(),
+            ));
+        }
+        if !(-LIMIT..=LIMIT).contains(&self.offset.x) || !(-LIMIT..=LIMIT).contains(&self.offset.y)
+        {
+            return Err(TreeError(
+                "popup offsets must be between -100,000 and 100,000".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -462,11 +523,7 @@ impl Node {
                 _ => {}
             }
         }
-        if self.popup.open_delay_ms > 60_000 || self.popup.close_delay_ms > 60_000 {
-            return Err(TreeError(
-                "popup delays must be between 0 and 60,000 milliseconds".into(),
-            ));
-        }
+        self.popup.validate()?;
         let mut keys = HashSet::new();
         for child in &self.children {
             if let Some(key) = &child.key

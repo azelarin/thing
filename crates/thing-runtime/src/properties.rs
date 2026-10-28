@@ -1,6 +1,7 @@
 use mlua::{Error, Result, Table, Value};
 use thing_core::{
-    Kind, Node, PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins, TextAlign, TextOverflow,
+    Kind, Node, PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins, PopupAlignment,
+    PopupAnchor, PopupConstraints, PopupOffset, TextAlign, TextOverflow,
 };
 
 pub(crate) fn string(value: Value, name: &str) -> Result<String> {
@@ -158,6 +159,76 @@ fn text_overflow(value: Value, name: &str) -> Result<TextOverflow> {
     }
 }
 
+fn popup_anchor(value: Value) -> Result<PopupAnchor> {
+    match string(value, "anchor")?.as_str() {
+        "auto" => Ok(PopupAnchor::Auto),
+        "top" => Ok(PopupAnchor::Top),
+        "bottom" => Ok(PopupAnchor::Bottom),
+        "left" => Ok(PopupAnchor::Left),
+        "right" => Ok(PopupAnchor::Right),
+        _ => Err(Error::runtime(
+            "anchor must be 'auto', 'top', 'bottom', 'left', or 'right'",
+        )),
+    }
+}
+
+fn popup_alignment(value: Value) -> Result<PopupAlignment> {
+    match string(value, "alignment")?.as_str() {
+        "start" => Ok(PopupAlignment::Start),
+        "center" => Ok(PopupAlignment::Center),
+        "end" => Ok(PopupAlignment::End),
+        _ => Err(Error::runtime(
+            "alignment must be 'start', 'center', or 'end'",
+        )),
+    }
+}
+
+fn popup_offset(value: Value) -> Result<PopupOffset> {
+    if value.is_nil() {
+        return Ok(PopupOffset::default());
+    }
+    let Value::Table(table) = value else {
+        return Err(Error::runtime("offset must be a table"));
+    };
+    let mut offset = PopupOffset::default();
+    for pair in table.pairs::<String, Value>() {
+        let (name, value) = pair?;
+        let target = match name.as_str() {
+            "x" => &mut offset.x,
+            "y" => &mut offset.y,
+            _ => return Err(Error::runtime(format!("unknown offset property {name:?}"))),
+        };
+        *target = integer(value, &format!("offset.{name}"))?;
+    }
+    Ok(offset)
+}
+
+fn popup_constraints(value: Value) -> Result<Option<PopupConstraints>> {
+    if value.is_nil() {
+        return Ok(None);
+    }
+    let Value::Table(table) = value else {
+        return Err(Error::runtime("constraints must be a table"));
+    };
+    let mut constraints = PopupConstraints::default();
+    for pair in table.pairs::<String, Value>() {
+        let (name, value) = pair?;
+        let target = match name.as_str() {
+            "flip_x" => &mut constraints.flip_x,
+            "flip_y" => &mut constraints.flip_y,
+            "slide_x" => &mut constraints.slide_x,
+            "slide_y" => &mut constraints.slide_y,
+            _ => {
+                return Err(Error::runtime(format!(
+                    "unknown constraint property {name:?}"
+                )));
+            }
+        };
+        *target = boolean(value, &format!("constraints.{name}"))?;
+    }
+    Ok(Some(constraints))
+}
+
 pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
     match name {
         "text" if node.kind == Kind::Text => node.text = string(value, name)?,
@@ -184,6 +255,12 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         }
         "close_delay" if node.kind == Kind::Popup => {
             node.popup.close_delay_ms = milliseconds(value, name)?
+        }
+        "anchor" if node.kind == Kind::Popup => node.popup.anchor = popup_anchor(value)?,
+        "alignment" if node.kind == Kind::Popup => node.popup.alignment = popup_alignment(value)?,
+        "offset" if node.kind == Kind::Popup => node.popup.offset = popup_offset(value)?,
+        "constraints" if node.kind == Kind::Popup => {
+            node.popup.constraints = popup_constraints(value)?
         }
         "edge" if node.kind == Kind::Panel => node.panel.edge = panel_edge(value)?,
         "margins" if node.kind == Kind::Panel => node.panel.margins = panel_margins(value)?,
