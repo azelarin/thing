@@ -2,8 +2,9 @@ use std::{collections::BTreeSet, path::PathBuf, time::Instant};
 
 use thing_core::{Node, NodeId};
 use thing_runtime::{
-    Action, AudioSnapshot, Event, MediaSnapshot, NiriState, NotificationSnapshot, OutputContext,
-    PowerSnapshot, Runtime, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTraySnapshot,
+    Action, AudioSnapshot, ClipboardSnapshot, Event, MediaSnapshot, NiriState,
+    NotificationSnapshot, OutputContext, PowerSnapshot, Runtime, Scalar, ServiceSnapshot,
+    SurfaceKey, SurfaceTree, SystemTraySnapshot,
 };
 use thing_ui::Layout;
 
@@ -250,6 +251,21 @@ impl<K: Clone + Eq> Configurations<K> {
             instance
                 .runtime
                 .set_notifications(notifications.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        self.services = services;
+        Ok(())
+    }
+
+    pub(crate) fn set_clipboard(&mut self, clipboard: ClipboardSnapshot) -> Result<(), String> {
+        let mut services = self.services.clone();
+        services
+            .set_clipboard(clipboard.clone())
+            .map_err(|error| error.to_string())?;
+        for instance in &mut self.instances {
+            instance
+                .runtime
+                .set_clipboard(clipboard.clone())
                 .map_err(|error| error.to_string())?;
         }
         self.services = services;

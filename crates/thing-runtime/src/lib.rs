@@ -12,10 +12,10 @@ mod state;
 mod transition;
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
 pub use services::{
-    Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, MediaAction, MediaPlayer,
-    MediaSnapshot, Notification, NotificationButton, NotificationSnapshot, NotificationUrgency,
-    PowerDevice, PowerSnapshot, ServiceSnapshot, SystemTrayAction, SystemTrayItem,
-    SystemTraySnapshot,
+    Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, ClipboardSnapshot, MediaAction,
+    MediaPlayer, MediaSnapshot, Notification, NotificationButton, NotificationSnapshot,
+    NotificationUrgency, PowerDevice, PowerSnapshot, ServiceSnapshot, SystemTrayAction,
+    SystemTrayItem, SystemTraySnapshot,
 };
 
 use mlua::{Error, Function, Lua, Result, Table, Value, VmState};
@@ -291,6 +291,11 @@ impl Runtime {
     /// replaces status notifier watcher and item state. call [`Self::refresh`] afterward.
     pub fn set_system_tray(&mut self, system_tray: SystemTraySnapshot) -> Result<()> {
         self.services.set_system_tray(system_tray)
+    }
+
+    /// replaces clipboard state in one update. call [`Self::refresh`] afterward.
+    pub fn set_clipboard(&mut self, clipboard: ClipboardSnapshot) -> Result<()> {
+        self.services.set_clipboard(clipboard)
     }
 
     /// replaces workspace and window lists. call [`Self::refresh`] to update widgets.
