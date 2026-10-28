@@ -105,6 +105,10 @@ impl AuthenticationBroker {
         self.inner.can_start(now)
     }
 
+    pub(crate) fn is_active(&self) -> bool {
+        self.inner.active.is_some()
+    }
+
     pub fn start(&mut self, secret: SecretBytes, now: Instant) -> Result<AttemptId, StartError> {
         if !self.inner.can_start(now) {
             return Err(StartError {

@@ -12,6 +12,7 @@ mod host;
 mod hover;
 mod input_method;
 mod launch;
+mod lock;
 mod managed_process;
 mod media;
 mod niri;
@@ -26,6 +27,7 @@ mod system_tray;
 mod text_data;
 mod watch;
 pub use host::{run, run_with_options};
+pub use lock::run as run_lock;
 pub use system_tray::{SystemTray, SystemTrayMode};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
