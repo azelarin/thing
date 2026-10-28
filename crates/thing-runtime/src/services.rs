@@ -8,6 +8,7 @@ use std::{
     mem::size_of,
     rc::Rc,
 };
+use thing_core::ImageSource;
 
 /// a request to a desktop service.
 #[derive(Clone, Debug, PartialEq)]
@@ -68,6 +69,11 @@ pub enum SystemTrayAction {
 const MAX_LAUNCH_ARGUMENTS: usize = 256;
 const MAX_LAUNCH_ARGUMENT_BYTES: usize = 4096;
 const MAX_LAUNCH_BYTES: usize = 64 * 1024;
+const MAX_TRAY_PIXMAPS: usize = 32;
+const MAX_TRAY_PIXMAP_SIDE: u32 = 4096;
+const MAX_TRAY_PIXMAP_BYTES: usize = 256 * 1024;
+const MAX_TRAY_ITEM_IMAGE_BYTES: usize = 512 * 1024;
+const MAX_TRAY_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 
 /// an audio device identified by its stable server name.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,6 +146,7 @@ pub struct SystemTrayItem {
     pub category: String,
     pub title: String,
     pub status: String,
+    pub icon: Option<ImageSource>,
     pub icon_name: String,
     pub attention_icon_name: String,
     pub overlay_icon_name: String,
@@ -153,6 +160,11 @@ pub struct SystemTrayItem {
     pub has_overlay_icon_pixmap: bool,
     pub has_tooltip_icon_pixmap: bool,
 }
+
+#[derive(Clone)]
+pub(crate) struct ImageHandle(pub ImageSource);
+
+impl UserData for ImageHandle {}
 
 /// one UPower device identified by its object path.
 #[derive(Clone, Debug, PartialEq)]
@@ -678,6 +690,9 @@ impl UserData for SystemTrayItemList {
                 item.set("category", tray_item.category.as_str())?;
                 item.set("title", tray_item.title.as_str())?;
                 item.set("status", tray_item.status.as_str())?;
+                if let Some(icon) = &tray_item.icon {
+                    item.set("icon", lua.create_userdata(ImageHandle(icon.clone()))?)?;
+                }
                 item.set("icon_name", tray_item.icon_name.as_str())?;
                 item.set(
                     "attention_icon_name",
@@ -1907,12 +1922,20 @@ fn validate_media_players(players: &[MediaPlayer]) -> Result<()> {
 
 fn validate_system_tray_items(items: &[SystemTrayItem]) -> Result<()> {
     let mut ids = BTreeSet::new();
+    let mut image_bytes = 0_usize;
     let invalid = items.len() > 128
         || items.iter().any(|item| {
+            let source_bytes = item.icon.as_ref().and_then(validate_system_tray_image);
+            let valid_source = item.icon.is_none() || source_bytes.is_some();
+            image_bytes = image_bytes
+                .checked_add(source_bytes.unwrap_or(0))
+                .unwrap_or(usize::MAX);
             item.id.is_empty()
                 || item.id.len() > 128
                 || item.id.contains('\0')
                 || !ids.insert(item.id.as_str())
+                || !valid_source
+                || image_bytes > MAX_TRAY_IMAGE_BYTES
                 || invalid_system_tray_text(&item.protocol_item_id, 4096)
                 || invalid_system_tray_text(&item.category, 4096)
                 || invalid_system_tray_text(&item.title, 4096)
@@ -1929,6 +1952,42 @@ fn validate_system_tray_items(items: &[SystemTrayItem]) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn validate_system_tray_image(source: &ImageSource) -> Option<usize> {
+    if source.id().len() > 256 || source.candidates().is_empty() || source.candidates().len() > 2 {
+        return None;
+    }
+    let mut retained = 0_usize;
+    for candidate in source.candidates() {
+        if candidate
+            .icon()
+            .is_some_and(|icon| invalid_system_tray_text(icon, 4096))
+            || candidate.pixmaps().len() > MAX_TRAY_PIXMAPS
+        {
+            return None;
+        }
+        for pixmap in candidate.pixmaps() {
+            if pixmap.width() == 0
+                || pixmap.height() == 0
+                || pixmap.width() > MAX_TRAY_PIXMAP_SIDE
+                || pixmap.height() > MAX_TRAY_PIXMAP_SIDE
+                || pixmap.rgba().len() > MAX_TRAY_PIXMAP_BYTES
+            {
+                return None;
+            }
+            let expected = usize::try_from(pixmap.width())
+                .ok()
+                .zip(usize::try_from(pixmap.height()).ok())
+                .and_then(|(width, height)| width.checked_mul(height))
+                .and_then(|pixels| pixels.checked_mul(4));
+            if expected != Some(pixmap.rgba().len()) {
+                return None;
+            }
+            retained = retained.checked_add(pixmap.rgba().len())?;
+        }
+    }
+    (retained <= MAX_TRAY_ITEM_IMAGE_BYTES).then_some(retained)
 }
 
 fn validate_power_devices(devices: &[PowerDevice]) -> Result<()> {

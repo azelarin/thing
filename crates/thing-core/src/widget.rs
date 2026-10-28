@@ -1,4 +1,4 @@
-use std::{collections::HashSet, error::Error, fmt};
+use std::{cmp::Ordering, collections::HashSet, error::Error, fmt, sync::Arc};
 
 use crate::{Color, vector::normalize_path};
 
@@ -1069,10 +1069,158 @@ impl Node {
     }
 }
 
-/// a local file or desktop icon to load.
+/// one validated rgba raster supplied directly by a desktop service.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ImagePixmap {
+    width: u32,
+    height: u32,
+    rgba: Arc<[u8]>,
+}
+
+impl ImagePixmap {
+    pub fn new(width: u32, height: u32, rgba: Vec<u8>) -> Result<Self, String> {
+        let expected = usize::try_from(width)
+            .ok()
+            .zip(usize::try_from(height).ok())
+            .and_then(|(width, height)| width.checked_mul(height))
+            .and_then(|pixels| pixels.checked_mul(4));
+        if width == 0 || height == 0 || expected != Some(rgba.len()) {
+            return Err("image pixmap dimensions do not match its rgba data".into());
+        }
+        Ok(Self {
+            width,
+            height,
+            rgba: rgba.into(),
+        })
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn rgba(&self) -> &[u8] {
+        &self.rgba
+    }
+}
+
+impl fmt::Debug for ImagePixmap {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ImagePixmap")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("bytes", &self.rgba.len())
+            .finish()
+    }
+}
+
+/// one named icon with optional in-memory raster fallbacks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageCandidate {
+    icon: Option<String>,
+    pixmaps: Arc<[ImagePixmap]>,
+}
+
+impl ImageCandidate {
+    pub fn new(icon: Option<String>, pixmaps: Vec<ImagePixmap>) -> Result<Self, String> {
+        let icon = icon.filter(|icon| !icon.is_empty());
+        if icon.is_none() && pixmaps.is_empty() {
+            return Err("image candidate has no icon name or pixmap".into());
+        }
+        Ok(Self {
+            icon,
+            pixmaps: pixmaps.into(),
+        })
+    }
+
+    pub fn icon(&self) -> Option<&str> {
+        self.icon.as_deref()
+    }
+
+    pub fn pixmaps(&self) -> &[ImagePixmap] {
+        &self.pixmaps
+    }
+}
+
+/// an immutable in-memory image source with an application-scoped identity.
+///
+/// callers must issue a different identity whenever any candidate changes.
+#[derive(Clone)]
+pub struct ImageSource {
+    id: Arc<str>,
+    candidates: Arc<[ImageCandidate]>,
+}
+
+impl ImageSource {
+    pub fn new(id: String, candidates: Vec<ImageCandidate>) -> Result<Self, String> {
+        if id.is_empty() || id.contains('\0') {
+            return Err("image source identity must be nonempty and contain no NUL".into());
+        }
+        if candidates.is_empty() {
+            return Err("image source has no candidates".into());
+        }
+        Ok(Self {
+            id: id.into(),
+            candidates: candidates.into(),
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn candidates(&self) -> &[ImageCandidate] {
+        &self.candidates
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.candidates
+            .iter()
+            .flat_map(|candidate| candidate.pixmaps())
+            .map(|pixmap| pixmap.rgba().len())
+            .sum()
+    }
+}
+
+impl fmt::Debug for ImageSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ImageSource")
+            .field("id", &self.id)
+            .field("candidates", &self.candidates)
+            .finish()
+    }
+}
+
+impl PartialEq for ImageSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for ImageSource {}
+
+impl PartialOrd for ImageSource {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ImageSource {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.id.cmp(&other.id)
+    }
+}
+
+/// a local file, desktop icon, or immutable in-memory source to load.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Image {
     pub source: Option<String>,
+    pub memory: Option<ImageSource>,
     pub icon: Option<String>,
     pub app_id: Option<String>,
     pub theme: String,
@@ -1082,6 +1230,7 @@ impl Default for Image {
     fn default() -> Self {
         Self {
             source: None,
+            memory: None,
             icon: None,
             app_id: None,
             theme: "hicolor".into(),

@@ -420,6 +420,7 @@ mod tests {
             category: "Communications".into(),
             title: "Mail".into(),
             status: "Active".into(),
+            icon: None,
             icon_name: "mail-unread".into(),
             attention_icon_name: String::new(),
             overlay_icon_name: String::new(),

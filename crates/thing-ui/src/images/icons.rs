@@ -45,6 +45,10 @@ impl Icons {
         } else {
             return Err("no image source".into());
         };
+        Self::find_name(name, &image.theme, size)
+    }
+
+    pub fn find_name(name: &str, theme: &str, size: u16) -> Result<PathBuf, String> {
         if std::path::Path::new(name).is_absolute() {
             return Ok(PathBuf::from(name));
         }
@@ -54,17 +58,14 @@ impl Icons {
             "application-x-executable".into(),
         ] {
             if let Some(path) = freedesktop_icons::lookup(&candidate)
-                .with_theme(&image.theme)
+                .with_theme(theme)
                 .with_size(size)
                 .find()
             {
                 return Ok(path);
             }
         }
-        Err(format!(
-            "icon {name:?} was not found in theme {:?}",
-            image.theme
-        ))
+        Err(format!("icon {name:?} was not found in theme {theme:?}"))
     }
 }
 

@@ -404,8 +404,9 @@ ui.image {
 }
 ```
 
-use `source` for a local file, `icon` for a theme icon name, or `app_id` to look up
-an application's desktop-entry icon. these properties are mutually exclusive.
+use `source` for a local file or an opaque image handle supplied by a desktop
+service, `icon` for a theme icon name, or `app_id` to look up an application's
+desktop-entry icon. these properties are mutually exclusive.
 `icon_theme` defaults to `hicolor`. application matching uses desktop filenames
 and `StartupWMClass`, case-insensitively, then the app id itself. missing icons
 fall back to `application-x-executable`. application discovery honors xdg data
@@ -1077,7 +1078,15 @@ the other string fields are `category`, `title`, `status`, `icon_name`,
 `attention_icon_name`, `overlay_icon_name`, `tooltip_icon_name`,
 `tooltip_title`, and `tooltip_text`. `item_is_menu` and `has_menu` describe menu
 behavior. the four `has_*_icon_pixmap` fields report whether a bounded, valid
-pixmap was advertised.
+pixmap was advertised. the normal and attention flags become false when the
+aggregate retention budget prevents thing from keeping their pixel data.
+
+`icon` is an opaque image handle ready for `ui.image.source`, or `nil` when the
+item has no usable icon. thing prefers the advertised theme name and falls back
+to the closest retained pixmap when the name cannot be loaded. an item in
+`NeedsAttention` state tries its attention icon before the normal icon. handles
+are immutable: a later item update receives a new handle, while a handle kept
+explicitly in local state continues to describe the older image.
 
 build the presentation in the configuration like any other dynamic list:
 
@@ -1093,7 +1102,7 @@ ui.row {
                 on_click = function() tray.activate(item.id) end,
                 on_middle_click = function() tray.secondary_activate(item.id) end,
                 on_secondary_click = function() tray.context_menu(item.id) end,
-                children = { ui.image { icon = item.icon_name } },
+                children = { ui.image { source = item.icon } },
             })
         end
         return children
@@ -1103,11 +1112,11 @@ ui.row {
 
 the three actions are event-handler only. thing currently passes `(0, 0)` as
 their coordinates because wayland clients do not know global screen
-coordinates, and it does not expose the protocol's scroll action. icon theme
-names work with `ui.image`, but advertised pixmap bytes are not retained or
-rendered yet. `has_menu` does not mean thing can render a DBusMenu layout; the
-context-menu action is only forwarded to the item. legacy XEmbed tray items are
-not supported.
+coordinates, and it does not expose the protocol's scroll action. pixmap payloads
+are limited to 512 kib per item and 32 mib across the tray. equal-size animation
+frames are not animated, and overlay and tooltip pixmaps are not composited.
+`has_menu` does not mean thing can render a DBusMenu layout; the context-menu
+action is only forwarded to the item. legacy XEmbed tray items are not supported.
 
 ## popups and input
 
