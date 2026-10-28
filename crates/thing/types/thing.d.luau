@@ -30,6 +30,10 @@ export type ThingMainAlign =
 export type ThingTextAlign = "start" | "center" | "end"
 export type ThingTextOverflow = "clip" | "ellipsis"
 export type ThingImageFit = "contain" | "cover" | "fill"
+export type ThingPathFit = "contain" | "cover" | "fill"
+export type ThingPathFillRule = "nonzero" | "evenodd"
+export type ThingPathStrokeCap = "butt" | "round" | "square"
+export type ThingPathStrokeJoin = "miter" | "round" | "bevel"
 export type ThingPopupAnchor = "auto" | ThingEdge
 export type ThingPopupAlignment = "start" | "center" | "end"
 export type ThingEasing = "linear" | "in_cubic" | "out_cubic" | "in_out_cubic"
@@ -64,6 +68,13 @@ export type ThingInputRegion =
     false
     | ThingInputRectangle
     | { rectangles: { any } }
+
+export type ThingPathViewBox = {
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+}
 
 export type ThingPopupOffset = {
     x: number?,
@@ -200,6 +211,22 @@ export type ThingImageProperties = {
     app_id: ThingReactive<string?>?,
     icon_theme: ThingReactive<string>?,
     fit: ThingReactive<ThingImageFit>?,
+}
+
+export type ThingPathProperties = {
+    key: string?,
+    visible: ThingReactive<boolean>?,
+    enabled: ThingReactive<boolean>?,
+    style: ThingStyle?,
+    data: ThingReactive<string>,
+    view_box: ThingReactive<ThingPathViewBox>,
+    fit: ThingReactive<ThingPathFit>?,
+    fill: ThingReactive<string?>?,
+    fill_rule: ThingReactive<ThingPathFillRule>?,
+    stroke: ThingReactive<string>?,
+    stroke_width: ThingReactive<number>?,
+    stroke_cap: ThingReactive<ThingPathStrokeCap>?,
+    stroke_join: ThingReactive<ThingPathStrokeJoin>?,
 }
 
 export type ThingButtonProperties = {
@@ -513,6 +540,7 @@ declare ui: {
     scroll: (properties: ThingContainerProperties) -> ThingWidget,
     text: (properties: ThingTextProperties) -> ThingWidget,
     image: (properties: ThingImageProperties) -> ThingWidget,
+    path: (properties: ThingPathProperties) -> ThingWidget,
     button: (properties: ThingButtonProperties) -> ThingWidget,
     slider: (properties: ThingSliderProperties) -> ThingWidget,
     range: (properties: ThingRangeProperties) -> ThingWidget,
