@@ -274,6 +274,48 @@ those state changes are not rolled back. widget updates are validated together.
 an invalid update leaves the current widgets unchanged and retries when another
 tracked dependency changes.
 
+## launching applications
+
+call `services.launch` from an event handler with the program and its arguments
+as an array:
+
+```luau
+ui.button {
+    on_click = function()
+        services.launch({ 'pavucontrol' })
+    end,
+}
+```
+
+arguments are passed directly to the program. thing does not split a command
+string or interpret quotes, variables, pipes, redirects, or globs. if a command
+really needs a shell, invoke it explicitly, such as
+`services.launch({ 'sh', '-c', 'your command' })`.
+
+the array may contain up to 256 utf-8 strings, each no longer than 4096 bytes
+and together no longer than 64 kib. the program name must not be empty. the
+optional working directory has the same per-string limit.
+
+an optional second argument sets the working directory. without one, the child
+inherits thing's working directory:
+
+```luau
+services.launch({ 'foot', '--working-directory', project }, project)
+```
+
+the child inherits the desktop session environment, including variables such as
+`WAYLAND_DISPLAY`, `DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, and `PATH`, along with
+the current locale and input-method settings. for launches caused directly by a
+mouse button release or key press, thing asks the compositor for a fresh xdg
+activation token. it launches without one when the protocol is unavailable or
+the request times out, and the compositor always decides whether the new window
+receives focus.
+
+the child's standard input, output, and error go to `/dev/null`. thing does not
+expose its exit status or terminate it during a reload or normal shutdown. a
+service manager can still apply its own process and cgroup lifetime policy.
+launch failures are reported in the terminal running thing.
+
 ## niri workspaces and windows
 
 `services.niri` provides niri workspace and window state. other widgets and services

@@ -1,7 +1,7 @@
 use crate::OutputContext;
 use crate::niri::{NiriAction, NiriData, NiriState, parse_id};
 use crate::state::{Scalar, Signal, Tracker};
-use mlua::{Error, Lua, Result, UserData, UserDataMethods, Value};
+use mlua::{Error, Lua, Result, Table, UserData, UserDataMethods, Value};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
@@ -18,7 +18,15 @@ pub enum Action {
     SetSourceMuted(bool),
     SetDefaultSource(String),
     Niri(NiriAction),
+    Launch {
+        argv: Vec<String>,
+        cwd: Option<String>,
+    },
 }
+
+const MAX_LAUNCH_ARGUMENTS: usize = 256;
+const MAX_LAUNCH_ARGUMENT_BYTES: usize = 4096;
+const MAX_LAUNCH_BYTES: usize = 64 * 1024;
 
 /// an audio device identified by its stable server name.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -320,6 +328,16 @@ impl Services {
         niri.set_readonly(true);
         clock.set_readonly(true);
         output.set_readonly(true);
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        services.set(
+            "launch",
+            lua.create_function(move |_, (arguments, cwd): (Table, Value)| {
+                let argv = launch_arguments(arguments)?;
+                let cwd = launch_working_directory(cwd)?;
+                enqueue(&actions, &allowed, Action::Launch { argv, cwd })
+            })?,
+        )?;
         services.set("audio", audio)?;
         services.set("clock", clock)?;
         services.set("niri", niri)?;
@@ -453,6 +471,86 @@ impl Services {
     pub fn set_niri(&self, state: NiriState) -> Result<()> {
         self.niri.set(state)
     }
+}
+
+fn launch_arguments(table: Table) -> Result<Vec<String>> {
+    let length = table.raw_len();
+    if length == 0 {
+        return Err(Error::runtime("launch requires at least one argument"));
+    }
+    if length > MAX_LAUNCH_ARGUMENTS {
+        return Err(Error::runtime(format!(
+            "launch accepts at most {MAX_LAUNCH_ARGUMENTS} arguments"
+        )));
+    }
+
+    let mut arguments = Vec::with_capacity(length);
+    let mut bytes = 0_usize;
+    for index in 1..=length {
+        let Value::String(value) = table.raw_get::<Value>(index)? else {
+            return Err(Error::runtime(
+                "launch arguments must be a dense array of strings",
+            ));
+        };
+        let value = value
+            .to_str()
+            .map_err(|_| Error::runtime("launch arguments must be valid utf-8"))?;
+        if value.len() > MAX_LAUNCH_ARGUMENT_BYTES {
+            return Err(Error::runtime(format!(
+                "launch arguments must not exceed {MAX_LAUNCH_ARGUMENT_BYTES} bytes each"
+            )));
+        }
+        if value.contains('\0') {
+            return Err(Error::runtime("launch arguments must contain no NUL bytes"));
+        }
+        bytes = bytes
+            .checked_add(value.len())
+            .ok_or_else(|| Error::runtime("launch arguments are too large"))?;
+        if bytes > MAX_LAUNCH_BYTES {
+            return Err(Error::runtime(format!(
+                "launch arguments must not exceed {MAX_LAUNCH_BYTES} bytes in total"
+            )));
+        }
+        arguments.push(value.to_owned());
+    }
+    if arguments[0].is_empty() {
+        return Err(Error::runtime("launch program must be nonempty"));
+    }
+    for pair in table.pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        let Value::Integer(index) = key else {
+            return Err(Error::runtime(
+                "launch arguments must be a dense array of strings",
+            ));
+        };
+        if !(1..=length as i64).contains(&index) {
+            return Err(Error::runtime(
+                "launch arguments must be a dense array of strings",
+            ));
+        }
+    }
+    Ok(arguments)
+}
+
+fn launch_working_directory(value: Value) -> Result<Option<String>> {
+    let value = match value {
+        Value::Nil => return Ok(None),
+        Value::String(value) => value,
+        _ => {
+            return Err(Error::runtime(
+                "launch working directory must be a string or nil",
+            ));
+        }
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| Error::runtime("launch working directory must be valid utf-8"))?;
+    if value.is_empty() || value.len() > MAX_LAUNCH_ARGUMENT_BYTES || value.contains('\0') {
+        return Err(Error::runtime(
+            "launch working directory must be nonempty, contain no NUL, and not exceed 4096 bytes",
+        ));
+    }
+    Ok(Some(value.to_owned()))
 }
 
 fn validate_service(name: &str, value: &Scalar) -> Result<()> {
