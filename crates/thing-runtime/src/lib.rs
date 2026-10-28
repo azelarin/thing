@@ -15,7 +15,7 @@ pub use services::{
     Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, ClipboardSnapshot, MediaAction,
     MediaPlayer, MediaSnapshot, Notification, NotificationButton, NotificationSnapshot,
     NotificationUrgency, PowerDevice, PowerSnapshot, ServiceSnapshot, SystemTrayAction,
-    SystemTrayItem, SystemTraySnapshot,
+    SystemTrayItem, SystemTrayMenu, SystemTrayMenuAction, SystemTrayMenuItem, SystemTraySnapshot,
 };
 
 use mlua::{Error, Function, Lua, Result, Table, Value, VmState};

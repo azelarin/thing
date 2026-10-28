@@ -43,7 +43,7 @@ use thing_core::{
 };
 use thing_runtime::{
     Action, Event, OutputContext, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree,
-    SystemTrayAction,
+    SystemTrayAction, SystemTrayMenuAction,
 };
 use thing_ui::{
     Interaction, Layout, PaintFrame, ScrollState, Size, TextInputCheckpoint, TextInputEditor,
@@ -842,6 +842,7 @@ impl App {
             })
             .collect();
         let layer_shell_version = self.layer_shell_version;
+        let retired_consumers = self.configurations.consumers();
         if let Err(error) = self
             .configurations
             .reload_for_checked(outputs, |_, runtime| {
@@ -850,6 +851,11 @@ impl App {
         {
             eprintln!("thing: reload failed; keeping the previous surfaces: {error}");
             return Ok(());
+        }
+        for consumer in retired_consumers {
+            if let Err(error) = release_system_tray_consumer(self.system_tray.as_ref(), &consumer) {
+                eprintln!("thing: {error}");
+            }
         }
         // release the previous configuration's glyph atlas and text layouts.
         let wake = self.image_ping.clone();
@@ -1550,6 +1556,7 @@ impl App {
         origin: Option<InputOrigin>,
     ) {
         let layer_shell_version = self.layer_shell_version;
+        let consumer = self.configurations.consumer(&output).map(str::to_owned);
         let result = self
             .configurations
             .dispatch_checked(&output, id, event, |surfaces| {
@@ -1578,6 +1585,12 @@ impl App {
                 Action::SystemTray { action, item } => {
                     send_system_tray_action(self.system_tray.as_ref(), action, &item)
                 }
+                Action::SystemTrayMenu { action, id } => send_system_tray_menu_action(
+                    self.system_tray.as_ref(),
+                    action,
+                    &id,
+                    consumer.as_deref(),
+                ),
                 Action::Launch { argv, cwd } => {
                     self.request_launch(LaunchRequest { argv, cwd }, origin.as_ref());
                     Ok(())
@@ -2893,6 +2906,31 @@ fn send_system_tray_action(
         .map_err(str::to_owned)
 }
 
+fn send_system_tray_menu_action(
+    system_tray: Option<&SystemTray>,
+    action: SystemTrayMenuAction,
+    id: &str,
+    consumer: Option<&str>,
+) -> Result<(), String> {
+    let system_tray = system_tray.ok_or_else(|| "system tray capability is disabled".to_owned())?;
+    let consumer = consumer.ok_or_else(|| "configuration is no longer available".to_owned())?;
+    system_tray
+        .send_menu(action, id, consumer)
+        .map_err(str::to_owned)
+}
+
+fn release_system_tray_consumer(
+    system_tray: Option<&SystemTray>,
+    consumer: &str,
+) -> Result<(), String> {
+    if let Some(system_tray) = system_tray {
+        system_tray
+            .release_menu_consumer(consumer)
+            .map_err(str::to_owned)?;
+    }
+    Ok(())
+}
+
 fn earliest_deadline(
     reload: Option<Instant>,
     hover: Option<Instant>,
@@ -2956,13 +2994,15 @@ mod output_tests {
     use super::{
         PanelState, configured_panel_size, earliest_deadline, fallback_logical_size,
         find_automatic_popup, find_manual_popup, interactive_path, panel_size,
-        send_system_tray_action, valid_dimensions, validate_surface_capabilities,
+        release_system_tray_consumer, send_system_tray_action, send_system_tray_menu_action,
+        valid_dimensions, validate_surface_capabilities,
     };
     use crate::{configuration::Configurations, panel};
     use tempfile::tempdir;
     use thing_core::{KeyboardMode, Kind, Node, NodeId, PanelEdge, PanelMargins, Scale};
     use thing_runtime::{
         Event, OutputContext, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTrayAction,
+        SystemTrayMenuAction,
     };
 
     #[test]
@@ -2971,6 +3011,16 @@ mod output_tests {
             send_system_tray_action(None, SystemTrayAction::Activate, "tray1"),
             Err("system tray capability is disabled".into())
         );
+        assert_eq!(
+            send_system_tray_menu_action(
+                None,
+                SystemTrayMenuAction::Open,
+                "menu1",
+                Some("configuration1"),
+            ),
+            Err("system tray capability is disabled".into())
+        );
+        assert_eq!(release_system_tray_consumer(None, "configuration1"), Ok(()));
     }
 
     #[test]
@@ -3409,7 +3459,11 @@ impl OutputHandler for App {
             self.remove_popup(index, false, false);
         }
         self.closed_surfaces.retain(|owner| owner.output != output);
-        self.configurations.remove(&output);
+        if let Some(consumer) = self.configurations.remove(&output)
+            && let Err(error) = release_system_tray_consumer(self.system_tray.as_ref(), &consumer)
+        {
+            eprintln!("thing: {error}");
+        }
         self.update_watch();
         if self
             .keyboard_surface

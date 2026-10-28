@@ -55,6 +55,15 @@ CASES = (
             "Property 'app_id' is not compatible.",
         ),
     ),
+    Case(
+        "invalid-system-tray-menu.luau",
+        (
+            "Expected this to be 'string', but got 'number'",
+            "Expected this to be 'string', but got 'boolean'",
+            "Expected this to be 'number', but got 'string'",
+            "Expected this to be 'number', but got 'boolean'",
+        ),
+    ),
 )
 
 
