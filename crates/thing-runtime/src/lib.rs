@@ -111,12 +111,20 @@ const MAX_UI_ACTIONS_PER_HANDLER: usize = 1024;
 pub struct UiTarget {
     node: NodeId,
     source: u64,
-    lineage: Vec<UiIdentity>,
+    lineage: Rc<[UiIdentity]>,
 }
 
 impl UiTarget {
     pub fn node(&self) -> NodeId {
         self.node
+    }
+
+    pub fn interactive_path_from(&self, root: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        let mut within_surface = false;
+        self.lineage.iter().filter_map(move |identity| {
+            within_surface |= identity.node == root;
+            (within_surface && identity.kind.is_interactive()).then_some(identity.node)
+        })
     }
 }
 
@@ -434,6 +442,17 @@ impl Runtime {
             .flatten()
     }
 
+    /// clones the current identities for a set of nodes in one tree scan.
+    pub fn ui_targets(&self, ids: &BTreeSet<NodeId>) -> BTreeMap<NodeId, UiTarget> {
+        self.ui
+            .borrow()
+            .targets
+            .values()
+            .filter(|target| ids.contains(&target.node))
+            .map(|target| (target.node, target.clone()))
+            .collect()
+    }
+
     pub fn focus_target(&self, id: NodeId) -> Option<UiTarget> {
         self.find(id)
             .is_some_and(|node| node.kind.is_interactive())
@@ -442,9 +461,10 @@ impl Runtime {
     }
 
     pub fn ui_target_is_current(&self, target: &UiTarget) -> bool {
-        if !self.is_available(target.node) {
-            return false;
-        }
+        self.is_available(target.node) && self.ui_target_identity_is_current(target)
+    }
+
+    pub fn ui_target_identity_is_current(&self, target: &UiTarget) -> bool {
         let context = self.ui.borrow();
         let Some(current) = context
             .targets
@@ -457,7 +477,7 @@ impl Runtime {
             && current
                 .lineage
                 .iter()
-                .zip(&target.lineage)
+                .zip(target.lineage.iter())
                 .all(|(current, previous)| {
                     current.node == previous.node
                         && current.kind == previous.kind
@@ -1090,7 +1110,7 @@ impl Runtime {
                 UiTarget {
                     node: node.id,
                     source,
-                    lineage: lineage.clone(),
+                    lineage: Rc::from(lineage.as_slice()),
                 },
             );
             for child in &node.children {
@@ -1595,7 +1615,7 @@ mod ui_action_tests {
             UiTarget {
                 node: identity.node,
                 source,
-                lineage: vec![identity],
+                lineage: vec![identity].into(),
             },
         );
 
@@ -1865,6 +1885,62 @@ mod ui_action_tests {
         );
         assert_eq!(runtime.rendered_surface_root(panel_target), Some(root.id));
         assert_eq!(runtime.rendered_surface_root(popup_target), Some(popup));
+    }
+
+    #[test]
+    fn unavailable_targets_keep_their_identity_for_input_cleanup() {
+        let (_directory, mut runtime) = load(
+            r#"
+            local shown = ui.state(true)
+            return ui.panel { children = {
+                ui.button {
+                    key = 'hide',
+                    on_click = function() shown:set(false) end,
+                },
+                ui.range {
+                    key = 'target',
+                    visible = function() return shown:get() end,
+                    on_pressed = function() end,
+                },
+            } }
+            "#,
+        );
+        let hide = runtime.root().unwrap().children[0].id;
+        let target = runtime.root().unwrap().children[1].id;
+        let target = runtime.ui_target(target).unwrap();
+
+        runtime.dispatch(hide, Event::Click).unwrap();
+
+        assert!(!runtime.ui_target_is_current(&target));
+        assert!(runtime.ui_target_identity_is_current(&target));
+    }
+
+    #[test]
+    fn interactive_paths_stop_at_the_rendered_surface_root() {
+        let (_directory, runtime) = load(
+            r#"
+            return ui.panel { children = { ui.button {
+                key = 'anchor',
+                children = { ui.popup { children = { ui.button {
+                    key = 'popup-target',
+                } } } },
+            } } }
+            "#,
+        );
+        let root = runtime.root().unwrap();
+        let anchor = root.children[0].id;
+        let popup = root.children[0].children[0].id;
+        let target = root.children[0].children[0].children[0].id;
+        let target = runtime.ui_target(target).unwrap();
+
+        assert_eq!(
+            target.interactive_path_from(root.id).collect::<Vec<_>>(),
+            [anchor, target.node()],
+        );
+        assert_eq!(
+            target.interactive_path_from(popup).collect::<Vec<_>>(),
+            [target.node()],
+        );
     }
 
     #[test]

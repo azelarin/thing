@@ -560,6 +560,54 @@ fn visual_child_updates_do_not_interrupt_a_range_press() {
 }
 
 #[test]
+fn unkeyed_range_replacement_keeps_its_captured_cleanup_until_release() {
+    let (_directory, path) = fixture(
+        r#"
+        local replaced = ui.state(false)
+        local events = ui.state('')
+        local list = ui.row { children = function()
+            local generation = if replaced:get() then 'new' else 'old'
+            return { ui.range {
+                on_pressed = function(down)
+                    events:set(events:get() .. generation .. (if down then 'T' else 'F'))
+                end,
+                children = { ui.row {} },
+            } }
+        end }
+        return ui.panel { children = {
+            list,
+            ui.button { on_click = function() replaced:set(true) end },
+            ui.text { text = function() return events:get() end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let old = runtime.root().unwrap().children[0].children[0].id;
+    let replace = runtime.root().unwrap().children[1].id;
+
+    assert!(runtime.dispatch(old, Event::Pressed(true)).unwrap());
+    assert!(runtime.has_active_press(old));
+    runtime.dispatch(replace, Event::Click).unwrap();
+    let replacement = runtime.root().unwrap().children[0].children[0].id;
+    assert_eq!(replacement, old);
+    assert!(runtime.has_active_press(replacement));
+
+    assert!(
+        runtime
+            .dispatch(replacement, Event::Pressed(false))
+            .unwrap()
+    );
+    assert!(!runtime.has_active_press(replacement));
+    assert!(runtime.dispatch(replacement, Event::Pressed(true)).unwrap());
+    assert!(
+        runtime
+            .dispatch(replacement, Event::Pressed(false))
+            .unwrap()
+    );
+    assert_eq!(runtime.root().unwrap().children[2].text, "oldToldFnewTnewF");
+}
+
+#[test]
 fn reload_drops_a_press_without_running_old_handlers() {
     let (_directory, path) = fixture(
         r#"

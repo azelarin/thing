@@ -248,6 +248,17 @@ impl Layout {
         &self.placements
     }
 
+    /// widgets whose presented geometry can begin pointer input.
+    pub fn pointer_targets(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.placements
+            .iter()
+            .zip(&self.pointer_regions)
+            .filter_map(|(placement, region)| {
+                (placement.interactive || region.scroll == Some(placement.id))
+                    .then_some(placement.id)
+            })
+    }
+
     pub fn get(&self, id: NodeId) -> Option<&Placement> {
         self.placements.iter().find(|placement| placement.id == id)
     }
@@ -274,13 +285,18 @@ impl Layout {
             .and_then(|region| region.interactive)
     }
 
+    /// the innermost scroll viewport under `point`.
+    pub fn scroll_target(&self, point: Point) -> Option<NodeId> {
+        self.pointer_region(point).and_then(|region| region.scroll)
+    }
+
     /// scroll the innermost vertical viewport under `point`. when that viewport
     /// is already at its limit, the event bubbles through its scroll ancestors.
     pub fn scroll_y(&self, point: Point, delta: f32, state: &mut ScrollState) -> bool {
         if !delta.is_finite() || delta == 0.0 {
             return false;
         }
-        let Some(id) = self.pointer_region(point).and_then(|region| region.scroll) else {
+        let Some(id) = self.scroll_target(point) else {
             return false;
         };
         let Some(mut area) = self.scroll_areas.iter().find(|area| area.id == id) else {
@@ -1711,6 +1727,11 @@ mod tests {
             &mut state,
         );
 
+        assert_eq!(
+            layout.scroll_target(Point { x: 10.0, y: 10.0 }),
+            Some(NodeId(2))
+        );
+        assert_eq!(layout.pointer_targets().collect::<Vec<_>>(), [NodeId(2)]);
         assert!(layout.scroll_y(Point { x: 10.0, y: 10.0 }, 20.0, &mut state));
         assert_eq!(state.offset(NodeId(2)), 20.0);
         assert_eq!(state.offset(NodeId(4)), 0.0);
@@ -1788,6 +1809,10 @@ mod tests {
             &mut state,
         );
 
+        assert_eq!(
+            layout.scroll_target(Point { x: 10.0, y: 10.0 }),
+            Some(NodeId(4))
+        );
         assert!(layout.scroll_y(Point { x: 10.0, y: 10.0 }, 20.0, &mut state));
         assert_eq!(state.offset(NodeId(2)), 0.0);
         assert_eq!(state.offset(NodeId(4)), 20.0);
@@ -1813,10 +1838,12 @@ mod tests {
 
         let overlap = Point { x: 50.0, y: 10.0 };
         assert_eq!(layout.scroll_event_target(overlap), None);
+        assert_eq!(layout.scroll_target(overlap), None);
         assert!(!layout.scroll_y(overlap, 20.0, &mut state));
         assert_eq!(state.offset(NodeId(3)), 0.0);
         let visible = Point { x: 15.0, y: 10.0 };
         assert_eq!(layout.scroll_event_target(visible), Some(NodeId(4)));
+        assert_eq!(layout.scroll_target(visible), Some(NodeId(3)));
         assert!(layout.scroll_y(visible, 20.0, &mut state));
         assert_eq!(state.offset(NodeId(3)), 20.0);
     }
