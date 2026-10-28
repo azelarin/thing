@@ -22,6 +22,10 @@ work on a branch and open a draft while the change is in progress. use
 [conventional commits](https://www.conventionalcommits.org/), such as
 `fix: preserve the panel after a failed reload`.
 
+describe the problem and the resulting behavior in a few sentences. summarize
+routine checks; include exact commands when a check needs reproducing. the draft
+badge is enough to show that work is unfinished.
+
 once the code has been reviewed and the checks pass, mark the pull request ready.
 squash-merge it and delete the branch.
 

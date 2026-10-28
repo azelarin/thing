@@ -38,10 +38,13 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] panels, popups, layout, text, and images
 - [x] clock, output audio controls, and niri workspaces and windows
 - [x] per-output configuration
-- [ ] panel sizing and input regions
-- [ ] hover popups, scrolling containers, text input, and keyboard repeat
+- [ ] panel sizing, input regions, and popup positioning
+- [ ] hover popups and scrolling containers
+- [ ] text input and keyboard repeat
+- [ ] vulkan rendering alongside opengl
 - [ ] drag and drop, animations, and custom shapes
-- [ ] microphone and per-application audio controls
+- [ ] microphone controls
+- [ ] per-application audio controls
 - [ ] media, tray, clipboard, and notification services
 - [ ] session locking and idle inhibition
 - [ ] accessibility and complete keyboard navigation
