@@ -1085,8 +1085,9 @@ aggregate retention budget prevents thing from keeping their pixel data.
 item has no usable icon. thing prefers the advertised theme name and falls back
 to the closest retained pixmap when the name cannot be loaded. an item in
 `NeedsAttention` state tries its attention icon before the normal icon. handles
-are immutable: a later item update receives a new handle, while a handle kept
-explicitly in local state continues to describe the older image.
+are immutable: an effective icon or status-candidate change receives a new
+handle, while configuration code that still holds an older handle can continue
+to render its previous candidates.
 
 build the presentation in the configuration like any other dynamic list:
 

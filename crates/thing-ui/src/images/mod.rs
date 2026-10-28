@@ -570,10 +570,13 @@ mod tests {
 
     #[test]
     fn memory_sources_fall_back_from_names_and_choose_a_suitable_resolution() {
-        let attention =
-            ImageCandidate::new(Some("/missing/attention-icon".into()), Vec::new()).unwrap();
+        let attention = ImageCandidate::new(
+            Some("thing-missing-attention-icon-9d52f20f".into()),
+            Vec::new(),
+        )
+        .unwrap();
         let normal = ImageCandidate::new(
-            Some("/missing/normal-icon".into()),
+            Some("thing-missing-normal-icon-9d52f20f".into()),
             vec![
                 ImagePixmap::new(16, 16, vec![255; 16 * 16 * 4]).unwrap(),
                 ImagePixmap::new(32, 32, [10, 20, 30, 128].repeat(32 * 32)).unwrap(),
@@ -582,6 +585,7 @@ mod tests {
         .unwrap();
         let image = Image {
             memory: Some(ImageSource::new("tray1-image1".into(), vec![attention, normal]).unwrap()),
+            theme: "Adwaita".into(),
             ..Image::default()
         };
         let key = Key {

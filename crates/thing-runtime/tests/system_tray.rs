@@ -171,7 +171,7 @@ fn system_tray_records_and_lists_are_read_only() {
 
 #[test]
 fn system_tray_image_sources_are_opaque_and_reactive() {
-    let (_directory, mut runtime) = runtime(
+    let (_directory, mut instance) = runtime(
         r#"
         return ui.panel { children = { ui.image {
             source = function()
@@ -181,16 +181,16 @@ fn system_tray_image_sources_are_opaque_and_reactive() {
         } } }
         "#,
     );
-    runtime
+    instance
         .set_system_tray(SystemTraySnapshot {
             available: true,
             items: vec![item("tray1")],
             ..SystemTraySnapshot::default()
         })
         .unwrap();
-    assert!(runtime.refresh().unwrap());
+    assert!(instance.refresh().unwrap());
     assert_eq!(
-        runtime.root().unwrap().children[0]
+        instance.root().unwrap().children[0]
             .image
             .memory
             .as_ref()
@@ -201,16 +201,16 @@ fn system_tray_image_sources_are_opaque_and_reactive() {
 
     let mut changed = item("tray1");
     changed.icon = Some(image_source("tray1", 40));
-    runtime
+    instance
         .set_system_tray(SystemTraySnapshot {
             available: true,
             items: vec![changed],
             ..SystemTraySnapshot::default()
         })
         .unwrap();
-    assert!(runtime.refresh().unwrap());
+    assert!(instance.refresh().unwrap());
     assert_eq!(
-        runtime.root().unwrap().children[0]
+        instance.root().unwrap().children[0]
             .image
             .memory
             .as_ref()
@@ -232,6 +232,34 @@ fn system_tray_image_sources_are_opaque_and_reactive() {
             .to_string()
             .contains("source must be a string, image source, or nil")
     );
+
+    let (_directory, mut conflicting) = runtime(
+        r#"
+        return ui.panel { children = { ui.image {
+            icon = "fallback",
+            source = function()
+                local items = services.system_tray.items:get()
+                return if #items == 0 then nil else items[1].icon
+            end,
+        } } }
+        "#,
+    );
+    conflicting
+        .set_system_tray(SystemTraySnapshot {
+            available: true,
+            items: vec![item("tray1")],
+            ..SystemTraySnapshot::default()
+        })
+        .unwrap();
+    let error = conflicting.refresh().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("image accepts only one of a file source, image handle, icon, or app_id")
+    );
+    let image = &conflicting.root().unwrap().children[0].image;
+    assert_eq!(image.icon.as_deref(), Some("fallback"));
+    assert!(image.memory.is_none());
 }
 
 #[test]

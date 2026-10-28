@@ -859,14 +859,19 @@ impl Node {
                 "fractional dimensions are not available on panel or popup surfaces".into(),
             ));
         }
-        if [&self.image.source, &self.image.icon, &self.image.app_id]
-            .iter()
-            .filter(|v| v.is_some())
-            .count()
+        if [
+            self.image.source.is_some(),
+            self.image.memory.is_some(),
+            self.image.icon.is_some(),
+            self.image.app_id.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count()
             > 1
         {
             return Err(TreeError(
-                "image accepts only one of source, icon, or app_id".into(),
+                "image accepts only one of a file source, image handle, icon, or app_id".into(),
             ));
         }
         if self.kind == Kind::CenterBox

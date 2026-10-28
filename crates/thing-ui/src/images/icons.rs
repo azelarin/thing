@@ -45,18 +45,31 @@ impl Icons {
         } else {
             return Err("no image source".into());
         };
-        Self::find_name(name, &image.theme, size)
+        Self::find_name_with_fallback(name, &image.theme, size)
     }
 
     pub fn find_name(name: &str, theme: &str, size: u16) -> Result<PathBuf, String> {
+        Self::find_candidates(name, theme, size, false)
+    }
+
+    fn find_name_with_fallback(name: &str, theme: &str, size: u16) -> Result<PathBuf, String> {
+        Self::find_candidates(name, theme, size, true)
+    }
+
+    fn find_candidates(
+        name: &str,
+        theme: &str,
+        size: u16,
+        include_generic: bool,
+    ) -> Result<PathBuf, String> {
         if std::path::Path::new(name).is_absolute() {
             return Ok(PathBuf::from(name));
         }
-        for candidate in [
-            name.to_owned(),
-            name.to_lowercase(),
-            "application-x-executable".into(),
-        ] {
+        let mut candidates = vec![name.to_owned(), name.to_lowercase()];
+        if include_generic {
+            candidates.push("application-x-executable".into());
+        }
+        for candidate in candidates {
             if let Some(path) = freedesktop_icons::lookup(&candidate)
                 .with_theme(theme)
                 .with_size(size)
