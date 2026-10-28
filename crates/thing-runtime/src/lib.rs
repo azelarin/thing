@@ -630,7 +630,7 @@ impl Runtime {
                                 .ok_or_else(|| {
                                     Error::runtime("transition refers to a missing list widget")
                                 })?;
-                            properties::apply(child, &property, transition::value(value))?;
+                            properties::apply_transition(child, &property, value)?;
                         }
                         Ok(())
                     })();
@@ -668,7 +668,7 @@ impl Runtime {
                         let target = transition::target(value, &property)?;
                         let mut state = previous.clone();
                         state.retarget(target, now);
-                        properties::apply(node, &property, transition::value(state.current()))?;
+                        properties::apply_transition(node, &property, state.current())?;
                         staged_transitions.insert(index, state);
                     } else {
                         properties::apply(node, &property, value)?;
@@ -694,7 +694,7 @@ impl Runtime {
                     .iter_mut()
                     .find_map(|surface| surface.root.find_mut(binding.node))
                     .ok_or_else(|| Error::runtime("transition refers to a missing widget"))?;
-                properties::apply(node, &binding.property, transition::value(state.target()))?;
+                properties::apply_transition(node, &binding.property, state.target())?;
             }
             for surface in &target {
                 surface.root.validate().map_err(Error::external)?;
@@ -756,7 +756,7 @@ impl Runtime {
                 .iter_mut()
                 .find_map(|surface| surface.root.find_mut(binding.node))
                 .ok_or_else(|| Error::runtime("transition refers to a missing widget"))?;
-            properties::apply(node, &binding.property, transition::value(state.current()))?;
+            properties::apply_transition(node, &binding.property, state.current())?;
             staged.insert(*index, state);
         }
         if staged.is_empty() {
@@ -777,7 +777,7 @@ impl Runtime {
         Ok(changed)
     }
 
-    /// whether a widget has an active numeric style transition.
+    /// whether a widget has an active style transition.
     pub fn is_animating(&self, id: NodeId) -> bool {
         self.bindings.values().any(|binding| {
             binding.node == id
@@ -788,7 +788,7 @@ impl Runtime {
         })
     }
 
-    /// whether any widget in a set has an active numeric style transition.
+    /// whether any widget in a set has an active style transition.
     pub fn is_any_animating(&self, ids: impl IntoIterator<Item = NodeId>) -> bool {
         let active: BTreeSet<_> = self
             .bindings
@@ -999,7 +999,8 @@ impl Runtime {
                 .get_mut(&index)
                 .expect("the transition binding was just inserted")
                 .transition = Some(transition::State::new(spec, target));
-            transition::value(target)
+            properties::apply_transition(node, &property, target)?;
+            return Ok(());
         } else if let Value::Function(function) = value {
             let index = self.bind(node.id, property.clone(), function)?;
             self.evaluate_binding(index)?
@@ -1249,6 +1250,7 @@ mod transition_tests {
     use std::{fs, time::Duration};
 
     use tempfile::TempDir;
+    use thing_core::Color;
 
     use super::*;
 
@@ -1338,6 +1340,105 @@ mod transition_tests {
         close(root(&runtime).children[0].style.width.unwrap(), 100.0);
         close(root(&runtime).children[0].style.opacity, 0.5);
         assert!(!runtime.is_animating(button));
+    }
+
+    #[test]
+    fn color_transitions_advance_and_retarget_without_jumping() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local color = ui.state('#000000')
+            return ui.panel { children = {
+                ui.button {
+                    key = 'white',
+                    on_click = function() color:set('#ffffff') end,
+                },
+                ui.button {
+                    key = 'black',
+                    on_click = function() color:set('#000000') end,
+                },
+                ui.row {
+                    key = 'animated',
+                    style = { background = ui.transition(function()
+                        return color:get()
+                    end, { duration = 100, easing = 'linear' }) },
+                },
+            } }
+            "#,
+        );
+        let white = child_with_key(root(&runtime), "white").id;
+        let black = child_with_key(root(&runtime), "black").id;
+        let animated = child_with_key(root(&runtime), "animated").id;
+        let start = Instant::now();
+
+        runtime
+            .dispatch_inner(white, Event::Click, Some(start))
+            .unwrap();
+        runtime.advance(start + Duration::from_millis(40)).unwrap();
+        assert_eq!(
+            child_with_key(root(&runtime), "animated").style.background,
+            Color([170, 170, 170, 255])
+        );
+
+        runtime
+            .dispatch_inner(black, Event::Click, Some(start + Duration::from_millis(40)))
+            .unwrap();
+        assert_eq!(
+            child_with_key(root(&runtime), "animated").style.background,
+            Color([170, 170, 170, 255])
+        );
+        runtime.advance(start + Duration::from_millis(90)).unwrap();
+        assert_eq!(
+            child_with_key(root(&runtime), "animated").style.background,
+            Color([124, 124, 124, 255])
+        );
+        runtime.advance(start + Duration::from_millis(140)).unwrap();
+        assert_eq!(
+            child_with_key(root(&runtime), "animated").style.background,
+            Color([0, 0, 0, 255])
+        );
+        assert!(!runtime.is_animating(animated));
+    }
+
+    #[test]
+    fn invalid_color_targets_preserve_the_previous_snapshot_and_recover() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local color = ui.state('#112233')
+            return ui.panel { children = {
+                ui.button {
+                    key = 'invalid',
+                    on_click = function() color:set('red') end,
+                },
+                ui.button {
+                    key = 'recover',
+                    on_click = function() color:set('#44556680') end,
+                },
+                ui.row {
+                    key = 'animated',
+                    style = { background = ui.transition(function()
+                        return color:get()
+                    end, { duration = 0 }) },
+                },
+            } }
+            "#,
+        );
+        let invalid = child_with_key(root(&runtime), "invalid").id;
+        let recover = child_with_key(root(&runtime), "recover").id;
+        let animated = child_with_key(root(&runtime), "animated").id;
+
+        assert!(runtime.dispatch(invalid, Event::Click).is_err());
+        assert_eq!(
+            child_with_key(root(&runtime), "animated").style.background,
+            Color([0x11, 0x22, 0x33, 0xff])
+        );
+        assert!(!runtime.is_animating(animated));
+
+        assert!(runtime.dispatch(recover, Event::Click).unwrap());
+        assert_eq!(
+            child_with_key(root(&runtime), "animated").style.background,
+            Color([0x44, 0x55, 0x66, 0x80])
+        );
+        assert!(!runtime.is_animating(animated));
     }
 
     #[test]
@@ -1726,6 +1827,8 @@ mod transition_tests {
             "return ui.panel { style = { width = ui.transition(function() return 1 end, { duration = 10.5 }) } }",
             "return ui.panel { style = { width = ui.transition(function() return 1 end, { duration = 10, easing = 'bounce' }) } }",
             "return ui.panel { style = { width = ui.transition(function() return nil end, { duration = 10 }) } }",
+            "return ui.panel { style = { background = ui.transition(function() return 1 end, { duration = 10 }) } }",
+            "return ui.panel { style = { background = ui.transition(function() return 'red' end, { duration = 10 }) } }",
             "return ui.panel { style = { font_size = ui.transition(function() return 14 end, { duration = 10 }) } }",
         ] {
             let directory = tempfile::tempdir().unwrap();
@@ -1750,6 +1853,33 @@ mod transition_tests {
             } } } }
             "#,
         );
+        assert!(!runtime.has_active_transitions());
+    }
+
+    #[test]
+    fn every_color_style_transition_is_accepted() {
+        let (_directory, _path, runtime) = load(
+            r#"
+            local function fixed(value)
+                return ui.transition(function() return value end, { duration = 0 })
+            end
+            return ui.panel { children = { ui.row { style = {
+                background = fixed('#01020304'),
+                foreground = fixed('#11121314'),
+                border_color = fixed('#21222324'),
+                hover_overlay = fixed('#31323334'),
+                pressed_overlay = fixed('#41424344'),
+                focus_ring_color = fixed('#51525354'),
+            } } } }
+            "#,
+        );
+        let style = &root(&runtime).children[0].style;
+        assert_eq!(style.background, Color([1, 2, 3, 4]));
+        assert_eq!(style.foreground, Color([0x11, 0x12, 0x13, 0x14]));
+        assert_eq!(style.border_color, Color([0x21, 0x22, 0x23, 0x24]));
+        assert_eq!(style.hover_overlay, Color([0x31, 0x32, 0x33, 0x34]));
+        assert_eq!(style.pressed_overlay, Color([0x41, 0x42, 0x43, 0x44]));
+        assert_eq!(style.focus_ring_color, Color([0x51, 0x52, 0x53, 0x54]));
         assert!(!runtime.has_active_transitions());
     }
 }

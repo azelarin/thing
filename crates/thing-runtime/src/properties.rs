@@ -1,10 +1,12 @@
 use mlua::{Error, Result, Table, Value};
 use thing_core::{
-    CrossAlign, ImageFit, KeyboardMode, Kind, MainAlign, Node, PanelEdge, PanelInputRect,
+    Color, CrossAlign, ImageFit, KeyboardMode, Kind, MainAlign, Node, PanelEdge, PanelInputRect,
     PanelInputRegion, PanelMargins, PathFillRule, PathFit, PathStrokeCap, PathStrokeJoin,
     PopupAlignment, PopupAnchor, PopupConstraints, PopupOffset, SurfaceAnchors, SurfaceLayer,
     TextAlign, TextOverflow, ViewBox,
 };
+
+use crate::transition::Resolved;
 
 pub(crate) fn string(value: Value, name: &str) -> Result<String> {
     match value {
@@ -472,6 +474,13 @@ fn popup_constraints(value: Value) -> Result<Option<PopupConstraints>> {
     Ok(Some(constraints))
 }
 
+pub(crate) fn apply_transition(node: &mut Node, name: &str, value: Resolved) -> Result<()> {
+    match value {
+        Resolved::Number(value) => apply(node, name, Value::Number(f64::from(value))),
+        Resolved::Color(value) => apply_color(node, name, value),
+    }
+}
+
 pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
     match name {
         "text" if node.kind == Kind::Text => node.text = string(value, name)?,
@@ -599,6 +608,23 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
             return Err(Error::runtime(format!(
                 "unknown property {name:?} on {:?}",
                 node.kind
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn apply_color(node: &mut Node, name: &str, color: Color) -> Result<()> {
+    match name {
+        "style.border_color" => node.style.border_color = color,
+        "style.hover_overlay" => node.style.hover_overlay = color,
+        "style.pressed_overlay" => node.style.pressed_overlay = color,
+        "style.focus_ring_color" => node.style.focus_ring_color = color,
+        "style.background" => node.style.background = color,
+        "style.foreground" => node.style.foreground = color,
+        _ => {
+            return Err(Error::runtime(format!(
+                "transition resolved a color for unsupported property {name:?}"
             )));
         }
     }
