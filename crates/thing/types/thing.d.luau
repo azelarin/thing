@@ -50,6 +50,7 @@ export type ThingManagedProcessOptions = {
 
 export type ThingPointerPhase = "press" | "move" | "release" | "cancel"
 export type ThingPointerButton = "primary" | "middle" | "secondary"
+export type ThingScrollSource = "wheel" | "finger" | "continuous" | "wheel_tilt" | "unknown"
 
 declare extern type ThingPointerEvent with
     read phase: ThingPointerPhase
@@ -63,6 +64,24 @@ declare extern type ThingPointerEvent with
     read alt: boolean
     read logo: boolean
 end
+
+declare extern type ThingScrollEvent with
+    read local_x: number
+    read local_y: number
+    read surface_x: number
+    read surface_y: number
+    read shift: boolean
+    read ctrl: boolean
+    read alt: boolean
+    read logo: boolean
+    read source: ThingScrollSource
+end
+
+export type ThingScrollHandler = (
+    x: number,
+    y: number,
+    event: ThingScrollEvent
+) -> ...boolean?
 
 export type ThingTransitionOptions = {
     duration: number,
@@ -338,7 +357,7 @@ export type ThingButtonProperties = {
     on_click: (() -> ())?,
     on_middle_click: (() -> ())?,
     on_secondary_click: (() -> ())?,
-    on_scroll: ((x: number, y: number) -> ())?,
+    on_scroll: ThingScrollHandler?,
     on_hover: ((inside: boolean) -> ())?,
     on_pointer: ((event: ThingPointerEvent) -> boolean?)?,
 }
@@ -349,7 +368,8 @@ export type ThingPointerAreaProperties = {
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
     children: ThingChildren?,
-    on_pointer: (event: ThingPointerEvent) -> boolean?,
+    on_pointer: ((event: ThingPointerEvent) -> boolean?)?,
+    on_scroll: ThingScrollHandler?,
 }
 
 export type ThingSliderProperties = {

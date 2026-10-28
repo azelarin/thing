@@ -9,8 +9,8 @@ use thing_runtime::{
     Action, AudioSnapshot, ClipboardSnapshot, Event, KeyInput, ManagedProcessDefinition,
     ManagedProcessSnapshot, ManagedProcessState, MediaSnapshot, NiriState, NotificationSnapshot,
     OutputContext, PointerDispatchOutcome as RuntimePointerOutcome, PointerEvent, PowerSnapshot,
-    Runtime, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTraySnapshot, UiAction,
-    UiTarget,
+    Runtime, Scalar, ScrollInput, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTraySnapshot,
+    UiAction, UiTarget,
 };
 use thing_ui::Layout;
 
@@ -51,6 +51,12 @@ pub(crate) struct KeyHandlerOutcome {
 pub(crate) struct PointerHandlerOutcome {
     pub(crate) handled: bool,
     pub(crate) active: bool,
+    pub(crate) dispatch: DispatchOutcome,
+}
+
+#[derive(Debug)]
+pub(crate) struct ScrollHandlerOutcome {
+    pub(crate) consumed: bool,
     pub(crate) dispatch: DispatchOutcome,
 }
 
@@ -202,11 +208,6 @@ impl<K: Clone + Eq> Configurations<K> {
             .map(|instance| &instance.runtime)
     }
 
-    pub(crate) fn has_scroll_handler(&self, key: &K, id: NodeId) -> bool {
-        self.runtime(key)
-            .is_some_and(|runtime| runtime.has_scroll_handler(id))
-    }
-
     pub(crate) fn has_active_press(&self, key: &K, id: NodeId) -> bool {
         self.runtime(key)
             .is_some_and(|runtime| runtime.has_active_press(id))
@@ -233,6 +234,16 @@ impl<K: Clone + Eq> Configurations<K> {
     pub(crate) fn pointer_target_is_current(&self, key: &K, target: &UiTarget) -> bool {
         self.runtime(key)
             .is_some_and(|runtime| runtime.pointer_target_is_current(target))
+    }
+
+    pub(crate) fn scroll_target_is_current(&self, key: &K, target: &UiTarget) -> bool {
+        self.runtime(key)
+            .is_some_and(|runtime| runtime.scroll_target_is_current(target))
+    }
+
+    pub(crate) fn scroll_view_target_is_current(&self, key: &K, target: &UiTarget) -> bool {
+        self.runtime(key)
+            .is_some_and(|runtime| runtime.scroll_view_target_is_current(target))
     }
 
     pub(crate) fn active_pointer_matches(&self, key: &K, target: &UiTarget) -> bool {
@@ -272,6 +283,30 @@ impl<K: Clone + Eq> Configurations<K> {
     ) -> bool {
         self.consumer(key) == Some(consumer)
             && self.pointer_target_is_current(key, target)
+            && self.rendered_surface_root(key, target.node()) == Some(surface_root)
+    }
+
+    pub(crate) fn presented_scroll_target_is_current(
+        &self,
+        key: &K,
+        consumer: &str,
+        surface_root: NodeId,
+        target: &UiTarget,
+    ) -> bool {
+        self.consumer(key) == Some(consumer)
+            && self.scroll_target_is_current(key, target)
+            && self.rendered_surface_root(key, target.node()) == Some(surface_root)
+    }
+
+    pub(crate) fn presented_scroll_view_target_is_current(
+        &self,
+        key: &K,
+        consumer: &str,
+        surface_root: NodeId,
+        target: &UiTarget,
+    ) -> bool {
+        self.consumer(key) == Some(consumer)
+            && self.scroll_view_target_is_current(key, target)
             && self.rendered_surface_root(key, target.node()) == Some(surface_root)
     }
 
@@ -671,6 +706,32 @@ impl<K: Clone + Eq> Configurations<K> {
             .cancel_pointer_checked(validate)
             .map_err(|error| error.to_string())?;
         Ok(PointerHandlerOutcome::collect(runtime, outcome))
+    }
+
+    pub(crate) fn dispatch_scroll_checked(
+        &mut self,
+        key: &K,
+        target: &UiTarget,
+        input: ScrollInput,
+        validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
+    ) -> Result<Option<ScrollHandlerOutcome>, String> {
+        let Some(runtime) = self.runtime_mut(key) else {
+            return Ok(None);
+        };
+        let Some(outcome) = runtime
+            .dispatch_scroll_checked(target, input, validate)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ScrollHandlerOutcome {
+            consumed: outcome.consumed,
+            dispatch: DispatchOutcome {
+                changed: outcome.changed,
+                actions: runtime.take_actions(),
+                ui_actions: runtime.take_ui_actions(),
+            },
+        }))
     }
 
     #[cfg(test)]
@@ -1324,6 +1385,103 @@ mod tests {
             }
             assert_eq!(text(&configurations, 1), if keyed { "new" } else { "none" });
         }
+    }
+
+    #[test]
+    fn scroll_fallback_rejects_a_replaced_presented_ancestor() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            local revision = ui.state(0)
+            local area = ui.pointer_area {
+                key = 'area',
+                style = { width = 100, height = 40 },
+                on_scroll = function()
+                    revision:set(revision:get() + 1)
+                    return false
+                end,
+                children = function()
+                    revision:get()
+                    return { ui.scroll {
+                        style = { width = 100, height = 40 },
+                        children = {
+                            ui.row { style = { width = 100, height = 80 } },
+                        },
+                    } }
+                end,
+            }
+            return ui.panel { children = { area } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+
+        let root = configurations.root(&1).unwrap();
+        let surface_root = root.id;
+        let area = root.children[0].id;
+        let scroll = root.children[0].children[0].id;
+        let layout = Layout::compute(
+            root,
+            Size {
+                width: 100.0,
+                height: 40.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        let point = Point { x: 10.0, y: 10.0 };
+        assert_eq!(layout.scroll_event_target(point), Some(area));
+        assert_eq!(layout.scroll_targets(point), [scroll]);
+        let (consumer, targets) = configurations.presented_targets(&1, root, &layout).unwrap();
+        let area_target = targets.get(&area).unwrap().clone();
+        let scroll_target = targets.get(&scroll).unwrap().clone();
+
+        let outcome = configurations
+            .dispatch_scroll_checked(
+                &1,
+                &area_target,
+                ScrollInput {
+                    x: 0.0,
+                    y: 0.25,
+                    local_x: 10.0,
+                    local_y: 10.0,
+                    surface_x: 10.0,
+                    surface_y: 10.0,
+                    shift: false,
+                    ctrl: false,
+                    alt: false,
+                    logo: false,
+                    source: thing_runtime::ScrollSource::Wheel,
+                },
+                |_| Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!outcome.consumed);
+        assert!(
+            outcome.dispatch.changed,
+            "identity-only replacement needs a fresh presented target map",
+        );
+        assert_eq!(
+            configurations.root(&1).unwrap().children[0].children[0].id,
+            scroll,
+            "the replacement deliberately reuses the presented node id",
+        );
+        assert!(configurations.presented_scroll_target_is_current(
+            &1,
+            &consumer,
+            surface_root,
+            &area_target,
+        ));
+        assert!(!configurations.presented_scroll_view_target_is_current(
+            &1,
+            &consumer,
+            surface_root,
+            &scroll_target,
+        ));
     }
 
     #[test]

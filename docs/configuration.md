@@ -270,7 +270,7 @@ widget kind; unkeyed children match by position and kind.
 | `image` | one of `source`, `icon`, `app_id`; optional `icon_theme` and `fit` |
 | `path` | `data`, `view_box`; optional fit, fill, and stroke controls |
 | `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll`, `on_hover`, `on_pointer` |
-| `pointer_area` | `children` and required `on_pointer` |
+| `pointer_area` | `children`, with at least one of `on_pointer` or `on_scroll` |
 | `slider` | `min`, `max`, `value`, `step`, `on_change`, `on_hover` |
 | `range` | `children`, `min`, `max`, `value`, `step`, `inset`, `on_change`, `on_hover`, `on_pressed` |
 | `popup` | `visible`, `open_on_hover`, `open_on_click`, `open_delay`, `close_delay`, `anchor`, `alignment`, `offset`, `constraints`, `on_key`, `on_hover`, `on_close` |
@@ -349,8 +349,10 @@ an explicit height, or use `grow = 1` inside a column whose height is already
 bounded. otherwise it grows to fit its children and has nowhere to scroll. one
 wheel step moves 40 logical pixels; high-resolution input keeps fractional
 movement. nested viewports keep the event until they reach the limit in that
-direction, then the next event moves the outer viewport. an `on_scroll` handler
-on the button under the pointer takes precedence over viewport movement.
+direction, then the next event moves the outer viewport. the deepest button or
+pointer area with an `on_scroll` handler receives the event first. returning
+`false` allows the same event to move the presented viewport; returning `true`
+or nothing consumes it.
 
 the offset stays with the scroll widget while reactive updates preserve its
 identity, including while it is hidden, and is clamped when its content shrinks.
@@ -430,10 +432,19 @@ list updates replace widgets and handlers together after validation. invalid
 updates keep the current list. removed rows unsubscribe from state. create local
 state outside child functions; keys do not create per-row state.
 
-click handlers receive no arguments. `on_scroll(x, y)` receives scroll steps;
-positive values move right/down. high-resolution wheels retain fractional steps.
-for continuous devices without wheel-step data, 15 compositor-reported pixels
-count as one step. a scroll gesture does not open a grabbed popup. buttons remain
+click handlers receive no arguments. `on_scroll(x, y, event)` receives normalized
+scroll steps; positive values move right/down, and diagonal input produces one
+callback. existing two-argument handlers continue to work. high-resolution
+wheels retain fractional steps. for continuous devices without wheel-step data,
+15 compositor-reported pixels count as one step.
+
+`event.local_x` and `event.local_y` are logical coordinates within the handler,
+while `surface_x` and `surface_y` are logical surface coordinates. `source` is
+`wheel`, `finger`, `continuous`, `wheel_tilt`, or `unknown`; the remaining fields
+report the `shift`, `ctrl`, `alt`, and `logo` modifiers. the event table is
+read-only. a handler error discards actions queued by that callback and stops the
+built-in scroll fallback. it does not undo arbitrary changes already made to
+luau values. a scroll gesture does not open a grabbed popup. buttons remain
 keyboard-activatable through the primary `on_click` handler.
 
 `on_hover(inside)` receives `true` when the pointer enters a button, slider,
@@ -444,7 +455,9 @@ every pointer motion.
 use `pointer_area` for a drag region or gesture that has no built-in button
 meaning. it is a horizontal container, does not enter keyboard focus order, and
 does not draw button interaction feedback. use a button when the same action
-also needs keyboard activation.
+also needs keyboard activation. a pointer area may provide `on_pointer`,
+`on_scroll`, or both. a scroll-only area does not capture presses or acquire
+button activation behavior.
 
 ```luau
 local last_x = ui.state(0)

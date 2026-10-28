@@ -64,8 +64,23 @@ local pointer_area = ui.pointer_area {
 }
 
 local pointer_button = ui.button {
+    on_scroll = function(x, y)
+        local legacy_delta = x + y
+        if legacy_delta == 0 then return end
+    end,
     on_pointer = function(event)
         return event.phase == "press"
+    end,
+}
+
+local scroll_area = ui.pointer_area {
+    on_scroll = function(x, y, event)
+        local local_position = event.local_x + event.local_y
+        local surface_position = event.surface_x + event.surface_y
+        local modified = event.shift or event.ctrl or event.alt or event.logo
+        local source: ThingScrollSource = event.source
+        return source == "wheel" and modified and local_position ~= surface_position
+            and x + y ~= 0
     end,
 }
 
@@ -158,6 +173,7 @@ return ui.panel {
         clipboard_button,
         pointer_area,
         pointer_button,
+        scroll_area,
         tray,
         tray_menu_button,
         process_button,

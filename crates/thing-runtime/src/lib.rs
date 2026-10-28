@@ -165,6 +165,39 @@ pub struct PointerDispatchOutcome {
     pub active: bool,
 }
 
+/// physical source reported for one compositor scroll frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollSource {
+    Wheel,
+    Finger,
+    Continuous,
+    WheelTilt,
+    Unknown,
+}
+
+/// normalized scroll deltas, pointer position, and current modifiers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollInput {
+    pub x: f64,
+    pub y: f64,
+    pub local_x: f64,
+    pub local_y: f64,
+    pub surface_x: f64,
+    pub surface_y: f64,
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub logo: bool,
+    pub source: ScrollSource,
+}
+
+/// the result of one custom scroll handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollDispatchOutcome {
+    pub changed: bool,
+    pub consumed: bool,
+}
+
 const MAX_UI_ACTIONS_PER_HANDLER: usize = 1024;
 
 /// one widget identity captured by a local ui action.
@@ -629,6 +662,29 @@ impl Runtime {
         self.is_available(id) && self.handlers.contains_key(&(id, "on_scroll"))
     }
 
+    /// capture an available button or pointer area that has a scroll handler.
+    pub fn scroll_target(&self, id: NodeId) -> Option<UiTarget> {
+        let target = self.ui_target(id)?;
+        self.scroll_target_is_current(&target).then_some(target)
+    }
+
+    /// whether a captured source and its keyed lineage still identify a scroll handler.
+    pub fn scroll_target_is_current(&self, target: &UiTarget) -> bool {
+        self.ui_target_is_current(target)
+            && self.find(target.node).is_some_and(|node| {
+                node.scroll_events && matches!(node.kind, Kind::Button | Kind::PointerArea)
+            })
+            && self.handlers.contains_key(&(target.node, "on_scroll"))
+    }
+
+    /// whether a captured source and its keyed lineage still identify a scroll viewport.
+    pub fn scroll_view_target_is_current(&self, target: &UiTarget) -> bool {
+        self.ui_target_is_current(target)
+            && self
+                .find(target.node)
+                .is_some_and(|node| node.kind == Kind::Scroll)
+    }
+
     /// capture an available button or pointer area that has a custom handler.
     pub fn pointer_target(&self, id: NodeId) -> Option<UiTarget> {
         let target = self.ui_target(id)?;
@@ -844,6 +900,78 @@ impl Runtime {
         result
     }
 
+    /// run a custom scroll handler captured from the presented widget tree.
+    pub fn dispatch_scroll_checked(
+        &mut self,
+        target: &UiTarget,
+        input: ScrollInput,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<Option<ScrollDispatchOutcome>> {
+        validate_scroll_input(input)?;
+        if !self.scroll_target_is_current(target) {
+            return Ok(None);
+        }
+        let handler = self.handlers[&(target.node, "on_scroll")].clone();
+        self.call_scroll_checked(&handler, input, &validate)
+            .map(Some)
+    }
+
+    fn call_scroll_checked(
+        &mut self,
+        handler: &Function,
+        input: ScrollInput,
+        validate: &impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<ScrollDispatchOutcome> {
+        let event = self.lua.create_table()?;
+        event.set("local_x", input.local_x)?;
+        event.set("local_y", input.local_y)?;
+        event.set("surface_x", input.surface_x)?;
+        event.set("surface_y", input.surface_y)?;
+        event.set("shift", input.shift)?;
+        event.set("ctrl", input.ctrl)?;
+        event.set("alt", input.alt)?;
+        event.set("logo", input.logo)?;
+        event.set("source", scroll_source_name(input.source))?;
+        event.set_readonly(true);
+
+        let checkpoint = self.action_checkpoint();
+        self.begin_call();
+        self.allow_actions(true);
+        let result =
+            handler
+                .call::<Value>((input.x, input.y, event))
+                .and_then(|value| match value {
+                    Value::Nil => Ok(true),
+                    Value::Boolean(consumed) => Ok(consumed),
+                    _ => Err(Error::runtime("on_scroll must return a boolean or nil")),
+                });
+        self.allow_actions(false);
+        let now = Instant::now();
+        let result = result.and_then(|consumed| {
+            self.refresh_at_checked(now, validate)
+                .map(|changed| ScrollDispatchOutcome { changed, consumed })
+        });
+        if result.is_err() {
+            self.truncate_actions(checkpoint);
+        }
+        let mut outcome = result?;
+        match self.cancel_unavailable_presses_checked(now, validate) {
+            Ok(cleaned) => outcome.changed |= cleaned,
+            Err(error) => {
+                self.truncate_actions(checkpoint);
+                return Err(error);
+            }
+        }
+        match self.reconcile_pointer_checked(validate) {
+            Ok(pointer) => outcome.changed |= pointer.changed,
+            Err(error) => {
+                self.truncate_actions(checkpoint);
+                return Err(error);
+            }
+        }
+        Ok(outcome)
+    }
+
     /// run an input handler. disabled or hidden widgets ignore input.
     pub fn dispatch(&mut self, id: NodeId, event: Event) -> Result<bool> {
         self.dispatch_checked(id, event, |_| Ok(()))
@@ -944,6 +1072,27 @@ impl Runtime {
                 self.end_press_checked(id, now, validate)
             };
         }
+        if let Event::Scroll { x, y } = event {
+            let Some(target) = self.scroll_target(id) else {
+                return Ok(false);
+            };
+            let input = ScrollInput {
+                x,
+                y,
+                local_x: 0.0,
+                local_y: 0.0,
+                surface_x: 0.0,
+                surface_y: 0.0,
+                shift: false,
+                ctrl: false,
+                alt: false,
+                logo: false,
+                source: ScrollSource::Unknown,
+            };
+            return self
+                .dispatch_scroll_checked(&target, input, validate)
+                .map(|outcome| outcome.is_some_and(|outcome| outcome.changed));
+        }
         if matches!(&event, Event::Hover(false)) && self.ended_hovers.remove(&id) {
             return Ok(false);
         }
@@ -958,8 +1107,7 @@ impl Runtime {
             Event::Click => "on_click",
             Event::MiddleClick => "on_middle_click",
             Event::SecondaryClick => "on_secondary_click",
-            Event::Scroll { x, y } if x.is_finite() && y.is_finite() => "on_scroll",
-            Event::Scroll { .. } => return Err(Error::runtime("scroll deltas must be finite")),
+            Event::Scroll { .. } => unreachable!("scroll events are handled above"),
             Event::Close => "on_close",
             Event::Hover(_) => "on_hover",
             Event::Change(value) if value.is_finite() => "on_change",
@@ -980,7 +1128,7 @@ impl Runtime {
             Event::Click | Event::MiddleClick | Event::SecondaryClick | Event::Close => {
                 handler.call::<()>(())
             }
-            Event::Scroll { x, y } => handler.call::<()>((x, y)),
+            Event::Scroll { .. } => unreachable!("scroll events are handled above"),
             Event::Change(value) => handler.call::<()>(value),
             Event::TextChange(value) | Event::Submit(value) => handler.call::<()>(value),
             Event::Hover(inside) => handler.call::<()>(inside),
@@ -1572,8 +1720,13 @@ impl Runtime {
                 return Err(Error::runtime("text_input requires on_change"));
             }
         }
-        if kind == Kind::PointerArea && table.raw_get::<Value>("on_pointer")?.is_nil() {
-            return Err(Error::runtime("pointer_area requires on_pointer"));
+        if kind == Kind::PointerArea
+            && table.raw_get::<Value>("on_pointer")?.is_nil()
+            && table.raw_get::<Value>("on_scroll")?.is_nil()
+        {
+            return Err(Error::runtime(
+                "pointer_area requires on_pointer or on_scroll",
+            ));
         }
         if depth == 0
             && !table.raw_get::<Value>("edge")?.is_nil()
@@ -1615,8 +1768,9 @@ impl Runtime {
                 | "on_pointer" => {
                     if (matches!(
                         key.as_str(),
-                        "on_click" | "on_middle_click" | "on_secondary_click" | "on_scroll"
+                        "on_click" | "on_middle_click" | "on_secondary_click"
                     ) && kind != Kind::Button)
+                        || (key == "on_scroll" && !matches!(kind, Kind::Button | Kind::PointerArea))
                         || (key == "on_change"
                             && !matches!(kind, Kind::Slider | Kind::Range | Kind::TextInput))
                         || (key == "on_pressed" && kind != Kind::Range)
@@ -1650,6 +1804,8 @@ impl Runtime {
                     };
                     if key == "on_pointer" {
                         node.pointer_events = true;
+                    } else if key == "on_scroll" {
+                        node.scroll_events = true;
                     }
                     self.handlers.insert((node.id, name), function);
                 }
@@ -1876,6 +2032,36 @@ fn validate_pointer_event(event: PointerEvent) -> Result<()> {
         Ok(())
     } else {
         Err(Error::runtime("pointer coordinates must be finite"))
+    }
+}
+
+fn validate_scroll_input(input: ScrollInput) -> Result<()> {
+    if [
+        input.x,
+        input.y,
+        input.local_x,
+        input.local_y,
+        input.surface_x,
+        input.surface_y,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
+    {
+        Ok(())
+    } else {
+        Err(Error::runtime(
+            "scroll deltas and coordinates must be finite",
+        ))
+    }
+}
+
+fn scroll_source_name(source: ScrollSource) -> &'static str {
+    match source {
+        ScrollSource::Wheel => "wheel",
+        ScrollSource::Finger => "finger",
+        ScrollSource::Continuous => "continuous",
+        ScrollSource::WheelTilt => "wheel_tilt",
+        ScrollSource::Unknown => "unknown",
     }
 }
 

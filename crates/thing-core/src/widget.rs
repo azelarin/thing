@@ -737,6 +737,7 @@ pub struct Node {
     pub visible: bool,
     pub autofocus: bool,
     pub pointer_events: bool,
+    pub scroll_events: bool,
     pub key: Option<String>,
     pub children: Vec<Node>,
 }
@@ -769,6 +770,7 @@ impl Node {
             visible: true,
             autofocus: false,
             pointer_events: false,
+            scroll_events: false,
             key: None,
             children: Vec::new(),
         }
@@ -867,7 +869,12 @@ impl Node {
                 "pointer events are available only on button and pointer_area widgets".into(),
             ));
         }
-        if self.kind == Kind::PointerArea && !self.pointer_events {
+        if self.scroll_events && !matches!(self.kind, Kind::Button | Kind::PointerArea) {
+            return Err(TreeError(
+                "scroll events are available only on button and pointer_area widgets".into(),
+            ));
+        }
+        if self.kind == Kind::PointerArea && !(self.pointer_events || self.scroll_events) {
             return Err(TreeError("pointer_area requires an event handler".into()));
         }
         let style = &self.style;
@@ -1393,6 +1400,29 @@ mod tests {
         assert_eq!(
             area.validate().unwrap_err().to_string(),
             "autofocus is available only on interactive widgets"
+        );
+    }
+
+    #[test]
+    fn pointer_areas_accept_scroll_without_press_interaction() {
+        let mut area = Node::new(NodeId(1), Kind::PointerArea);
+        area.scroll_events = true;
+        area.children.push(Node::new(NodeId(2), Kind::Text));
+        assert!(area.validate().is_ok());
+        assert!(!area.pointer_events);
+        assert!(!area.kind.is_interactive());
+
+        area.scroll_events = false;
+        assert_eq!(
+            area.validate().unwrap_err().to_string(),
+            "pointer_area requires an event handler"
+        );
+
+        let mut row = Node::new(NodeId(3), Kind::Row);
+        row.scroll_events = true;
+        assert_eq!(
+            row.validate().unwrap_err().to_string(),
+            "scroll events are available only on button and pointer_area widgets"
         );
     }
 
