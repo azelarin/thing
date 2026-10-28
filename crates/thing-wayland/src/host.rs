@@ -1267,6 +1267,7 @@ impl App {
             eprintln!("thing: reload failed; keeping the previous surfaces: {error}");
             return Ok(());
         }
+        self.cancel_pending_text_paste();
         // the replacement runtimes never inherit an in-flight pointer sequence.
         if let Some(capture) = self.pointer_capture.take() {
             self.clear_pressed_for_capture(&capture);
