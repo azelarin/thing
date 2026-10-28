@@ -6196,9 +6196,9 @@ impl PointerHandler for App {
                     if handler
                         .as_ref()
                         .is_some_and(|target| !self.surface_scroll_target_is_current(index, target))
-                        || !scroll_fallback_targets_current(&scroll_targets, |target| {
-                            self.surface_scroll_view_target_is_current(index, target)
-                        })
+                        || !scroll_targets
+                            .iter()
+                            .all(|target| self.surface_scroll_view_target_is_current(index, target))
                     {
                         continue;
                     }
@@ -6269,10 +6269,6 @@ fn runtime_scroll_input(
     .into_iter()
     .all(f64::is_finite)
     .then_some(input)
-}
-
-fn scroll_fallback_targets_current<T>(targets: &[T], current: impl FnMut(&T) -> bool) -> bool {
-    targets.iter().all(current)
 }
 
 fn runtime_pointer_button(button: u32) -> Option<RuntimePointerButton> {
@@ -6346,9 +6342,9 @@ mod input_tests {
         keyboard_leave_matches, keyboard_surface_changed, paint_interaction,
         pending_paste_is_current, prepare_text_input_submit, reconcile_controlled_text_edit,
         repeat_action_is_current, reset_active_text_input_generation, retain_non_focus_actions,
-        reveal_text_input_focus, root_key_input, runtime_pointer_event, scroll_distance,
-        semantic_pointer_target, surface_action_route, text_clipboard_action, text_key_action,
-        runtime_scroll_input, scroll_fallback_targets_current, scroll_steps, widget_key_action,
+        reveal_text_input_focus, root_key_input, runtime_pointer_event, runtime_scroll_input,
+        scroll_distance, scroll_steps, semantic_pointer_target, surface_action_route,
+        text_clipboard_action, text_key_action, widget_key_action,
     };
 
     struct FixedMeasurer;
@@ -6794,13 +6790,6 @@ mod input_tests {
             )
             .is_none()
         );
-    }
-
-    #[test]
-    fn scroll_fallback_requires_every_presented_ancestor_to_remain_current() {
-        let targets = [1_u8, 2, 3];
-        assert!(scroll_fallback_targets_current(&targets, |_| true));
-        assert!(!scroll_fallback_targets_current(&targets, |target| *target != 2));
     }
 
     #[test]
