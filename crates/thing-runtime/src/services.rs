@@ -42,11 +42,16 @@ pub enum Action {
         key: u64,
         action: String,
     },
+    SetClipboardText(String),
+    ClearClipboard,
     Launch {
         argv: Vec<String>,
         cwd: Option<String>,
     },
 }
+
+const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
+const MAX_QUEUED_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
 
 /// a media playback control request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,6 +255,42 @@ pub struct NotificationSnapshot {
     pub owned: bool,
     pub error: String,
     pub active: Vec<Notification>,
+}
+
+/// one confirmed generation of clipboard state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClipboardSnapshot {
+    pub available: bool,
+    pub text: Option<String>,
+    pub loading: bool,
+    pub error: String,
+}
+
+impl ClipboardSnapshot {
+    fn values(&self) -> [(&'static str, Scalar); 4] {
+        [
+            ("clipboard.available", Scalar::Boolean(self.available)),
+            (
+                "clipboard.text",
+                self.text.clone().map_or(Scalar::Nil, Scalar::String),
+            ),
+            ("clipboard.loading", Scalar::Boolean(self.loading)),
+            ("clipboard.error", Scalar::String(self.error.clone())),
+        ]
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (name, value) in self.values() {
+            validate_service(name, &value)?;
+        }
+        if !self.available && (self.text.is_some() || self.loading) {
+            return Err(Error::runtime("inconsistent clipboard snapshot"));
+        }
+        if self.loading && (self.text.is_some() || !self.error.is_empty()) {
+            return Err(Error::runtime("inconsistent clipboard snapshot"));
+        }
+        Ok(())
+    }
 }
 
 impl NotificationSnapshot {
@@ -554,6 +595,14 @@ impl ServiceSnapshot {
             self.values.insert(name.into(), value);
         }
         self.system_tray_items = system_tray.items;
+        Ok(())
+    }
+
+    pub fn set_clipboard(&mut self, clipboard: ClipboardSnapshot) -> Result<()> {
+        clipboard.validate()?;
+        for (name, value) in clipboard.values() {
+            self.values.insert(name.into(), value);
+        }
         Ok(())
     }
 
@@ -911,6 +960,7 @@ impl Services {
         };
         let services = lua.create_table()?;
         let audio = lua.create_table()?;
+        let clipboard = lua.create_table()?;
         let clock = lua.create_table()?;
         let media = lua.create_table()?;
         let notifications = lua.create_table()?;
@@ -999,6 +1049,10 @@ impl Services {
             ("audio.source_muted", Scalar::Boolean(false)),
             ("audio.source_device", Scalar::String(String::new())),
             ("audio.error", Scalar::String(String::new())),
+            ("clipboard.available", Scalar::Boolean(false)),
+            ("clipboard.text", Scalar::Nil),
+            ("clipboard.loading", Scalar::Boolean(false)),
+            ("clipboard.error", Scalar::String(String::new())),
             ("clock.time", Scalar::String("--:--".into())),
             ("clock.date", Scalar::String(String::new())),
             ("media.available", Scalar::Boolean(false)),
@@ -1042,6 +1096,7 @@ impl Services {
                 .ok_or_else(|| Error::runtime("invalid service name"))?;
             match service {
                 "audio" => audio.set(property, signal)?,
+                "clipboard" => clipboard.set(property, signal)?,
                 "clock" => clock.set(property, signal)?,
                 "media" => media.set(property, signal)?,
                 "notifications" => notifications.set(property, signal)?,
@@ -1147,6 +1202,22 @@ impl Services {
             })?,
         )?;
         audio.set_readonly(true);
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        clipboard.set(
+            "set_text",
+            lua.create_function(move |_, text: String| {
+                validate_clipboard_text(&text)?;
+                enqueue_clipboard(&actions, &allowed, Action::SetClipboardText(text))
+            })?,
+        )?;
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        clipboard.set(
+            "clear",
+            lua.create_function(move |_, ()| enqueue(&actions, &allowed, Action::ClearClipboard))?,
+        )?;
+        clipboard.set_readonly(true);
         for (name, action) in [
             ("play_pause", MediaAction::PlayPause),
             ("next", MediaAction::Next),
@@ -1236,6 +1307,7 @@ impl Services {
             })?,
         )?;
         services.set("audio", audio)?;
+        services.set("clipboard", clipboard)?;
         services.set("clock", clock)?;
         services.set("media", media)?;
         services.set("notifications", notifications)?;
@@ -1508,6 +1580,15 @@ impl Services {
         Ok(())
     }
 
+    pub fn set_clipboard(&self, clipboard: ClipboardSnapshot) -> Result<()> {
+        clipboard.validate()?;
+        let updates = clipboard
+            .values()
+            .into_iter()
+            .map(|(name, value)| (self.signals[name], value));
+        self.tracker.borrow_mut().write_batch(updates)
+    }
+
     pub fn set_power_devices(
         &self,
         display: Option<PowerDevice>,
@@ -1774,6 +1855,8 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "notifications.owned"
             | "system_tray.available"
             | "system_tray.watcher_owned"
+            | "clipboard.available"
+            | "clipboard.loading"
             | "niri.available",
             Scalar::Boolean(_),
         ) => true,
@@ -1795,12 +1878,15 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "power.error"
             | "notifications.error"
             | "system_tray.error"
+            | "clipboard.error"
             | "niri.error",
             Scalar::String(value),
         ) => value.len() <= 4096 && !value.contains('\0'),
         ("media.art_url", Scalar::String(value)) => {
             value.len() <= 16 * 1024 && !value.contains('\0')
         }
+        ("clipboard.text", Scalar::Nil) => true,
+        ("clipboard.text", Scalar::String(value)) => validate_clipboard_text(value).is_ok(),
         _ => false,
     };
     if valid {
@@ -2127,6 +2213,50 @@ fn enqueue(actions: &RefCell<Vec<Action>>, allowed: &Cell<bool>, action: Action)
     Ok(())
 }
 
+fn validate_clipboard_text(value: &str) -> Result<()> {
+    if value.len() > MAX_CLIPBOARD_TEXT_BYTES || value.contains('\0') {
+        Err(Error::runtime(
+            "clipboard text must contain no NUL and must not exceed 1 MiB",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn enqueue_clipboard(
+    actions: &RefCell<Vec<Action>>,
+    allowed: &Cell<bool>,
+    action: Action,
+) -> Result<()> {
+    if !allowed.get() {
+        return Err(Error::runtime(
+            "service actions are allowed only in event handlers",
+        ));
+    }
+    let mut actions = actions.borrow_mut();
+    if actions.len() >= 128 {
+        return Err(Error::runtime("too many service actions in one event"));
+    }
+    let queued = actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::SetClipboardText(text) => Some(text.len()),
+            _ => None,
+        })
+        .try_fold(0_usize, usize::checked_add)
+        .and_then(|bytes| match &action {
+            Action::SetClipboardText(text) => bytes.checked_add(text.len()),
+            _ => Some(bytes),
+        });
+    if queued.is_none_or(|bytes| bytes > MAX_QUEUED_CLIPBOARD_BYTES) {
+        return Err(Error::runtime(
+            "clipboard actions exceed the 4 MiB per-event limit",
+        ));
+    }
+    actions.push(action);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2250,5 +2380,75 @@ mod tests {
         };
         assert!(services.set_audio(invalid).is_err());
         assert_eq!(services.snapshot(), before);
+    }
+
+    #[test]
+    fn clipboard_snapshot_updates_atomically() {
+        let lua = Lua::new();
+        let tracker = Rc::new(RefCell::new(Tracker::default()));
+        let services = Services::install(&lua, tracker.clone()).unwrap();
+
+        tracker.borrow_mut().begin(1);
+        lua.load("return services.clipboard.text:get()")
+            .eval::<Value>()
+            .unwrap();
+        tracker.borrow_mut().finish(1);
+        services
+            .set_clipboard(ClipboardSnapshot {
+                available: true,
+                text: Some(String::new()),
+                ..ClipboardSnapshot::default()
+            })
+            .unwrap();
+        assert_eq!(tracker.borrow().dirty, BTreeSet::from([1]));
+
+        let before = services.snapshot();
+        assert!(
+            services
+                .set_clipboard(ClipboardSnapshot {
+                    available: false,
+                    text: Some("stale".into()),
+                    ..ClipboardSnapshot::default()
+                })
+                .is_err()
+        );
+        assert_eq!(services.snapshot(), before);
+    }
+
+    #[test]
+    fn clipboard_actions_are_explicit_and_bounded() {
+        let lua = Lua::new();
+        let tracker = Rc::new(RefCell::new(Tracker::default()));
+        let services = Services::install(&lua, tracker).unwrap();
+        assert!(
+            lua.load("services.clipboard.set_text('outside')")
+                .exec()
+                .is_err()
+        );
+
+        services.allow_actions(true);
+        lua.load("services.clipboard.set_text('hello'); services.clipboard.clear()")
+            .exec()
+            .unwrap();
+        assert_eq!(
+            services.take_actions(),
+            vec![
+                Action::SetClipboardText("hello".into()),
+                Action::ClearClipboard,
+            ]
+        );
+
+        let chunk = "a".repeat(MAX_CLIPBOARD_TEXT_BYTES);
+        lua.globals().set("chunk", chunk).unwrap();
+        for _ in 0..4 {
+            lua.load("services.clipboard.set_text(chunk)")
+                .exec()
+                .unwrap();
+        }
+        assert!(
+            lua.load("services.clipboard.set_text(chunk)")
+                .exec()
+                .is_err()
+        );
     }
 }

@@ -2,8 +2,9 @@ use std::{collections::BTreeSet, path::PathBuf, time::Instant};
 
 use thing_core::{Node, NodeId};
 use thing_runtime::{
-    Action, AudioSnapshot, Event, MediaSnapshot, NiriState, NotificationSnapshot, OutputContext,
-    PowerSnapshot, Runtime, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTraySnapshot,
+    Action, AudioSnapshot, ClipboardSnapshot, Event, MediaSnapshot, NiriState,
+    NotificationSnapshot, OutputContext, PowerSnapshot, Runtime, Scalar, ServiceSnapshot,
+    SurfaceKey, SurfaceTree, SystemTraySnapshot,
 };
 use thing_ui::Layout;
 
@@ -250,6 +251,21 @@ impl<K: Clone + Eq> Configurations<K> {
             instance
                 .runtime
                 .set_notifications(notifications.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        self.services = services;
+        Ok(())
+    }
+
+    pub(crate) fn set_clipboard(&mut self, clipboard: ClipboardSnapshot) -> Result<(), String> {
+        let mut services = self.services.clone();
+        services
+            .set_clipboard(clipboard.clone())
+            .map_err(|error| error.to_string())?;
+        for instance in &mut self.instances {
+            instance
+                .runtime
+                .set_clipboard(clipboard.clone())
                 .map_err(|error| error.to_string())?;
         }
         self.services = services;
@@ -1217,6 +1233,48 @@ mod tests {
         assert!(configurations.refresh().is_empty());
         assert_eq!(text(&configurations, 1), "true::1:1:Saved:Open");
         assert_eq!(text(&configurations, 2), "true::1:1:Saved:Open");
+    }
+
+    #[test]
+    fn clipboard_updates_reach_existing_and_later_outputs_together() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            return ui.panel { children = { ui.text { text = function()
+                return `{services.clipboard.available:get()}:{services.clipboard.loading:get()}:{services.clipboard.text:get() or 'none'}:{services.clipboard.error:get()}`
+            end } } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        configurations
+            .set_clipboard(ClipboardSnapshot {
+                available: true,
+                text: Some("copied".into()),
+                ..ClipboardSnapshot::default()
+            })
+            .unwrap();
+        assert_eq!(configurations.refresh(), vec![1]);
+        assert_eq!(text(&configurations, 1), "true:false:copied:");
+
+        configurations.add(2, output("DP-2", 2560)).unwrap();
+        assert_eq!(text(&configurations, 2), "true:false:copied:");
+        assert!(
+            configurations
+                .set_clipboard(ClipboardSnapshot {
+                    available: false,
+                    text: Some("stale".into()),
+                    ..ClipboardSnapshot::default()
+                })
+                .is_err()
+        );
+        assert!(configurations.refresh().is_empty());
+        for key in [1, 2] {
+            assert_eq!(text(&configurations, key), "true:false:copied:");
+        }
     }
 
     #[test]

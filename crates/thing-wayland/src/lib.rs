@@ -1,8 +1,10 @@
 //! wayland host for the thing runtime.
 
 mod audio;
+mod clipboard;
 mod clock;
 mod configuration;
+mod data_transfer;
 mod egl;
 mod host;
 mod hover;
@@ -37,6 +39,8 @@ pub struct RunOptions {
     pub notification_server: bool,
     /// status notifier policy, or `None` to leave tray support disabled.
     pub system_tray: Option<SystemTrayMode>,
+    /// whether thing may read and control the regular clipboard.
+    pub clipboard: bool,
 }
 
 impl RunOptions {
@@ -55,6 +59,12 @@ impl RunOptions {
     /// select a status notifier policy, or disable the tray worker with `None`.
     pub fn with_system_tray(mut self, system_tray: Option<SystemTrayMode>) -> Self {
         self.system_tray = system_tray;
+        self
+    }
+
+    /// enable or disable regular clipboard access.
+    pub fn with_clipboard(mut self, enabled: bool) -> Self {
+        self.clipboard = enabled;
         self
     }
 }
@@ -81,5 +91,6 @@ mod tests {
     fn run_options_leave_opt_in_services_disabled_by_default() {
         assert!(!RunOptions::default().notification_server);
         assert_eq!(RunOptions::default().system_tray, None);
+        assert!(!RunOptions::default().clipboard);
     }
 }
