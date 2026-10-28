@@ -1,6 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use taffy::{prelude as tf, style::Position};
+use taffy::{
+    geometry::Point as TaffyPoint,
+    prelude as tf,
+    style::{Overflow, Position},
+};
 use thing_core::{Kind, Node, NodeId, Point, Rect};
 
 /// a size in logical pixels.
@@ -26,12 +30,64 @@ pub struct Placement {
     pub opacity: f32,
 }
 
+/// scroll offsets for one surface, measured in logical pixels.
+#[derive(Clone, Debug, Default)]
+pub struct ScrollState {
+    offsets: BTreeMap<NodeId, f32>,
+}
+
+impl ScrollState {
+    fn offset(&self, id: NodeId) -> f32 {
+        self.offsets.get(&id).copied().unwrap_or(0.0)
+    }
+
+    fn set(&mut self, id: NodeId, offset: f32) {
+        if offset > 0.0 {
+            self.offsets.insert(id, offset);
+        } else {
+            self.offsets.remove(&id);
+        }
+    }
+
+    fn retain_tree(&mut self, root: &Node) {
+        fn collect(node: &Node, ids: &mut BTreeSet<NodeId>) {
+            if node.kind == Kind::Scroll {
+                ids.insert(node.id);
+            }
+            for child in &node.children {
+                collect(child, ids);
+            }
+        }
+
+        let mut ids = BTreeSet::new();
+        collect(root, &mut ids);
+        self.offsets.retain(|id, _| ids.contains(id));
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScrollArea {
+    id: NodeId,
+    parent: Option<NodeId>,
+    max_offset: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PointerRegion {
+    bounds: Rect,
+    clip: Rect,
+    interactive: Option<NodeId>,
+    scroll: Option<NodeId>,
+}
+
 #[derive(Clone, Copy)]
 struct Inherited {
     origin: Point,
     clip: Rect,
     enabled: bool,
     opacity: f32,
+    interactive_parent: Option<NodeId>,
+    scroll_parent: Option<NodeId>,
 }
 
 /// resolved geometry for one surface. popup children have separate surfaces and
@@ -39,10 +95,21 @@ struct Inherited {
 #[derive(Debug, Default)]
 pub struct Layout {
     placements: Vec<Placement>,
+    pointer_regions: Vec<PointerRegion>,
+    scroll_areas: Vec<ScrollArea>,
 }
 
 impl Layout {
     pub fn compute(root: &Node, size: Size, measurer: &mut impl Measurer) -> Result<Self, String> {
+        Self::compute_with_scroll(root, size, &mut ScrollState::default(), measurer)
+    }
+
+    pub fn compute_with_scroll(
+        root: &Node,
+        size: Size,
+        state: &mut ScrollState,
+        measurer: &mut impl Measurer,
+    ) -> Result<Self, String> {
         root.validate_surface().map_err(|error| error.to_string())?;
         if ![size.width, size.height]
             .iter()
@@ -108,17 +175,23 @@ impl Layout {
             height: size.height,
         };
         let mut result = Self::default();
+        let mut next_state = state.clone();
+        next_state.retain_tree(root);
         result.collect(
             root,
             &tree,
             &ids,
+            &mut next_state,
             Inherited {
                 origin: Point { x: 0.0, y: 0.0 },
                 clip,
                 enabled: true,
                 opacity: 1.0,
+                interactive_parent: None,
+                scroll_parent: None,
             },
         )?;
+        *state = next_state;
         Ok(result)
     }
 
@@ -146,11 +219,63 @@ impl Layout {
             .map(|p| p.id)
     }
 
+    /// the nearest interactive widget on the topmost painted branch at `point`.
+    pub fn scroll_event_target(&self, point: Point) -> Option<NodeId> {
+        self.pointer_region(point)
+            .and_then(|region| region.interactive)
+    }
+
+    /// scroll the innermost vertical viewport under `point`. when that viewport
+    /// is already at its limit, the event bubbles through its scroll ancestors.
+    pub fn scroll_y(&self, point: Point, delta: f32, state: &mut ScrollState) -> bool {
+        if !delta.is_finite() || delta == 0.0 {
+            return false;
+        }
+        let Some(id) = self.pointer_region(point).and_then(|region| region.scroll) else {
+            return false;
+        };
+        let Some(mut area) = self.scroll_areas.iter().find(|area| area.id == id) else {
+            return false;
+        };
+        loop {
+            let current = state.offset(area.id).clamp(0.0, area.max_offset);
+            let can_move = if delta > 0.0 {
+                current < area.max_offset
+            } else {
+                current > 0.0
+            };
+            if can_move {
+                let next = (current + delta).clamp(0.0, area.max_offset);
+                state.set(area.id, next);
+                return next != current;
+            }
+            let Some(parent) = area.parent else {
+                return false;
+            };
+            let Some(parent_area) = self
+                .scroll_areas
+                .iter()
+                .find(|candidate| candidate.id == parent)
+            else {
+                return false;
+            };
+            area = parent_area;
+        }
+    }
+
+    fn pointer_region(&self, point: Point) -> Option<&PointerRegion> {
+        self.pointer_regions
+            .iter()
+            .rev()
+            .find(|region| region.bounds.contains(point) && region.clip.contains(point))
+    }
+
     fn collect(
         &mut self,
         node: &Node,
         tree: &tf::TaffyTree<NodeId>,
         ids: &BTreeMap<NodeId, tf::NodeId>,
+        state: &mut ScrollState,
         inherited: Inherited,
     ) -> Result<(), String> {
         if !node.visible {
@@ -161,6 +286,8 @@ impl Layout {
             clip,
             enabled,
             opacity,
+            interactive_parent,
+            scroll_parent,
         } = inherited;
         let geometry = tree.layout(ids[&node.id]).map_err(|e| e.to_string())?;
         let bounds = Rect {
@@ -171,6 +298,16 @@ impl Layout {
         };
         let enabled = enabled && node.enabled;
         let opacity = opacity * node.style.opacity;
+        let pointer_interactive = if enabled && node.kind.is_interactive() {
+            Some(node.id)
+        } else {
+            interactive_parent
+        };
+        let pointer_scroll = if node.kind == Kind::Scroll && enabled {
+            Some(node.id)
+        } else {
+            scroll_parent
+        };
         self.placements.push(Placement {
             id: node.id,
             bounds,
@@ -179,23 +316,52 @@ impl Layout {
             enabled,
             opacity,
         });
+        self.pointer_regions.push(PointerRegion {
+            bounds,
+            clip,
+            interactive: pointer_interactive,
+            scroll: pointer_scroll,
+        });
         let Some(child_clip) = bounds.intersection(clip) else {
             return Ok(());
         };
+        let mut child_origin = Point {
+            x: bounds.x,
+            y: bounds.y,
+        };
+        let mut child_scroll_parent = scroll_parent;
+        if node.kind == Kind::Scroll {
+            let max_offset = if geometry.scroll_height().is_finite() {
+                geometry.scroll_height().max(0.0)
+            } else {
+                0.0
+            };
+            let offset = state.offset(node.id).clamp(0.0, max_offset);
+            state.set(node.id, offset);
+            if enabled {
+                self.scroll_areas.push(ScrollArea {
+                    id: node.id,
+                    parent: scroll_parent,
+                    max_offset,
+                });
+                child_scroll_parent = Some(node.id);
+            }
+            child_origin.y -= offset;
+        }
         for child in &node.children {
             if child.kind != Kind::Popup {
                 self.collect(
                     child,
                     tree,
                     ids,
+                    state,
                     Inherited {
-                        origin: Point {
-                            x: bounds.x,
-                            y: bounds.y,
-                        },
+                        origin: child_origin,
                         clip: child_clip,
                         enabled,
                         opacity,
+                        interactive_parent: pointer_interactive,
+                        scroll_parent: child_scroll_parent,
                     },
                 )?;
             }
@@ -265,7 +431,15 @@ fn build(
             tf::FlexDirection::Row
         },
         flex_grow: style.grow,
-        flex_shrink: 0.0,
+        flex_shrink: if node.kind == Kind::Scroll { 1.0 } else { 0.0 },
+        overflow: TaffyPoint {
+            x: Overflow::Clip,
+            y: if node.kind == Kind::Scroll {
+                Overflow::Scroll
+            } else {
+                Overflow::Clip
+            },
+        },
         align_items: tf::AlignItems::CENTER,
         justify_content: if node.kind == Kind::CenterBox {
             tf::JustifyContent::CENTER
@@ -305,6 +479,17 @@ mod tests {
                 height: 10.0,
             }
         }
+    }
+
+    fn fixed(id: u64, kind: Kind, width: f32, height: f32) -> Node {
+        let mut node = Node::new(NodeId(id), kind);
+        node.style.width = Some(width);
+        node.style.height = Some(height);
+        node
+    }
+
+    fn scrolled(root: &Node, size: Size, state: &mut ScrollState) -> Layout {
+        Layout::compute_with_scroll(root, size, state, &mut FixedText).unwrap()
     }
 
     #[test]
@@ -440,5 +625,271 @@ mod tests {
         .unwrap();
 
         assert_eq!(layout.get(popup.id).unwrap().bounds.width, 200.0);
+    }
+
+    #[test]
+    fn scroll_offsets_share_clipping_between_paint_and_hit_testing() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut scroll = fixed(2, Kind::Scroll, 100.0, 40.0);
+        for id in 3..=5 {
+            scroll.children.push(fixed(id, Kind::Button, 100.0, 30.0));
+        }
+        root.children.push(scroll);
+        let size = Size {
+            width: 100.0,
+            height: 40.0,
+        };
+        let point = Point { x: 10.0, y: 10.0 };
+        let mut state = ScrollState::default();
+        let layout = scrolled(&root, size, &mut state);
+
+        assert!(layout.scroll_y(point, 25.0, &mut state));
+        assert_eq!(state.offset(NodeId(2)), 25.0);
+        let layout = scrolled(&root, size, &mut state);
+        assert_eq!(layout.get(NodeId(3)).unwrap().bounds.y, -25.0);
+        assert_eq!(layout.get(NodeId(4)).unwrap().bounds.y, 5.0);
+        assert_eq!(layout.get(NodeId(3)).unwrap().clip.height, 40.0);
+        assert_eq!(layout.hit_test(Point { x: 10.0, y: 4.0 }), Some(NodeId(3)));
+        assert_eq!(layout.hit_test(Point { x: 10.0, y: 5.0 }), Some(NodeId(4)));
+        assert_eq!(layout.hit_test(Point { x: 10.0, y: 45.0 }), None);
+
+        assert!(layout.scroll_y(point, 1_000.0, &mut state));
+        assert_eq!(state.offset(NodeId(2)), 50.0);
+        let layout = scrolled(&root, size, &mut state);
+        assert_eq!(layout.get(NodeId(5)).unwrap().bounds.y, 10.0);
+        assert_eq!(layout.hit_test(Point { x: 10.0, y: 39.0 }), Some(NodeId(5)));
+        assert!(!layout.scroll_y(point, 1.0, &mut state));
+    }
+
+    #[test]
+    fn scrolling_retargets_a_stationary_pointer_after_layout() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut scroll = fixed(2, Kind::Scroll, 100.0, 40.0);
+        scroll.children.push(fixed(3, Kind::Button, 100.0, 40.0));
+        scroll.children.push(fixed(4, Kind::Button, 100.0, 40.0));
+        root.children.push(scroll);
+        let size = Size {
+            width: 100.0,
+            height: 40.0,
+        };
+        let point = Point { x: 10.0, y: 10.0 };
+        let mut state = ScrollState::default();
+        let layout = scrolled(&root, size, &mut state);
+        assert_eq!(layout.hit_test(point), Some(NodeId(3)));
+
+        assert!(layout.scroll_y(point, 40.0, &mut state));
+        let layout = scrolled(&root, size, &mut state);
+        assert_eq!(layout.hit_test(point), Some(NodeId(4)));
+    }
+
+    #[test]
+    fn scroll_limit_includes_gap_and_padding() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut scroll = fixed(2, Kind::Scroll, 100.0, 50.0);
+        scroll.style.padding = 10.0;
+        scroll.style.gap = 5.0;
+        scroll.children.push(fixed(3, Kind::Button, 80.0, 20.0));
+        scroll.children.push(fixed(4, Kind::Button, 80.0, 20.0));
+        root.children.push(scroll);
+        let mut state = ScrollState::default();
+        let layout = scrolled(
+            &root,
+            Size {
+                width: 100.0,
+                height: 50.0,
+            },
+            &mut state,
+        );
+
+        assert!(layout.scroll_y(Point { x: 1.0, y: 1.0 }, 100.0, &mut state));
+        assert_eq!(state.offset(NodeId(2)), 15.0);
+    }
+
+    #[test]
+    fn growing_scroll_viewport_shrinks_below_fixed_siblings() {
+        let mut root = Node::new(NodeId(1), Kind::Column);
+        root.children.push(fixed(2, Kind::Button, 100.0, 30.0));
+        let mut scroll = Node::new(NodeId(3), Kind::Scroll);
+        scroll.style.width = Some(100.0);
+        scroll.style.grow = 1.0;
+        scroll.children.push(fixed(4, Kind::Button, 100.0, 200.0));
+        root.children.push(scroll);
+        let mut state = ScrollState::default();
+        let layout = scrolled(
+            &root,
+            Size {
+                width: 100.0,
+                height: 100.0,
+            },
+            &mut state,
+        );
+
+        assert_eq!(layout.get(NodeId(3)).unwrap().bounds.height, 70.0);
+        assert!(layout.scroll_y(Point { x: 1.0, y: 31.0 }, 500.0, &mut state));
+        assert_eq!(state.offset(NodeId(3)), 130.0);
+    }
+
+    #[test]
+    fn nested_scrolls_bubble_only_at_the_directional_limit() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut outer = fixed(2, Kind::Scroll, 100.0, 100.0);
+        let mut page = fixed(3, Kind::Column, 100.0, 200.0);
+        let mut inner = fixed(4, Kind::Scroll, 100.0, 50.0);
+        inner.children.push(fixed(5, Kind::Button, 100.0, 50.0));
+        inner.children.push(fixed(6, Kind::Button, 100.0, 50.0));
+        page.children.push(inner);
+        outer.children.push(page);
+        root.children.push(outer);
+        let size = Size {
+            width: 100.0,
+            height: 100.0,
+        };
+        let point = Point { x: 10.0, y: 10.0 };
+        let mut state = ScrollState::default();
+        let layout = scrolled(&root, size, &mut state);
+
+        assert!(layout.scroll_y(point, 70.0, &mut state));
+        assert_eq!(state.offset(NodeId(4)), 50.0);
+        assert_eq!(state.offset(NodeId(2)), 0.0);
+        assert!(layout.scroll_y(point, 20.0, &mut state));
+        assert_eq!(state.offset(NodeId(2)), 20.0);
+
+        let layout = scrolled(&root, size, &mut state);
+        assert!(layout.scroll_y(point, -70.0, &mut state));
+        assert_eq!(state.offset(NodeId(4)), 0.0);
+        assert_eq!(state.offset(NodeId(2)), 20.0);
+        assert!(layout.scroll_y(point, -70.0, &mut state));
+        assert_eq!(state.offset(NodeId(2)), 0.0);
+    }
+
+    #[test]
+    fn disabled_nested_scroll_uses_the_enabled_ancestor() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut outer = fixed(2, Kind::Scroll, 100.0, 50.0);
+        let mut page = fixed(3, Kind::Column, 100.0, 100.0);
+        let mut inner = fixed(4, Kind::Scroll, 100.0, 40.0);
+        inner.enabled = false;
+        inner.children.push(fixed(5, Kind::Button, 100.0, 80.0));
+        page.children.push(inner);
+        outer.children.push(page);
+        root.children.push(outer);
+        let mut state = ScrollState::default();
+        let layout = scrolled(
+            &root,
+            Size {
+                width: 100.0,
+                height: 50.0,
+            },
+            &mut state,
+        );
+
+        assert!(layout.scroll_y(Point { x: 10.0, y: 10.0 }, 20.0, &mut state));
+        assert_eq!(state.offset(NodeId(2)), 20.0);
+        assert_eq!(state.offset(NodeId(4)), 0.0);
+    }
+
+    #[test]
+    fn scroll_state_survives_visibility_and_clamps_or_prunes_with_the_tree() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut scroll = fixed(2, Kind::Scroll, 100.0, 40.0);
+        for id in 3..=5 {
+            scroll.children.push(fixed(id, Kind::Button, 100.0, 30.0));
+        }
+        root.children.push(scroll);
+        let size = Size {
+            width: 100.0,
+            height: 40.0,
+        };
+        let point = Point { x: 10.0, y: 10.0 };
+        let mut state = ScrollState::default();
+        let layout = scrolled(&root, size, &mut state);
+        assert!(layout.scroll_y(point, 30.0, &mut state));
+
+        root.children[0].visible = false;
+        scrolled(&root, size, &mut state);
+        assert_eq!(state.offset(NodeId(2)), 30.0);
+
+        root.children[0].visible = true;
+        root.children[0].children.pop();
+        scrolled(&root, size, &mut state);
+        assert_eq!(state.offset(NodeId(2)), 20.0);
+
+        root.children.clear();
+        scrolled(&root, size, &mut state);
+        assert_eq!(state.offset(NodeId(2)), 0.0);
+    }
+
+    #[test]
+    fn colliding_node_ids_have_independent_scroll_state() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut scroll = fixed(2, Kind::Scroll, 100.0, 40.0);
+        scroll.children.push(fixed(3, Kind::Button, 100.0, 80.0));
+        root.children.push(scroll);
+        let size = Size {
+            width: 100.0,
+            height: 40.0,
+        };
+        let point = Point { x: 10.0, y: 10.0 };
+        let mut left = ScrollState::default();
+        let mut right = ScrollState::default();
+        let layout = scrolled(&root, size, &mut left);
+        scrolled(&root, size, &mut right);
+
+        assert!(layout.scroll_y(point, 20.0, &mut left));
+        assert_eq!(left.offset(NodeId(2)), 20.0);
+        assert_eq!(right.offset(NodeId(2)), 0.0);
+    }
+
+    #[test]
+    fn overlapping_scrolls_use_frontmost_paint_order() {
+        let mut root = Node::new(NodeId(1), Kind::Stack);
+        for (scroll_id, child_id) in [(2, 3), (4, 5)] {
+            let mut scroll = fixed(scroll_id, Kind::Scroll, 100.0, 40.0);
+            scroll
+                .children
+                .push(fixed(child_id, Kind::Button, 100.0, 80.0));
+            root.children.push(scroll);
+        }
+        let mut state = ScrollState::default();
+        let layout = scrolled(
+            &root,
+            Size {
+                width: 100.0,
+                height: 40.0,
+            },
+            &mut state,
+        );
+
+        assert!(layout.scroll_y(Point { x: 10.0, y: 10.0 }, 20.0, &mut state));
+        assert_eq!(state.offset(NodeId(2)), 0.0);
+        assert_eq!(state.offset(NodeId(4)), 20.0);
+    }
+
+    #[test]
+    fn foreground_centerbox_group_blocks_an_overlapped_scroll_viewport() {
+        let mut root = Node::new(NodeId(1), Kind::CenterBox);
+        root.children.push(fixed(2, Kind::Row, 10.0, 40.0));
+        let mut scroll = fixed(3, Kind::Scroll, 80.0, 40.0);
+        scroll.children.push(fixed(4, Kind::Button, 80.0, 80.0));
+        root.children.push(scroll);
+        root.children.push(fixed(5, Kind::Row, 80.0, 40.0));
+        let mut state = ScrollState::default();
+        let layout = scrolled(
+            &root,
+            Size {
+                width: 100.0,
+                height: 40.0,
+            },
+            &mut state,
+        );
+
+        let overlap = Point { x: 50.0, y: 10.0 };
+        assert_eq!(layout.scroll_event_target(overlap), None);
+        assert!(!layout.scroll_y(overlap, 20.0, &mut state));
+        assert_eq!(state.offset(NodeId(3)), 0.0);
+        let visible = Point { x: 15.0, y: 10.0 };
+        assert_eq!(layout.scroll_event_target(visible), Some(NodeId(4)));
+        assert!(layout.scroll_y(visible, 20.0, &mut state));
+        assert_eq!(state.offset(NodeId(3)), 20.0);
     }
 }

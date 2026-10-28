@@ -251,6 +251,11 @@ impl Runtime {
         self.services.take_actions()
     }
 
+    /// whether an available widget has an explicit scroll handler.
+    pub fn has_scroll_handler(&self, id: NodeId) -> bool {
+        is_available(&self.root, id) && self.handlers.contains_key(&(id, "on_scroll"))
+    }
+
     /// run an input handler. disabled or hidden widgets ignore input.
     pub fn dispatch(&mut self, id: NodeId, event: Event) -> Result<bool> {
         if matches!(event, Event::Hover(false)) && self.ended_hovers.remove(&id) {

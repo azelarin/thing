@@ -87,10 +87,9 @@ resets each output's local state and closes its popups.
 
 ## widgets and children
 
-the current model has `panel`, `popup`, `row`, `centerbox`, `column`, `stack`, `scroll`, `text`,
-`image`, `button`, and `slider` constructors. `scroll` currently clips its contents;
-scrolling that container is still pending. pass properties
-in a table and children in a dense array:
+the current model has `panel`, `popup`, `row`, `centerbox`, `column`, `stack`,
+`scroll`, `text`, `image`, `button`, and `slider` constructors. pass properties in
+a table and children in a dense array:
 
 ```luau
 return ui.panel {
@@ -128,6 +127,20 @@ it an explicit height and width (or `grow = 1` inside a row). the middle child
 stays centered even when the side groups have different widths. hidden children
 keep their slot. groups can overlap if they exceed the available space; choose
 which content to hide in your configuration on narrow outputs.
+
+`scroll` lays out its children vertically and clips them to its bounds. give it
+an explicit height, or use `grow = 1` inside a column whose height is already
+bounded. otherwise it grows to fit its children and has nowhere to scroll. one
+wheel step moves 40 logical pixels; high-resolution input keeps fractional
+movement. nested viewports keep the event until they reach the limit in that
+direction, then the next event moves the outer viewport. an `on_scroll` handler
+on the button under the pointer takes precedence over viewport movement.
+
+the offset stays with the scroll widget while reactive updates preserve its
+identity, including while it is hidden, and is clamped when its content shrinks.
+a successful configuration reload and closing a popup reset their offsets.
+scrollbars, horizontal scrolling, touch dragging, and programmatic movement are
+not available yet.
 
 slider defaults are 0–1, value 0, and step 0.01. a step of zero means continuous
 input. the range must be finite and increasing. pointer input clamps to the range;

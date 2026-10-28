@@ -64,6 +64,11 @@ impl<K: Clone + Eq> Configurations<K> {
             .map(|instance| &instance.runtime)
     }
 
+    pub(crate) fn has_scroll_handler(&self, key: &K, id: NodeId) -> bool {
+        self.runtime(key)
+            .is_some_and(|runtime| runtime.has_scroll_handler(id))
+    }
+
     pub(crate) fn output(&self, key: &K) -> Option<&OutputContext> {
         self.instances
             .iter()

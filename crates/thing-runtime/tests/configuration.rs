@@ -256,6 +256,31 @@ fn rejects_invalid_popup_delays() {
 }
 
 #[test]
+fn reports_scroll_handlers_even_when_they_do_not_change_state() {
+    let (_directory, path) = fixture(
+        r#"
+        return ui.panel { children = {
+            ui.button { on_scroll = function() end },
+            ui.button {},
+            ui.button { enabled = false, on_scroll = function() end },
+            ui.button { visible = false, on_scroll = function() end },
+        } }
+    "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let buttons = &runtime.root().children;
+    assert!(runtime.has_scroll_handler(buttons[0].id));
+    assert!(!runtime.has_scroll_handler(buttons[1].id));
+    assert!(!runtime.has_scroll_handler(buttons[2].id));
+    assert!(!runtime.has_scroll_handler(buttons[3].id));
+    assert!(
+        !runtime
+            .dispatch(buttons[0].id, Event::Scroll { x: 0.0, y: 1.0 })
+            .unwrap()
+    );
+}
+
+#[test]
 fn failed_reload_preserves_widgets_and_local_state() {
     let (_directory, path) = fixture(
         r#"

@@ -7,7 +7,7 @@ use femtovg::{
 use parley::PositionedLayoutItem;
 use thing_core::{Kind, Node, NodeId, Rect};
 
-use crate::{Layout, Size, TextSystem};
+use crate::{Layout, ScrollState, Size, TextSystem};
 
 /// transient input state belongs to the host, not to the widget snapshot.
 #[derive(Clone, Copy, Debug, Default)]
@@ -174,8 +174,13 @@ impl<R: Renderer> Painter<R> {
         result
     }
 
-    pub fn layout(&mut self, root: &Node, size: Size) -> Result<Layout, String> {
-        Layout::compute(root, size, &mut self.text)
+    pub fn layout(
+        &mut self,
+        root: &Node,
+        size: Size,
+        scroll: &mut ScrollState,
+    ) -> Result<Layout, String> {
+        Layout::compute_with_scroll(root, size, scroll, &mut self.text)
     }
 
     fn draw_text(&mut self, node: &Node, bounds: Rect) -> Result<(), String> {

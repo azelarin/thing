@@ -40,7 +40,7 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] per-output configuration
 - [ ] panel sizing, input regions, and popup positioning
 - [x] hover popups
-- [ ] scrolling containers
+- [x] scrolling containers
 - [ ] text input and consistent key repeat
 - [ ] vulkan rendering alongside opengl
 - [ ] drag and drop, animations, and custom shapes
