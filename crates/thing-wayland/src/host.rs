@@ -405,6 +405,10 @@ impl TextKeyAction {
             Self::Insert(_) | Self::Backspace | Self::Delete | Self::MoveLeft | Self::MoveRight
         )
     }
+
+    fn changes_value(&self) -> bool {
+        matches!(self, Self::Insert(_) | Self::Backspace | Self::Delete)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1798,7 +1802,7 @@ impl App {
             .text_input
             .as_mut()
             .expect("the focused text input was initialized");
-        let checkpoint = active.editor.checkpoint();
+        let checkpoint = action.changes_value().then(|| active.editor.checkpoint());
         let changed = match action {
             TextKeyAction::Insert(text) => active.editor.replace_selection(&text),
             TextKeyAction::Backspace => active.editor.backspace(word),
@@ -1832,6 +1836,7 @@ impl App {
         let Some(proposed) = proposed else {
             return repeats;
         };
+        let checkpoint = checkpoint.expect("value-changing edits create a rollback checkpoint");
         self.dispatch(output, id, Event::TextChange(proposed.clone()), origin);
 
         let Some(surface) = self.index(&wl) else {
@@ -2398,9 +2403,22 @@ impl App {
     }
 
     fn clear_keyboard_focus(&mut self) {
+        self.set_keyboard_surface(None);
+    }
+
+    fn set_keyboard_surface(&mut self, next: Option<wl_surface::WlSurface>) {
         self.clear_key_repeat();
-        self.keyboard_surface = None;
+        let previous = std::mem::replace(&mut self.keyboard_surface, next);
         self.modifiers = Modifiers::default();
+        for surface in &mut self.surfaces {
+            if keyboard_focus_transition_affects(
+                previous.as_ref(),
+                self.keyboard_surface.as_ref(),
+                surface.role.surface(),
+            ) {
+                surface.dirty = true;
+            }
+        }
     }
 
     fn clear_key_repeat(&mut self) {
@@ -2663,6 +2681,18 @@ fn reconcile_controlled_text_edit(
 
 fn direct_input_serial(direct: bool, serial: u32) -> Option<u32> {
     direct.then_some(serial)
+}
+
+fn keyboard_focus_transition_affects<T: PartialEq>(
+    previous: Option<&T>,
+    next: Option<&T>,
+    candidate: &T,
+) -> bool {
+    previous == Some(candidate) || next == Some(candidate)
+}
+
+fn keyboard_leave_matches<T: PartialEq>(current: Option<&T>, leaving: &T) -> bool {
+    current == Some(leaving)
 }
 
 fn focused_widget_is_interactive(layout: Option<&Layout>, id: NodeId) -> bool {
@@ -3700,8 +3730,9 @@ mod input_tests {
 
     use super::{
         RepeatSession, RepeatTimerAction, SliderKeyAction, TextKeyAction, WidgetKeyAction,
-        direct_input_serial, focused_widget_is_interactive, reconcile_controlled_text_edit,
-        scroll_distance, text_key_action, widget_key_action,
+        direct_input_serial, focused_widget_is_interactive, keyboard_focus_transition_affects,
+        keyboard_leave_matches, reconcile_controlled_text_edit, scroll_distance, text_key_action,
+        widget_key_action,
     };
 
     struct FixedMeasurer;
@@ -3831,6 +3862,7 @@ mod input_tests {
         let insert = text_key_action(&event, Modifiers::default(), true).unwrap();
         assert_eq!(insert, TextKeyAction::Insert("é".into()));
         assert!(insert.repeats());
+        assert!(insert.changes_value());
 
         let ctrl = Modifiers {
             ctrl: true,
@@ -3839,6 +3871,7 @@ mod input_tests {
         let select = text_key_action(&key_event(30, Keysym::a), ctrl, true).unwrap();
         assert_eq!(select, TextKeyAction::SelectAll);
         assert!(!select.repeats());
+        assert!(!select.changes_value());
         assert_eq!(text_key_action(&event, ctrl, true), None);
 
         let alt_gr = Modifiers {
@@ -3858,6 +3891,14 @@ mod input_tests {
             text_key_action(&key_event(28, Keysym::Return), Modifiers::default(), false),
             None
         );
+        for action in [
+            TextKeyAction::MoveLeft,
+            TextKeyAction::MoveRight,
+            TextKeyAction::MoveToStart,
+            TextKeyAction::MoveToEnd,
+        ] {
+            assert!(!action.changes_value());
+        }
     }
 
     #[test]
@@ -3877,6 +3918,21 @@ mod input_tests {
         node.text = "accepted".into();
         reconcile_controlled_text_edit(&mut editor, &node, 100.0, "accepted", checkpoint);
         assert_eq!(editor.value(), "accepted");
+    }
+
+    #[test]
+    fn keyboard_focus_transitions_dirty_only_old_and_new_surfaces() {
+        assert!(keyboard_focus_transition_affects(Some(&1), Some(&2), &1));
+        assert!(keyboard_focus_transition_affects(Some(&1), Some(&2), &2));
+        assert!(!keyboard_focus_transition_affects(Some(&1), Some(&2), &3));
+
+        assert!(keyboard_focus_transition_affects(Some(&1), Some(&1), &1));
+        assert!(keyboard_focus_transition_affects(Some(&1), None, &1));
+        assert!(!keyboard_focus_transition_affects(Some(&1), None, &2));
+
+        assert!(keyboard_leave_matches(Some(&1), &1));
+        assert!(!keyboard_leave_matches(Some(&1), &2));
+        assert!(!keyboard_leave_matches::<u8>(None, &1));
     }
 
     #[test]
@@ -3981,8 +4037,7 @@ impl KeyboardHandler for App {
         _: &[u32],
         _: &[Keysym],
     ) {
-        self.clear_keyboard_focus();
-        self.keyboard_surface = Some(surface.clone());
+        self.set_keyboard_surface(Some(surface.clone()));
         self.reconcile_hover_intent();
     }
     fn leave(
@@ -3993,7 +4048,7 @@ impl KeyboardHandler for App {
         surface: &wl_surface::WlSurface,
         _: u32,
     ) {
-        if self.keyboard_surface.as_ref() == Some(surface) {
+        if keyboard_leave_matches(self.keyboard_surface.as_ref(), surface) {
             self.clear_keyboard_focus();
         }
         self.reconcile_hover_intent();
