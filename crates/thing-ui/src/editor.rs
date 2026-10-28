@@ -3,6 +3,7 @@ use std::{borrow::Cow, num::NonZeroUsize, ops::Range};
 use parley::{
     FontContext, FontFeature, FontSettings, FontStack, FontWeight, LayoutContext, PlainEditor,
     StyleProperty,
+    layout::{Affinity, Cursor, Selection},
 };
 use thing_core::{Node, TextAlign};
 use unicode_segmentation::UnicodeSegmentation;
@@ -17,6 +18,42 @@ static TABULAR_FEATURES: [FontFeature; 1] = [parley::swash::Setting {
 pub struct TextInputCheckpoint {
     editor: PlainEditor<()>,
     scroll_x: f32,
+    revision: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextInputPreedit {
+    pub text: String,
+    pub cursor: Option<(usize, usize)>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextInputImeBatch {
+    pub preedit: Option<TextInputPreedit>,
+    pub commit: String,
+    pub delete_before: usize,
+    pub delete_after: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextInputSurrounding {
+    pub value: String,
+    pub anchor: usize,
+    pub cursor: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextInputImeOutcome {
+    pub changed: bool,
+    pub surrounding: TextInputSurrounding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextInputImeError {
+    InvalidCursor,
+    InvalidDelete,
+    InvalidText,
+    ValueTooLong,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -48,6 +85,7 @@ pub struct TextInputEditor {
     style: EditorStyle,
     viewport_width: f32,
     scroll_x: f32,
+    revision: u64,
 }
 
 impl TextInputEditor {
@@ -60,6 +98,7 @@ impl TextInputEditor {
             style: style.clone(),
             viewport_width: viewport_width.max(0.0),
             scroll_x: 0.0,
+            revision: 0,
         };
         result.apply_style(&style);
         result.editor.set_width(None);
@@ -81,8 +120,9 @@ impl TextInputEditor {
             self.style = style;
         }
         self.viewport_width = viewport_width.max(0.0);
-        if self.editor.raw_text() != node.text {
+        if self.editor.text() != node.text.as_str() {
             self.editor.set_text(&node.text);
+            self.revision = self.revision.wrapping_add(1);
             self.refresh();
             self.editor
                 .driver(&mut self.fonts, &mut self.context)
@@ -96,16 +136,45 @@ impl TextInputEditor {
         TextInputCheckpoint {
             editor: self.editor.clone(),
             scroll_x: self.scroll_x,
+            revision: self.revision,
         }
     }
 
     pub fn restore(&mut self, checkpoint: TextInputCheckpoint) {
         self.editor = checkpoint.editor;
         self.scroll_x = checkpoint.scroll_x;
+        self.revision = checkpoint.revision;
     }
 
-    pub fn value(&self) -> &str {
-        self.editor.raw_text()
+    pub fn value(&self) -> Cow<'_, str> {
+        if self.editor.raw_compose().is_some() {
+            Cow::Owned(self.editor.text().to_string())
+        } else {
+            Cow::Borrowed(self.editor.raw_text())
+        }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn display_is_empty(&self) -> bool {
+        self.editor.raw_text().is_empty()
+    }
+
+    pub fn is_composing(&self) -> bool {
+        self.editor.raw_compose().is_some()
+    }
+
+    pub fn cancel_composition(&mut self) -> bool {
+        if !self.is_composing() {
+            return false;
+        }
+        self.editor
+            .driver(&mut self.fonts, &mut self.context)
+            .clear_compose();
+        self.ensure_caret_visible();
+        true
     }
 
     pub fn selected_text(&self) -> Option<&str> {
@@ -116,12 +185,138 @@ impl TextInputEditor {
         self.editor.raw_selection().text_range()
     }
 
-    pub fn replace_selection(&mut self, text: &str) -> bool {
-        if text
-            .chars()
-            .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
+    pub fn display_selection(&self) -> (usize, usize) {
+        let selection = self.editor.raw_selection();
+        (selection.anchor().index(), selection.focus().index())
+    }
+
+    pub fn surrounding(&self) -> TextInputSurrounding {
+        let value = self.value().into_owned();
+        if let Some(compose) = self.editor.raw_compose() {
+            return TextInputSurrounding {
+                value,
+                anchor: compose.start,
+                cursor: compose.start,
+            };
+        }
+        let selection = self.editor.raw_selection();
+        TextInputSurrounding {
+            value,
+            anchor: selection.anchor().index(),
+            cursor: selection.focus().index(),
+        }
+    }
+
+    pub fn apply_ime_batch(
+        &mut self,
+        batch: TextInputImeBatch,
+    ) -> Result<TextInputImeOutcome, TextInputImeError> {
+        let checkpoint = self.checkpoint();
+        let previous = self.surrounding();
+        let result = self.apply_ime_batch_inner(batch, &previous);
+        if result.is_err() {
+            self.restore(checkpoint);
+        }
+        result
+    }
+
+    fn apply_ime_batch_inner(
+        &mut self,
+        batch: TextInputImeBatch,
+        previous: &TextInputSurrounding,
+    ) -> Result<TextInputImeOutcome, TextInputImeError> {
+        if invalid_text(&batch.commit) {
+            return Err(TextInputImeError::InvalidText);
+        }
+        if let Some(preedit) = &batch.preedit {
+            validate_preedit(preedit)?;
+        }
+
+        if self.is_composing() {
+            self.editor
+                .driver(&mut self.fonts, &mut self.context)
+                .clear_compose();
+        }
+        self.delete_surrounding(batch.delete_before, batch.delete_after)?;
+        if !batch.commit.is_empty() {
+            self.replace_selection_inner(&batch.commit, false)?;
+        }
+
+        let preedit = batch.preedit.filter(|preedit| !preedit.text.is_empty());
+        if preedit.is_some() && !self.editor.raw_selection().is_collapsed() {
+            self.editor
+                .driver(&mut self.fonts, &mut self.context)
+                .delete_selection();
+        }
+        let surrounding = self.surrounding();
+
+        if let Some(preedit) = preedit {
+            let selected = self.selection_range().len();
+            let next_len = self
+                .editor
+                .raw_text()
+                .len()
+                .checked_sub(selected)
+                .and_then(|len| len.checked_add(preedit.text.len()))
+                .ok_or(TextInputImeError::ValueTooLong)?;
+            if next_len > MAX_VALUE_BYTES {
+                return Err(TextInputImeError::ValueTooLong);
+            }
+            self.editor
+                .driver(&mut self.fonts, &mut self.context)
+                .set_compose(&preedit.text, preedit.cursor);
+        }
+
+        let changed = surrounding.value != previous.value;
+        if surrounding != *previous {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        self.ensure_caret_visible();
+        Ok(TextInputImeOutcome {
+            changed,
+            surrounding,
+        })
+    }
+
+    fn delete_surrounding(&mut self, before: usize, after: usize) -> Result<(), TextInputImeError> {
+        let selection = *self.editor.raw_selection();
+        let range = selection.text_range();
+        let start = range
+            .start
+            .checked_sub(before)
+            .ok_or(TextInputImeError::InvalidDelete)?;
+        let end = range
+            .end
+            .checked_add(after)
+            .filter(|end| *end <= self.editor.raw_text().len())
+            .ok_or(TextInputImeError::InvalidDelete)?;
+        if !self.editor.raw_text().is_char_boundary(start)
+            || !self.editor.raw_text().is_char_boundary(end)
         {
-            return false;
+            return Err(TextInputImeError::InvalidDelete);
+        }
+        let mut driver = self.editor.driver(&mut self.fonts, &mut self.context);
+        if let Some(after) = NonZeroUsize::new(after) {
+            driver.delete_bytes_after_selection(after);
+        }
+        if let Some(before) = NonZeroUsize::new(before) {
+            driver.delete_bytes_before_selection(before);
+        }
+        Ok(())
+    }
+
+    pub fn replace_selection(&mut self, text: &str) -> bool {
+        self.cancel_composition();
+        self.replace_selection_inner(text, true).unwrap_or(false)
+    }
+
+    fn replace_selection_inner(
+        &mut self,
+        text: &str,
+        update_revision: bool,
+    ) -> Result<bool, TextInputImeError> {
+        if invalid_text(text) {
+            return Err(TextInputImeError::InvalidText);
         }
         let selected = self.selection_range().len();
         let Some(next_len) = self
@@ -131,21 +326,27 @@ impl TextInputEditor {
             .checked_sub(selected)
             .and_then(|len| len.checked_add(text.len()))
         else {
-            return false;
+            return Err(TextInputImeError::ValueTooLong);
         };
         if next_len > MAX_VALUE_BYTES {
-            return false;
+            return Err(TextInputImeError::ValueTooLong);
         }
-        let before = self.editor.raw_text().to_owned();
+        let before = self.surrounding();
         self.editor
             .driver(&mut self.fonts, &mut self.context)
             .insert_or_replace_selection(text);
         self.ensure_caret_visible();
-        self.editor.raw_text() != before
+        let after = self.surrounding();
+        let changed = after.value != before.value;
+        if update_revision && after != before {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        Ok(changed)
     }
 
     pub fn backspace(&mut self, word: bool) -> bool {
-        let before = self.editor.raw_text().to_owned();
+        self.cancel_composition();
+        let before = self.surrounding();
         self.refresh();
         let selection = *self.editor.raw_selection();
         let grapheme_len = if selection.is_collapsed() && !word {
@@ -167,11 +368,17 @@ impl TextInputEditor {
             driver.delete_bytes_before_selection(len);
         }
         self.ensure_caret_visible();
-        self.editor.raw_text() != before
+        let after = self.surrounding();
+        let changed = after.value != before.value;
+        if after != before {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        changed
     }
 
     pub fn delete(&mut self, word: bool) -> bool {
-        let before = self.editor.raw_text().to_owned();
+        self.cancel_composition();
+        let before = self.surrounding();
         self.refresh();
         let selection = *self.editor.raw_selection();
         let grapheme_len = if selection.is_collapsed() && !word {
@@ -193,10 +400,17 @@ impl TextInputEditor {
             driver.delete_bytes_after_selection(len);
         }
         self.ensure_caret_visible();
-        self.editor.raw_text() != before
+        let after = self.surrounding();
+        let changed = after.value != before.value;
+        if after != before {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        changed
     }
 
     pub fn move_left(&mut self, select: bool, word: bool) {
+        self.cancel_composition();
+        let before = self.display_selection();
         let mut driver = self.editor.driver(&mut self.fonts, &mut self.context);
         match (select, word) {
             (false, false) => driver.move_left(),
@@ -204,10 +418,15 @@ impl TextInputEditor {
             (true, false) => driver.select_left(),
             (true, true) => driver.select_word_left(),
         }
+        if self.display_selection() != before {
+            self.revision = self.revision.wrapping_add(1);
+        }
         self.ensure_caret_visible();
     }
 
     pub fn move_right(&mut self, select: bool, word: bool) {
+        self.cancel_composition();
+        let before = self.display_selection();
         let mut driver = self.editor.driver(&mut self.fonts, &mut self.context);
         match (select, word) {
             (false, false) => driver.move_right(),
@@ -215,10 +434,15 @@ impl TextInputEditor {
             (true, false) => driver.select_right(),
             (true, true) => driver.select_word_right(),
         }
+        if self.display_selection() != before {
+            self.revision = self.revision.wrapping_add(1);
+        }
         self.ensure_caret_visible();
     }
 
     pub fn move_to_start(&mut self, select: bool) {
+        self.cancel_composition();
+        let before = self.display_selection();
         let mut driver = self.editor.driver(&mut self.fonts, &mut self.context);
         // this editor is unwrapped and single-line. parley's text-start motion
         // preserves the horizontal position when the layout has only one line.
@@ -227,39 +451,62 @@ impl TextInputEditor {
         } else {
             driver.move_to_line_start();
         }
+        if self.display_selection() != before {
+            self.revision = self.revision.wrapping_add(1);
+        }
         self.ensure_caret_visible();
     }
 
     pub fn move_to_end(&mut self, select: bool) {
+        self.cancel_composition();
+        let before = self.display_selection();
         let mut driver = self.editor.driver(&mut self.fonts, &mut self.context);
         if select {
             driver.select_to_line_end();
         } else {
             driver.move_to_line_end();
         }
+        if self.display_selection() != before {
+            self.revision = self.revision.wrapping_add(1);
+        }
         self.ensure_caret_visible();
     }
 
     pub fn select_all(&mut self) {
+        self.cancel_composition();
+        let before = self.display_selection();
         self.editor
             .driver(&mut self.fonts, &mut self.context)
             .select_all();
+        if self.display_selection() != before {
+            self.revision = self.revision.wrapping_add(1);
+        }
         self.ensure_caret_visible();
     }
 
     pub fn move_to_point(&mut self, x: f32, y: f32) {
+        self.cancel_composition();
+        let before = self.display_selection();
         let x = x - self.text_offset_x();
         self.editor
             .driver(&mut self.fonts, &mut self.context)
             .move_to_point(x, y);
+        if self.display_selection() != before {
+            self.revision = self.revision.wrapping_add(1);
+        }
         self.ensure_caret_visible();
     }
 
     pub fn extend_selection_to_point(&mut self, x: f32, y: f32) {
+        self.cancel_composition();
+        let before = self.display_selection();
         let x = x - self.text_offset_x();
         self.editor
             .driver(&mut self.fonts, &mut self.context)
             .extend_selection_to_point(x, y);
+        if self.display_selection() != before {
+            self.revision = self.revision.wrapping_add(1);
+        }
         self.ensure_caret_visible();
     }
 
@@ -275,6 +522,22 @@ impl TextInputEditor {
 
     pub fn cursor_geometry(&self) -> Option<parley::BoundingBox> {
         self.editor.cursor_geometry(1.0)
+    }
+
+    pub fn preedit_geometry(&self) -> Vec<(parley::BoundingBox, usize)> {
+        let Some(range) = self.editor.raw_compose() else {
+            return Vec::new();
+        };
+        let layout = self.layout();
+        Selection::new(
+            Cursor::from_byte_index(layout, range.start, Affinity::Downstream),
+            Cursor::from_byte_index(layout, range.end, Affinity::Upstream),
+        )
+        .geometry(layout)
+    }
+
+    pub fn ime_cursor_area(&self) -> parley::BoundingBox {
+        self.editor.ime_cursor_area()
     }
 
     pub fn text_offset_x(&self) -> f32 {
@@ -343,6 +606,24 @@ impl TextInputEditor {
         }
         self.scroll_x = self.scroll_x.clamp(0.0, max_scroll);
     }
+}
+
+fn invalid_text(text: &str) -> bool {
+    text.chars()
+        .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
+}
+
+fn validate_preedit(preedit: &TextInputPreedit) -> Result<(), TextInputImeError> {
+    if invalid_text(&preedit.text) {
+        return Err(TextInputImeError::InvalidText);
+    }
+    let Some((anchor, cursor)) = preedit.cursor else {
+        return Ok(());
+    };
+    if !preedit.text.is_char_boundary(anchor) || !preedit.text.is_char_boundary(cursor) {
+        return Err(TextInputImeError::InvalidCursor);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -553,5 +834,334 @@ mod tests {
             assert!(!editor.replace_selection(&invalid.to_string()));
             assert_eq!(editor.value(), "safe");
         }
+    }
+
+    #[test]
+    fn preedit_is_displayed_without_entering_the_controlled_value() {
+        let mut editor = editor("abc");
+        let outcome = editor
+            .apply_ime_batch(TextInputImeBatch {
+                preedit: Some(TextInputPreedit {
+                    text: "候補".into(),
+                    cursor: Some((6, 0)),
+                }),
+                ..TextInputImeBatch::default()
+            })
+            .unwrap();
+
+        assert_eq!(outcome.surrounding.value, "abc");
+        assert!(!outcome.changed);
+        assert_eq!(editor.value(), "abc");
+        assert_eq!(editor.display_selection(), (9, 3));
+        assert!(editor.is_composing());
+        assert!(!editor.display_is_empty());
+        assert!(!editor.preedit_geometry().is_empty());
+        assert!(editor.ime_cursor_area().width() > 0.0);
+    }
+
+    #[test]
+    fn preedit_replaces_selection_as_one_committed_change() {
+        let mut editor = editor("selected");
+        editor.select_all();
+        let outcome = editor
+            .apply_ime_batch(TextInputImeBatch {
+                preedit: Some(TextInputPreedit {
+                    text: "編集中".into(),
+                    cursor: Some((0, 9)),
+                }),
+                ..TextInputImeBatch::default()
+            })
+            .unwrap();
+
+        assert!(outcome.changed);
+        assert_eq!(outcome.surrounding.value, "");
+        assert_eq!(outcome.surrounding.anchor, 0);
+        assert_eq!(outcome.surrounding.cursor, 0);
+        assert_eq!(editor.value(), "");
+
+        let cleared = editor
+            .apply_ime_batch(TextInputImeBatch::default())
+            .unwrap();
+        assert!(!cleared.changed);
+        assert!(!editor.is_composing());
+        assert!(editor.display_is_empty());
+    }
+
+    #[test]
+    fn commit_replaces_old_preedit_before_installing_the_next_one() {
+        let mut editor = editor("abc");
+        editor
+            .apply_ime_batch(TextInputImeBatch {
+                preedit: Some(TextInputPreedit {
+                    text: "x".into(),
+                    cursor: Some((1, 1)),
+                }),
+                ..TextInputImeBatch::default()
+            })
+            .unwrap();
+        let outcome = editor
+            .apply_ime_batch(TextInputImeBatch {
+                preedit: Some(TextInputPreedit {
+                    text: "z".into(),
+                    cursor: None,
+                }),
+                commit: "y".into(),
+                ..TextInputImeBatch::default()
+            })
+            .unwrap();
+
+        assert_eq!(outcome.surrounding.value, "abcy");
+        assert_eq!(editor.value(), "abcy");
+        assert!(editor.is_composing());
+        assert!(editor.cursor_geometry().is_none());
+    }
+
+    #[test]
+    fn delete_surrounding_uses_utf8_bytes_outside_the_selection() {
+        let mut field = editor("aéXz");
+        field.move_to_start(false);
+        field.move_right(false, false);
+        field.move_right(false, false);
+        field.move_right(true, false);
+        assert_eq!(field.selection_range(), 3..4);
+
+        let outcome = field
+            .apply_ime_batch(TextInputImeBatch {
+                commit: "Q".into(),
+                delete_before: "é".len(),
+                delete_after: 1,
+                ..TextInputImeBatch::default()
+            })
+            .unwrap();
+        assert_eq!(outcome.surrounding.value, "aQ");
+
+        let mut invalid = editor("é");
+        let revision = invalid.revision();
+        assert_eq!(
+            invalid.apply_ime_batch(TextInputImeBatch {
+                delete_before: 1,
+                ..TextInputImeBatch::default()
+            }),
+            Err(TextInputImeError::InvalidDelete)
+        );
+        assert_eq!(invalid.value(), "é");
+        assert_eq!(invalid.revision(), revision);
+    }
+
+    #[test]
+    fn delete_surrounding_preserves_reversed_selection_orientation() {
+        let mut editor = editor("aéXz");
+        editor.move_to_start(false);
+        editor.move_right(false, false);
+        editor.move_right(false, false);
+        editor.move_right(false, false);
+        editor.move_left(true, false);
+        assert_eq!(editor.display_selection(), (4, 3));
+
+        let outcome = editor
+            .apply_ime_batch(TextInputImeBatch {
+                delete_before: "é".len(),
+                delete_after: 1,
+                ..TextInputImeBatch::default()
+            })
+            .unwrap();
+
+        assert_eq!(outcome.surrounding.value, "aX");
+        assert_eq!(outcome.surrounding.anchor, 2);
+        assert_eq!(outcome.surrounding.cursor, 1);
+    }
+
+    #[test]
+    fn delete_surrounding_counts_from_an_existing_preedit() {
+        let mut editor = editor("abcz");
+        editor.move_to_start(false);
+        editor.move_right(false, false);
+        editor.move_right(false, false);
+        editor
+            .apply_ime_batch(TextInputImeBatch {
+                preedit: Some(TextInputPreedit {
+                    text: "候".into(),
+                    cursor: Some((3, 3)),
+                }),
+                ..TextInputImeBatch::default()
+            })
+            .unwrap();
+
+        let outcome = editor
+            .apply_ime_batch(TextInputImeBatch {
+                commit: "Q".into(),
+                delete_before: 1,
+                delete_after: 1,
+                ..TextInputImeBatch::default()
+            })
+            .unwrap();
+        assert_eq!(outcome.surrounding.value, "aQz");
+    }
+
+    #[test]
+    fn invalid_ime_batches_restore_text_selection_and_revision() {
+        let mut editor = editor("é");
+        editor.move_to_start(false);
+        let before = editor.checkpoint();
+        let revision = editor.revision();
+        let invalid = TextInputImeBatch {
+            preedit: Some(TextInputPreedit {
+                text: "é".into(),
+                cursor: Some((1, 2)),
+            }),
+            ..TextInputImeBatch::default()
+        };
+        assert_eq!(
+            editor.apply_ime_batch(invalid),
+            Err(TextInputImeError::InvalidCursor)
+        );
+        assert_eq!(editor.value(), "é");
+        assert_eq!(editor.display_selection(), (0, 0));
+        assert_eq!(editor.revision(), revision);
+
+        assert_eq!(
+            editor.apply_ime_batch(TextInputImeBatch {
+                preedit: Some(TextInputPreedit {
+                    text: "x".repeat(MAX_VALUE_BYTES + 1),
+                    cursor: None,
+                }),
+                ..TextInputImeBatch::default()
+            }),
+            Err(TextInputImeError::ValueTooLong)
+        );
+        editor.restore(before);
+    }
+
+    #[test]
+    fn invalid_batches_preserve_an_existing_composition() {
+        let mut editor = editor("a long value that scrolls beyond the viewport");
+        editor
+            .apply_ime_batch(TextInputImeBatch {
+                preedit: Some(TextInputPreedit {
+                    text: "候補".into(),
+                    cursor: Some((6, 0)),
+                }),
+                ..TextInputImeBatch::default()
+            })
+            .unwrap();
+        let value = editor.value().into_owned();
+        let selection = editor.display_selection();
+        let scroll_x = editor.scroll_x;
+        let revision = editor.revision();
+
+        for invalid in [
+            TextInputImeBatch {
+                commit: "\n".into(),
+                ..TextInputImeBatch::default()
+            },
+            TextInputImeBatch {
+                preedit: Some(TextInputPreedit {
+                    text: "\u{2028}".into(),
+                    cursor: None,
+                }),
+                ..TextInputImeBatch::default()
+            },
+            TextInputImeBatch {
+                commit: "x".repeat(MAX_VALUE_BYTES + 1),
+                ..TextInputImeBatch::default()
+            },
+        ] {
+            assert!(editor.apply_ime_batch(invalid).is_err());
+            assert_eq!(editor.value(), value);
+            assert_eq!(editor.display_selection(), selection);
+            assert_eq!(editor.scroll_x, scroll_x);
+            assert_eq!(editor.revision(), revision);
+            assert!(editor.is_composing());
+        }
+    }
+
+    #[test]
+    fn exact_value_limit_is_accepted() {
+        let mut editor = editor(&"x".repeat(MAX_VALUE_BYTES - 1));
+        let outcome = editor
+            .apply_ime_batch(TextInputImeBatch {
+                commit: "y".into(),
+                ..TextInputImeBatch::default()
+            })
+            .unwrap();
+
+        assert_eq!(outcome.surrounding.value.len(), MAX_VALUE_BYTES);
+        assert!(outcome.changed);
+    }
+
+    #[test]
+    fn absent_and_empty_preedit_events_clear_composition() {
+        let mut editor = editor("value");
+        let compose = || TextInputImeBatch {
+            preedit: Some(TextInputPreedit {
+                text: "x".into(),
+                cursor: Some((1, 1)),
+            }),
+            ..TextInputImeBatch::default()
+        };
+
+        editor.apply_ime_batch(compose()).unwrap();
+        editor
+            .apply_ime_batch(TextInputImeBatch {
+                preedit: Some(TextInputPreedit::default()),
+                ..TextInputImeBatch::default()
+            })
+            .unwrap();
+        assert!(!editor.is_composing());
+
+        editor.apply_ime_batch(compose()).unwrap();
+        editor
+            .apply_ime_batch(TextInputImeBatch::default())
+            .unwrap();
+        assert!(!editor.is_composing());
+    }
+
+    #[test]
+    fn revision_tracks_only_committed_surrounding_changes() {
+        let mut editor = editor("abc");
+        let initial = editor.revision();
+        editor
+            .apply_ime_batch(TextInputImeBatch::default())
+            .unwrap();
+        assert_eq!(editor.revision(), initial);
+
+        editor.move_to_end(false);
+        assert_eq!(editor.revision(), initial);
+        editor.move_left(false, false);
+        let moved = editor.revision();
+        assert_ne!(moved, initial);
+        editor.move_right(false, false);
+        assert_ne!(editor.revision(), moved);
+
+        editor.select_all();
+        let selected = editor.revision();
+        assert!(!editor.replace_selection("abc"));
+        assert_ne!(editor.revision(), selected);
+        let collapsed = editor.revision();
+        editor.move_to_end(false);
+        assert_eq!(editor.revision(), collapsed);
+    }
+
+    #[test]
+    fn prepare_preserves_matching_composition_and_replaces_external_values() {
+        let mut editor = editor("old");
+        editor
+            .apply_ime_batch(TextInputImeBatch {
+                preedit: Some(TextInputPreedit {
+                    text: "x".into(),
+                    cursor: Some((1, 1)),
+                }),
+                ..TextInputImeBatch::default()
+            })
+            .unwrap();
+        let mut node = Node::new(NodeId(1), Kind::TextInput);
+        node.text = "old".into();
+        editor.prepare(&node, 160.0);
+        assert!(editor.is_composing());
+
+        node.text = "new".into();
+        editor.prepare(&node, 160.0);
+        assert!(!editor.is_composing());
+        assert_eq!(editor.value(), "new");
     }
 }

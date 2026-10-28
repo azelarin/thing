@@ -311,10 +311,18 @@ extends the selection; control adds word movement or deletion, and control-a
 selects everything. enter calls `on_submit`. values and placeholders are limited
 to one mib and cannot contain control characters or unicode line separators.
 
-this first text-entry layer handles text reported directly by the keyboard. it
-does not yet implement wayland's text-input protocol, so input-method preedit and
-on-screen keyboards are not supported. system clipboard shortcuts are also not
-available yet. both remain part of the incomplete text-input roadmap item.
+when the compositor provides wayland's text-input-v3 protocol, the field also
+accepts input methods and on-screen keyboards. composing text is shown in the
+field with an underline but is not included in `value`. if composition replaces
+a selection, that deletion is still proposed through `on_change`. thing reports
+the edited area so the compositor can place candidate windows nearby.
+
+this support is for ordinary, non-sensitive text. while a field is focused,
+thing may share a window of up to 4,000 bytes around its selection with the
+compositor and input method. `text_input` does not yet have content-purpose or
+password controls, so it cannot mark a field as secret. system clipboard
+shortcuts are also not available yet; the opt-in clipboard service described
+below is separate from focused-field copy and paste.
 
 `centerbox` takes exactly three non-popup children: start, center, and end. give
 it an explicit height and width (or `grow = 1` inside a row). the middle child

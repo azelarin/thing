@@ -5,7 +5,10 @@ mod images;
 mod layout;
 mod paint;
 mod text;
-pub use editor::{TextInputCheckpoint, TextInputEditor};
+pub use editor::{
+    TextInputCheckpoint, TextInputEditor, TextInputImeBatch, TextInputImeError,
+    TextInputImeOutcome, TextInputPreedit, TextInputSurrounding,
+};
 pub use femtovg::renderer::OpenGl;
 #[cfg(feature = "wgpu")]
 pub use femtovg::renderer::{WGPURenderOutput, WGPURenderer};
