@@ -3,6 +3,16 @@
 keep each pull request focused on one change. explain what it does and how you
 checked it. if it changes the luau api, update the configuration guide too.
 
+## issues
+
+if something breaks, open an issue with the steps to reproduce it, what you
+expected, and what happened. a small luau configuration and the error output
+usually help more than a description alone. for display problems, include your
+compositor, graphics driver, and output scale.
+
+feature requests are welcome too. describe what you're trying to build and where
+the current api gets in your way.
+
 ## pull requests
 
 work on a branch and open a draft while the change is in progress. use
@@ -26,8 +36,7 @@ python3 -m unittest discover -s tools -p 'test_*.py'
 
 text tests need an installed font, and socket tests need permission to bind local
 unix sockets. for rendering or input changes, also try the affected behavior in
-a wayland session. include the compositor, driver, and output scale when reporting
-a graphical problem.
+a wayland session.
 
 keep `Cargo.lock` when building. before updating dependencies, check that the
 runtime tests pass: `mlua` 0.12.2 currently needs the locked `luau0-src` version.

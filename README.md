@@ -37,7 +37,8 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] luau configurations, reactive state, and reloads
 - [x] panels, popups, layout, text, and images
 - [x] clock, output audio controls, and niri workspaces and windows
-- [ ] per-output configuration, sizing, and input regions
+- [x] per-output configuration
+- [ ] panel sizing and input regions
 - [ ] hover popups, scrolling containers, text input, and keyboard repeat
 - [ ] drag and drop, animations, and custom shapes
 - [ ] microphone and per-application audio controls

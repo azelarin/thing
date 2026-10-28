@@ -47,9 +47,8 @@ sections below explain the rest of the api.
 ## outputs
 
 thing runs a separate configuration for each connected output. each has its own
-local state, so opening a popup or changing a counter on one monitor doesn't
-change the other monitors. desktop services such as audio still describe the
-same system.
+local state, so changing a counter on one monitor doesn't change the counters on
+other monitors. desktop services such as audio still describe the same system.
 
 use `services.output` to read the output that owns your panel:
 
@@ -74,8 +73,9 @@ ui.text {
 
 you can also read them during setup to choose a different layout for a particular
 output. those reads capture the current value; they don't subscribe to changes.
-the scale can update after the compositor supplies its preferred fractional
-scale.
+the initial scale comes from the compositor's integer output scale. it can
+update after the compositor supplies its preferred fractional scale, so use a
+property function when your layout depends on it.
 
 `thing check` runs without a display. its output is unavailable, with an empty
 name, zero width and height, and a scale of `1`. output-specific branches still
