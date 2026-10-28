@@ -8,7 +8,7 @@ use std::{
     os::{fd::AsRawFd, unix::net::UnixStream},
     sync::{Arc, Mutex, MutexGuard},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_io::{Async, Timer};
@@ -40,6 +40,7 @@ const MAX_COMMANDS: usize = 128;
 const MAX_PLAYER_QUERIES: usize = 4;
 const MAX_PROPERTY_BYTES: usize = 256 * 1024;
 const METHOD_TIMEOUT: Duration = Duration::from_secs(2);
+const QUERY_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct Command {
@@ -63,6 +64,11 @@ struct QueryRequest {
 struct QueryResult {
     request: QueryRequest,
     result: Result<Player, String>,
+}
+
+struct DelayedQuery {
+    deadline: Instant,
+    request: QueryRequest,
 }
 
 type PlayerQuery = LocalBoxFuture<'static, QueryResult>;
@@ -338,6 +344,7 @@ async fn session(
     publish(update_shared(shared, &model));
     let mut running = BTreeSet::new();
     let mut queries = FuturesUnordered::<PlayerQuery>::new();
+    let mut retries = BTreeMap::new();
 
     loop {
         if stopping(shared) {
@@ -348,6 +355,7 @@ async fn session(
             &mut names,
             &mut known,
             &mut queued,
+            &mut retries,
             &mut model,
             next_player_id,
         )? {
@@ -356,6 +364,7 @@ async fn session(
         if stopping(shared) {
             return Ok(());
         }
+        let retry_deadline = retries.values().map(|retry| retry.deadline).min();
         let input = future::race(
             async { Input::Name(names.next().await) },
             future::race(
@@ -368,14 +377,23 @@ async fn session(
                         Input::Query(result)
                     },
                     future::race(
-                        async {
-                            let command = { lock(shared).commands.pop_front() };
-                            let Some(command) = command else {
+                        async move {
+                            let Some(deadline) = retry_deadline else {
                                 return future::pending().await;
                             };
-                            Input::Command(command)
+                            Timer::at(deadline).await;
+                            Input::Retry
                         },
-                        async { Input::Wake(wake_source.readable().await) },
+                        future::race(
+                            async {
+                                let command = { lock(shared).commands.pop_front() };
+                                let Some(command) = command else {
+                                    return future::pending().await;
+                                };
+                                Input::Command(command)
+                            },
+                            async { Input::Wake(wake_source.readable().await) },
+                        ),
                     ),
                 ),
             ),
@@ -387,7 +405,14 @@ async fn session(
                 drain(wake_source.get_ref());
             }
             Input::Name(Some(Ok(message))) => {
-                if apply_name_event(message, &mut known, &mut queued, &mut model, next_player_id)? {
+                if apply_name_event(
+                    message,
+                    &mut known,
+                    &mut queued,
+                    &mut retries,
+                    &mut model,
+                    next_player_id,
+                )? {
                     publish(update_shared(shared, &model));
                 }
             }
@@ -398,6 +423,7 @@ async fn session(
                     continue;
                 };
                 for (name, player) in known.iter().filter(|(_, player)| player.owner == owner) {
+                    retries.remove(&player.id);
                     queue_player_query(&mut queued, name.clone(), player.clone(), true);
                 }
             }
@@ -414,28 +440,71 @@ async fn session(
                     return Ok(());
                 }
             }
-            Input::Query(result) => {
-                running.remove(&result.request.player.id);
+            Input::Query(QueryResult { request, result }) => {
+                running.remove(&request.player.id);
                 if drain_pending_name_events(
                     &mut names,
                     &mut known,
                     &mut queued,
+                    &mut retries,
                     &mut model,
                     next_player_id,
                 )? {
                     publish(update_shared(shared, &model));
                 }
-                let current = known.get(&result.request.name).is_some_and(|player| {
-                    player.id == result.request.player.id
-                        && player.owner == result.request.player.owner
+                let current = known.get(&request.name).is_some_and(|player| {
+                    player.id == request.player.id && player.owner == request.player.owner
                 });
-                if current && let Ok(player) = result.result {
-                    if result.request.tracks_transition {
-                        model.update(player);
-                    } else {
-                        model.discover(player);
+                let discovered = model.player(&request.name).is_some_and(|player| {
+                    player.id == request.player.id && player.owner == request.player.owner
+                });
+                if current {
+                    match result {
+                        Ok(player) => {
+                            retries.remove(&request.player.id);
+                            if request.tracks_transition {
+                                model.update(player);
+                            } else {
+                                model.discover(player);
+                            }
+                            publish(update_shared(shared, &model));
+                        }
+                        Err(_) if !discovered => schedule_player_retry(&mut retries, request),
+                        Err(_) => {}
                     }
+                }
+            }
+            Input::Retry => {
+                let Some(request) = take_due_player_retry(&mut retries, Instant::now()) else {
+                    continue;
+                };
+                if drain_pending_name_events(
+                    &mut names,
+                    &mut known,
+                    &mut queued,
+                    &mut retries,
+                    &mut model,
+                    next_player_id,
+                )? {
                     publish(update_shared(shared, &model));
+                }
+                let current = known.get(&request.name).is_some_and(|player| {
+                    player.id == request.player.id && player.owner == request.player.owner
+                });
+                let discovered = model.player(&request.name).is_some_and(|player| {
+                    player.id == request.player.id && player.owner == request.player.owner
+                });
+                if current
+                    && !discovered
+                    && !running.contains(&request.player.id)
+                    && !queued.contains_key(&request.player.id)
+                {
+                    queue_player_query(
+                        &mut queued,
+                        request.name,
+                        request.player,
+                        request.tracks_transition,
+                    );
                 }
             }
         }
@@ -448,6 +517,40 @@ enum Input {
     Wake(io::Result<()>),
     Command(Command),
     Query(QueryResult),
+    Retry,
+}
+
+fn schedule_player_retry(retries: &mut BTreeMap<String, DelayedQuery>, request: QueryRequest) {
+    if retries.contains_key(&request.player.id) || retries.len() >= MAX_PLAYERS {
+        return;
+    }
+    retries.insert(
+        request.player.id.clone(),
+        DelayedQuery {
+            deadline: Instant::now() + QUERY_RETRY_DELAY,
+            request,
+        },
+    );
+}
+
+fn take_due_player_retry(
+    retries: &mut BTreeMap<String, DelayedQuery>,
+    now: Instant,
+) -> Option<QueryRequest> {
+    let id = retries
+        .iter()
+        .find(|(_, retry)| retry.deadline <= now)
+        .map(|(id, _)| id.clone())?;
+    retries.remove(&id).map(|retry| retry.request)
+}
+
+fn discard_player_queries(
+    queued: &mut BTreeMap<String, QueryRequest>,
+    retries: &mut BTreeMap<String, DelayedQuery>,
+    id: &str,
+) {
+    queued.remove(id);
+    retries.remove(id);
 }
 
 fn queue_player_query(
@@ -501,6 +604,7 @@ fn drain_pending_name_events(
     names: &mut MessageStream,
     known: &mut BTreeMap<String, KnownPlayer>,
     queued: &mut BTreeMap<String, QueryRequest>,
+    retries: &mut BTreeMap<String, DelayedQuery>,
     model: &mut Model,
     next_player_id: &mut u64,
 ) -> Result<bool, String> {
@@ -509,7 +613,8 @@ fn drain_pending_name_events(
         match names.next().now_or_never() {
             None => return Ok(changed),
             Some(Some(Ok(message))) => {
-                changed |= apply_name_event(message, known, queued, model, next_player_id)?;
+                changed |=
+                    apply_name_event(message, known, queued, retries, model, next_player_id)?;
             }
             Some(Some(Err(error))) => return Err(error.to_string()),
             Some(None) => return Err("media name subscription ended".into()),
@@ -521,6 +626,7 @@ fn apply_name_event(
     message: Message,
     known: &mut BTreeMap<String, KnownPlayer>,
     queued: &mut BTreeMap<String, QueryRequest>,
+    retries: &mut BTreeMap<String, DelayedQuery>,
     model: &mut Model,
     next_player_id: &mut u64,
 ) -> Result<bool, String> {
@@ -541,7 +647,7 @@ fn apply_name_event(
             .cloned()
         {
             known.remove(&name);
-            queued.remove(&player.id);
+            discard_player_queries(queued, retries, &player.id);
         }
         changed = true;
     }
@@ -553,7 +659,7 @@ fn apply_name_event(
         {
             model.remove(&name, &player.owner);
             known.remove(&name);
-            queued.remove(&player.id);
+            discard_player_queries(queued, retries, &player.id);
             changed = true;
         }
         if let Some(player) = register_player(known, &name, &new_owner, next_player_id)? {
@@ -818,7 +924,6 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
             mpsc,
         },
-        time::Instant,
     };
 
     use tempfile::TempDir;
@@ -834,6 +939,55 @@ mod tests {
         assert!(is_player_name("org.mpris.MediaPlayer2.firefox"));
         assert!(!is_player_name("org.mpris.MediaPlayer2"));
         assert!(!is_player_name("org.mpris.MediaPlayer20.firefox"));
+    }
+
+    #[test]
+    fn failed_query_retries_are_bounded_and_deduplicated() {
+        let mut retries = BTreeMap::new();
+        for index in 0..=MAX_PLAYERS {
+            schedule_player_retry(
+                &mut retries,
+                QueryRequest {
+                    name: format!("{PLAYER_NAME}-{index}"),
+                    player: KnownPlayer {
+                        owner: format!(":1.{index}"),
+                        id: format!("p{index}"),
+                    },
+                    tracks_transition: false,
+                },
+            );
+        }
+        assert_eq!(retries.len(), MAX_PLAYERS);
+
+        let first_deadline = retries["p0"].deadline;
+        schedule_player_retry(
+            &mut retries,
+            QueryRequest {
+                name: PLAYER_NAME.into(),
+                player: KnownPlayer {
+                    owner: ":1.0".into(),
+                    id: "p0".into(),
+                },
+                tracks_transition: true,
+            },
+        );
+        assert_eq!(retries.len(), MAX_PLAYERS);
+        assert_eq!(retries["p0"].deadline, first_deadline);
+        assert!(!retries["p0"].request.tracks_transition);
+
+        let mut queued = BTreeMap::from([("p1".into(), retries["p1"].request.clone())]);
+        discard_player_queries(&mut queued, &mut retries, "p1");
+        assert!(!queued.contains_key("p1"));
+        assert!(!retries.contains_key("p1"));
+
+        retries.get_mut("p0").unwrap().deadline = Instant::now();
+        assert_eq!(
+            take_due_player_retry(&mut retries, Instant::now())
+                .unwrap()
+                .player
+                .id,
+            "p0"
+        );
     }
 
     #[test]
@@ -1223,6 +1377,122 @@ mod tests {
     }
 
     #[test]
+    fn initial_query_failure_recovers_without_another_signal() {
+        let directory = TempDir::new().unwrap();
+        let socket = directory.path().join("bus");
+        let address = format!("unix:path={}", socket.display());
+        let mut bus = Bus::start(&address);
+        let state = Arc::new(Mutex::new(FakeState::new(
+            &"x".repeat(MAX_PROPERTY_BYTES + 1),
+            true,
+        )));
+        let calls = Arc::new(FakeCalls::default());
+        let player = fake_player(&address, state.clone(), calls.clone());
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let media = Media::start_at(Some(address), ping).unwrap();
+
+        wait_until(|| calls.metadata_queries.load(Ordering::Acquire) == 1);
+        state.lock().unwrap().title = "recovered title".into();
+        let snapshot = wait_for(&media, |snapshot| snapshot.title == "recovered title");
+        assert!(snapshot.available);
+        assert!(calls.metadata_queries.load(Ordering::Acquire) >= 2);
+
+        drop(media);
+        drop(player);
+        bus.stop();
+    }
+
+    #[test]
+    fn property_signal_supersedes_a_pending_discovery_retry() {
+        let directory = TempDir::new().unwrap();
+        let socket = directory.path().join("bus");
+        let address = format!("unix:path={}", socket.display());
+        let mut bus = Bus::start(&address);
+        let state = Arc::new(Mutex::new(FakeState::new(
+            &"x".repeat(MAX_PROPERTY_BYTES + 1),
+            true,
+        )));
+        let calls = Arc::new(FakeCalls::default());
+        let player = fake_player(&address, state.clone(), calls.clone());
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let media = Media::start_at(Some(address), ping).unwrap();
+
+        wait_until(|| calls.metadata_queries.load(Ordering::Acquire) == 1);
+        state.lock().unwrap().title = "recovered title".into();
+        emit_invalidated_properties(&player);
+        let snapshot = wait_for(&media, |snapshot| snapshot.title == "recovered title");
+        assert!(snapshot.available);
+        assert_eq!(calls.metadata_queries.load(Ordering::Acquire), 2);
+        thread::sleep(QUERY_RETRY_DELAY + Duration::from_millis(100));
+        assert_eq!(calls.metadata_queries.load(Ordering::Acquire), 2);
+
+        drop(media);
+        drop(player);
+        bus.stop();
+    }
+
+    #[test]
+    fn retired_lifetime_discards_its_pending_discovery_retry() {
+        let directory = TempDir::new().unwrap();
+        let socket = directory.path().join("bus");
+        let address = format!("unix:path={}", socket.display());
+        let mut bus = Bus::start(&address);
+        let state = Arc::new(Mutex::new(FakeState::new(
+            &"x".repeat(MAX_PROPERTY_BYTES + 1),
+            true,
+        )));
+        let calls = Arc::new(FakeCalls::default());
+        let player = fake_player(&address, state.clone(), calls.clone());
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let media = Media::start_at(Some(address), ping).unwrap();
+
+        wait_until(|| calls.metadata_queries.load(Ordering::Acquire) == 1);
+        state.lock().unwrap().title = "replacement title".into();
+        assert!(async_io::block_on(player.release_name(PLAYER_NAME)).unwrap());
+        async_io::block_on(player.request_name(PLAYER_NAME)).unwrap();
+        let snapshot = wait_for(&media, |snapshot| snapshot.title == "replacement title");
+        assert!(snapshot.available);
+        assert_eq!(calls.metadata_queries.load(Ordering::Acquire), 2);
+        thread::sleep(QUERY_RETRY_DELAY + Duration::from_millis(100));
+        assert_eq!(calls.metadata_queries.load(Ordering::Acquire), 2);
+
+        drop(media);
+        drop(player);
+        bus.stop();
+    }
+
+    #[test]
+    fn persistent_discovery_failures_are_rate_limited_and_shutdown_is_bounded() {
+        let directory = TempDir::new().unwrap();
+        let socket = directory.path().join("bus");
+        let address = format!("unix:path={}", socket.display());
+        let mut bus = Bus::start(&address);
+        let calls = Arc::new(FakeCalls::default());
+        let player = fake_player(
+            &address,
+            Arc::new(Mutex::new(FakeState::new(
+                &"x".repeat(MAX_PROPERTY_BYTES + 1),
+                true,
+            ))),
+            calls.clone(),
+        );
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let media = Media::start_at(Some(address), ping).unwrap();
+
+        wait_until(|| calls.metadata_queries.load(Ordering::Acquire) == 1);
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(calls.metadata_queries.load(Ordering::Acquire), 1);
+        wait_until(|| calls.metadata_queries.load(Ordering::Acquire) == 2);
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        drop(media);
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        drop(player);
+        bus.stop();
+    }
+
+    #[test]
     fn shutdown_is_bounded_while_a_player_query_is_stalled() {
         let directory = TempDir::new().unwrap();
         let socket = directory.path().join("bus");
@@ -1466,22 +1736,25 @@ mod tests {
 
         #[zbus(property)]
         async fn metadata(&self) -> HashMap<String, OwnedValue> {
-            self.calls.metadata_queries.fetch_add(1, Ordering::Release);
-            let (stall, delay) = {
+            let (stall, delay, title) = {
                 let state = self.state.lock().unwrap();
-                (state.stall_metadata, state.metadata_delay)
+                (
+                    state.stall_metadata,
+                    state.metadata_delay,
+                    state.title.clone(),
+                )
             };
+            self.calls.metadata_queries.fetch_add(1, Ordering::Release);
             if stall {
                 std::future::pending::<()>().await;
             }
             if !delay.is_zero() {
                 Timer::after(delay).await;
             }
-            let state = self.state.lock().unwrap();
             HashMap::from([
                 (
                     "xesam:title".into(),
-                    Value::from(state.title.as_str()).try_into().unwrap(),
+                    Value::from(title.as_str()).try_into().unwrap(),
                 ),
                 (
                     "xesam:artist".into(),
