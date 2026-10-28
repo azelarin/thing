@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, path::PathBuf, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    time::Instant,
+};
 
 use thing_core::{Node, NodeId};
 use thing_runtime::{
@@ -117,6 +121,35 @@ impl<K: Clone + Eq> Configurations<K> {
             .is_some_and(|runtime| runtime.ui_target_is_current(target))
     }
 
+    pub(crate) fn ui_target_identity_is_current(&self, key: &K, target: &UiTarget) -> bool {
+        self.runtime(key)
+            .is_some_and(|runtime| runtime.ui_target_identity_is_current(target))
+    }
+
+    pub(crate) fn presented_target_is_current(
+        &self,
+        key: &K,
+        consumer: &str,
+        surface_root: NodeId,
+        target: &UiTarget,
+    ) -> bool {
+        self.consumer(key) == Some(consumer)
+            && self.ui_target_is_current(key, target)
+            && self.rendered_surface_root(key, target.node()) == Some(surface_root)
+    }
+
+    pub(crate) fn presented_target_identity_is_current(
+        &self,
+        key: &K,
+        consumer: &str,
+        surface_root: NodeId,
+        target: &UiTarget,
+    ) -> bool {
+        self.consumer(key) == Some(consumer)
+            && self.ui_target_identity_is_current(key, target)
+            && self.rendered_surface_root(key, target.node()) == Some(surface_root)
+    }
+
     pub(crate) fn rendered_surface_root(&self, key: &K, id: NodeId) -> Option<NodeId> {
         self.runtime(key)?.rendered_surface_root(id)
     }
@@ -130,6 +163,24 @@ impl<K: Clone + Eq> Configurations<K> {
         self.runtime(key).is_some_and(|runtime| {
             runtime.is_any_animating(layout.placements().iter().map(|placement| placement.id))
         })
+    }
+
+    pub(crate) fn presented_targets(
+        &self,
+        key: &K,
+        root: &Node,
+        layout: &Layout,
+    ) -> Option<(String, BTreeMap<NodeId, UiTarget>)> {
+        let consumer = self.consumer(key)?.to_owned();
+        let mut ids: BTreeSet<_> = layout.pointer_targets().collect();
+        if layout
+            .get(root.id)
+            .is_some_and(|placement| placement.enabled)
+        {
+            ids.insert(root.id);
+        }
+        let targets = self.runtime(key)?.ui_targets(&ids);
+        Some((consumer, targets))
     }
 
     pub(crate) fn output(&self, key: &K) -> Option<&OutputContext> {
@@ -478,7 +529,7 @@ mod tests {
     use std::{fs, sync::Arc, time::Duration};
 
     use tempfile::tempdir;
-    use thing_core::{KeyboardMode, Kind, Scale};
+    use thing_core::{KeyboardMode, Kind, Point, Scale};
     use thing_runtime::{
         AudioDevice, AudioSource, AudioStream, MediaPlayer, Notification, NotificationButton,
         NotificationUrgency, PowerDevice, SystemTrayItem, SystemTrayMenu, SystemTrayMenuItem,
@@ -854,6 +905,103 @@ mod tests {
         configurations.dispatch(&1, first, Event::Click).unwrap();
         assert!(configurations.root(&1).unwrap().children[0].children[0].visible);
         assert!(!configurations.root(&2).unwrap().children[0].children[0].visible);
+    }
+
+    #[test]
+    fn presented_hits_follow_keyed_identity_but_not_reused_node_ids() {
+        for keyed in [false, true] {
+            let directory = tempdir().unwrap();
+            let entry = directory.path().join("panel.luau");
+            let source = r#"
+                local replaced = ui.state(false)
+                local fired = ui.state('none')
+                local list = ui.row { children = function()
+                    local replacement = replaced:get()
+                    return { ui.button {
+                        __KEY__
+                        style = {
+                            width = replacement and 20 or 100,
+                            height = 30,
+                        },
+                        on_click = function()
+                            fired:set(replacement and 'new' or 'old')
+                        end,
+                    } }
+                end }
+                return ui.panel { children = {
+                    ui.button {
+                        key = 'replace',
+                        on_click = function() replaced:set(true) end,
+                    },
+                    list,
+                    ui.text { text = function() return fired:get() end },
+                } }
+                "#
+            .replace("__KEY__", if keyed { "key = 'target'," } else { "" });
+            fs::write(&entry, source).unwrap();
+            let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+            configurations.add(1, output("DP-1", 1920)).unwrap();
+
+            let root = configurations.root(&1).unwrap();
+            let surface_root = root.id;
+            let replace = root.children[0].id;
+            let target = root.children[1].children[0].id;
+            let presented = Layout::compute(
+                root,
+                Size {
+                    width: 300.0,
+                    height: 80.0,
+                },
+                &mut FixedText,
+            )
+            .unwrap();
+            let old = presented.get(target).unwrap().bounds;
+            let point = Point {
+                x: old.x + old.width - 1.0,
+                y: old.y + old.height / 2.0,
+            };
+            assert_eq!(presented.hit_test(point), Some(target));
+            let (consumer, presented_targets) = configurations
+                .presented_targets(&1, root, &presented)
+                .unwrap();
+            let presented_target = presented_targets.get(&target).unwrap().clone();
+
+            assert!(
+                configurations
+                    .dispatch(&1, replace, Event::Click)
+                    .unwrap()
+                    .changed
+            );
+            assert_eq!(
+                configurations.root(&1).unwrap().children[1].children[0].id,
+                target,
+                "both replacements reuse the presented node id",
+            );
+            let current = Layout::compute(
+                configurations.root(&1).unwrap(),
+                Size {
+                    width: 300.0,
+                    height: 80.0,
+                },
+                &mut FixedText,
+            )
+            .unwrap();
+            assert_ne!(current.hit_test(point), Some(target));
+            let current = configurations.presented_target_is_current(
+                &1,
+                &consumer,
+                surface_root,
+                &presented_target,
+            );
+            assert_eq!(current, keyed);
+
+            if current {
+                configurations
+                    .dispatch(&1, presented_target.node(), Event::Click)
+                    .unwrap();
+            }
+            assert_eq!(text(&configurations, 1), if keyed { "new" } else { "none" });
+        }
     }
 
     #[test]

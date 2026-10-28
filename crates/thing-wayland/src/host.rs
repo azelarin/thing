@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::Path,
     rc::Rc,
     time::{Duration, Instant},
@@ -397,10 +398,17 @@ struct SurfaceInit {
     scale: Scale,
 }
 
+struct PresentedSurface {
+    layout: Layout,
+    root: NodeId,
+    consumer: String,
+    targets: BTreeMap<NodeId, UiTarget>,
+}
+
 #[derive(Default)]
 struct SurfaceLayouts {
     // pointer geometry changes only after the corresponding frame is visible.
-    presented: Option<Layout>,
+    presented: Option<PresentedSurface>,
     // keyboard focus and ime can use the next layout before presentation.
     input: Option<Layout>,
     input_invalidated: bool,
@@ -414,11 +422,11 @@ enum LayoutSnapshot {
 
 impl SurfaceLayouts {
     fn presented(&self) -> Option<&Layout> {
-        self.presented.as_ref()
+        self.presented.as_ref().map(|presented| &presented.layout)
     }
 
     fn input(&self) -> Option<&Layout> {
-        self.input.as_ref().or(self.presented.as_ref())
+        self.input.as_ref().or_else(|| self.presented())
     }
 
     fn snapshot(&self, snapshot: LayoutSnapshot) -> Option<&Layout> {
@@ -433,8 +441,45 @@ impl SurfaceLayouts {
         self.input_invalidated = false;
     }
 
-    fn publish(&mut self, layout: Layout) {
-        self.presented = Some(layout);
+    fn presented_target(&self, id: NodeId) -> Option<ScopedUiTarget> {
+        let presented = self.presented.as_ref()?;
+        Some(ScopedUiTarget {
+            consumer: presented.consumer.clone(),
+            target: presented.targets.get(&id)?.clone(),
+        })
+    }
+
+    fn presented_path(&self, id: NodeId) -> Vec<ScopedUiTarget> {
+        let Some(presented) = &self.presented else {
+            return Vec::new();
+        };
+        let Some(target) = presented.targets.get(&id) else {
+            return Vec::new();
+        };
+        target
+            .interactive_path_from(presented.root)
+            .filter_map(|id| {
+                Some(ScopedUiTarget {
+                    consumer: presented.consumer.clone(),
+                    target: presented.targets.get(&id)?.clone(),
+                })
+            })
+            .collect()
+    }
+
+    fn publish(
+        &mut self,
+        layout: Layout,
+        root: NodeId,
+        consumer: String,
+        targets: BTreeMap<NodeId, UiTarget>,
+    ) {
+        self.presented = Some(PresentedSurface {
+            layout,
+            root,
+            consumer,
+            targets,
+        });
         self.input = None;
         self.input_invalidated = false;
     }
@@ -460,7 +505,7 @@ struct InputOrigin {
     surface: wl_surface::WlSurface,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ScopedUiTarget {
     consumer: String,
     target: UiTarget,
@@ -744,10 +789,11 @@ struct Surface {
     autofocus_pending: bool,
     text_input: Option<ActiveTextInput>,
     pointer_position: Option<Point>,
-    hover_path: Vec<NodeId>,
+    hover_path: Vec<ScopedUiTarget>,
     press_serial: Option<u32>,
     pressed_button: Option<u32>,
-    range_press: Option<NodeId>,
+    pressed_target: Option<ScopedUiTarget>,
+    range_press: Option<ScopedUiTarget>,
     configured: bool,
     dirty: bool,
     waiting: bool,
@@ -1159,6 +1205,7 @@ impl App {
             hover_path: Vec::new(),
             press_serial: None,
             pressed_button: None,
+            pressed_target: None,
             range_press: None,
             configured: false,
             dirty: true,
@@ -1330,6 +1377,7 @@ impl App {
             surface.hover_path.clear();
             surface.press_serial = None;
             surface.pressed_button = None;
+            surface.pressed_target = None;
             surface.range_press = None;
         }
         surface.dirty = true;
@@ -1419,9 +1467,10 @@ impl App {
             return;
         };
         let wl = self.surfaces[index].role.surface().clone();
+        let surface_root = self.surfaces[index].root;
         let hovered = std::mem::take(&mut self.surfaces[index].hover_path);
         let pressed = notify_hover
-            .then(|| self.surfaces[index].range_press)
+            .then(|| self.surfaces[index].range_press.clone())
             .flatten();
         if let Err(error) = self.render.park() {
             self.error = Some(error);
@@ -1432,11 +1481,25 @@ impl App {
             self.clear_keyboard_focus();
         }
         if notify_hover {
-            if let Some(id) = pressed {
-                self.dispatch(owner.output.clone(), id, Event::Pressed(false), None);
+            if let Some(target) = pressed
+                && self.runtime_owns_active_press(&owner.output, &target)
+            {
+                self.dispatch(
+                    owner.output.clone(),
+                    target.target.node(),
+                    Event::Pressed(false),
+                    None,
+                );
             }
-            for id in hovered {
-                self.dispatch(owner.output.clone(), id, Event::Hover(false), None);
+            for target in hovered {
+                if self.scoped_target_identity_is_current_at(&owner.output, surface_root, &target) {
+                    self.dispatch(
+                        owner.output.clone(),
+                        target.target.node(),
+                        Event::Hover(false),
+                        None,
+                    );
+                }
             }
         }
     }
@@ -1693,6 +1756,9 @@ impl App {
                 },
                 &mut scroll,
             )?;
+            let presented_ui = configurations
+                .presented_targets(&surface.output, root, &layout)
+                .ok_or("rendered output has no configuration consumer")?;
             let wl = surface.role.surface().clone();
             let viewport = surface.viewport.clone();
             let logical = surface.size;
@@ -1738,9 +1804,12 @@ impl App {
             match result {
                 FrameResult::Presented { redraw } => {
                     let animating = configurations.layout_is_animating(&surface.output, &layout);
+                    let (consumer, targets) = presented_ui;
                     surface.waiting = true;
                     surface.scroll = scroll;
-                    surface.layouts.publish(layout);
+                    surface
+                        .layouts
+                        .publish(layout, surface.root, consumer, targets);
                     surface.dirty = redraw || animating;
                     presented.push(index);
                 }
@@ -1843,11 +1912,12 @@ impl App {
         let Role::Popup(role) = &popup_surface.role else {
             return None;
         };
-        let parent = self.surfaces.iter().find(|surface| {
+        let parent_index = self.surfaces.iter().position(|surface| {
             surface.output == owner.output
                 && surface.key == owner.key
                 && matches!(surface.role, Role::Panel(_))
         })?;
+        let parent = &self.surfaces[parent_index];
         let root = self
             .configurations
             .surface_root(&owner.output, &owner.key)?;
@@ -1859,11 +1929,14 @@ impl App {
             PopupMode::Automatic(key) | PopupMode::Hover(key) => Some(key.anchor),
         };
         let trigger = match anchor {
-            Some(anchor) => parent
-                .layouts
-                .presented()?
-                .get(anchor)
-                .map(|placement| placement.bounds)?,
+            Some(anchor) => {
+                self.current_presented_target(parent_index, anchor)?;
+                parent
+                    .layouts
+                    .presented()?
+                    .get(anchor)
+                    .map(|placement| placement.bounds)?
+            }
             None => Rect {
                 x: 0.0,
                 y: 0.0,
@@ -2257,6 +2330,7 @@ impl App {
 
     fn invalidate_output(&mut self, output: &wl_output::WlOutput) {
         self.reconcile_range_presses(output);
+        self.reconcile_presented_pointer_state(output);
         while let Some(index) = self.surfaces.iter().position(|surface| {
             if &surface.output != output {
                 return false;
@@ -2286,7 +2360,40 @@ impl App {
         self.reconcile_hover_intent();
     }
 
-    fn range_input(&mut self, surface: usize, id: NodeId, x: f32) {
+    fn reconcile_presented_pointer_state(&mut self, output: &wl_output::WlOutput) {
+        for index in 0..self.surfaces.len() {
+            if &self.surfaces[index].output != output {
+                continue;
+            }
+            let hovered_is_current = self.surfaces[index]
+                .input
+                .hovered
+                .and_then(|id| self.surfaces[index].layouts.presented_target(id))
+                .is_some_and(|target| self.surface_target_is_current(index, &target));
+            if self.surfaces[index].input.hovered.is_some() && !hovered_is_current {
+                self.surfaces[index].input.hovered = None;
+                self.surfaces[index].dirty = true;
+            }
+            let pressed_is_current = self.surfaces[index]
+                .pressed_target
+                .as_ref()
+                .is_none_or(|target| self.surface_target_is_current(index, target));
+            if !pressed_is_current {
+                let surface = &mut self.surfaces[index];
+                surface.input.pressed = None;
+                surface.pressed_target = None;
+                surface.pressed_button = None;
+                surface.press_serial = None;
+                surface.dirty = true;
+            }
+        }
+    }
+
+    fn range_input(&mut self, surface: usize, target: &ScopedUiTarget, x: f32) {
+        if !self.surface_target_is_current(surface, target) {
+            return;
+        }
+        let id = target.target.node();
         let output = self.surfaces[surface].output.clone();
         let key = self.surfaces[surface].key.clone();
         let Some(node) = self
@@ -2320,25 +2427,31 @@ impl App {
         let stale: Vec<_> = self
             .surfaces
             .iter()
-            .filter(|surface| &surface.output == output)
-            .filter_map(|surface| {
-                let id = surface.range_press?;
-                (!self.configurations.active_press_is_available(output, id))
-                    .then(|| (surface.role.surface().clone(), id))
+            .enumerate()
+            .filter(|(_, surface)| &surface.output == output)
+            .filter_map(|(index, surface)| {
+                let target = surface.range_press.as_ref()?;
+                let id = target.target.node();
+                (!self.surface_target_is_current(index, target)
+                    || !self.configurations.active_press_is_available(output, id))
+                .then(|| (surface.role.surface().clone(), target.clone()))
             })
             .collect();
-        for (wl, id) in stale {
+        for (wl, target) in stale {
+            let id = target.target.node();
+            let notify = self.runtime_owns_active_press(output, &target);
             if let Some(index) = self.index(&wl) {
                 let surface = &mut self.surfaces[index];
                 if surface.input.pressed == Some(id) {
                     surface.input.pressed = None;
                 }
                 surface.pressed_button = None;
+                surface.pressed_target = None;
                 surface.press_serial = None;
                 surface.range_press = None;
                 surface.dirty = true;
             }
-            if self.configurations.has_active_press(output, id) {
+            if notify {
                 self.dispatch(output.clone(), id, Event::Pressed(false), None);
             }
         }
@@ -2384,10 +2497,80 @@ impl App {
                 .ui_target_is_current(output, &target.target)
     }
 
-    fn focus_from_pointer(&mut self, surface: usize, id: Option<NodeId>) {
+    fn surface_target_is_current(&self, surface: usize, target: &ScopedUiTarget) -> bool {
+        let Some(surface) = self.surfaces.get(surface) else {
+            return false;
+        };
+        self.configurations.presented_target_is_current(
+            &surface.output,
+            &target.consumer,
+            surface.root,
+            &target.target,
+        )
+    }
+
+    fn scoped_target_identity_is_current_at(
+        &self,
+        output: &wl_output::WlOutput,
+        surface_root: NodeId,
+        target: &ScopedUiTarget,
+    ) -> bool {
+        self.configurations.presented_target_identity_is_current(
+            output,
+            &target.consumer,
+            surface_root,
+            &target.target,
+        )
+    }
+
+    fn scoped_target_is_current_at(
+        &self,
+        output: &wl_output::WlOutput,
+        surface_root: NodeId,
+        target: &ScopedUiTarget,
+    ) -> bool {
+        self.configurations.presented_target_is_current(
+            output,
+            &target.consumer,
+            surface_root,
+            &target.target,
+        )
+    }
+
+    fn runtime_owns_active_press(
+        &self,
+        output: &wl_output::WlOutput,
+        target: &ScopedUiTarget,
+    ) -> bool {
+        self.configurations.consumer(output) == Some(target.consumer.as_str())
+            && self
+                .configurations
+                .has_active_press(output, target.target.node())
+    }
+
+    fn current_presented_target(&self, surface: usize, id: NodeId) -> Option<ScopedUiTarget> {
+        let target = self.surfaces.get(surface)?.layouts.presented_target(id)?;
+        self.surface_target_is_current(surface, &target)
+            .then_some(target)
+    }
+
+    fn same_surface_target(
+        &self,
+        surface: usize,
+        previous: &ScopedUiTarget,
+        next: &ScopedUiTarget,
+    ) -> bool {
+        previous == next
+            || (previous.consumer == next.consumer
+                && previous.target.node() == next.target.node()
+                && self.surface_target_is_current(surface, previous)
+                && self.surface_target_is_current(surface, next))
+    }
+
+    fn focus_from_pointer(&mut self, surface: usize, target: Option<ScopedUiTarget>) {
         let output = self.surfaces[surface].output.clone();
         self.cancel_queued_focus(&output);
-        let target = id.and_then(|id| self.scoped_focus_target(&output, id));
+        let target = target.filter(|target| self.surface_target_is_current(surface, target));
         let next = target.as_ref().map(|target| target.target.node());
         let previous = self.surfaces[surface].input.focused;
         if previous != next {
@@ -2814,10 +2997,12 @@ impl App {
         let id = self.surfaces[index].root;
         let output = self.surfaces[index].output.clone();
         let wl = self.surfaces[index].role.surface().clone();
+        let surface_root = self.surfaces[index].root;
+        let close_target = self.surfaces[index].layouts.presented_target(surface_root);
         let mode = self.surfaces[index].role.popup_mode().cloned();
         let hovered = std::mem::take(&mut self.surfaces[index].hover_path);
         let pressed = notify_runtime
-            .then(|| self.surfaces[index].range_press)
+            .then(|| self.surfaces[index].range_press.clone())
             .flatten();
         if let Err(error) = self.render.park() {
             self.error = Some(error);
@@ -2830,13 +3015,31 @@ impl App {
             self.clear_keyboard_focus();
         }
         if notify_runtime {
-            if let Some(id) = pressed {
-                self.dispatch(output.clone(), id, Event::Pressed(false), None);
+            if let Some(target) = pressed
+                && self.runtime_owns_active_press(&output, &target)
+            {
+                self.dispatch(
+                    output.clone(),
+                    target.target.node(),
+                    Event::Pressed(false),
+                    None,
+                );
             }
-            for hovered in hovered {
-                self.dispatch(output.clone(), hovered, Event::Hover(false), None);
+            for target in hovered {
+                if self.scoped_target_identity_is_current_at(&output, surface_root, &target) {
+                    self.dispatch(
+                        output.clone(),
+                        target.target.node(),
+                        Event::Hover(false),
+                        None,
+                    );
+                }
             }
-            self.dispatch(output, id, Event::Close, None);
+            if close_target.as_ref().is_none_or(|target| {
+                self.scoped_target_identity_is_current_at(&output, surface_root, target)
+            }) {
+                self.dispatch(output, id, Event::Close, None);
+            }
         }
     }
 
@@ -2844,7 +3047,7 @@ impl App {
         &mut self,
         parent: usize,
         serial: u32,
-        activated: Option<NodeId>,
+        activated: Option<ScopedUiTarget>,
         qh: &QueueHandle<Self>,
     ) {
         let Some(parent_surface) = self.surfaces.get(parent) else {
@@ -2885,9 +3088,12 @@ impl App {
             return;
         }
 
-        let Some(anchor) = activated else {
+        let Some(activated) =
+            activated.filter(|target| self.surface_target_is_current(parent, target))
+        else {
             return;
         };
+        let anchor = activated.target.node();
         let Some(target) = self
             .configurations
             .surface_root(&owner.output, &owner.key)
@@ -2944,12 +3150,10 @@ impl App {
         serial: Option<u32>,
         qh: &QueueHandle<Self>,
     ) -> bool {
-        let Some(parent) = self
-            .index(parent_wl)
-            .and_then(|index| self.surfaces.get(index))
-        else {
+        let Some(parent_index) = self.index(parent_wl) else {
             return false;
         };
+        let parent = &self.surfaces[parent_index];
         let Role::Panel(layer) = &parent.role else {
             return false;
         };
@@ -2958,6 +3162,9 @@ impl App {
         let parent_scale = parent.scale;
         let anchor = match anchor_id {
             Some(id) => {
+                if self.current_presented_target(parent_index, id).is_none() {
+                    return false;
+                }
                 let Some(anchor) = parent
                     .layouts
                     .presented()
@@ -3135,6 +3342,12 @@ impl App {
         &self,
         key: &HoverKey<SurfaceOwner>,
     ) -> Option<HoverTarget<SurfaceOwner>> {
+        let index = self.surfaces.iter().position(|surface| {
+            surface.output == key.owner.output
+                && surface.key == key.owner.key
+                && matches!(surface.role, Role::Panel(_))
+        })?;
+        self.current_presented_target(index, key.anchor)?;
         let target = automatic_target(
             self.configurations
                 .surface_root(&key.owner.output, &key.owner.key)?,
@@ -3151,17 +3364,19 @@ impl App {
     fn hover_layout_ready(&self, key: &HoverKey<SurfaceOwner>) -> bool {
         self.surfaces
             .iter()
+            .enumerate()
             .find(|surface| {
-                surface.output == key.owner.output
-                    && surface.key == key.owner.key
-                    && matches!(surface.role, Role::Panel(_))
+                surface.1.output == key.owner.output
+                    && surface.1.key == key.owner.key
+                    && matches!(surface.1.role, Role::Panel(_))
             })
-            .is_some_and(|surface| {
+            .is_some_and(|(index, surface)| {
                 !surface.dirty
                     && surface
                         .layouts
                         .presented()
                         .is_some_and(|layout| layout.get(key.anchor).is_some())
+                    && self.current_presented_target(index, key.anchor).is_some()
             })
     }
 
@@ -3178,17 +3393,11 @@ impl App {
     fn reconcile_pointers(&mut self, selected: Option<&[usize]>) {
         let mut leaving = Vec::new();
         let mut entering = Vec::new();
-        for (index, surface) in self.surfaces.iter_mut().enumerate() {
+        for index in 0..self.surfaces.len() {
             if selected.is_some_and(|selected| !selected.contains(&index)) {
                 continue;
             }
-            let Some(root) = self
-                .configurations
-                .surface_root(&surface.output, &surface.key)
-                .and_then(|root| root.find(surface.root))
-            else {
-                continue;
-            };
+            let surface = &self.surfaces[index];
             let hit = surface.pointer_position.and_then(|point| {
                 surface
                     .layouts
@@ -3196,56 +3405,83 @@ impl App {
                     .and_then(|layout| layout.hit_test(point))
             });
             let mut path = hit
-                .and_then(|id| interactive_path(root, id))
+                .map(|id| surface.layouts.presented_path(id))
                 .unwrap_or_default();
-            if surface.pointer_position.is_some()
-                && root.kind == Kind::Popup
-                && root.visible
-                && root.enabled
-            {
-                path.insert(0, root.id);
+            if surface.pointer_position.is_some() && matches!(surface.role, Role::Popup(_)) {
+                let root = surface.root;
+                if path
+                    .first()
+                    .is_none_or(|target| target.target.node() != root)
+                    && let Some(target) = surface.layouts.presented_target(root)
+                {
+                    path.insert(0, target);
+                }
             }
-            let hit = hit.filter(|id| path.contains(id));
-            if surface.input.hovered != hit {
-                surface.input.hovered = hit;
+            let current_hit = hit
+                .and_then(|id| surface.layouts.presented_target(id))
+                .filter(|target| self.surface_target_is_current(index, target))
+                .map(|target| target.target.node());
+            let previous = &surface.hover_path;
+            for target in previous.iter().filter(|target| {
+                !path
+                    .iter()
+                    .any(|next| self.same_surface_target(index, target, next))
+            }) {
+                leaving.push((surface.output.clone(), surface.root, target.clone()));
+            }
+            for target in path.iter().filter(|target| {
+                !previous
+                    .iter()
+                    .any(|old| self.same_surface_target(index, old, target))
+            }) {
+                entering.push((surface.output.clone(), surface.root, target.clone()));
+            }
+            let surface = &mut self.surfaces[index];
+            if surface.input.hovered != current_hit {
+                surface.input.hovered = current_hit;
                 surface.dirty = true;
-            }
-            for id in surface.hover_path.iter().filter(|id| !path.contains(id)) {
-                leaving.push((surface.output.clone(), *id));
-            }
-            for id in path.iter().filter(|id| !surface.hover_path.contains(id)) {
-                entering.push((surface.output.clone(), *id));
             }
             surface.hover_path = path;
         }
-        for (output, id) in leaving {
-            self.dispatch(output, id, Event::Hover(false), None);
+        for (output, root, target) in leaving {
+            if self.scoped_target_identity_is_current_at(&output, root, &target) {
+                self.dispatch(output, target.target.node(), Event::Hover(false), None);
+            }
         }
-        for (output, id) in entering {
-            self.dispatch(output, id, Event::Hover(true), None);
+        for (output, root, target) in entering {
+            if self.scoped_target_is_current_at(&output, root, &target) {
+                self.dispatch(output, target.target.node(), Event::Hover(true), None);
+            }
         }
         self.reconcile_hover_intent();
     }
 
     fn reconcile_hover_intent(&mut self) {
-        let pointer = self.surfaces.iter().find_map(|surface| {
-            surface.pointer_position?;
-            if let Some(PopupMode::Hover(key)) = surface.role.popup_mode() {
-                return self.current_hover_target(key);
-            }
-            if !matches!(surface.role, Role::Panel(_)) {
-                return None;
-            }
-            surface.hover_path.iter().rev().find_map(|anchor| {
-                automatic_target(
-                    self.configurations
-                        .surface_root(&surface.output, &surface.key)?,
-                    surface.owner(),
-                    *anchor,
-                    true,
-                )
-            })
-        });
+        let pointer = self
+            .surfaces
+            .iter()
+            .enumerate()
+            .find_map(|(index, surface)| {
+                surface.pointer_position?;
+                if let Some(PopupMode::Hover(key)) = surface.role.popup_mode() {
+                    return self.current_hover_target(key);
+                }
+                if !matches!(surface.role, Role::Panel(_)) {
+                    return None;
+                }
+                surface.hover_path.iter().rev().find_map(|anchor| {
+                    if !self.surface_target_is_current(index, anchor) {
+                        return None;
+                    }
+                    automatic_target(
+                        self.configurations
+                            .surface_root(&surface.output, &surface.key)?,
+                        surface.owner(),
+                        anchor.target.node(),
+                        true,
+                    )
+                })
+            });
         let keyboard = self.keyboard_hover_target();
         let mut owners: Vec<_> = self
             .surfaces
@@ -3316,26 +3552,31 @@ impl App {
             leaving.extend(
                 std::mem::take(&mut surface.hover_path)
                     .into_iter()
-                    .map(|id| (surface.output.clone(), id)),
+                    .map(|target| (surface.output.clone(), surface.root, target)),
             );
             surface.pointer_position = None;
             pressed.extend(
                 surface
                     .range_press
                     .take()
-                    .map(|id| (surface.output.clone(), id)),
+                    .map(|target| (surface.output.clone(), surface.root, target)),
             );
             surface.input.hovered = None;
             surface.input.pressed = None;
             surface.press_serial = None;
             surface.pressed_button = None;
+            surface.pressed_target = None;
             surface.dirty = true;
         }
-        for (output, id) in pressed {
-            self.dispatch(output, id, Event::Pressed(false), None);
+        for (output, _, target) in pressed {
+            if self.runtime_owns_active_press(&output, &target) {
+                self.dispatch(output, target.target.node(), Event::Pressed(false), None);
+            }
         }
-        for (output, id) in leaving {
-            self.dispatch(output, id, Event::Hover(false), None);
+        for (output, root, target) in leaving {
+            if self.scoped_target_identity_is_current_at(&output, root, &target) {
+                self.dispatch(output, target.target.node(), Event::Hover(false), None);
+            }
         }
         if preserve_keyboard_hover && self.keyboard_hover_target().is_some() {
             self.reconcile_hover_intent();
@@ -3599,11 +3840,15 @@ impl App {
         };
         match action {
             WidgetKeyAction::Activate => {
+                let activated = self.surfaces[index]
+                    .focus_target
+                    .clone()
+                    .filter(|target| target.target.node() == id);
                 self.surfaces[index].input.reveal_keyboard_focus();
                 self.surfaces[index].dirty = true;
                 self.dispatch(output, id, Event::Click, origin);
                 if let Some(index) = self.index(&event_surface) {
-                    self.sync_popup(index, serial, Some(id), qh);
+                    self.sync_popup(index, serial, activated, qh);
                 }
             }
             WidgetKeyAction::Slider(action) => {
@@ -4775,22 +5020,25 @@ impl PointerHandler for App {
                 x: event.position.0 as f32,
                 y: event.position.1 as f32,
             };
-            let hit = self.surfaces[index]
+            let hit_id = self.surfaces[index]
                 .layouts
                 .presented()
                 .and_then(|layout| layout.hit_test(point));
+            let hit = hit_id.and_then(|id| self.current_presented_target(index, id));
             match event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                     let surface = &mut self.surfaces[index];
                     surface.pointer_position = Some(point);
                     if surface.pressed_button == Some(0x110)
-                        && let Some(id) = surface.input.pressed
+                        && let Some(target) = surface.pressed_target.clone()
                     {
                         let output = surface.output.clone();
                         let event_surface = surface.role.surface().clone();
-                        self.range_input(index, id, point.x);
+                        let id = target.target.node();
+                        self.range_input(index, &target, point.x);
                         self.reconcile_range_presses(&output);
                         if let Some(index) = self.index(&event_surface)
+                            && self.surface_target_is_current(index, &target)
                             && self.surfaces[index]
                                 .text_input
                                 .as_ref()
@@ -4812,14 +5060,16 @@ impl PointerHandler for App {
                     self.clear_key_repeat();
                     let surface = &mut self.surfaces[index];
                     surface.pointer_position = Some(point);
-                    surface.input.pressed = hit;
+                    surface.input.pressed = hit.as_ref().map(|target| target.target.node());
+                    surface.pressed_target = hit.clone();
                     surface.pressed_button = Some(button);
                     surface.press_serial = Some(serial);
                     surface.dirty = true;
-                    self.focus_from_pointer(index, hit);
+                    self.focus_from_pointer(index, hit.clone());
                     if button == 0x110
-                        && let Some(id) = hit
+                        && let Some(target) = hit
                     {
+                        let id = target.target.node();
                         let output = self.surfaces[index].output.clone();
                         let key = self.surfaces[index].key.clone();
                         let event_surface = self.surfaces[index].role.surface().clone();
@@ -4829,7 +5079,7 @@ impl PointerHandler for App {
                             .and_then(|root| root.find(id))
                             .map(|node| node.kind);
                         if kind == Some(Kind::Range) {
-                            self.surfaces[index].range_press = Some(id);
+                            self.surfaces[index].range_press = Some(target.clone());
                             self.dispatch(output.clone(), id, Event::Pressed(true), None);
                             self.reconcile_range_presses(&output);
                         }
@@ -4838,10 +5088,12 @@ impl PointerHandler for App {
                                 && self.configurations.has_active_press(&output, id)))
                             && let Some(index) = self.index(&event_surface)
                         {
-                            self.range_input(index, id, point.x);
+                            self.range_input(index, &target, point.x);
                             self.reconcile_range_presses(&output);
                         }
-                        if let Some(index) = self.index(&event_surface) {
+                        if let Some(index) = self.index(&event_surface)
+                            && self.surface_target_is_current(index, &target)
+                        {
                             self.focus_text_input(index, id, Some(point), self.modifiers.shift);
                         }
                     } else if button == 0x110 {
@@ -4855,19 +5107,33 @@ impl PointerHandler for App {
                 } if self.surfaces[index].pressed_button == Some(button) => {
                     self.surfaces[index].pressed_button = None;
                     self.surfaces[index].pointer_position = Some(point);
-                    let pressed = self.surfaces[index].input.pressed.take();
+                    self.surfaces[index].input.pressed = None;
+                    let pressed = self.surfaces[index].pressed_target.take();
                     let range_press = self.surfaces[index].range_press.take();
                     let popup_serial = self.surfaces[index].press_serial.take();
                     let output = self.surfaces[index].output.clone();
                     let event_surface = self.surfaces[index].role.surface().clone();
                     self.surfaces[index].dirty = true;
-                    if let Some(id) = range_press {
+                    if let Some(target) = range_press {
                         let origin = direct_input_serial(true, release_serial)
-                            .and_then(|serial| self.input_origin(event_surface, serial));
-                        self.dispatch(output, id, Event::Pressed(false), origin);
+                            .and_then(|serial| self.input_origin(event_surface.clone(), serial));
+                        if self.runtime_owns_active_press(&output, &target) {
+                            self.dispatch(
+                                output,
+                                target.target.node(),
+                                Event::Pressed(false),
+                                origin,
+                            );
+                        }
                         continue;
                     }
-                    if let Some(id) = pressed.filter(|id| Some(*id) == hit) {
+                    if let Some(target) = pressed.filter(|pressed| {
+                        hit.as_ref().is_some_and(|hit| {
+                            self.same_surface_target(index, pressed, hit)
+                                && self.surface_target_is_current(index, pressed)
+                        })
+                    }) {
+                        let id = target.target.node();
                         self.dispatch(
                             output,
                             id,
@@ -4880,7 +5146,7 @@ impl PointerHandler for App {
                         );
                         if let Some((index, serial)) = self.index(&event_surface).zip(popup_serial)
                         {
-                            self.sync_popup(index, serial, (button == 0x110).then_some(id), qh);
+                            self.sync_popup(index, serial, (button == 0x110).then_some(target), qh);
                         }
                     }
                 }
@@ -4896,14 +5162,32 @@ impl PointerHandler for App {
                         continue;
                     }
                     let output = self.surfaces[index].output.clone();
-                    let handler = self.surfaces[index]
+                    let handler_id = self.surfaces[index]
                         .layouts
                         .presented()
-                        .and_then(|layout| layout.scroll_event_target(point))
-                        .filter(|id| self.configurations.has_scroll_handler(&output, *id));
-                    if let Some(id) = handler {
-                        self.dispatch(output, id, Event::Scroll { x, y }, None);
-                    } else if let Some(delta) = scroll_distance(y) {
+                        .and_then(|layout| layout.scroll_event_target(point));
+                    let handler =
+                        handler_id.and_then(|id| self.current_presented_target(index, id));
+                    if handler_id.is_some() && handler.is_none() {
+                        continue;
+                    }
+                    let scroll_id = self.surfaces[index]
+                        .layouts
+                        .presented()
+                        .and_then(|layout| layout.scroll_target(point));
+                    let scroll_target =
+                        scroll_id.and_then(|id| self.current_presented_target(index, id));
+                    if scroll_id.is_some() && scroll_target.is_none() {
+                        continue;
+                    }
+                    if let Some(target) = handler.filter(|target| {
+                        self.configurations
+                            .has_scroll_handler(&output, target.target.node())
+                    }) {
+                        self.dispatch(output, target.target.node(), Event::Scroll { x, y }, None);
+                    } else if scroll_target.is_some()
+                        && let Some(delta) = scroll_distance(y)
+                    {
                         let surface = &mut self.surfaces[index];
                         let changed = surface.layouts.presented().is_some_and(|layout| {
                             layout.scroll_y(point, delta, &mut surface.scroll)
@@ -4939,7 +5223,7 @@ fn scroll_distance(steps: f64) -> Option<f32> {
 
 #[cfg(test)]
 mod input_tests {
-    use std::{num::NonZeroU32, time::Duration};
+    use std::{collections::BTreeMap, num::NonZeroU32, time::Duration};
 
     use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym, Modifiers, RepeatInfo};
     use thing_core::{Kind, Node, NodeId, Rect};
@@ -5035,7 +5319,12 @@ mod input_tests {
     #[test]
     fn input_layouts_do_not_replace_pointer_geometry_before_presentation() {
         let mut layouts = SurfaceLayouts::default();
-        layouts.publish(slider_layout(false, true));
+        layouts.publish(
+            slider_layout(false, true),
+            NodeId(1),
+            "consumer".into(),
+            BTreeMap::new(),
+        );
         assert!(
             !layouts
                 .presented()
@@ -5045,6 +5334,11 @@ mod input_tests {
         );
 
         layouts.stage_input(slider_layout(true, true));
+        assert_eq!(
+            layouts.presented.as_ref().unwrap().consumer,
+            "consumer",
+            "staging input geometry must preserve presented widget identities",
+        );
         assert!(
             !layouts
                 .presented()
