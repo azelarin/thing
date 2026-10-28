@@ -260,7 +260,7 @@ fn parse_actions(actions: Vec<String>) -> fdo::Result<Vec<NotificationAction>> {
             "notification request has too many actions".into(),
         ));
     }
-    if actions.len() % 2 != 0 {
+    if !actions.len().is_multiple_of(2) {
         return Err(fdo::Error::InvalidArgs(
             "notification actions must be key/label pairs".into(),
         ));
