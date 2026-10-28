@@ -557,6 +557,52 @@ fn pointer_self_removal_cancels_once_with_the_retained_handler() {
 }
 
 #[test]
+fn root_key_refresh_cancels_an_unavailable_pointer_target() {
+    let (_directory, path) = fixture(
+        r#"
+        local shown = ui.state(true)
+        local events = ui.state('')
+        return ui.panel {
+            on_key = function()
+                shown:set(false)
+                return true
+            end,
+            children = {
+                ui.pointer_area {
+                    visible = function() return shown:get() end,
+                    on_pointer = function(event)
+                        events:set(events:get() .. event.phase .. ';')
+                    end,
+                },
+                ui.text { text = function() return events:get() end },
+            },
+        }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let root = runtime.root().unwrap().id;
+    let area = runtime.root().unwrap().children[0].id;
+    let target = runtime.pointer_target(area).unwrap();
+    runtime
+        .begin_pointer_checked(
+            &target,
+            pointer_event(PointerPhase::Press, 1.0, 1.0),
+            |_| Ok(()),
+        )
+        .unwrap();
+
+    let outcome = runtime
+        .dispatch_key(root, key_input("Escape", None, false))
+        .unwrap()
+        .unwrap();
+
+    assert!(outcome.handled && outcome.changed);
+    assert!(runtime.active_pointer_target().is_none());
+    assert!(!runtime.root().unwrap().children[0].visible);
+    assert_eq!(runtime.root().unwrap().children[1].text, "press;cancel;");
+}
+
+#[test]
 fn pointer_areas_require_handlers_and_reject_focus_semantics() {
     for source in [
         "return ui.panel { children = { ui.pointer_area {} } }",

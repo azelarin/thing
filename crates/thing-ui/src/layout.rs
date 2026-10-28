@@ -255,8 +255,10 @@ impl Layout {
             .iter()
             .zip(&self.pointer_regions)
             .filter_map(|(placement, region)| {
-                (placement.interactive || region.scroll == Some(placement.id))
-                    .then_some(placement.id)
+                (placement.interactive
+                    || placement.pointer_events
+                    || region.scroll == Some(placement.id))
+                .then_some(placement.id)
             })
     }
 
@@ -1042,6 +1044,10 @@ mod tests {
         );
         assert_eq!(layout.hit_test(Point { x: 50.0, y: 10.0 }), None);
         assert_eq!(layout.focus_order().collect::<Vec<_>>(), vec![NodeId(2)]);
+        assert_eq!(
+            layout.pointer_targets().collect::<Vec<_>>(),
+            [NodeId(1), NodeId(2)],
+        );
 
         let mut button = fixed(3, Kind::Button, 100.0, 40.0);
         let mut nested = fixed(4, Kind::PointerArea, 20.0, 20.0);

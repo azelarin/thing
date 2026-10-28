@@ -914,6 +914,13 @@ impl Runtime {
                 return Err(error);
             }
         }
+        match self.reconcile_pointer_checked(&validate) {
+            Ok(pointer) => result.changed |= pointer.changed,
+            Err(error) => {
+                self.truncate_actions(checkpoint);
+                return Err(error);
+            }
+        }
         Ok(Some(result))
     }
 

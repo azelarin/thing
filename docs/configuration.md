@@ -457,13 +457,14 @@ ui.pointer_area {
 ```
 
 `on_pointer(event)` receives `press`, `move`, `release`, and `cancel` phases.
-`event.x` and `event.y` are logical coordinates within the current widget;
+`event.x` and `event.y` are logical coordinates within the presented widget;
 `surface_x` and `surface_y` are logical surface coordinates. `button` is
 `primary`, `middle`, or `secondary`, and the `shift`, `ctrl`, `alt`, and `logo`
 fields report the current modifiers. a press captures subsequent motion and
 release even outside the widget. if layout moves during the drag, local
-coordinates follow its current geometry. a synthetic cancellation keeps the
-last delivered coordinates because its target may no longer have geometry.
+coordinates follow the geometry currently shown on screen. a synthetic
+cancellation keeps the last delivered coordinates because its target may no
+longer have geometry.
 
 the deepest control or pointer area owns pointer input; custom events do not
 bubble to ancestors and capture cannot move to another widget. hiding,
