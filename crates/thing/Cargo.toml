@@ -14,7 +14,10 @@ thing-runtime = { path = "../thing-runtime" }
 thing-wayland = { path = "../thing-wayland" }
 
 [dev-dependencies]
+async-io = "2.6.0"
+libc = "0.2"
 tempfile = "3.27"
+zbus = { version = "5.19.0", default-features = false, features = ["async-io"] }
 
 [lints]
 workspace = true
