@@ -6,6 +6,8 @@ mod clock;
 mod configuration;
 mod data_transfer;
 mod egl;
+#[cfg(test)]
+mod focused_clipboard;
 mod host;
 mod hover;
 mod input_method;
