@@ -1927,9 +1927,7 @@ fn validate_system_tray_items(items: &[SystemTrayItem]) -> Result<()> {
         || items.iter().any(|item| {
             let source_bytes = item.icon.as_ref().and_then(validate_system_tray_image);
             let valid_source = item.icon.is_none() || source_bytes.is_some();
-            image_bytes = image_bytes
-                .checked_add(source_bytes.unwrap_or(0))
-                .unwrap_or(usize::MAX);
+            image_bytes = image_bytes.saturating_add(source_bytes.unwrap_or(0));
             item.id.is_empty()
                 || item.id.len() > 128
                 || item.id.contains('\0')
