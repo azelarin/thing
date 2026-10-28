@@ -69,7 +69,7 @@ impl TextInputEditor {
         result
             .editor
             .driver(&mut result.fonts, &mut result.context)
-            .move_to_text_end();
+            .move_to_line_end();
         result.ensure_caret_visible();
         result
     }
@@ -86,7 +86,7 @@ impl TextInputEditor {
             self.refresh();
             self.editor
                 .driver(&mut self.fonts, &mut self.context)
-                .move_to_text_end();
+                .move_to_line_end();
         }
         self.refresh();
         self.ensure_caret_visible();
@@ -220,10 +220,12 @@ impl TextInputEditor {
 
     pub fn move_to_start(&mut self, select: bool) {
         let mut driver = self.editor.driver(&mut self.fonts, &mut self.context);
+        // this editor is unwrapped and single-line. parley's text-start motion
+        // preserves the horizontal position when the layout has only one line.
         if select {
-            driver.select_to_text_start();
+            driver.select_to_line_start();
         } else {
-            driver.move_to_text_start();
+            driver.move_to_line_start();
         }
         self.ensure_caret_visible();
     }
@@ -231,9 +233,9 @@ impl TextInputEditor {
     pub fn move_to_end(&mut self, select: bool) {
         let mut driver = self.editor.driver(&mut self.fonts, &mut self.context);
         if select {
-            driver.select_to_text_end();
+            driver.select_to_line_end();
         } else {
-            driver.move_to_text_end();
+            driver.move_to_line_end();
         }
         self.ensure_caret_visible();
     }
@@ -350,6 +352,58 @@ mod tests {
         assert_eq!(editor.value(), "a e\u{301}");
         assert!(editor.backspace(false));
         assert_eq!(editor.value(), "a ");
+    }
+
+    #[test]
+    fn editing_sequence_uses_single_line_boundaries() {
+        let mut editor = editor("naïve אבג 👨‍👩‍👧");
+        editor.select_all();
+        assert!(editor.replace_selection("x👨‍👩‍👧y"));
+        editor.move_left(false, false);
+        assert!(editor.backspace(false));
+        editor.move_to_start(false);
+        assert!(editor.delete(false));
+        editor.move_to_end(false);
+        for character in ["a", "b", "c"] {
+            assert!(editor.replace_selection(character));
+        }
+        editor.move_left(false, false);
+        editor.move_left(false, false);
+        editor.move_right(true, false);
+        assert!(editor.replace_selection("z"));
+
+        assert_eq!(editor.value(), "yazc");
+    }
+
+    #[test]
+    fn boundary_selection_extends_from_the_existing_caret() {
+        let mut editor = editor("abc");
+        editor.move_to_start(true);
+        assert_eq!(editor.selection_range(), 0..3);
+        editor.move_to_start(false);
+        assert_eq!(editor.selection_range(), 0..0);
+        editor.move_to_end(true);
+        assert_eq!(editor.selection_range(), 0..3);
+        editor.move_to_end(false);
+        assert_eq!(editor.selection_range(), 3..3);
+    }
+
+    #[test]
+    fn right_to_left_boundaries_use_logical_text_edges() {
+        let mut editor = editor("אבג");
+        assert_eq!(
+            editor.selection_range(),
+            editor.value().len()..editor.value().len()
+        );
+        editor.move_to_start(false);
+        assert_eq!(editor.selection_range(), 0..0);
+        editor.move_to_end(false);
+        assert_eq!(
+            editor.selection_range(),
+            editor.value().len()..editor.value().len()
+        );
+        editor.move_to_start(true);
+        assert_eq!(editor.selection_range(), 0..editor.value().len());
     }
 
     #[test]
