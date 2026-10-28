@@ -1400,6 +1400,16 @@ mod tests {
     }
 
     #[test]
+    fn subnormal_arc_endpoints_are_handled_without_panicking() {
+        let mut path = VectorPath::default();
+        path.set_data("M 0 0 A 1 1 0 0 1 5e-324 0".into()).unwrap();
+        assert_eq!(
+            path.segments,
+            vec![VectorSegment::MoveTo { x: 0.0, y: 0.0 }]
+        );
+    }
+
+    #[test]
     fn path_requires_valid_data_and_view_box() {
         let mut node = Node::new(NodeId(1), Kind::Path);
         assert_eq!(

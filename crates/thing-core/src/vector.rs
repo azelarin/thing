@@ -270,12 +270,29 @@ fn append_arc(
     {
         return Err(TreeError("path arc exceeds numeric limits".into()));
     }
+    let rotation = rotation_degrees.to_radians();
+    let (sin, cos) = (rotation % std::f64::consts::TAU).sin_cos();
+    let half_x = values[0] * 0.5;
+    let half_y = values[1] * 0.5;
+    let projected_x = cos * half_x + sin * half_y;
+    let projected_y = -sin * half_x + cos * half_y;
+    let weighted_x = values[2] * projected_y;
+    let weighted_y = values[3] * projected_x;
+    let chord = weighted_x * weighted_x + weighted_y * weighted_y;
+    if !chord.is_finite() {
+        return Err(TreeError("path arc exceeds numeric limits".into()));
+    }
+    // kurbo requires this weighted chord to be nonzero. if it underflows,
+    // the endpoints are already identical at the path's f32 precision.
+    if chord == 0.0 {
+        return Ok(());
+    }
 
     let arc = kurbo::Arc::from_svg_arc(&kurbo::SvgArc {
         from: kurbo::Point::ZERO,
         to: kurbo::Point::new(values[0], values[1]),
         radii: kurbo::Vec2::new(values[2], values[3]),
-        x_rotation: rotation_degrees.to_radians(),
+        x_rotation: rotation,
         large_arc,
         sweep,
     })
