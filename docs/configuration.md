@@ -85,6 +85,45 @@ when you save a configuration, thing prepares a replacement for every output.
 if one fails, all outputs keep their current configuration. a successful reload
 resets each output's local state and closes its popups.
 
+## panel surface
+
+surface properties belong on the root `ui.panel`. a top or bottom panel fills
+the output width unless `style.width` is set; its height defaults to 36 logical
+pixels. a left or right panel follows the same rule with the axes exchanged.
+a fixed panel is centered along the edge it occupies.
+
+| property | default | meaning |
+| --- | --- | --- |
+| `edge` | `'top'` | `'top'`, `'bottom'`, `'left'`, or `'right'` |
+| `margins` | all zero | `{ top, right, bottom, left }` distances from the output edges |
+| `exclusive_zone` | automatic | workspace space reserved for the panel; `0` reserves nothing and `-1` ignores other exclusive zones |
+| `input_region` | whole surface | `false` for click-through, or one rectangle `{ x, y, width, height }` |
+
+automatic exclusivity follows the configured surface size. it includes the
+margin opposite the panel edge; the compositor also includes the margin on the
+panel edge. an explicit `exclusive_zone` is used unchanged.
+
+the painted surface, exclusive zone, and interactive area can have different
+sizes. this example paints a 52 pixel-high top panel while reserving and
+accepting pointer input in only the first 36 pixels:
+
+```luau
+return ui.panel {
+    exclusive_zone = 36,
+    input_region = { height = 36 },
+    style = { height = 52, background = '#191b22' },
+}
+```
+
+input rectangles use surface-local logical pixels and are clipped to the
+surface. `x` and `y` default to zero. an omitted width or height extends from
+that origin to the corresponding far edge, so it follows compositor resizes.
+the region affects pointer and touch input, not keyboard focus.
+
+surface properties may be functions just like other reactive properties. the
+function returns the whole value: for example, a reactive `margins` property
+returns the complete margins table.
+
 ## widgets and children
 
 the current model has `panel`, `popup`, `row`, `centerbox`, `column`, `stack`,
