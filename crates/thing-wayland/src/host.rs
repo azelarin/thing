@@ -58,6 +58,7 @@ use crate::{
     audio::Audio,
     configuration::Configurations,
     egl::{Graphics, Window},
+    hover::{Command as HoverCommand, HoverKey, HoverState, HoverTarget},
     niri::Niri,
     watch::Watch,
 };
@@ -104,6 +105,7 @@ pub fn run(entry: &Path) -> Result<(), String> {
         configurations: Configurations::new(entry, services),
         watch: watch.clone(),
         reload_at: None,
+        hover: HoverState::default(),
         audio,
         niri,
         surfaces: Vec::new(),
@@ -195,10 +197,11 @@ pub fn run(entry: &Path) -> Result<(), String> {
             app.reload(&qh)?;
         }
         app.draw(&qh)?;
+        app.process_hover(&qh);
         connection.flush().map_err(|error| error.to_string())?;
         event_loop
             .dispatch(
-                app.reload_at
+                app.next_deadline()
                     .map(|deadline| deadline.saturating_duration_since(Instant::now())),
                 &mut app,
             )
@@ -210,15 +213,29 @@ pub fn run(entry: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PopupMode {
+    Manual,
+    Automatic(HoverKey<wl_output::WlOutput>),
+    Hover(HoverKey<wl_output::WlOutput>),
+}
+
 enum Role {
     Panel(LayerSurface),
-    Popup(Popup),
+    Popup(Popup, PopupMode),
 }
 impl Role {
     fn surface(&self) -> &wl_surface::WlSurface {
         match self {
             Self::Panel(layer) => layer.wl_surface(),
-            Self::Popup(popup) => popup.wl_surface(),
+            Self::Popup(popup, _) => popup.wl_surface(),
+        }
+    }
+
+    fn popup_mode(&self) -> Option<&PopupMode> {
+        match self {
+            Self::Panel(_) => None,
+            Self::Popup(_, mode) => Some(mode),
         }
     }
 }
@@ -236,6 +253,8 @@ struct Surface {
     fractional: Option<WpFractionalScaleV1>,
     layout: Option<Layout>,
     input: Interaction,
+    pointer_position: Option<Point>,
+    hover_path: Vec<NodeId>,
     press_serial: Option<u32>,
     pressed_button: Option<u32>,
     configured: bool,
@@ -263,6 +282,7 @@ struct App {
     niri: Niri,
     watch: Rc<Watch>,
     reload_at: Option<Instant>,
+    hover: HoverState<wl_output::WlOutput>,
     surfaces: Vec<Surface>,
     registry: RegistryState,
     seats: SeatState,
@@ -294,6 +314,13 @@ impl Drop for App {
 }
 
 impl App {
+    fn next_deadline(&self) -> Option<Instant> {
+        [self.reload_at, self.hover.next_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
     fn update_niri(&mut self) {
         let Some(snapshot) = self.niri.take_snapshot() else {
             return;
@@ -349,6 +376,7 @@ impl App {
         self.painter = Some(Painter::new(self.graphics.renderer()?, move || {
             wake.ping()
         })?);
+        self.hover.clear();
         self.surfaces
             .retain(|surface| matches!(surface.role, Role::Panel(_)));
         self.surfaces
@@ -374,6 +402,8 @@ impl App {
             surface.root = root.id;
             surface.layout = None;
             surface.input = Interaction::default();
+            surface.pointer_position = None;
+            surface.hover_path.clear();
             surface.press_serial = None;
             surface.pressed_button = None;
             surface.dirty = true;
@@ -481,6 +511,8 @@ impl App {
             fractional,
             layout: None,
             input: Interaction::default(),
+            pointer_position: None,
+            hover_path: Vec::new(),
             press_serial: None,
             pressed_button: None,
             configured: false,
@@ -630,6 +662,7 @@ impl App {
             surface.layout = Some(layout);
             surface.dirty = false;
         }
+        self.reconcile_pointer();
         Ok(())
     }
 
@@ -656,17 +689,13 @@ impl App {
     }
 
     fn invalidate_output(&mut self, output: &wl_output::WlOutput) {
-        let desired = self
-            .configurations
-            .root(output)
-            .and_then(|root| find_popup(root, None))
-            .map(|(id, _)| id);
         if let Some(index) = self.surfaces.iter().position(|surface| {
             &surface.output == output
-                && matches!(surface.role, Role::Popup(_))
-                && Some(surface.root) != desired
+                && surface.role.popup_mode().is_some_and(|mode| {
+                    !popup_is_current(self.configurations.root(output), surface.root, mode)
+                })
         }) {
-            self.close_popup(index);
+            self.remove_popup(index, true, false);
         }
         self.sync_panel_height(output);
         for surface in self
@@ -676,6 +705,7 @@ impl App {
         {
             surface.dirty = true;
         }
+        self.reconcile_hover_intent();
     }
 
     fn slider(&mut self, surface: usize, id: NodeId, x: f32) {
@@ -703,67 +733,148 @@ impl App {
         self.dispatch(output, id, Event::Change(value));
     }
 
-    fn close_popup(&mut self, index: usize) {
+    fn remove_popup(&mut self, index: usize, notify: bool, suppress_hover: bool) {
         let id = self.surfaces[index].root;
         let output = self.surfaces[index].output.clone();
+        let wl = self.surfaces[index].role.surface().clone();
+        let mode = self.surfaces[index].role.popup_mode().cloned();
+        let hovered = std::mem::take(&mut self.surfaces[index].hover_path);
         if let Err(error) = self.graphics.park() {
             self.error = Some(error);
         }
         self.surfaces.remove(index);
-        self.dispatch(output, id, Event::Close);
-        self.keyboard_surface = None;
+        if let Some(PopupMode::Hover(key) | PopupMode::Automatic(key)) = mode {
+            self.hover.close(&key, suppress_hover);
+        }
+        if self.keyboard_surface.as_ref() == Some(&wl) {
+            self.keyboard_surface = None;
+        }
+        for hovered in hovered {
+            self.dispatch(output.clone(), hovered, Event::Hover(false));
+        }
+        if notify {
+            self.dispatch(output, id, Event::Close);
+        }
     }
 
-    fn sync_popup(&mut self, parent: usize, serial: u32, qh: &QueueHandle<Self>) {
+    fn sync_popup(
+        &mut self,
+        parent: usize,
+        serial: u32,
+        activated: Option<NodeId>,
+        qh: &QueueHandle<Self>,
+    ) {
         let Some(parent_surface) = self.surfaces.get(parent) else {
             return;
         };
         let parent_wl = parent_surface.role.surface().clone();
         let output = parent_surface.output.clone();
-        let desired = self
+        if !matches!(parent_surface.role, Role::Panel(_)) {
+            return;
+        }
+
+        if let Some((id, _)) = self
             .configurations
             .root(&output)
-            .and_then(|root| find_popup(root, None));
-        if let Some(index) = self
-            .surfaces
-            .iter()
-            .position(|s| matches!(s.role, Role::Popup(_)))
+            .and_then(|root| find_manual_popup(root, None))
         {
-            let current = &self.surfaces[index];
-            if current.output != output
-                || desired.as_ref().is_none_or(|(id, _)| *id != current.root)
-            {
-                self.close_popup(index);
-            } else {
+            if self.surfaces.iter().any(|surface| {
+                surface.output == output
+                    && surface.root == id
+                    && matches!(surface.role.popup_mode(), Some(PopupMode::Manual))
+            }) {
                 return;
             }
+            if let Some(index) = self.popup_index() {
+                self.remove_popup(index, true, true);
+            }
+            let Some((id, anchor)) = self
+                .configurations
+                .root(&output)
+                .and_then(|root| find_manual_popup(root, None))
+            else {
+                return;
+            };
+            self.hover.reconcile(None, Instant::now());
+            self.create_popup(&parent_wl, id, anchor, PopupMode::Manual, Some(serial), qh);
+            return;
         }
-        // closing the previous popup may run a handler that changes visibility.
-        let Some((id, anchor_id)) = self
+
+        let Some(anchor) = activated else {
+            return;
+        };
+        let Some(target) = self
             .configurations
             .root(&output)
-            .and_then(|root| find_popup(root, None))
+            .and_then(|root| automatic_target(root, output.clone(), anchor, false))
         else {
             return;
         };
+        if let Some(index) = self.popup_index() {
+            let mode = self.surfaces[index].role.popup_mode().cloned();
+            if mode.as_ref() == Some(&PopupMode::Automatic(target.key.clone())) {
+                self.remove_popup(index, true, true);
+                return;
+            }
+            let upgrading = mode.as_ref() == Some(&PopupMode::Hover(target.key.clone()));
+            self.remove_popup(index, !upgrading, true);
+        }
+        if self
+            .configurations
+            .root(&output)
+            .and_then(|root| find_manual_popup(root, None))
+            .is_some()
+        {
+            let Some(parent) = self.index(&parent_wl) else {
+                return;
+            };
+            self.sync_popup(parent, serial, None, qh);
+            return;
+        }
+        let Some(target) = self
+            .configurations
+            .root(&output)
+            .and_then(|root| automatic_target(root, output.clone(), anchor, false))
+        else {
+            return;
+        };
+        self.hover.close(&target.key, true);
+        self.create_popup(
+            &parent_wl,
+            target.key.popup,
+            Some(target.key.anchor),
+            PopupMode::Automatic(target.key),
+            Some(serial),
+            qh,
+        );
+    }
+
+    fn create_popup(
+        &mut self,
+        parent_wl: &wl_surface::WlSurface,
+        id: NodeId,
+        anchor_id: Option<NodeId>,
+        mode: PopupMode,
+        serial: Option<u32>,
+        qh: &QueueHandle<Self>,
+    ) -> bool {
         let Some(parent) = self
-            .index(&parent_wl)
+            .index(parent_wl)
             .and_then(|index| self.surfaces.get(index))
         else {
-            return;
+            return false;
         };
         let Role::Panel(layer) = &parent.role else {
-            return;
+            return false;
         };
-        let layer = layer.clone();
-        let parent_output = parent.output.clone();
+        let output = parent.output.clone();
         let parent_scale = parent.scale;
         let Some(node) = self
             .configurations
             .root(&output)
             .and_then(|root| root.find(id))
         else {
-            return;
+            return false;
         };
         let width = node.style.width.unwrap_or(320.0).round().clamp(1.0, 4096.0) as i32;
         let height = node
@@ -772,15 +883,35 @@ impl App {
             .unwrap_or(200.0)
             .round()
             .clamp(1.0, 4096.0) as i32;
-        let anchor = anchor_id
-            .and_then(|id| parent.layout.as_ref()?.get(id))
-            .map(|p| p.bounds)
-            .unwrap_or(Rect {
+        let anchor = match anchor_id {
+            Some(id) => {
+                let Some(anchor) = parent
+                    .layout
+                    .as_ref()
+                    .and_then(|layout| layout.get(id))
+                    .map(|placement| placement.bounds)
+                else {
+                    return false;
+                };
+                anchor
+            }
+            None => Rect {
                 x: 0.0,
                 y: 0.0,
                 width: 1.0,
                 height: parent.size.1 as f32,
-            });
+            },
+        };
+        let layer = layer.clone();
+        let seat = match serial {
+            Some(_) => {
+                let Some(seat) = self.seat.clone() else {
+                    return false;
+                };
+                Some(seat)
+            }
+            None => None,
+        };
         let positioner = self.xdg_shell.xdg_wm_base().create_positioner(qh, ());
         positioner.set_size(width, height);
         positioner.set_anchor_rect(
@@ -802,12 +933,12 @@ impl App {
         match popup {
             Ok(popup) => {
                 layer.get_popup(popup.xdg_popup());
-                if let Some(seat) = &self.seat {
+                if let Some((seat, serial)) = seat.as_ref().zip(serial) {
                     popup.xdg_popup().grab(seat, serial);
                 }
                 let surface = self.make_surface(
-                    Role::Popup(popup),
-                    parent_output,
+                    Role::Popup(popup, mode),
+                    output,
                     id,
                     (width as u32, height as u32),
                     parent_scale,
@@ -815,18 +946,283 @@ impl App {
                 );
                 surface.role.surface().commit();
                 self.surfaces.push(surface);
+                true
             }
-            Err(error) => eprintln!("thing: cannot open popup: {error}"),
+            Err(error) => {
+                eprintln!("thing: cannot open popup: {error}");
+                false
+            }
         }
+    }
+
+    fn popup_index(&self) -> Option<usize> {
+        self.surfaces
+            .iter()
+            .position(|surface| surface.role.popup_mode().is_some())
+    }
+
+    fn process_hover(&mut self, qh: &QueueHandle<Self>) {
+        let now = Instant::now();
+        for _ in 0..4 {
+            let Some(command) = self.hover.take_due(now) else {
+                break;
+            };
+            match command {
+                HoverCommand::Close(key) => {
+                    if let Some(index) = self.surfaces.iter().position(|surface| {
+                        surface.role.popup_mode() == Some(&PopupMode::Hover(key.clone()))
+                    }) {
+                        self.remove_popup(index, true, false);
+                    }
+                }
+                HoverCommand::Open(target) => {
+                    if !self.hover.wants(&target.key) {
+                        continue;
+                    }
+                    let Some(current) = self.current_hover_target(&target.key) else {
+                        self.hover.close(&target.key, true);
+                        continue;
+                    };
+                    if !self.hover_layout_ready(&current.key) {
+                        self.hover.defer(current);
+                        break;
+                    }
+                    if let Some(index) = self.popup_index() {
+                        if !matches!(
+                            self.surfaces[index].role.popup_mode(),
+                            Some(PopupMode::Hover(_))
+                        ) {
+                            continue;
+                        }
+                        self.remove_popup(index, true, false);
+                        self.reconcile_hover_intent();
+                        if !self.hover.wants(&current.key)
+                            || self.current_hover_target(&current.key).is_none()
+                        {
+                            continue;
+                        }
+                        if !self.hover_layout_ready(&current.key) {
+                            self.hover.defer(current);
+                            break;
+                        }
+                    }
+                    let Some(parent) = self.surfaces.iter().find(|surface| {
+                        surface.output == current.key.output
+                            && matches!(surface.role, Role::Panel(_))
+                    }) else {
+                        self.hover.close(&current.key, true);
+                        continue;
+                    };
+                    let parent_wl = parent.role.surface().clone();
+                    let key = current.key.clone();
+                    if self.create_popup(
+                        &parent_wl,
+                        key.popup,
+                        Some(key.anchor),
+                        PopupMode::Hover(key.clone()),
+                        None,
+                        qh,
+                    ) {
+                        if let Some(previous) = self.hover.opened(current)
+                            && previous != key
+                        {
+                            self.hover.close(&previous, false);
+                        }
+                    } else {
+                        self.hover.close(&key, true);
+                    }
+                }
+            }
+        }
+    }
+
+    fn current_hover_target(
+        &self,
+        key: &HoverKey<wl_output::WlOutput>,
+    ) -> Option<HoverTarget<wl_output::WlOutput>> {
+        let target = automatic_target(
+            self.configurations.root(&key.output)?,
+            key.output.clone(),
+            key.anchor,
+            true,
+        )?;
+        if &target.key != key {
+            return None;
+        }
+        Some(target)
+    }
+
+    fn hover_layout_ready(&self, key: &HoverKey<wl_output::WlOutput>) -> bool {
+        self.surfaces
+            .iter()
+            .find(|surface| surface.output == key.output && matches!(surface.role, Role::Panel(_)))
+            .is_some_and(|surface| {
+                !surface.dirty
+                    && surface
+                        .layout
+                        .as_ref()
+                        .is_some_and(|layout| layout.get(key.anchor).is_some())
+            })
+    }
+
+    fn reconcile_pointer(&mut self) {
+        let mut leaving = Vec::new();
+        let mut entering = Vec::new();
+        for surface in &mut self.surfaces {
+            let Some(root) = self
+                .configurations
+                .root(&surface.output)
+                .and_then(|root| root.find(surface.root))
+            else {
+                continue;
+            };
+            let hit = surface.pointer_position.and_then(|point| {
+                surface
+                    .layout
+                    .as_ref()
+                    .and_then(|layout| layout.hit_test(point))
+            });
+            let mut path = hit
+                .and_then(|id| interactive_path(root, id))
+                .unwrap_or_default();
+            if surface.pointer_position.is_some()
+                && root.kind == Kind::Popup
+                && root.visible
+                && root.enabled
+            {
+                path.insert(0, root.id);
+            }
+            let hit = hit.filter(|id| path.contains(id));
+            if surface.input.hovered != hit {
+                surface.input.hovered = hit;
+                surface.dirty = true;
+            }
+            for id in surface.hover_path.iter().filter(|id| !path.contains(id)) {
+                leaving.push((surface.output.clone(), *id));
+            }
+            for id in path.iter().filter(|id| !surface.hover_path.contains(id)) {
+                entering.push((surface.output.clone(), *id));
+            }
+            surface.hover_path = path;
+        }
+        for (output, id) in leaving {
+            self.dispatch(output, id, Event::Hover(false));
+        }
+        for (output, id) in entering {
+            self.dispatch(output, id, Event::Hover(true));
+        }
+        self.reconcile_hover_intent();
+    }
+
+    fn reconcile_hover_intent(&mut self) {
+        if self.surfaces.iter().any(|surface| {
+            matches!(
+                surface.role.popup_mode(),
+                Some(PopupMode::Manual | PopupMode::Automatic(_))
+            )
+        }) {
+            self.hover.reconcile(None, Instant::now());
+            return;
+        }
+        let pointer = self.surfaces.iter().find_map(|surface| {
+            surface.pointer_position?;
+            if let Some(PopupMode::Hover(key)) = surface.role.popup_mode() {
+                return self.current_hover_target(key);
+            }
+            if !matches!(surface.role, Role::Panel(_)) {
+                return None;
+            }
+            surface.hover_path.iter().rev().find_map(|anchor| {
+                automatic_target(
+                    self.configurations.root(&surface.output)?,
+                    surface.output.clone(),
+                    *anchor,
+                    true,
+                )
+            })
+        });
+        let keyboard = self.keyboard_hover_target();
+        let desired = pointer.or(keyboard);
+        let key = desired.as_ref().map(|target| target.key.clone());
+        let now = Instant::now();
+        self.hover.reconcile(desired, now);
+        if let Some(key) = key
+            && self.hover_layout_ready(&key)
+        {
+            self.hover.resume(&key, now);
+        }
+    }
+
+    fn keyboard_hover_target(&self) -> Option<HoverTarget<wl_output::WlOutput>> {
+        self.surfaces.iter().find_map(|surface| {
+            if !matches!(surface.role, Role::Panel(_))
+                || self.keyboard_surface.as_ref() != Some(surface.role.surface())
+            {
+                return None;
+            }
+            let anchor = surface.input.keyboard_focused()?;
+            automatic_target(
+                self.configurations.root(&surface.output)?,
+                surface.output.clone(),
+                anchor,
+                true,
+            )
+        })
+    }
+
+    fn clear_pointer_state(&mut self, preserve_keyboard_hover: bool) {
+        let mut leaving = Vec::new();
+        for surface in &mut self.surfaces {
+            leaving.extend(
+                std::mem::take(&mut surface.hover_path)
+                    .into_iter()
+                    .map(|id| (surface.output.clone(), id)),
+            );
+            surface.pointer_position = None;
+            surface.input.hovered = None;
+            surface.input.pressed = None;
+            surface.press_serial = None;
+            surface.pressed_button = None;
+            surface.dirty = true;
+        }
+        for (output, id) in leaving {
+            self.dispatch(output, id, Event::Hover(false));
+        }
+        if preserve_keyboard_hover && self.keyboard_hover_target().is_some() {
+            self.reconcile_hover_intent();
+            return;
+        }
+        self.hover.clear();
+        if let Some(index) = self
+            .surfaces
+            .iter()
+            .position(|surface| matches!(surface.role.popup_mode(), Some(PopupMode::Hover(_))))
+        {
+            self.remove_popup(index, true, false);
+        }
+        self.hover.clear();
+        self.reconcile_hover_intent();
     }
 
     fn key(&mut self, event: KeyEvent, serial: u32, qh: &QueueHandle<Self>) {
         let Some(index) = self.keyboard_surface.as_ref().and_then(|wl| self.index(wl)) else {
             return;
         };
-        if event.keysym == Keysym::Escape && matches!(self.surfaces[index].role, Role::Popup(_)) {
-            self.close_popup(index);
-            return;
+        if event.keysym == Keysym::Escape {
+            if self.surfaces[index].role.popup_mode().is_some() {
+                self.remove_popup(index, true, true);
+                self.reconcile_hover_intent();
+                return;
+            }
+            if let Some(popup) = self
+                .surfaces
+                .iter()
+                .position(|surface| matches!(surface.role.popup_mode(), Some(PopupMode::Hover(_))))
+            {
+                self.remove_popup(popup, true, true);
+                self.reconcile_hover_intent();
+                return;
+            }
         }
         let surface = &mut self.surfaces[index];
         if event.keysym == Keysym::Tab || event.keysym == Keysym::ISO_Left_Tab {
@@ -848,6 +1244,7 @@ impl App {
                 surface.input.focus_from_keyboard(order[next]);
                 surface.dirty = true;
             }
+            self.reconcile_hover_intent();
             return;
         }
         let Some(id) = surface.input.focused else {
@@ -869,7 +1266,7 @@ impl App {
             let event_surface = self.surfaces[index].role.surface().clone();
             self.dispatch(output, id, Event::Click);
             if let Some(index) = self.index(&event_surface) {
-                self.sync_popup(index, serial, qh);
+                self.sync_popup(index, serial, Some(id), qh);
             }
         } else if node.kind == Kind::Slider {
             let slider = node.slider;
@@ -941,7 +1338,11 @@ fn fallback_logical_size(dimensions: (i32, i32), scale: u32, rotated: bool) -> O
 
 #[cfg(test)]
 mod output_tests {
-    use super::{fallback_logical_size, valid_dimensions};
+    use super::{
+        fallback_logical_size, find_automatic_popup, find_manual_popup, interactive_path,
+        valid_dimensions,
+    };
+    use thing_core::{Kind, Node, NodeId};
 
     #[test]
     fn mode_fallback_applies_scale_and_rotation() {
@@ -961,14 +1362,47 @@ mod output_tests {
         assert_eq!(valid_dimensions((-1, 1080)), None);
         assert_eq!(fallback_logical_size((1, 1), 2, false), None);
     }
+
+    #[test]
+    fn popup_lookup_keeps_manual_and_automatic_activation_separate() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut button = Node::new(NodeId(2), Kind::Button);
+        let mut automatic = Node::new(NodeId(3), Kind::Popup);
+        automatic.popup.open_on_hover = true;
+        button.children.push(automatic);
+        button.children.push(Node::new(NodeId(4), Kind::Popup));
+        root.children.push(button);
+
+        assert_eq!(
+            find_manual_popup(&root, None),
+            Some((NodeId(4), Some(NodeId(2))))
+        );
+        assert_eq!(
+            find_automatic_popup(&root, NodeId(2), None).map(|node| node.id),
+            Some(NodeId(3))
+        );
+    }
+
+    #[test]
+    fn interactive_path_keeps_ancestors_hovered_across_descendants() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut outer = Node::new(NodeId(2), Kind::Button);
+        outer.children.push(Node::new(NodeId(3), Kind::Button));
+        root.children.push(outer);
+
+        assert_eq!(
+            interactive_path(&root, NodeId(3)),
+            Some(vec![NodeId(2), NodeId(3)])
+        );
+    }
 }
 
-fn find_popup(node: &Node, anchor: Option<NodeId>) -> Option<(NodeId, Option<NodeId>)> {
+fn find_manual_popup(node: &Node, anchor: Option<NodeId>) -> Option<(NodeId, Option<NodeId>)> {
     if !node.visible {
         return None;
     }
     if node.kind == Kind::Popup {
-        return Some((node.id, anchor));
+        return (!node.popup.is_automatic()).then_some((node.id, anchor));
     }
     let anchor = if node.kind == Kind::Button {
         Some(node.id)
@@ -977,7 +1411,94 @@ fn find_popup(node: &Node, anchor: Option<NodeId>) -> Option<(NodeId, Option<Nod
     };
     node.children
         .iter()
-        .find_map(|child| find_popup(child, anchor))
+        .find_map(|child| find_manual_popup(child, anchor))
+}
+
+fn find_automatic_popup(
+    node: &Node,
+    wanted_anchor: NodeId,
+    anchor: Option<NodeId>,
+) -> Option<&Node> {
+    if !node.visible || !node.enabled {
+        return None;
+    }
+    if node.kind == Kind::Popup {
+        return (node.popup.is_automatic() && anchor == Some(wanted_anchor)).then_some(node);
+    }
+    let anchor = if node.kind == Kind::Button {
+        Some(node.id)
+    } else {
+        anchor
+    };
+    node.children
+        .iter()
+        .find_map(|child| find_automatic_popup(child, wanted_anchor, anchor))
+}
+
+fn automatic_target(
+    root: &Node,
+    output: wl_output::WlOutput,
+    anchor: NodeId,
+    hover: bool,
+) -> Option<HoverTarget<wl_output::WlOutput>> {
+    let popup = find_automatic_popup(root, anchor, None)?;
+    if if hover {
+        !popup.popup.open_on_hover
+    } else {
+        !popup.popup.open_on_click
+    } {
+        return None;
+    }
+    Some(HoverTarget {
+        key: HoverKey {
+            output,
+            anchor,
+            popup: popup.id,
+        },
+        open_delay: Duration::from_millis(u64::from(popup.popup.open_delay_ms)),
+        close_delay: Duration::from_millis(u64::from(popup.popup.close_delay_ms)),
+    })
+}
+
+fn popup_is_current(root: Option<&Node>, id: NodeId, mode: &PopupMode) -> bool {
+    let Some(root) = root else {
+        return false;
+    };
+    match mode {
+        PopupMode::Manual => find_manual_popup(root, None).is_some_and(|(popup, _)| popup == id),
+        PopupMode::Automatic(key) => automatic_target(root, key.output.clone(), key.anchor, false)
+            .is_some_and(|target| target.key.popup == id),
+        PopupMode::Hover(key) => automatic_target(root, key.output.clone(), key.anchor, true)
+            .is_some_and(|target| target.key.popup == id),
+    }
+}
+
+fn interactive_path(root: &Node, target: NodeId) -> Option<Vec<NodeId>> {
+    fn visit(node: &Node, target: NodeId, path: &mut Vec<NodeId>) -> bool {
+        if !node.visible || !node.enabled {
+            return false;
+        }
+        let interactive = node.kind.is_interactive();
+        if interactive {
+            path.push(node.id);
+        }
+        if node.id == target
+            || node
+                .children
+                .iter()
+                .filter(|child| child.kind != Kind::Popup)
+                .any(|child| visit(child, target, path))
+        {
+            return true;
+        }
+        if interactive {
+            path.pop();
+        }
+        false
+    }
+
+    let mut path = Vec::new();
+    visit(root, target, &mut path).then_some(path)
 }
 
 impl CompositorHandler for App {
@@ -1075,18 +1596,18 @@ impl OutputHandler for App {
         _: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        while let Some(index) = self
-            .surfaces
-            .iter()
-            .rposition(|surface| surface.output == output && matches!(surface.role, Role::Popup(_)))
-        {
-            self.close_popup(index);
+        self.hover.remove_output(&output);
+        while let Some(index) = self.surfaces.iter().rposition(|surface| {
+            surface.output == output && matches!(surface.role, Role::Popup(..))
+        }) {
+            self.remove_popup(index, true, false);
         }
         if let Err(error) = self.graphics.park() {
             self.error = Some(error);
         }
         self.surfaces.retain(|surface| surface.output != output);
         self.configurations.remove(&output);
+        self.hover.remove_output(&output);
         self.update_watch();
         if self
             .keyboard_surface
@@ -1102,16 +1623,18 @@ impl LayerShellHandler for App {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
         if let Some(index) = self.index(layer.wl_surface()) {
             let output = self.surfaces[index].output.clone();
+            self.hover.remove_output(&output);
             while let Some(index) = self.surfaces.iter().rposition(|surface| {
-                surface.output == output && matches!(surface.role, Role::Popup(_))
+                surface.output == output && matches!(surface.role, Role::Popup(..))
             }) {
-                self.close_popup(index);
+                self.remove_popup(index, true, false);
             }
             if let Err(error) = self.graphics.park() {
                 self.error = Some(error);
             }
             self.surfaces.retain(|surface| surface.output != output);
             self.configurations.remove(&output);
+            self.hover.remove_output(&output);
             self.update_watch();
             if self
                 .keyboard_surface
@@ -1176,7 +1699,8 @@ impl PopupHandler for App {
     }
     fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &Popup) {
         if let Some(index) = self.index(popup.wl_surface()) {
-            self.close_popup(index);
+            self.remove_popup(index, true, true);
+            self.reconcile_hover_intent();
         }
     }
 }
@@ -1227,11 +1751,14 @@ impl SeatHandler for App {
             && let Some(pointer) = self.pointer.take()
         {
             pointer.release();
+            self.clear_pointer_state(true);
         }
         if capability == Capability::Keyboard
             && let Some(keyboard) = self.keyboard.take()
         {
             keyboard.release();
+            self.keyboard_surface = None;
+            self.reconcile_hover_intent();
         }
     }
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
@@ -1244,10 +1771,9 @@ impl SeatHandler for App {
                 keyboard.release();
             }
             self.keyboard_surface = None;
+            self.clear_pointer_state(false);
             for surface in &mut self.surfaces {
                 surface.input = Interaction::default();
-                surface.press_serial = None;
-                surface.pressed_button = None;
                 surface.dirty = true;
             }
         }
@@ -1277,10 +1803,7 @@ impl PointerHandler for App {
             match event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                     let surface = &mut self.surfaces[index];
-                    if surface.input.hovered != hit {
-                        surface.input.hovered = hit;
-                        surface.dirty = true;
-                    }
+                    surface.pointer_position = Some(point);
                     if surface.pressed_button == Some(0x110)
                         && let Some(id) = surface.input.pressed
                     {
@@ -1288,13 +1811,14 @@ impl PointerHandler for App {
                     }
                 }
                 PointerEventKind::Leave { .. } => {
-                    self.surfaces[index].input.hovered = None;
+                    self.surfaces[index].pointer_position = None;
                     self.surfaces[index].dirty = true;
                 }
                 PointerEventKind::Press { button, serial, .. }
                     if matches!(button, 0x110..=0x112) =>
                 {
                     let surface = &mut self.surfaces[index];
+                    surface.pointer_position = Some(point);
                     surface.input.pressed = hit;
                     surface.pressed_button = Some(button);
                     surface.press_serial = Some(serial);
@@ -1310,6 +1834,7 @@ impl PointerHandler for App {
                     if self.surfaces[index].pressed_button == Some(button) =>
                 {
                     self.surfaces[index].pressed_button = None;
+                    self.surfaces[index].pointer_position = Some(point);
                     let pressed = self.surfaces[index].input.pressed.take();
                     let serial = self.surfaces[index].press_serial.take();
                     let output = self.surfaces[index].output.clone();
@@ -1326,7 +1851,7 @@ impl PointerHandler for App {
                             },
                         );
                         if let Some((index, serial)) = self.index(&event_surface).zip(serial) {
-                            self.sync_popup(index, serial, qh);
+                            self.sync_popup(index, serial, (button == 0x110).then_some(id), qh);
                         }
                     }
                 }
@@ -1335,6 +1860,7 @@ impl PointerHandler for App {
                     vertical,
                     ..
                 } => {
+                    self.surfaces[index].pointer_position = Some(point);
                     let x = scroll_steps(horizontal);
                     let y = scroll_steps(vertical);
                     if (x != 0.0 || y != 0.0)
@@ -1347,6 +1873,7 @@ impl PointerHandler for App {
                 _ => {}
             }
         }
+        self.reconcile_pointer();
     }
 }
 
@@ -1372,6 +1899,7 @@ impl KeyboardHandler for App {
         _: &[Keysym],
     ) {
         self.keyboard_surface = Some(surface.clone());
+        self.reconcile_hover_intent();
     }
     fn leave(
         &mut self,
@@ -1382,6 +1910,7 @@ impl KeyboardHandler for App {
         _: u32,
     ) {
         self.keyboard_surface = None;
+        self.reconcile_hover_intent();
     }
     fn press_key(
         &mut self,

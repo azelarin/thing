@@ -76,6 +76,7 @@ pub enum Event {
         y: f64,
     },
     Change(f64),
+    Hover(bool),
     Close,
 }
 
@@ -105,6 +106,7 @@ pub struct Runtime {
     sources: BTreeMap<NodeId, u64>,
     deferred: BTreeSet<usize>,
     handlers: Handlers,
+    ended_hovers: BTreeSet<NodeId>,
     deadline: Rc<Cell<Instant>>,
     limits: Limits,
     modules: modules::Modules,
@@ -182,6 +184,7 @@ impl Runtime {
             sources: BTreeMap::new(),
             deferred: BTreeSet::new(),
             handlers: BTreeMap::new(),
+            ended_hovers: BTreeSet::new(),
             deadline,
             limits,
             modules,
@@ -250,7 +253,13 @@ impl Runtime {
 
     /// run an input handler. disabled or hidden widgets ignore input.
     pub fn dispatch(&mut self, id: NodeId, event: Event) -> Result<bool> {
-        if !matches!(event, Event::Close) && !is_available(&self.root, id) {
+        if matches!(event, Event::Hover(false)) && self.ended_hovers.remove(&id) {
+            return Ok(false);
+        }
+        if matches!(event, Event::Hover(true)) && self.ended_hovers.contains(&id) {
+            return Ok(false);
+        }
+        if !matches!(event, Event::Close | Event::Hover(false)) && !is_available(&self.root, id) {
             return Ok(false);
         }
         let name = match event {
@@ -260,10 +269,11 @@ impl Runtime {
             Event::Scroll { x, y } if x.is_finite() && y.is_finite() => "on_scroll",
             Event::Scroll { .. } => return Err(Error::runtime("scroll deltas must be finite")),
             Event::Close => "on_close",
+            Event::Hover(_) => "on_hover",
             Event::Change(value) if value.is_finite() => "on_change",
             Event::Change(_) => return Err(Error::runtime("input value must be finite")),
         };
-        let Some(handler) = self.handlers.get(&(id, name)) else {
+        let Some(handler) = self.handlers.get(&(id, name)).cloned() else {
             return Ok(false);
         };
         self.begin_call();
@@ -275,9 +285,27 @@ impl Runtime {
             }
             Event::Scroll { x, y } => handler.call::<()>((x, y)),
             Event::Change(value) => handler.call::<()>(value),
+            Event::Hover(inside) => handler.call::<()>(inside),
         };
         self.services.allow_actions(false);
         let result = result.and_then(|()| self.refresh());
+        let result = match result {
+            Ok(changed)
+                if matches!(event, Event::Hover(true))
+                    && (self.root.find(id).is_none()
+                        || !self.handlers.contains_key(&(id, "on_hover"))) =>
+            {
+                self.ended_hovers.insert(id);
+                self.begin_call();
+                self.services.allow_actions(true);
+                let cleanup = handler.call::<()>(false);
+                self.services.allow_actions(false);
+                cleanup
+                    .and_then(|()| self.refresh())
+                    .map(|cleanup_changed| changed || cleanup_changed)
+            }
+            result => result,
+        };
         if result.is_err() {
             self.services.truncate_actions(checkpoint);
         }
@@ -430,12 +458,13 @@ impl Runtime {
                 "_id" | "_kind" | "children" => {}
                 "key" => node.key = Some(properties::string(value, "key")?),
                 "on_click" | "on_middle_click" | "on_secondary_click" | "on_scroll"
-                | "on_change" | "on_close" => {
+                | "on_change" | "on_hover" | "on_close" => {
                     if (matches!(
                         key.as_str(),
                         "on_click" | "on_middle_click" | "on_secondary_click" | "on_scroll"
                     ) && kind != Kind::Button)
                         || (key == "on_change" && kind != Kind::Slider)
+                        || (key == "on_hover" && kind != Kind::Popup && !kind.is_interactive())
                         || (key == "on_close" && kind != Kind::Popup)
                     {
                         return Err(Error::runtime(format!(
@@ -451,6 +480,7 @@ impl Runtime {
                         "on_secondary_click" => "on_secondary_click",
                         "on_scroll" => "on_scroll",
                         "on_change" => "on_change",
+                        "on_hover" => "on_hover",
                         _ => "on_close",
                     };
                     self.handlers.insert((node.id, name), function);

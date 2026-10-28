@@ -95,6 +95,32 @@ pub struct Slider {
     pub step: f64,
 }
 
+/// activation and timing for a popup managed by the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PopupOptions {
+    pub open_on_hover: bool,
+    pub open_on_click: bool,
+    pub open_delay_ms: u32,
+    pub close_delay_ms: u32,
+}
+
+impl Default for PopupOptions {
+    fn default() -> Self {
+        Self {
+            open_on_hover: false,
+            open_on_click: false,
+            open_delay_ms: 300,
+            close_delay_ms: 250,
+        }
+    }
+}
+
+impl PopupOptions {
+    pub fn is_automatic(self) -> bool {
+        self.open_on_hover || self.open_on_click
+    }
+}
+
 impl Default for Slider {
     fn default() -> Self {
         Self {
@@ -157,6 +183,7 @@ pub struct Node {
     pub style: Style,
     pub text: String,
     pub image: Image,
+    pub popup: PopupOptions,
     pub slider: Slider,
     pub enabled: bool,
     pub visible: bool,
@@ -172,6 +199,7 @@ impl Node {
             style: Style::default(),
             text: String::new(),
             image: Image::default(),
+            popup: PopupOptions::default(),
             slider: Slider::default(),
             enabled: true,
             visible: true,
@@ -182,10 +210,23 @@ impl Node {
 
     /// validates widget properties, sibling keys, and tree depth and size limits.
     pub fn validate(&self) -> Result<(), TreeError> {
-        self.validate_inner(0, &mut HashSet::new())
+        self.validate_inner(0, &mut HashSet::new(), None, &mut HashSet::new(), false)
     }
 
-    fn validate_inner(&self, depth: usize, ids: &mut HashSet<NodeId>) -> Result<(), TreeError> {
+    /// validates a tree rendered as one surface. an automatic popup root may
+    /// inherit its button anchor from the parent surface.
+    pub fn validate_surface(&self) -> Result<(), TreeError> {
+        self.validate_inner(0, &mut HashSet::new(), None, &mut HashSet::new(), true)
+    }
+
+    fn validate_inner(
+        &self,
+        depth: usize,
+        ids: &mut HashSet<NodeId>,
+        anchor: Option<NodeId>,
+        automatic_popups: &mut HashSet<NodeId>,
+        allow_external_anchor: bool,
+    ) -> Result<(), TreeError> {
         if depth > 64 || ids.len() >= 10_000 {
             return Err(TreeError(
                 "widget tree exceeds 64 levels or 10,000 nodes".into(),
@@ -251,6 +292,31 @@ impl Node {
         if self.kind == Kind::Slider {
             self.slider.validate()?;
         }
+        let anchor = if self.kind == Kind::Button {
+            Some(self.id)
+        } else {
+            anchor
+        };
+        if self.kind == Kind::Popup && self.popup.is_automatic() {
+            match anchor {
+                Some(anchor) if !automatic_popups.insert(anchor) => {
+                    return Err(TreeError(
+                        "a button can own only one automatic popup".into(),
+                    ));
+                }
+                None if !(allow_external_anchor && depth == 0) => {
+                    return Err(TreeError(
+                        "an automatic popup needs a button ancestor".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if self.popup.open_delay_ms > 60_000 || self.popup.close_delay_ms > 60_000 {
+            return Err(TreeError(
+                "popup delays must be between 0 and 60,000 milliseconds".into(),
+            ));
+        }
         let mut keys = HashSet::new();
         for child in &self.children {
             if let Some(key) = &child.key
@@ -258,7 +324,13 @@ impl Node {
             {
                 return Err(TreeError(format!("duplicate sibling key {key:?}")));
             }
-            child.validate_inner(depth + 1, ids)?;
+            child.validate_inner(
+                depth + 1,
+                ids,
+                anchor,
+                automatic_popups,
+                allow_external_anchor,
+            )?;
         }
         Ok(())
     }
@@ -337,6 +409,19 @@ mod tests {
         node.style.width = None;
         node.style.opacity = f32::INFINITY;
         assert!(node.validate().is_err());
+    }
+
+    #[test]
+    fn surface_validation_accepts_only_the_root_popup_external_anchor() {
+        let mut popup = Node::new(NodeId(1), Kind::Popup);
+        popup.popup.open_on_hover = true;
+        assert!(popup.validate().is_err());
+        assert!(popup.validate_surface().is_ok());
+
+        let mut nested = Node::new(NodeId(2), Kind::Popup);
+        nested.popup.open_on_hover = true;
+        popup.children.push(nested);
+        assert!(popup.validate_surface().is_err());
     }
 
     #[test]

@@ -111,6 +111,151 @@ fn writing_the_same_value_does_not_invalidate_bindings() {
 }
 
 #[test]
+fn hover_edges_update_state_even_after_the_widget_disables_itself() {
+    let (_directory, path) = fixture(
+        r#"
+        local hovered = ui.state(false)
+        return ui.panel { children = {
+            ui.text { text = function() return tostring(hovered:get()) end },
+            ui.button {
+                enabled = function() return not hovered:get() end,
+                on_hover = function(inside) hovered:set(inside) end,
+            },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let button = runtime.root().children[1].id;
+
+    assert!(runtime.dispatch(button, Event::Hover(true)).unwrap());
+    assert_eq!(runtime.root().children[0].text, "true");
+    assert!(!runtime.root().children[1].enabled);
+    assert!(runtime.dispatch(button, Event::Hover(false)).unwrap());
+    assert_eq!(runtime.root().children[0].text, "false");
+    assert!(runtime.root().children[1].enabled);
+}
+
+#[test]
+fn hover_cleanup_uses_the_retired_handler() {
+    let (_directory, path) = fixture(
+        r#"
+        local hovered = ui.state(false)
+        local enters = ui.state(0)
+        local leaves = ui.state(0)
+        return ui.panel { children = {
+            ui.text { text = function()
+                return `{enters:get()}:{leaves:get()}:{tostring(hovered:get())}`
+            end },
+            ui.row { children = function()
+                if hovered:get() then
+                    return { ui.button { key = 'target' } }
+                end
+                return { ui.button {
+                    key = 'target',
+                    on_hover = function(inside)
+                        if inside then
+                            enters:set(enters:get() + 1)
+                        else
+                            leaves:set(leaves:get() + 1)
+                        end
+                        hovered:set(inside)
+                    end,
+                } }
+            end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let button = runtime.root().children[1].children[0].id;
+
+    assert!(runtime.dispatch(button, Event::Hover(true)).unwrap());
+    assert_eq!(runtime.root().children[0].text, "1:1:false");
+    assert_eq!(runtime.root().children[1].children[0].id, button);
+    assert!(!runtime.dispatch(button, Event::Hover(false)).unwrap());
+    assert_eq!(runtime.root().children[0].text, "1:1:false");
+    assert!(runtime.dispatch(button, Event::Hover(true)).unwrap());
+    assert_eq!(runtime.root().children[0].text, "2:2:false");
+}
+
+#[test]
+fn hover_cleanup_runs_after_the_target_is_removed() {
+    let (_directory, path) = fixture(
+        r#"
+        local present = ui.state(true)
+        local hovered = ui.state(false)
+        return ui.panel { children = {
+            ui.text { text = function() return tostring(hovered:get()) end },
+            ui.row { children = function()
+                if not present:get() then return {} end
+                return { ui.button {
+                    on_hover = function(inside)
+                        hovered:set(inside)
+                        present:set(not inside)
+                    end,
+                } }
+            end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let old = runtime.root().children[1].children[0].id;
+
+    assert!(runtime.dispatch(old, Event::Hover(true)).unwrap());
+    assert_eq!(runtime.root().children[0].text, "false");
+    let replacement = runtime.root().children[1].children[0].id;
+    assert_ne!(replacement, old);
+    assert!(!runtime.dispatch(old, Event::Hover(false)).unwrap());
+}
+
+#[test]
+fn parses_automatic_popup_activation_and_delays() {
+    let (_directory, path) = fixture(
+        r#"
+        return ui.panel { children = { ui.button { children = { ui.popup {
+            open_on_hover = true,
+            open_on_click = true,
+            open_delay = 175,
+            close_delay = 225,
+            on_hover = function(_) end,
+        } } } } }
+        "#,
+    );
+    let runtime = Runtime::load(path).unwrap();
+    let popup = &runtime.root().children[0].children[0];
+
+    assert!(popup.popup.open_on_hover);
+    assert!(popup.popup.open_on_click);
+    assert_eq!(popup.popup.open_delay_ms, 175);
+    assert_eq!(popup.popup.close_delay_ms, 225);
+}
+
+#[test]
+fn rejects_ambiguous_or_unanchored_automatic_popups() {
+    for source in [
+        "return ui.panel { children = { ui.popup { open_on_hover = true } } }",
+        r#"
+        return ui.panel { children = { ui.button { children = {
+            ui.popup { open_on_hover = true },
+            ui.popup { open_on_click = true },
+        } } } }
+        "#,
+    ] {
+        let (_directory, path) = fixture(source);
+        assert!(Runtime::load(path).is_err());
+    }
+}
+
+#[test]
+fn rejects_invalid_popup_delays() {
+    for delay in ["-1", "1.5", "60001"] {
+        let (_directory, path) = fixture(&format!(
+            "return ui.panel {{ children = {{ ui.button {{ children = {{ ui.popup {{ open_on_hover = true, open_delay = {delay} }} }} }} }} }} }}"
+        ));
+        assert!(Runtime::load(path).is_err());
+    }
+}
+
+#[test]
 fn failed_reload_preserves_widgets_and_local_state() {
     let (_directory, path) = fixture(
         r#"

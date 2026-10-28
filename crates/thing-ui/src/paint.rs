@@ -32,6 +32,14 @@ impl Interaction {
     pub fn reveal_keyboard_focus(&mut self) {
         self.focus_visible = self.focused.is_some();
     }
+
+    pub fn keyboard_focused(&self) -> Option<NodeId> {
+        if self.focus_visible {
+            self.focused
+        } else {
+            None
+        }
+    }
 }
 
 /// renderer-independent inputs for one frame.

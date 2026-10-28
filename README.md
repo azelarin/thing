@@ -39,7 +39,8 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] clock, output audio controls, and niri workspaces and windows
 - [x] per-output configuration
 - [ ] panel sizing, input regions, and popup positioning
-- [ ] hover popups and scrolling containers
+- [x] hover popups
+- [ ] scrolling containers
 - [ ] text input and consistent key repeat
 - [ ] vulkan rendering alongside opengl
 - [ ] drag and drop, animations, and custom shapes
