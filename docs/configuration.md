@@ -65,6 +65,12 @@ thing never falls back to another PAM service. authentication currently calls
 `pam_authenticate` only; it does not open a PAM session or run account and
 credential management stages.
 
+the lock host currently provides live `services.clock`, `services.output`, and
+`services.authentication` state; other desktop services are not connected.
+interaction is keyboard-only: `secret_input`, root `on_key`, and tab focus
+traversal are supported, while pointer input, desktop service actions, and local
+ui actions are unavailable.
+
 `services.authentication` is read-only. `state` is one of `idle`,
 `authenticating`, `waiting`, `rejected`, or `unavailable`; `prompt` contains a
 bounded follow-up prompt while waiting, and `message` contains bounded status
