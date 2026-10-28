@@ -309,7 +309,7 @@ click and drag to select text, or use tab and shift-tab to move keyboard focus.
 arrow keys follow visual text order, including mixed right-to-left text. shift
 extends the selection; control adds word movement or deletion, and control-a
 selects everything. enter calls `on_submit`. values and placeholders are limited
-to one mib and cannot contain NUL or line breaks.
+to one mib and cannot contain control characters or unicode line separators.
 
 this first text-entry layer handles text reported directly by the keyboard. it
 does not yet implement wayland's text-input protocol, so input-method preedit and

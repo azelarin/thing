@@ -1116,9 +1116,13 @@ impl fmt::Display for TreeError {
 
 fn validate_single_line(value: &str, name: &str) -> Result<(), TreeError> {
     const MAX_BYTES: usize = 1024 * 1024;
-    if value.len() > MAX_BYTES || value.contains(['\0', '\n', '\r']) {
+    if value.len() > MAX_BYTES
+        || value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
+    {
         return Err(TreeError(format!(
-            "{name} must be at most 1 MiB and contain no NUL or line breaks"
+            "{name} must be at most 1 MiB and contain no control characters or line separators"
         )));
     }
     Ok(())
@@ -1255,6 +1259,10 @@ mod tests {
 
         input.text = "two\nlines".into();
         assert!(input.validate().is_err());
+        for invalid in ['\u{000b}', '\u{000c}', '\u{0085}', '\u{2028}', '\u{2029}'] {
+            input.text = format!("before{invalid}after");
+            assert!(input.validate().is_err());
+        }
         input.text = "x".repeat(1024 * 1024 + 1);
         assert!(input.validate().is_err());
     }

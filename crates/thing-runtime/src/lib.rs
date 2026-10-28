@@ -1180,7 +1180,10 @@ fn validate_surface_string(value: &str, name: &str) -> Result<()> {
 }
 
 fn valid_text_input_event(value: &str) -> bool {
-    value.len() <= 1024 * 1024 && !value.contains(['\0', '\n', '\r'])
+    value.len() <= 1024 * 1024
+        && !value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
 }
 
 fn is_available(node: &Node, id: NodeId) -> bool {

@@ -117,7 +117,10 @@ impl TextInputEditor {
     }
 
     pub fn replace_selection(&mut self, text: &str) -> bool {
-        if text.chars().any(char::is_control) {
+        if text
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
+        {
             return false;
         }
         let selected = self.selection_range().len();
@@ -385,5 +388,15 @@ mod tests {
             editor.selection_range(),
             editor.value().len()..editor.value().len()
         );
+    }
+
+    #[test]
+    fn replacement_rejects_controls_and_unicode_line_separators() {
+        let mut editor = editor("safe");
+        for invalid in ['\u{000b}', '\u{000c}', '\u{0085}', '\u{2028}', '\u{2029}'] {
+            editor.select_all();
+            assert!(!editor.replace_selection(&invalid.to_string()));
+            assert_eq!(editor.value(), "safe");
+        }
     }
 }

@@ -964,11 +964,18 @@ fn controlled_text_inputs_publish_only_accepted_values() {
             .unwrap()
     );
     assert_eq!(runtime.root().unwrap().children[1].text, "naïve 👨‍👩‍👧");
-    assert!(
-        runtime
-            .dispatch(input, Event::TextChange("two\nlines".into()))
-            .is_err()
-    );
+    for invalid in [
+        "two\nlines",
+        "vertical\u{000b}tab",
+        "next\u{0085}line",
+        "line\u{2028}separator",
+    ] {
+        assert!(
+            runtime
+                .dispatch(input, Event::TextChange(invalid.into()))
+                .is_err()
+        );
+    }
 }
 
 #[test]

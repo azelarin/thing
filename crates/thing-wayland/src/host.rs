@@ -2662,8 +2662,11 @@ fn text_key_action(event: &KeyEvent, modifiers: Modifiers, direct: bool) -> Opti
         return None;
     }
     let text = event.utf8.as_ref()?;
-    (!text.is_empty() && !text.chars().any(char::is_control))
-        .then(|| TextKeyAction::Insert(text.clone()))
+    (!text.is_empty()
+        && !text.chars().any(|character| {
+            character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
+        }))
+    .then(|| TextKeyAction::Insert(text.clone()))
 }
 
 fn reconcile_controlled_text_edit(
@@ -3899,6 +3902,13 @@ mod input_tests {
         ] {
             assert!(!action.changes_value());
         }
+
+        let mut separator = key_event(30, Keysym::e);
+        separator.utf8 = Some("\u{2028}".into());
+        assert_eq!(
+            text_key_action(&separator, Modifiers::default(), true),
+            None
+        );
     }
 
     #[test]
