@@ -84,7 +84,9 @@ fn private_bus_tracks_devices_properties_service_lifetime_and_reconnect() {
     let snapshot = wait_for(&power, |snapshot| !snapshot.available);
     assert!(snapshot.error.is_empty());
     async_io::block_on(service.connection.request_name(UPOWER_NAME)).unwrap();
-    let snapshot = wait_for(&power, |snapshot| snapshot.available);
+    let snapshot = wait_for(&power, |snapshot| {
+        snapshot.available && snapshot.devices.len() == 1
+    });
     assert!(!snapshot.on_battery);
     assert_eq!(snapshot.devices.len(), 1);
 
