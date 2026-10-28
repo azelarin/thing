@@ -972,7 +972,7 @@ mod tests {
         let target_id = configurations.root(&1).unwrap().children[0].children[0].id;
         let target = configurations.focus_target(&1, target_id).unwrap();
 
-        assert!(!configurations.set_output(&1, output("DP-1", 2560)).unwrap());
+        assert!(configurations.set_output(&1, output("DP-1", 2560)).unwrap());
         assert_eq!(
             configurations.root(&1).unwrap().children[0].children[0].id,
             target_id
@@ -1210,6 +1210,105 @@ mod tests {
             }
             assert_eq!(text(&configurations, 1), if keyed { "new" } else { "none" });
         }
+    }
+
+    #[test]
+    fn source_only_replacements_request_a_presented_identity_update() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            local fired = ui.state('none')
+            local list = ui.row { children = function()
+                local available = services.audio.available:get()
+                return { ui.button {
+                    style = { width = 100, height = 30 },
+                    on_scroll = function()
+                        fired:set(available and 'new' or 'old')
+                    end,
+                } }
+            end }
+            return ui.panel { children = {
+                list,
+                ui.text { text = function() return fired:get() end },
+            } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+
+        let root = configurations.root(&1).unwrap();
+        let surface_root = root.id;
+        let target = root.children[0].children[0].id;
+        let presented = Layout::compute(
+            root,
+            Size {
+                width: 300.0,
+                height: 80.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        let (consumer, presented_targets) = configurations
+            .presented_targets(&1, root, &presented)
+            .unwrap();
+        let presented_target = presented_targets.get(&target).unwrap().clone();
+
+        configurations
+            .set_audio(AudioSnapshot {
+                available: true,
+                ..AudioSnapshot::default()
+            })
+            .unwrap();
+        let refreshed = configurations.refresh();
+
+        assert_eq!(
+            configurations.root(&1).unwrap().children[0].children[0].id,
+            target,
+            "the structurally identical replacement reuses its node id",
+        );
+        let current = Layout::compute(
+            configurations.root(&1).unwrap(),
+            Size {
+                width: 300.0,
+                height: 80.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        assert_eq!(
+            presented.placements(),
+            current.placements(),
+            "the replacement has identical presented geometry",
+        );
+        assert!(!configurations.presented_target_is_current(
+            &1,
+            &consumer,
+            surface_root,
+            &presented_target,
+        ));
+        assert_eq!(
+            refreshed,
+            [1],
+            "the host needs a frame to publish the replacement input identity",
+        );
+        let (_, current_targets) = configurations
+            .presented_targets(&1, configurations.root(&1).unwrap(), &current)
+            .unwrap();
+        let current_target = current_targets.get(&target).unwrap();
+        assert!(configurations.presented_target_is_current(
+            &1,
+            &consumer,
+            surface_root,
+            current_target,
+        ));
+
+        configurations
+            .dispatch(&1, current_target.node(), Event::Scroll { x: 0.0, y: 1.0 })
+            .unwrap();
+        assert_eq!(text(&configurations, 1), "new");
     }
 
     #[test]
