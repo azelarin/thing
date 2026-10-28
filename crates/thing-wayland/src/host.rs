@@ -3341,14 +3341,13 @@ impl PointerHandler for App {
                             self.dispatch(output.clone(), id, Event::Pressed(true), None);
                             self.reconcile_range_presses(&output);
                         }
-                        if kind == Some(Kind::Slider)
+                        if (kind == Some(Kind::Slider)
                             || (kind == Some(Kind::Range)
-                                && self.configurations.has_active_press(&output, id))
+                                && self.configurations.has_active_press(&output, id)))
+                            && let Some(index) = self.index(&event_surface)
                         {
-                            if let Some(index) = self.index(&event_surface) {
-                                self.range_input(index, id, point.x);
-                                self.reconcile_range_presses(&output);
-                            }
+                            self.range_input(index, id, point.x);
+                            self.reconcile_range_presses(&output);
                         }
                     }
                 }
