@@ -24,7 +24,7 @@ wgpu = { version = "30.0.1", optional = true, default-features = false, features
 smithay-client-toolkit = "0.20.0"
 wayland-client = { version = "0.31.15", features = ["system"] }
 wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
-calloop = "0.14.4"
+calloop = { version = "0.14.4", features = ["signals"] }
 calloop-wayland-source = "0.4.1"
 libc = "0.2"
 libpulse-binding = "2.30.1"

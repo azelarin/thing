@@ -51,7 +51,13 @@ use wayland_protocols::{
         },
         viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
     },
-    xdg::shell::client::xdg_positioner,
+    xdg::{
+        activation::v1::client::{
+            xdg_activation_token_v1::{self, XdgActivationTokenV1},
+            xdg_activation_v1::XdgActivationV1,
+        },
+        shell::client::xdg_positioner,
+    },
 };
 
 use crate::{
@@ -59,6 +65,7 @@ use crate::{
     audio::Audio,
     configuration::Configurations,
     hover::{Command as HoverCommand, HoverKey, HoverState, HoverTarget},
+    launch::{self, LaunchRequest, Launcher, PendingLaunches},
     niri::Niri,
     panel::{self, Geometry, ResolvedInputRegion},
     render::{FrameResult, Render, Window},
@@ -76,6 +83,10 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
     let entry = entry
         .canonicalize()
         .map_err(|error| format!("{}: {error}", entry.display()))?;
+    // signalfd must block SIGCHLD before any worker exists. workers inherit the
+    // mask; launched children restore its previous state immediately before exec.
+    let (launcher, child_signals) =
+        launch::prepare().map_err(|error| format!("cannot monitor launched processes: {error}"))?;
     let (time, date, next_minute) = crate::clock::read();
     let mut services = ServiceSnapshot::default();
     services
@@ -97,6 +108,7 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
     let layer_shell = LayerShell::bind(&globals, &qh)
         .map_err(|error| format!("the compositor must support wlr-layer-shell: {error}"))?;
     let xdg_shell = XdgShell::bind(&globals, &qh).map_err(|error| error.to_string())?;
+    let activation: Option<XdgActivationV1> = globals.bind(&qh, 1..=1, ()).ok();
     let (image_ping, image_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let wake = image_ping.clone();
     let gpu_wake = image_ping.clone();
@@ -125,6 +137,8 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
         hover: HoverState::default(),
         audio,
         niri,
+        launcher,
+        pending_launches: PendingLaunches::new(),
         surfaces: Vec::new(),
         registry: RegistryState::new(&globals),
         seats: SeatState::new(&globals, &qh),
@@ -132,12 +146,14 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
         compositor,
         layer_shell,
         xdg_shell,
+        activation,
         fractional: globals.bind(&qh, 1..=1, ()).ok(),
         viewporter: globals.bind(&qh, 1..=1, ()).ok(),
         pointer: None,
         keyboard: None,
         seat: None,
         keyboard_surface: None,
+        queue: qh.clone(),
         shift: false,
         loading_outputs: true,
         exit: false,
@@ -158,6 +174,10 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
     app.loading_outputs = false;
     app.update_watch();
     let mut event_loop: EventLoop<App> = EventLoop::try_new().map_err(|error| error.to_string())?;
+    event_loop
+        .handle()
+        .insert_source(child_signals, |_, _, app| app.reap_children())
+        .map_err(|e| e.to_string())?;
     event_loop
         .handle()
         .insert_source(image_source, |_, _, app| app.invalidate_all())
@@ -206,6 +226,7 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
         })
         .map_err(|e| e.to_string())?;
     while !app.exit {
+        app.expire_launches();
         if app
             .reload_at
             .is_some_and(|deadline| deadline <= Instant::now())
@@ -234,6 +255,12 @@ enum PopupMode {
     Manual,
     Automatic(HoverKey<wl_output::WlOutput>),
     Hover(HoverKey<wl_output::WlOutput>),
+}
+
+struct InputOrigin {
+    seat: wl_seat::WlSeat,
+    serial: u32,
+    surface: wl_surface::WlSurface,
 }
 
 enum Role {
@@ -315,6 +342,8 @@ struct App {
     configurations: Configurations<wl_output::WlOutput>,
     audio: Audio,
     niri: Niri,
+    launcher: Launcher,
+    pending_launches: PendingLaunches<XdgActivationTokenV1>,
     watch: Rc<Watch>,
     reload_at: Option<Instant>,
     hover: HoverState<wl_output::WlOutput>,
@@ -325,12 +354,14 @@ struct App {
     compositor: CompositorState,
     layer_shell: LayerShell,
     xdg_shell: XdgShell,
+    activation: Option<XdgActivationV1>,
     fractional: Option<WpFractionalScaleManagerV1>,
     viewporter: Option<WpViewporter>,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     seat: Option<wl_seat::WlSeat>,
     keyboard_surface: Option<wl_surface::WlSurface>,
+    queue: QueueHandle<App>,
     shift: bool,
     loading_outputs: bool,
     exit: bool,
@@ -339,6 +370,12 @@ struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        for (_, token) in self.pending_launches.drain() {
+            token.destroy();
+        }
+        if let Some(activation) = self.activation.take() {
+            activation.destroy();
+        }
         self.render.prepare_drop();
         // popups are appended after their parents and must be released first.
         while self.surfaces.pop().is_some() {}
@@ -350,6 +387,7 @@ impl App {
         earliest_deadline(
             self.reload_at,
             self.hover.next_deadline(),
+            self.pending_launches.next_deadline(),
             self.surfaces.iter().filter_map(|surface| surface.retry_at),
         )
     }
@@ -761,7 +799,13 @@ impl App {
         Ok(())
     }
 
-    fn dispatch(&mut self, output: wl_output::WlOutput, id: NodeId, event: Event) {
+    fn dispatch(
+        &mut self,
+        output: wl_output::WlOutput,
+        id: NodeId,
+        event: Event,
+        origin: Option<InputOrigin>,
+    ) {
         let (changed, actions) = match self.configurations.dispatch(&output, id, event) {
             Ok(result) => result,
             Err(error) => {
@@ -769,17 +813,81 @@ impl App {
                 return;
             }
         };
-        if changed {
-            self.invalidate_output(&output);
-        }
+        // a successful handler can remove its own popup. request activation
+        // before invalidation destroys the surface that received the input.
         for action in actions {
             let result = match action {
                 Action::Niri(action) => self.niri.send(action),
-                action => self.audio.send(action).map_err(str::to_owned),
+                Action::Launch { argv, cwd } => {
+                    self.request_launch(LaunchRequest { argv, cwd }, origin.as_ref());
+                    Ok(())
+                }
+                action @ (Action::SetVolume(_)
+                | Action::SetMuted(_)
+                | Action::SetDefaultSink(_)
+                | Action::SetSourceVolume(_)
+                | Action::SetSourceMuted(_)
+                | Action::SetDefaultSource(_)) => self.audio.send(action).map_err(str::to_owned),
             };
             if let Err(error) = result {
                 eprintln!("thing: {error}");
             }
+        }
+        if changed {
+            self.invalidate_output(&output);
+        }
+    }
+
+    fn input_origin(&self, surface: wl_surface::WlSurface, serial: u32) -> Option<InputOrigin> {
+        Some(InputOrigin {
+            seat: self.seat.clone()?,
+            serial,
+            surface,
+        })
+    }
+
+    fn request_launch(&mut self, request: LaunchRequest, origin: Option<&InputOrigin>) {
+        let (Some(activation), Some(origin)) = (self.activation.clone(), origin) else {
+            self.spawn_launch(request, None);
+            return;
+        };
+        let queue = self.queue.clone();
+        let now = Instant::now();
+        if let Err(request) = self.pending_launches.push(now, request, |id| {
+            let token = activation.get_activation_token(&queue, id);
+            token.set_serial(origin.serial, &origin.seat);
+            token.set_surface(&origin.surface);
+            token.commit();
+            token
+        }) {
+            self.spawn_launch(request, None);
+        }
+    }
+
+    fn spawn_launch(&mut self, request: LaunchRequest, token: Option<&str>) {
+        let program = request.argv.first().map_or("<missing>", String::as_str);
+        if let Err(error) = self
+            .launcher
+            .spawn(&request.argv, request.cwd.as_deref(), token)
+        {
+            if let Some(cwd) = &request.cwd {
+                eprintln!("thing: cannot launch {program:?} in {cwd:?}: {error}");
+            } else {
+                eprintln!("thing: cannot launch {program:?}: {error}");
+            }
+        }
+    }
+
+    fn expire_launches(&mut self) {
+        for (request, token) in self.pending_launches.expire(Instant::now()) {
+            token.destroy();
+            self.spawn_launch(request, None);
+        }
+    }
+
+    fn reap_children(&mut self) {
+        for (pid, error) in self.launcher.reap() {
+            eprintln!("thing: cannot reap launched process {pid}: {error}");
         }
     }
 
@@ -827,7 +935,7 @@ impl App {
         };
         let fraction = (x - bounds.x - 8.0) / (bounds.width - 16.0).max(1.0);
         let value = node.slider.value_at(fraction as f64);
-        self.dispatch(output, id, Event::Change(value));
+        self.dispatch(output, id, Event::Change(value), None);
     }
 
     fn remove_popup(&mut self, index: usize, notify: bool, suppress_hover: bool) {
@@ -847,10 +955,10 @@ impl App {
             self.keyboard_surface = None;
         }
         for hovered in hovered {
-            self.dispatch(output.clone(), hovered, Event::Hover(false));
+            self.dispatch(output.clone(), hovered, Event::Hover(false), None);
         }
         if notify {
-            self.dispatch(output, id, Event::Close);
+            self.dispatch(output, id, Event::Close, None);
         }
     }
 
@@ -1216,10 +1324,10 @@ impl App {
             surface.hover_path = path;
         }
         for (output, id) in leaving {
-            self.dispatch(output, id, Event::Hover(false));
+            self.dispatch(output, id, Event::Hover(false), None);
         }
         for (output, id) in entering {
-            self.dispatch(output, id, Event::Hover(true));
+            self.dispatch(output, id, Event::Hover(true), None);
         }
         self.reconcile_hover_intent();
     }
@@ -1296,7 +1404,7 @@ impl App {
             surface.dirty = true;
         }
         for (output, id) in leaving {
-            self.dispatch(output, id, Event::Hover(false));
+            self.dispatch(output, id, Event::Hover(false), None);
         }
         if preserve_keyboard_hover && self.keyboard_hover_target().is_some() {
             self.reconcile_hover_intent();
@@ -1314,7 +1422,7 @@ impl App {
         self.reconcile_hover_intent();
     }
 
-    fn key(&mut self, event: KeyEvent, serial: u32, qh: &QueueHandle<Self>) {
+    fn key(&mut self, event: KeyEvent, serial: u32, direct: bool, qh: &QueueHandle<Self>) {
         let Some(index) = self.keyboard_surface.as_ref().and_then(|wl| self.index(wl)) else {
             return;
         };
@@ -1368,13 +1476,16 @@ impl App {
         else {
             return;
         };
+        let event_surface = self.surfaces[index].role.surface().clone();
+        let origin = direct
+            .then(|| self.input_origin(event_surface.clone(), serial))
+            .flatten();
         if node.kind == Kind::Button
             && (event.keysym == Keysym::Return || event.keysym == Keysym::space)
         {
             self.surfaces[index].input.reveal_keyboard_focus();
             self.surfaces[index].dirty = true;
-            let event_surface = self.surfaces[index].role.surface().clone();
-            self.dispatch(output, id, Event::Click);
+            self.dispatch(output, id, Event::Click, origin);
             if let Some(index) = self.index(&event_surface) {
                 self.sync_popup(index, serial, Some(id), qh);
             }
@@ -1398,6 +1509,7 @@ impl App {
                 output,
                 id,
                 Event::Change(value.clamp(slider.min, slider.max)),
+                origin,
             );
         }
     }
@@ -1479,9 +1591,15 @@ fn apply_input_region(
 fn earliest_deadline(
     reload: Option<Instant>,
     hover: Option<Instant>,
+    launch: Option<Instant>,
     retries: impl IntoIterator<Item = Instant>,
 ) -> Option<Instant> {
-    reload.into_iter().chain(hover).chain(retries).min()
+    reload
+        .into_iter()
+        .chain(hover)
+        .chain(launch)
+        .chain(retries)
+        .min()
 }
 
 fn output_context(info: OutputInfo) -> Option<OutputContext> {
@@ -1542,15 +1660,23 @@ mod output_tests {
         let reload = now + Duration::from_millis(80);
 
         assert_eq!(
-            earliest_deadline(Some(reload), Some(hover), [retry]),
+            earliest_deadline(Some(reload), Some(hover), None, [retry]),
             Some(retry)
         );
         assert_eq!(
-            earliest_deadline(Some(reload), Some(hover), []),
+            earliest_deadline(Some(reload), Some(hover), None, []),
             Some(hover)
         );
-        assert_eq!(earliest_deadline(Some(reload), None, []), Some(reload));
-        assert_eq!(earliest_deadline(None, None, [retry]), Some(retry));
+        assert_eq!(
+            earliest_deadline(Some(reload), None, None, []),
+            Some(reload)
+        );
+        assert_eq!(earliest_deadline(None, None, None, [retry]), Some(retry));
+        let launch = now + Duration::from_millis(8);
+        assert_eq!(
+            earliest_deadline(Some(reload), Some(hover), Some(launch), [retry]),
+            Some(launch)
+        );
     }
 
     #[test]
@@ -2131,13 +2257,15 @@ impl PointerHandler for App {
                         self.slider(index, id, point.x);
                     }
                 }
-                PointerEventKind::Release { button, .. }
-                    if self.surfaces[index].pressed_button == Some(button) =>
-                {
+                PointerEventKind::Release {
+                    button,
+                    serial: release_serial,
+                    ..
+                } if self.surfaces[index].pressed_button == Some(button) => {
                     self.surfaces[index].pressed_button = None;
                     self.surfaces[index].pointer_position = Some(point);
                     let pressed = self.surfaces[index].input.pressed.take();
-                    let serial = self.surfaces[index].press_serial.take();
+                    let popup_serial = self.surfaces[index].press_serial.take();
                     let output = self.surfaces[index].output.clone();
                     let event_surface = self.surfaces[index].role.surface().clone();
                     self.surfaces[index].dirty = true;
@@ -2150,8 +2278,10 @@ impl PointerHandler for App {
                                 0x112 => Event::MiddleClick,
                                 _ => Event::Click,
                             },
+                            self.input_origin(event_surface.clone(), release_serial),
                         );
-                        if let Some((index, serial)) = self.index(&event_surface).zip(serial) {
+                        if let Some((index, serial)) = self.index(&event_surface).zip(popup_serial)
+                        {
                             self.sync_popup(index, serial, (button == 0x110).then_some(id), qh);
                         }
                     }
@@ -2174,7 +2304,7 @@ impl PointerHandler for App {
                         .and_then(|layout| layout.scroll_event_target(point))
                         .filter(|id| self.configurations.has_scroll_handler(&output, *id));
                     if let Some(id) = handler {
-                        self.dispatch(output, id, Event::Scroll { x, y });
+                        self.dispatch(output, id, Event::Scroll { x, y }, None);
                     } else if let Some(delta) = scroll_distance(y) {
                         let surface = &mut self.surfaces[index];
                         let changed = surface.layout.as_ref().is_some_and(|layout| {
@@ -2256,7 +2386,7 @@ impl KeyboardHandler for App {
         serial: u32,
         event: KeyEvent,
     ) {
-        self.key(event, serial, qh);
+        self.key(event, serial, true, qh);
     }
     fn repeat_key(
         &mut self,
@@ -2266,7 +2396,7 @@ impl KeyboardHandler for App {
         serial: u32,
         event: KeyEvent,
     ) {
-        self.key(event, serial, qh);
+        self.key(event, serial, false, qh);
     }
     fn release_key(
         &mut self,
@@ -2316,6 +2446,26 @@ impl Dispatch<WpFractionalScaleV1, wl_surface::WlSurface> for App {
     }
 }
 
+impl Dispatch<XdgActivationTokenV1, u64> for App {
+    fn event(
+        app: &mut Self,
+        _: &XdgActivationTokenV1,
+        event: xdg_activation_token_v1::Event,
+        id: &u64,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let xdg_activation_token_v1::Event::Done { token } = event else {
+            return;
+        };
+        let Some(completed) = app.pending_launches.complete(*id, Instant::now()) else {
+            return;
+        };
+        completed.token.destroy();
+        app.spawn_launch(completed.request, completed.fresh.then_some(token.as_str()));
+    }
+}
+
 delegate_compositor!(App);
 delegate_output!(App);
 delegate_layer!(App);
@@ -2328,6 +2478,7 @@ delegate_registry!(App);
 delegate_noop!(App: ignore WpFractionalScaleManagerV1);
 delegate_noop!(App: ignore WpViewporter);
 delegate_noop!(App: ignore WpViewport);
+delegate_noop!(App: ignore XdgActivationV1);
 delegate_noop!(App: ignore xdg_positioner::XdgPositioner);
 
 impl ProvidesRegistryState for App {

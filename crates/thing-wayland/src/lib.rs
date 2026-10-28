@@ -6,6 +6,7 @@ mod configuration;
 mod egl;
 mod host;
 mod hover;
+mod launch;
 mod niri;
 mod panel;
 mod render;
