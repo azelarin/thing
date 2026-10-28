@@ -40,6 +40,7 @@ CASES = (
             "Property 'placeholder_color' is not compatible.",
         ),
     ),
+    Case("invalid-springs.luau", ("Property 'background' is not compatible.",)),
     Case(
         "invalid-clipboard.luau",
         (

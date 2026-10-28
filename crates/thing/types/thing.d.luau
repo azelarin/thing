@@ -17,6 +17,7 @@ declare extern type ThingWidget with end
 declare extern type ThingImageSource with end
 declare extern type ThingNumberTransition with end
 declare extern type ThingColorTransition with end
+declare extern type ThingNumberSpring with end
 
 export type ThingEdge = "top" | "right" | "bottom" | "left"
 export type ThingLayer = "background" | "bottom" | "top" | "overlay"
@@ -43,6 +44,12 @@ export type ThingEasing = "linear" | "in_cubic" | "out_cubic" | "in_out_cubic"
 export type ThingTransitionOptions = {
     duration: number,
     easing: ThingEasing?,
+}
+
+export type ThingSpringOptions = {
+    stiffness: number,
+    damping: number,
+    epsilon: number?,
 }
 
 export type ThingAnchors = {
@@ -90,8 +97,8 @@ export type ThingPopupConstraints = {
     slide_y: boolean?,
 }
 
-type ThingAnimatedNumber = number | (() -> number) | ThingNumberTransition
-type ThingAnimatedOptionalNumber = number | (() -> number?) | ThingNumberTransition
+type ThingAnimatedNumber = number | (() -> number) | ThingNumberTransition | ThingNumberSpring
+type ThingAnimatedOptionalNumber = number | (() -> number?) | ThingNumberTransition | ThingNumberSpring
 type ThingAnimatedColor = string | (() -> string) | ThingColorTransition
 type ThingImageSourceValue = string | ThingImageSource
 
@@ -649,6 +656,7 @@ declare ui: {
         ((value: () -> number, options: ThingTransitionOptions) -> ThingNumberTransition)
         & ((value: () -> string, options: ThingTransitionOptions) -> ThingColorTransition)
     ),
+    spring: (value: () -> number, options: ThingSpringOptions) -> ThingNumberSpring,
     asset: (relative_path: string) -> string,
 }
 

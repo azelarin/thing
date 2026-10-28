@@ -23,5 +23,9 @@ local unsupported_input_color = ui.text_input {
 }
 
 return ui.panel {
-    children = { wrong_width, wrong_background, unsupported_input_color },
+    children = {
+        wrong_width,
+        wrong_background,
+        unsupported_input_color,
+    },
 }

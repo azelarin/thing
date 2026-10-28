@@ -641,9 +641,9 @@ impl Runtime {
                                 .iter_mut()
                                 .find_map(|child| child.find_mut(id))
                                 .ok_or_else(|| {
-                                    Error::runtime("transition refers to a missing list widget")
+                                    Error::runtime("animation refers to a missing list widget")
                                 })?;
-                            properties::apply_transition(child, &property, value)?;
+                            properties::apply_animation_frame(child, &property, value)?;
                         }
                         Ok(())
                     })();
@@ -681,7 +681,7 @@ impl Runtime {
                         let target = transition::target(value, &property)?;
                         let mut state = previous.clone();
                         state.retarget(target, now);
-                        properties::apply_transition(node, &property, state.current())?;
+                        properties::apply_animation_frame(node, &property, state.current())?;
                         staged_transitions.insert(index, state);
                     } else {
                         properties::apply(node, &property, value)?;
@@ -706,7 +706,7 @@ impl Runtime {
                 let node = target
                     .iter_mut()
                     .find_map(|surface| surface.root.find_mut(binding.node))
-                    .ok_or_else(|| Error::runtime("transition refers to a missing widget"))?;
+                    .ok_or_else(|| Error::runtime("animation refers to a missing widget"))?;
                 properties::apply_transition(node, &binding.property, state.target())?;
             }
             for surface in &target {
@@ -742,12 +742,12 @@ impl Runtime {
         Ok(changed || self.has_active_transitions())
     }
 
-    /// advance active transitions to a monotonic point in time.
+    /// advance active style animations to a monotonic point in time.
     pub fn advance(&mut self, now: Instant) -> Result<bool> {
         self.advance_checked(now, |_| Ok(()))
     }
 
-    /// advance transitions and validate the interpolated surfaces before publishing them.
+    /// advance animations and validate the interpolated surfaces before publishing them.
     pub fn advance_checked(
         &mut self,
         now: Instant,
@@ -768,8 +768,8 @@ impl Runtime {
             let node = candidate
                 .iter_mut()
                 .find_map(|surface| surface.root.find_mut(binding.node))
-                .ok_or_else(|| Error::runtime("transition refers to a missing widget"))?;
-            properties::apply_transition(node, &binding.property, state.current())?;
+                .ok_or_else(|| Error::runtime("animation refers to a missing widget"))?;
+            properties::apply_animation_frame(node, &binding.property, state.current())?;
             staged.insert(*index, state);
         }
         if staged.is_empty() {
@@ -782,7 +782,7 @@ impl Runtime {
         for (index, transition) in staged {
             self.bindings
                 .get_mut(&index)
-                .expect("an active transition belongs to a live binding")
+                .expect("an active animation belongs to a live binding")
                 .transition = Some(transition);
         }
         let changed = candidate != self.surfaces;
@@ -790,7 +790,7 @@ impl Runtime {
         Ok(changed)
     }
 
-    /// whether a widget has an active style transition.
+    /// whether a widget has an active style animation.
     pub fn is_animating(&self, id: NodeId) -> bool {
         self.bindings.values().any(|binding| {
             binding.node == id
@@ -801,7 +801,7 @@ impl Runtime {
         })
     }
 
-    /// whether any widget in a set has an active style transition.
+    /// whether any widget in a set has an active style animation.
     pub fn is_any_animating(&self, ids: impl IntoIterator<Item = NodeId>) -> bool {
         let active: BTreeSet<_> = self
             .bindings
@@ -1011,9 +1011,10 @@ impl Runtime {
             _ => None,
         };
         let value = if let Some((function, spec)) = descriptor {
-            if !transition::supports(&property) {
+            if !spec.supports(&property) {
                 return Err(Error::runtime(format!(
-                    "transitions are not supported for {property}"
+                    "{} are not supported for {property}",
+                    spec.name()
                 )));
             }
             let index = self.bind(node.id, property.clone(), function)?;
@@ -1271,7 +1272,13 @@ fn install_ui(lua: &Lua, tracker: Rc<RefCell<Tracker>>) -> Result<()> {
     ui.set(
         "transition",
         lua.create_function(|_, (function, options): (Function, Table)| {
-            transition::Descriptor::new(function, options)
+            transition::Descriptor::transition(function, options)
+        })?,
+    )?;
+    ui.set(
+        "spring",
+        lua.create_function(|_, (function, options): (Function, Table)| {
+            transition::Descriptor::spring(function, options)
         })?,
     )?;
     ui.set_readonly(true);
@@ -1373,6 +1380,223 @@ mod transition_tests {
         close(root(&runtime).children[0].style.width.unwrap(), 100.0);
         close(root(&runtime).children[0].style.opacity, 0.5);
         assert!(!runtime.is_animating(button));
+    }
+
+    #[test]
+    fn spring_overshoot_is_clamped_without_ending_internal_motion() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local moving = ui.state(false)
+            return ui.panel { children = {
+                ui.button { on_click = function() moving:set(true) end },
+                ui.row { style = {
+                    width = ui.spring(function()
+                        return moving:get() and 0 or 100
+                    end, { stiffness = 100, damping = 0.1, epsilon = 0.001 }),
+                    opacity = ui.spring(function()
+                        return moving:get() and 1 or 0
+                    end, { stiffness = 100, damping = 0.1, epsilon = 0.001 }),
+                } },
+            } }
+            "#,
+        );
+        let button = root(&runtime).children[0].id;
+        let animated = root(&runtime).children[1].id;
+        let start = Instant::now();
+
+        runtime
+            .dispatch_inner(button, Event::Click, Some(start))
+            .unwrap();
+        assert!(runtime.advance(start + Duration::from_millis(300)).unwrap());
+        close(root(&runtime).children[1].style.width.unwrap(), 0.0);
+        close(root(&runtime).children[1].style.opacity, 1.0);
+        assert!(runtime.is_animating(animated));
+
+        assert!(runtime.advance(start + Duration::from_millis(600)).unwrap());
+        assert!(root(&runtime).children[1].style.width.unwrap() > 0.0);
+        assert!(root(&runtime).children[1].style.opacity < 1.0);
+
+        runtime.advance(start + Duration::from_secs(60)).unwrap();
+        close(root(&runtime).children[1].style.width.unwrap(), 0.0);
+        close(root(&runtime).children[1].style.opacity, 1.0);
+        assert!(!runtime.is_animating(animated));
+    }
+
+    #[test]
+    fn very_stiff_springs_do_not_snap_after_a_finite_step() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local moved = ui.state(false)
+            return ui.panel { children = {
+                ui.button { on_click = function() moved:set(true) end },
+                ui.row { style = { width = ui.spring(function()
+                    return moved:get() and 100 or 0
+                end, { stiffness = 1e308, damping = 1e-154 }) } },
+            } }
+            "#,
+        );
+        let button = root(&runtime).children[0].id;
+        let animated = root(&runtime).children[1].id;
+        let start = Instant::now();
+
+        runtime
+            .dispatch_inner(button, Event::Click, Some(start))
+            .unwrap();
+        runtime.advance(start + Duration::from_millis(1)).unwrap();
+
+        assert!(runtime.is_animating(animated));
+        assert!(root(&runtime).children[1].style.width.is_some());
+    }
+
+    #[test]
+    fn extremely_overdamped_springs_do_not_snap_after_a_finite_step() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local moved = ui.state(false)
+            return ui.panel { children = {
+                ui.button { on_click = function() moved:set(true) end },
+                ui.row { style = { width = ui.spring(function()
+                    return moved:get() and 100 or 0
+                end, { stiffness = 1, damping = 5e306 }) } },
+            } }
+            "#,
+        );
+        let button = root(&runtime).children[0].id;
+        let animated = root(&runtime).children[1].id;
+        let start = Instant::now();
+
+        runtime
+            .dispatch_inner(button, Event::Click, Some(start))
+            .unwrap();
+        runtime.advance(start + Duration::from_millis(1)).unwrap();
+
+        assert!(runtime.is_animating(animated));
+        close(root(&runtime).children[1].style.width.unwrap(), 0.0);
+    }
+
+    #[test]
+    fn invalid_spring_targets_are_rejected_instead_of_clamped() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local invalid = ui.state(false)
+            return ui.panel { children = {
+                ui.button { on_click = function() invalid:set(true) end },
+                ui.row { style = { opacity = ui.spring(function()
+                    return invalid:get() and 2 or 0.5
+                end, { stiffness = 170, damping = 0.8 }) } },
+            } }
+            "#,
+        );
+        let button = root(&runtime).children[0].id;
+
+        assert!(runtime.dispatch(button, Event::Click).is_err());
+        close(root(&runtime).children[1].style.opacity, 0.5);
+        assert!(!runtime.is_animating(root(&runtime).children[1].id));
+    }
+
+    #[test]
+    fn rejected_spring_frames_do_not_advance_internal_state() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local expanded = ui.state(false)
+            return ui.panel { children = {
+                ui.button { on_click = function() expanded:set(true) end },
+                ui.row { style = { width = ui.spring(function()
+                    return expanded:get() and 200 or 100
+                end, { stiffness = 100, damping = 0.8 }) } },
+            } }
+            "#,
+        );
+        let button = root(&runtime).children[0].id;
+        let animated = root(&runtime).children[1].id;
+        let start = Instant::now();
+        runtime
+            .dispatch_inner(button, Event::Click, Some(start))
+            .unwrap();
+
+        let reject_motion = |surfaces: &[SurfaceTree]| {
+            (surfaces[0].root.children[1].style.width == Some(100.0))
+                .then_some(())
+                .ok_or_else(|| "animated width is unsupported".into())
+        };
+        assert!(
+            runtime
+                .advance_checked(start + Duration::from_millis(100), reject_motion)
+                .is_err()
+        );
+        close(root(&runtime).children[1].style.width.unwrap(), 100.0);
+        assert!(runtime.is_animating(animated));
+
+        assert!(runtime.advance(start + Duration::from_millis(100)).unwrap());
+        let width = root(&runtime).children[1].style.width.unwrap();
+        assert!(width > 100.0 && width < 200.0);
+    }
+
+    #[test]
+    fn keyed_children_keep_spring_velocity_when_retargeted() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local width = ui.state(100)
+            local revision = ui.state(0)
+            local function spring_width()
+                return ui.spring(function() return width:get() end, {
+                    stiffness = 100,
+                    damping = 0.5,
+                    epsilon = 0.001,
+                })
+            end
+            return ui.panel { children = {
+                ui.button {
+                    key = 'start',
+                    on_click = function() width:set(200) end,
+                },
+                ui.button {
+                    key = 'reverse',
+                    on_click = function()
+                        width:set(100)
+                        revision:set(revision:get() + 1)
+                    end,
+                },
+                ui.row { key = 'control', style = { width = spring_width() } },
+                ui.column { children = function()
+                    local _ = revision:get()
+                    return { ui.row {
+                        key = 'stable',
+                        style = { width = spring_width() },
+                    } }
+                end },
+            } }
+            "#,
+        );
+        let start_button = child_with_key(root(&runtime), "start").id;
+        let reverse_button = child_with_key(root(&runtime), "reverse").id;
+        let stable = child_with_key(root(&runtime), "stable").id;
+        let start = Instant::now();
+
+        runtime
+            .dispatch_inner(start_button, Event::Click, Some(start))
+            .unwrap();
+        runtime.advance(start + Duration::from_millis(100)).unwrap();
+        runtime
+            .dispatch_inner(
+                reverse_button,
+                Event::Click,
+                Some(start + Duration::from_millis(100)),
+            )
+            .unwrap();
+        assert_eq!(child_with_key(root(&runtime), "stable").id, stable);
+
+        runtime.advance(start + Duration::from_millis(150)).unwrap();
+        close(
+            child_with_key(root(&runtime), "control")
+                .style
+                .width
+                .unwrap(),
+            child_with_key(root(&runtime), "stable")
+                .style
+                .width
+                .unwrap(),
+        );
     }
 
     #[test]
@@ -1712,7 +1936,7 @@ mod transition_tests {
     }
 
     #[test]
-    fn removed_children_drop_their_transition_state() {
+    fn removed_children_drop_their_animation_state() {
         let (_directory, _path, mut runtime) = load(
             r#"
             local expanded = ui.state(false)
@@ -1728,12 +1952,20 @@ mod transition_tests {
                 },
                 ui.column { children = function()
                     if not present:get() then return {} end
-                    return { ui.row {
-                        key = 'animated',
-                        style = { width = ui.transition(function()
-                            return expanded:get() and 200 or 100
-                        end, { duration = 100, easing = 'linear' }) },
-                    } }
+                    return {
+                        ui.row {
+                            key = 'animated',
+                            style = { width = ui.transition(function()
+                                return expanded:get() and 200 or 100
+                            end, { duration = 100, easing = 'linear' }) },
+                        },
+                        ui.row {
+                            key = 'spring',
+                            style = { width = ui.spring(function()
+                                return expanded:get() and 200 or 100
+                            end, { stiffness = 100, damping = 0.8 }) },
+                        },
+                    }
                 end },
             } }
             "#,
@@ -1741,6 +1973,7 @@ mod transition_tests {
         let start_button = child_with_key(root(&runtime), "start").id;
         let remove_button = child_with_key(root(&runtime), "remove").id;
         let animated = child_with_key(root(&runtime), "animated").id;
+        let spring = child_with_key(root(&runtime), "spring").id;
         let start = Instant::now();
 
         runtime
@@ -1748,6 +1981,7 @@ mod transition_tests {
             .unwrap();
         runtime.advance(start + Duration::from_millis(40)).unwrap();
         assert!(runtime.is_animating(animated));
+        assert!(runtime.is_animating(spring));
         runtime
             .dispatch_inner(
                 remove_button,
@@ -1756,7 +1990,9 @@ mod transition_tests {
             )
             .unwrap();
         assert!(root(&runtime).find(animated).is_none());
+        assert!(root(&runtime).find(spring).is_none());
         assert!(!runtime.is_animating(animated));
+        assert!(!runtime.is_animating(spring));
         assert!(!runtime.advance(start + Duration::from_millis(50)).unwrap());
     }
 
@@ -1817,7 +2053,7 @@ mod transition_tests {
     }
 
     #[test]
-    fn failed_and_successful_reloads_have_explicit_transition_semantics() {
+    fn failed_and_successful_reloads_have_explicit_animation_semantics() {
         let (_directory, path, mut runtime) = load(
             r#"
             local expanded = ui.state(false)
@@ -1825,7 +2061,10 @@ mod transition_tests {
                 on_click = function() expanded:set(true) end,
                 style = { width = ui.transition(function()
                     return expanded:get() and 200 or 100
-                end, { duration = 100, easing = 'linear' }) },
+                end, { duration = 100, easing = 'linear' }),
+                height = ui.spring(function()
+                    return expanded:get() and 200 or 100
+                end, { stiffness = 100, damping = 0.8 }) },
             } } }
             "#,
         );
@@ -1839,16 +2078,21 @@ mod transition_tests {
         assert!(runtime.reload(&path).is_err());
         runtime.advance(start + Duration::from_millis(50)).unwrap();
         close(root(&runtime).children[0].style.width.unwrap(), 150.0);
+        assert!(root(&runtime).children[0].style.height.unwrap() > 100.0);
+        assert!(runtime.is_animating(button));
 
         fs::write(
             &path,
             r#"return ui.panel { style = { width = ui.transition(function()
                 return 40
-            end, { duration = 100 }) } }"#,
+            end, { duration = 100 }), height = ui.spring(function()
+                return 30
+            end, { stiffness = 100, damping = 0.8 }) } }"#,
         )
         .unwrap();
         runtime.reload(&path).unwrap();
         close(root(&runtime).style.width.unwrap(), 40.0);
+        close(root(&runtime).style.height.unwrap(), 30.0);
         assert!(!runtime.is_animating(root(&runtime).id));
     }
 
@@ -1869,6 +2113,50 @@ mod transition_tests {
             fs::write(&path, source).unwrap();
             assert!(Runtime::load(path).is_err(), "accepted {source}");
         }
+    }
+
+    #[test]
+    fn spring_options_and_targets_are_strict() {
+        for source in [
+            "return ui.panel { style = { width = ui.spring(function() return 1 end, {}) } }",
+            "return ui.panel { style = { width = ui.spring(function() return 1 end, { damping = 1 }) } }",
+            "return ui.panel { style = { width = ui.spring(function() return 1 end, { stiffness = 1 }) } }",
+            "return ui.panel { style = { width = ui.spring(function() return 1 end, { stiffness = 0, damping = 1 }) } }",
+            "return ui.panel { style = { width = ui.spring(function() return 1 end, { stiffness = 1, damping = 0 }) } }",
+            "return ui.panel { style = { width = ui.spring(function() return 1 end, { stiffness = 1, damping = 1, epsilon = 0 }) } }",
+            "return ui.panel { style = { width = ui.spring(function() return 1 end, { stiffness = 1e-308, damping = 1e308 }) } }",
+            "return ui.panel { style = { width = ui.spring(function() return 1 end, { stiffness = 1e32, damping = 1e292 }) } }",
+            "return ui.panel { style = { width = ui.spring(function() return 1 end, { stiffness = 1, damping = 1, unknown = 1 }) } }",
+            "return ui.panel { style = { width = ui.spring(function() return 'wide' end, { stiffness = 1, damping = 1 }) } }",
+            "return ui.panel { style = { background = ui.spring(function() return 1 end, { stiffness = 1, damping = 1 }) } }",
+            "return ui.panel { style = { font_size = ui.spring(function() return 14 end, { stiffness = 1, damping = 1 }) } }",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("panel.luau");
+            fs::write(&path, source).unwrap();
+            assert!(Runtime::load(path).is_err(), "accepted {source}");
+        }
+    }
+
+    #[test]
+    fn every_numeric_style_spring_is_accepted() {
+        let (_directory, _path, runtime) = load(
+            r#"
+            local function fixed(value)
+                return ui.spring(function() return value end, {
+                    stiffness = 170,
+                    damping = 0.8,
+                })
+            end
+            return ui.panel { children = { ui.row { style = {
+                width = fixed(100), height = fixed(40), padding = fixed(1),
+                padding_x = fixed(2), padding_y = fixed(3), gap = fixed(4),
+                grow = fixed(0), radius = fixed(5), border_width = fixed(1),
+                opacity = fixed(0.8),
+            } } } }
+            "#,
+        );
+        assert!(!runtime.has_active_transitions());
     }
 
     #[test]
