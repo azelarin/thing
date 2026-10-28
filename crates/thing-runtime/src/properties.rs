@@ -1,7 +1,7 @@
 use mlua::{Error, Result, Table, Value};
 use thing_core::{
-    Kind, Node, PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins, PopupAlignment,
-    PopupAnchor, PopupConstraints, PopupOffset, TextAlign, TextOverflow,
+    CrossAlign, Kind, MainAlign, Node, PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins,
+    PopupAlignment, PopupAnchor, PopupConstraints, PopupOffset, TextAlign, TextOverflow,
 };
 
 pub(crate) fn string(value: Value, name: &str) -> Result<String> {
@@ -159,6 +159,40 @@ fn text_overflow(value: Value, name: &str) -> Result<TextOverflow> {
     }
 }
 
+fn cross_align(value: Value, name: &str) -> Result<CrossAlign> {
+    match string(value, name)?.as_str() {
+        "start" => Ok(CrossAlign::Start),
+        "center" => Ok(CrossAlign::Center),
+        "end" => Ok(CrossAlign::End),
+        "stretch" => Ok(CrossAlign::Stretch),
+        _ => Err(Error::runtime(format!(
+            "{name} must be 'start', 'center', 'end', or 'stretch'"
+        ))),
+    }
+}
+
+fn optional_cross_align(value: Value, name: &str) -> Result<Option<CrossAlign>> {
+    if value.is_nil() {
+        Ok(None)
+    } else {
+        cross_align(value, name).map(Some)
+    }
+}
+
+fn main_align(value: Value, name: &str) -> Result<MainAlign> {
+    match string(value, name)?.as_str() {
+        "start" => Ok(MainAlign::Start),
+        "center" => Ok(MainAlign::Center),
+        "end" => Ok(MainAlign::End),
+        "space_between" => Ok(MainAlign::SpaceBetween),
+        "space_around" => Ok(MainAlign::SpaceAround),
+        "space_evenly" => Ok(MainAlign::SpaceEvenly),
+        _ => Err(Error::runtime(format!(
+            "{name} must be 'start', 'center', 'end', 'space_between', 'space_around', or 'space_evenly'"
+        ))),
+    }
+}
+
 fn popup_anchor(value: Value) -> Result<PopupAnchor> {
     match string(value, "anchor")?.as_str() {
         "auto" => Ok(PopupAnchor::Auto),
@@ -284,11 +318,21 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
                 Some(number(value, name)? as f32)
             }
         }
+        "style.min_width" => node.style.min_width = optional_number(value, name)?,
+        "style.max_width" => node.style.max_width = optional_number(value, name)?,
+        "style.min_height" => node.style.min_height = optional_number(value, name)?,
+        "style.max_height" => node.style.max_height = optional_number(value, name)?,
         "style.padding" => node.style.padding = number(value, name)? as f32,
         "style.padding_x" => node.style.padding_x = optional_number(value, name)?,
         "style.padding_y" => node.style.padding_y = optional_number(value, name)?,
         "style.gap" => node.style.gap = number(value, name)? as f32,
         "style.grow" => node.style.grow = number(value, name)? as f32,
+        "style.shrink" => node.style.shrink = optional_number(value, name)?,
+        "style.align" => node.style.align = cross_align(value, name)?,
+        "style.align_self" => node.style.align_self = optional_cross_align(value, name)?,
+        "style.align_content" => node.style.align_content = cross_align(value, name)?,
+        "style.justify" => node.style.justify = main_align(value, name)?,
+        "style.wrap" => node.style.wrap = boolean(value, name)?,
         "style.radius" => node.style.radius = number(value, name)? as f32,
         "style.border_width" => node.style.border_width = number(value, name)? as f32,
         "style.border_color" => {
