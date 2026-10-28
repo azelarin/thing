@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     io,
     path::Path,
     rc::Rc,
@@ -48,7 +47,7 @@ use thing_runtime::{
     ManagedProcessSnapshot, OutputContext, PointerButton as RuntimePointerButton,
     PointerEvent as RuntimePointerEvent, PointerPhase, Scalar, ScrollInput as RuntimeScrollInput,
     ScrollSource as RuntimeScrollSource, ServiceSnapshot, SurfaceKey, SurfaceTree,
-    SystemTrayAction, SystemTrayMenuAction, UiAction, UiTarget,
+    SystemTrayAction, SystemTrayMenuAction, UiAction,
 };
 use thing_ui::{
     Interaction, Layout, PaintFrame, ScrollState, Size, TextInputCheckpoint, TextInputEditor,
@@ -106,11 +105,15 @@ use crate::{
         Configurations, DispatchOutcome, PointerHandlerOutcome, RemovedConfiguration,
         ScrollHandlerOutcome,
     },
+    focus::{LayoutSnapshot, ScopedUiTarget, SurfaceLayouts},
     focused_clipboard::{FocusedClipboard, PasteId},
     hover::{Command as HoverCommand, HoverKey, HoverStates, HoverTarget},
     input_method::{
         ChangeCause as InputMethodChangeCause, CursorRectangle as InputMethodCursorRectangle,
         Done as InputMethodDone, InputMethod, TextState as InputMethodTextState,
+    },
+    keyboard::{
+        RepeatSession, RepeatTimerAction, TextKeyAction, repeat_action_is_current, text_key_action,
     },
     launch::{self, LaunchRequest, Launcher, PendingLaunches},
     managed_process::{
@@ -610,117 +613,10 @@ struct SurfaceInit {
     scale: Scale,
 }
 
-struct PresentedSurface {
-    layout: Layout,
-    root: NodeId,
-    consumer: String,
-    targets: BTreeMap<NodeId, UiTarget>,
-}
-
-#[derive(Default)]
-struct SurfaceLayouts {
-    // pointer geometry changes only after the corresponding frame is visible.
-    presented: Option<PresentedSurface>,
-    // keyboard focus and ime can use the next layout before presentation.
-    input: Option<Layout>,
-    input_invalidated: bool,
-}
-
-#[derive(Clone, Copy)]
-enum LayoutSnapshot {
-    Presented,
-    Input,
-}
-
-impl SurfaceLayouts {
-    fn presented(&self) -> Option<&Layout> {
-        self.presented.as_ref().map(|presented| &presented.layout)
-    }
-
-    fn input(&self) -> Option<&Layout> {
-        self.input.as_ref().or_else(|| self.presented())
-    }
-
-    fn snapshot(&self, snapshot: LayoutSnapshot) -> Option<&Layout> {
-        match snapshot {
-            LayoutSnapshot::Presented => self.presented(),
-            LayoutSnapshot::Input => self.input(),
-        }
-    }
-
-    fn stage_input(&mut self, layout: Layout) {
-        self.input = Some(layout);
-        self.input_invalidated = false;
-    }
-
-    fn presented_target(&self, id: NodeId) -> Option<ScopedUiTarget> {
-        let presented = self.presented.as_ref()?;
-        Some(ScopedUiTarget {
-            consumer: presented.consumer.clone(),
-            target: presented.targets.get(&id)?.clone(),
-        })
-    }
-
-    fn presented_path(&self, id: NodeId) -> Vec<ScopedUiTarget> {
-        let Some(presented) = &self.presented else {
-            return Vec::new();
-        };
-        let Some(target) = presented.targets.get(&id) else {
-            return Vec::new();
-        };
-        target
-            .interactive_path_from(presented.root)
-            .filter_map(|id| {
-                Some(ScopedUiTarget {
-                    consumer: presented.consumer.clone(),
-                    target: presented.targets.get(&id)?.clone(),
-                })
-            })
-            .collect()
-    }
-
-    fn publish(
-        &mut self,
-        layout: Layout,
-        root: NodeId,
-        consumer: String,
-        targets: BTreeMap<NodeId, UiTarget>,
-    ) {
-        self.presented = Some(PresentedSurface {
-            layout,
-            root,
-            consumer,
-            targets,
-        });
-        self.input = None;
-        self.input_invalidated = false;
-    }
-
-    fn invalidate_input(&mut self) {
-        self.input = None;
-        self.input_invalidated = true;
-    }
-
-    fn clear_input(&mut self) {
-        self.input = None;
-        self.input_invalidated = false;
-    }
-
-    fn input_needs_refresh(&self) -> bool {
-        self.input_invalidated
-    }
-}
-
 struct InputOrigin {
     seat: wl_seat::WlSeat,
     serial: u32,
     surface: wl_surface::WlSurface,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ScopedUiTarget {
-    consumer: String,
-    target: UiTarget,
 }
 
 struct PendingPaste {
@@ -820,158 +716,6 @@ enum SliderKeyAction {
     Increase,
     Minimum,
     Maximum,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum TextKeyAction {
-    Insert(String),
-    Backspace,
-    Delete,
-    MoveLeft,
-    MoveRight,
-    MoveToStart,
-    MoveToEnd,
-    SelectAll,
-    Submit,
-}
-
-impl TextKeyAction {
-    fn repeats(&self) -> bool {
-        matches!(
-            self,
-            Self::Insert(_) | Self::Backspace | Self::Delete | Self::MoveLeft | Self::MoveRight
-        )
-    }
-
-    fn changes_value(&self) -> bool {
-        matches!(self, Self::Insert(_) | Self::Backspace | Self::Delete)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct RepeatSettings {
-    delay: Duration,
-    interval: Duration,
-}
-
-impl RepeatSettings {
-    fn from_info(info: RepeatInfo) -> Option<Self> {
-        match info {
-            RepeatInfo::Repeat { rate, delay } => Some(Self {
-                delay: Duration::from_millis(u64::from(delay)),
-                interval: Duration::from_micros((1_000_000 / u64::from(rate.get())).max(1)),
-            }),
-            RepeatInfo::Disable => None,
-        }
-    }
-}
-
-struct RepeatingKey<S> {
-    event: KeyEvent,
-    surface: S,
-    first: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RepeatTimerAction {
-    None,
-    Arm(Duration),
-    Disarm,
-}
-
-struct RepeatSession<S> {
-    settings: Option<RepeatSettings>,
-    key: Option<RepeatingKey<S>>,
-    host_armed: bool,
-}
-
-impl<S> Default for RepeatSession<S> {
-    fn default() -> Self {
-        Self {
-            settings: None,
-            key: None,
-            host_armed: false,
-        }
-    }
-}
-
-impl<S: PartialEq> RepeatSession<S> {
-    fn press(
-        &mut self,
-        event: KeyEvent,
-        surface: S,
-        key_repeats: bool,
-        action_repeats: bool,
-    ) -> RepeatTimerAction {
-        if !key_repeats {
-            return RepeatTimerAction::None;
-        }
-        if !action_repeats {
-            return self.clear();
-        }
-        self.key = Some(RepeatingKey {
-            event,
-            surface,
-            first: true,
-        });
-        match self.settings {
-            Some(settings) => {
-                self.host_armed = true;
-                RepeatTimerAction::Arm(settings.delay)
-            }
-            None if self.host_armed => {
-                self.host_armed = false;
-                RepeatTimerAction::Disarm
-            }
-            None => RepeatTimerAction::None,
-        }
-    }
-
-    fn update(&mut self, info: RepeatInfo) -> RepeatTimerAction {
-        self.settings = RepeatSettings::from_info(info);
-        match (self.settings, self.key.as_mut()) {
-            (Some(settings), Some(key)) => {
-                key.first = true;
-                self.host_armed = true;
-                RepeatTimerAction::Arm(settings.delay)
-            }
-            _ if self.host_armed => {
-                self.host_armed = false;
-                RepeatTimerAction::Disarm
-            }
-            _ => RepeatTimerAction::None,
-        }
-    }
-
-    fn release(&mut self, raw_code: u32) -> RepeatTimerAction {
-        if self
-            .key
-            .as_ref()
-            .is_some_and(|key| key.event.raw_code == raw_code)
-        {
-            self.clear()
-        } else {
-            RepeatTimerAction::None
-        }
-    }
-
-    fn clear(&mut self) -> RepeatTimerAction {
-        self.key = None;
-        if self.host_armed {
-            self.host_armed = false;
-            RepeatTimerAction::Disarm
-        } else {
-            RepeatTimerAction::None
-        }
-    }
-
-    fn accepts_compositor_repeat(&self, raw_code: u32, surface: &S) -> bool {
-        self.settings.is_none()
-            && self
-                .key
-                .as_ref()
-                .is_some_and(|key| key.event.raw_code == raw_code && &key.surface == surface)
-    }
 }
 
 struct PopupRole {
@@ -4881,34 +4625,6 @@ fn widget_key_action(kind: Kind, keysym: Keysym, direct: bool) -> Option<WidgetK
     }
 }
 
-fn text_key_action(event: &KeyEvent, modifiers: Modifiers, direct: bool) -> Option<TextKeyAction> {
-    if modifiers.logo || (modifiers.alt && !modifiers.ctrl) {
-        return None;
-    }
-    match event.keysym {
-        Keysym::BackSpace => return Some(TextKeyAction::Backspace),
-        Keysym::Delete => return Some(TextKeyAction::Delete),
-        Keysym::Left => return Some(TextKeyAction::MoveLeft),
-        Keysym::Right => return Some(TextKeyAction::MoveRight),
-        Keysym::Home if direct => return Some(TextKeyAction::MoveToStart),
-        Keysym::End if direct => return Some(TextKeyAction::MoveToEnd),
-        Keysym::Return | Keysym::KP_Enter if direct => return Some(TextKeyAction::Submit),
-        Keysym::a | Keysym::A if direct && modifiers.ctrl && !modifiers.alt => {
-            return Some(TextKeyAction::SelectAll);
-        }
-        _ => {}
-    }
-    if modifiers.ctrl && !modifiers.alt {
-        return None;
-    }
-    let text = event.utf8.as_ref()?;
-    (!text.is_empty()
-        && !text.chars().any(|character| {
-            character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
-        }))
-    .then(|| TextKeyAction::Insert(text.clone()))
-}
-
 fn reconcile_controlled_text_edit(
     editor: &mut TextInputEditor,
     node: &Node,
@@ -5023,14 +4739,6 @@ fn paint_interaction(mut input: Interaction, surface_has_keyboard_focus: bool) -
         input.hide_keyboard_focus();
     }
     input
-}
-
-fn repeat_action_is_current<T: PartialEq>(
-    action_repeats: bool,
-    before: &Option<T>,
-    after: &Option<T>,
-) -> bool {
-    action_repeats && before == after
 }
 
 fn keyboard_focus_transition_affects<T: PartialEq>(
@@ -6717,8 +6425,8 @@ mod input_tests {
 
         layouts.stage_input(slider_layout(true, true));
         assert_eq!(
-            layouts.presented.as_ref().unwrap().consumer,
-            "consumer",
+            layouts.presented_consumer(),
+            Some("consumer"),
             "staging input geometry must preserve presented widget identities",
         );
         assert!(
@@ -7508,7 +7216,7 @@ mod input_tests {
             session.update(enabled_repeat()),
             RepeatTimerAction::Arm(Duration::from_millis(600))
         );
-        assert!(session.host_armed);
+        assert!(session.host_is_armed());
         assert_eq!(session.key.as_ref().unwrap().surface, 7);
         assert!(!session.accepts_compositor_repeat(106, &7));
 
@@ -7516,7 +7224,7 @@ mod input_tests {
             session.update(RepeatInfo::Disable),
             RepeatTimerAction::Disarm
         );
-        assert!(!session.host_armed);
+        assert!(!session.host_is_armed());
         assert_eq!(session.key.as_ref().unwrap().event.raw_code, 106);
         assert!(session.accepts_compositor_repeat(106, &7));
     }
@@ -7533,7 +7241,7 @@ mod input_tests {
         assert!(session.key.is_some());
         assert_eq!(session.release(106), RepeatTimerAction::Disarm);
         assert!(session.key.is_none());
-        assert!(!session.host_armed);
+        assert!(!session.host_is_armed());
 
         assert_eq!(
             session.press(right_key(106), 8, true, true),
@@ -7541,7 +7249,7 @@ mod input_tests {
         );
         assert_eq!(session.clear(), RepeatTimerAction::Disarm);
         assert!(session.key.is_none());
-        assert!(!session.host_armed);
+        assert!(!session.host_is_armed());
     }
 
     #[test]
@@ -7560,14 +7268,14 @@ mod input_tests {
         let held = session.key.as_ref().unwrap();
         assert_eq!(held.event.raw_code, 106);
         assert_eq!(held.surface, 7);
-        assert!(session.host_armed);
+        assert!(session.host_is_armed());
 
         assert_eq!(
             session.press(key_event(102, Keysym::Home), 8, true, false),
             RepeatTimerAction::Disarm
         );
         assert!(session.key.is_none());
-        assert!(!session.host_armed);
+        assert!(!session.host_is_armed());
     }
 }
 
