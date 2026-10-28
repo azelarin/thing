@@ -13,6 +13,7 @@ local gap = ui.spring(function()
 end, { stiffness = 170, damping = 0.8, epsilon = 0.1 })
 
 local input = ui.text_input {
+    autofocus = true,
     value = function()
         return query:get()
     end,
@@ -36,6 +37,8 @@ local clipboard_button = ui.button {
         return clipboard.available:get() and not clipboard.loading:get()
     end,
     on_click = function()
+        ui.focus(input)
+        ui.reveal(input)
         if clipboard.text:get() == nil then
             clipboard.set_text(query:get())
         else

@@ -348,8 +348,9 @@ on the button under the pointer takes precedence over viewport movement.
 the offset stays with the scroll widget while reactive updates preserve its
 identity, including while it is hidden, and is clamped when its content shrinks.
 a successful configuration reload and closing a popup reset their offsets.
-scrollbars, horizontal scrolling, touch dragging, and programmatic movement are
-not available yet. scroll children stay in one column, so `wrap` is not available.
+`ui.reveal(widget)` can move the enclosing vertical scroll views from an event
+handler. scrollbars, horizontal scrolling, and touch dragging are not available
+yet. scroll children stay in one column, so `wrap` is not available.
 when centered or end-justified content becomes taller than its viewport, it
 falls back to the start edge so the beginning remains reachable.
 
@@ -1392,6 +1393,43 @@ an automatic popup's `visible` property is an availability gate. setting it to
 false cancels a pending open and closes the popup. one button can own one
 automatic popup. `on_close` runs when the popup is dismissed, but not when an
 open hover popup is recreated in grabbed mode.
+
+buttons, sliders, ranges, and text inputs accept `autofocus = true`. one widget
+per panel or popup may use it. thing applies autofocus when that surface first
+receives keyboard focus; an earlier pointer or explicit focus choice wins.
+
+event handlers can move focus or reveal a row after updating state:
+
+```luau
+local search = ui.text_input {
+    autofocus = true,
+    value = '',
+    on_change = function() end,
+}
+local result = ui.button { key = 'first-result' }
+
+ui.button {
+    on_click = function()
+        ui.focus(search)
+        ui.reveal(result)
+    end,
+}
+```
+
+`ui.focus(widget)` accepts an interactive widget. it also reveals that widget
+when its panel or popup has keyboard focus; otherwise the request waits for that
+surface's next keyboard entry. a popup created by the same event can claim the
+request. if that popup is still closed when the next frame is prepared, the
+request expires instead of carrying into a later opening. `ui.reveal(widget)`
+moves every enclosing vertical scroll view by the smallest amount needed. both
+functions are available only inside event handlers and take effect after the
+handler's reactive update passes validation. hidden, disabled, and zero-sized
+targets are ignored. if an updated list recreates the target, give it a stable
+`key`. a container recreated around that target needs its own key as well. an
+unkeyed positional replacement does not inherit focus or a queued action. hiding,
+disabling, or removing the focused widget clears focus and text input state. a
+successful configuration reload starts a new focus lifetime and can apply its
+autofocus choice, while a failed reload leaves the current one alone.
 
 the host supports one grabbed popup at a time. an input event is required to open
 it. outside clicks and escape dismiss it and call `on_close`. tab/shift+tab move

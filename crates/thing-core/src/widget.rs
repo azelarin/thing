@@ -733,6 +733,7 @@ pub struct Node {
     pub panel: PanelProperties,
     pub enabled: bool,
     pub visible: bool,
+    pub autofocus: bool,
     pub key: Option<String>,
     pub children: Vec<Node>,
 }
@@ -763,6 +764,7 @@ impl Node {
             panel: PanelProperties::default(),
             enabled: true,
             visible: true,
+            autofocus: false,
             key: None,
             children: Vec::new(),
         }
@@ -780,7 +782,8 @@ impl Node {
                 allow_automatic_popup_anchor: self.allows_automatic_popup_anchor(),
                 inside_range: false,
             },
-        )
+        )?;
+        self.validate_autofocus_surfaces()
     }
 
     /// validates a tree rendered as one surface. an automatic popup root may
@@ -796,7 +799,8 @@ impl Node {
                 allow_automatic_popup_anchor: self.allows_automatic_popup_anchor(),
                 inside_range: false,
             },
-        )
+        )?;
+        self.validate_autofocus_surfaces()
     }
 
     fn allows_automatic_popup_anchor(&self) -> bool {
@@ -848,6 +852,11 @@ impl Node {
                 "{:?} cannot contain children",
                 self.kind
             )));
+        }
+        if self.autofocus && !self.kind.is_interactive() {
+            return Err(TreeError(
+                "autofocus is available only on interactive widgets".into(),
+            ));
         }
         let style = &self.style;
         if (self.kind == Kind::Popup || (depth == 0 && self.kind == Kind::Panel))
@@ -1069,6 +1078,33 @@ impl Node {
             )?;
         }
         Ok(())
+    }
+
+    fn validate_autofocus_surfaces(&self) -> Result<(), TreeError> {
+        fn validate_surface(root: &Node) -> Result<(), TreeError> {
+            fn collect(node: &Node, count: &mut usize) -> Result<(), TreeError> {
+                *count += usize::from(node.autofocus);
+                for child in &node.children {
+                    if child.kind == Kind::Popup {
+                        validate_surface(child)?;
+                    } else {
+                        collect(child, count)?;
+                    }
+                }
+                Ok(())
+            }
+
+            let mut count = 0;
+            collect(root, &mut count)?;
+            if count > 1 {
+                return Err(TreeError(
+                    "a rendered surface can contain only one autofocus widget".into(),
+                ));
+            }
+            Ok(())
+        }
+
+        validate_surface(self)
     }
 
     pub fn find(&self, id: NodeId) -> Option<&Self> {
@@ -1298,6 +1334,33 @@ mod tests {
         root.children[0].key = Some("device".into());
         root.children[1].key = Some("device".into());
         assert!(root.validate().is_err());
+    }
+
+    #[test]
+    fn autofocus_is_unique_per_rendered_surface() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut first = Node::new(NodeId(2), Kind::Button);
+        first.autofocus = true;
+        let mut second = Node::new(NodeId(3), Kind::TextInput);
+        second.autofocus = true;
+        root.children = vec![first, second];
+        assert_eq!(
+            root.validate().unwrap_err().to_string(),
+            "a rendered surface can contain only one autofocus widget"
+        );
+
+        let second = root.children.pop().unwrap();
+        let mut popup = Node::new(NodeId(4), Kind::Popup);
+        popup.children.push(second);
+        root.children.push(popup);
+        assert!(root.validate().is_ok());
+
+        let mut text = Node::new(NodeId(5), Kind::Text);
+        text.autofocus = true;
+        assert_eq!(
+            text.validate().unwrap_err().to_string(),
+            "autofocus is available only on interactive widgets"
+        );
     }
 
     #[test]

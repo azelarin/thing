@@ -73,6 +73,14 @@ CASES = (
             "Expected this to be 'number', but got 'boolean'",
         ),
     ),
+    Case(
+        "invalid-ui-actions.luau",
+        (
+            "Property 'autofocus' is not compatible.",
+            "Expected this to be 'ThingWidget', but got 'string'",
+            "Expected this to be 'ThingWidget', but got 'boolean'",
+        ),
+    ),
 )
 
 

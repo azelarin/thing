@@ -43,7 +43,7 @@ use thing_core::{
 };
 use thing_runtime::{
     Action, Event, OutputContext, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree,
-    SystemTrayAction, SystemTrayMenuAction,
+    SystemTrayAction, SystemTrayMenuAction, UiAction, UiTarget,
 };
 use thing_ui::{
     Interaction, Layout, PaintFrame, ScrollState, Size, TextInputCheckpoint, TextInputEditor,
@@ -227,6 +227,7 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         input_method,
         launcher,
         pending_launches: PendingLaunches::new(),
+        pending_ui_actions: Vec::new(),
         surfaces: Vec::new(),
         closed_surfaces: Vec::new(),
         registry: RegistryState::new(&globals),
@@ -396,11 +397,127 @@ struct SurfaceInit {
     scale: Scale,
 }
 
+#[derive(Default)]
+struct SurfaceLayouts {
+    // pointer geometry changes only after the corresponding frame is visible.
+    presented: Option<Layout>,
+    // keyboard focus and ime can use the next layout before presentation.
+    input: Option<Layout>,
+    input_invalidated: bool,
+}
+
+#[derive(Clone, Copy)]
+enum LayoutSnapshot {
+    Presented,
+    Input,
+}
+
+impl SurfaceLayouts {
+    fn presented(&self) -> Option<&Layout> {
+        self.presented.as_ref()
+    }
+
+    fn input(&self) -> Option<&Layout> {
+        self.input.as_ref().or(self.presented.as_ref())
+    }
+
+    fn snapshot(&self, snapshot: LayoutSnapshot) -> Option<&Layout> {
+        match snapshot {
+            LayoutSnapshot::Presented => self.presented(),
+            LayoutSnapshot::Input => self.input(),
+        }
+    }
+
+    fn stage_input(&mut self, layout: Layout) {
+        self.input = Some(layout);
+        self.input_invalidated = false;
+    }
+
+    fn publish(&mut self, layout: Layout) {
+        self.presented = Some(layout);
+        self.input = None;
+        self.input_invalidated = false;
+    }
+
+    fn invalidate_input(&mut self) {
+        self.input = None;
+        self.input_invalidated = true;
+    }
+
+    fn clear_input(&mut self) {
+        self.input = None;
+        self.input_invalidated = false;
+    }
+
+    fn input_needs_refresh(&self) -> bool {
+        self.input_invalidated
+    }
+}
+
 struct InputOrigin {
     seat: wl_seat::WlSeat,
     serial: u32,
     surface: wl_surface::WlSurface,
 }
+
+#[derive(Clone)]
+struct ScopedUiTarget {
+    consumer: String,
+    target: UiTarget,
+}
+
+#[derive(Clone)]
+enum HostUiAction {
+    Focus(ScopedUiTarget),
+    Reveal(ScopedUiTarget),
+}
+
+impl HostUiAction {
+    fn target(&self) -> &ScopedUiTarget {
+        match self {
+            Self::Focus(target) | Self::Reveal(target) => target,
+        }
+    }
+
+    fn is_focus(&self) -> bool {
+        matches!(self, Self::Focus(_))
+    }
+}
+
+struct PendingUiAction {
+    output: wl_output::WlOutput,
+    action: HostUiAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MissingSurfacePolicy {
+    WaitForSameCycle,
+    Expire,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceActionRoute {
+    Assign(usize),
+    Retain,
+    Drop,
+}
+
+fn surface_action_route(
+    surface: Option<usize>,
+    missing: MissingSurfacePolicy,
+) -> SurfaceActionRoute {
+    match (surface, missing) {
+        (Some(index), _) => SurfaceActionRoute::Assign(index),
+        (None, MissingSurfacePolicy::WaitForSameCycle) => SurfaceActionRoute::Retain,
+        (None, MissingSurfacePolicy::Expire) => SurfaceActionRoute::Drop,
+    }
+}
+
+fn retain_non_focus_actions<T>(actions: &mut Vec<T>, mut is_focus: impl FnMut(&T) -> bool) {
+    actions.retain(|action| !is_focus(action));
+}
+
+const MAX_PENDING_UI_ACTIONS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WidgetKeyAction {
@@ -618,10 +735,13 @@ struct Surface {
     scale: Scale,
     viewport: Option<WpViewport>,
     fractional: Option<WpFractionalScaleV1>,
-    // geometry from the last successfully presented frame.
-    layout: Option<Layout>,
+    layouts: SurfaceLayouts,
     scroll: ScrollState,
     input: Interaction,
+    focus_target: Option<ScopedUiTarget>,
+    pending_focus: Option<ScopedUiTarget>,
+    ui_actions: Vec<HostUiAction>,
+    autofocus_pending: bool,
     text_input: Option<ActiveTextInput>,
     pointer_position: Option<Point>,
     hover_path: Vec<NodeId>,
@@ -703,6 +823,7 @@ pub(crate) struct App {
     input_method: InputMethod,
     launcher: Launcher,
     pending_launches: PendingLaunches<XdgActivationTokenV1>,
+    pending_ui_actions: Vec<PendingUiAction>,
     watch: Rc<Watch>,
     reload_at: Option<Instant>,
     hover: HoverStates<SurfaceOwner>,
@@ -850,6 +971,14 @@ impl App {
         for output in outputs {
             self.invalidate_output(&output);
         }
+        self.reconcile_published_configuration();
+    }
+
+    fn reconcile_published_configuration(&mut self) {
+        self.reconcile_focus_targets();
+        self.apply_pending_ui_actions_now();
+        self.prepare_invalidated_input_layouts_now();
+        self.reconcile_layout_focus();
         self.reconcile_input_method(InputMethodChangeCause::Other);
     }
 
@@ -884,6 +1013,7 @@ impl App {
         self.render.reset_painter(move || wake.ping())?;
         self.hover.clear();
         self.clear_key_repeat();
+        self.pending_ui_actions.clear();
         while let Some(index) = self
             .surfaces
             .iter()
@@ -915,6 +1045,7 @@ impl App {
         {
             self.clear_keyboard_focus();
         }
+        self.apply_pending_ui_actions(MissingSurfacePolicy::Expire)?;
         self.update_watch();
         self.reconcile_input_method(InputMethodChangeCause::Other);
         eprintln!("thing: reloaded {}", self.configurations.entry().display());
@@ -1016,9 +1147,13 @@ impl App {
             scale: init.scale,
             viewport,
             fractional,
-            layout: None,
+            layouts: SurfaceLayouts::default(),
             scroll: ScrollState::default(),
             input: Interaction::default(),
+            focus_target: None,
+            pending_focus: None,
+            ui_actions: Vec::new(),
+            autofocus_pending: true,
             text_input: None,
             pointer_position: None,
             hover_path: Vec::new(),
@@ -1183,9 +1318,13 @@ impl App {
         surface.root = root_id;
         surface.panel = Some(next);
         if reset_input {
-            surface.layout = None;
+            surface.layouts = SurfaceLayouts::default();
             surface.scroll = ScrollState::default();
             surface.input = Interaction::default();
+            surface.focus_target = None;
+            surface.pending_focus = None;
+            surface.ui_actions.clear();
+            surface.autofocus_pending = true;
             surface.text_input = None;
             surface.pointer_position = None;
             surface.hover_path.clear();
@@ -1197,6 +1336,7 @@ impl App {
         layer.wl_surface().commit();
         if reset_input && self.keyboard_surface.as_ref() == Some(&wl) {
             self.clear_key_repeat();
+            self.schedule_autofocus(index);
         }
         Ok(())
     }
@@ -1237,8 +1377,12 @@ impl App {
                 });
             self.update_watch();
             match result {
-                Ok(true) => self.invalidate_output(output),
-                Ok(false) => {}
+                Ok(changed) => {
+                    if changed {
+                        self.invalidate_output(output);
+                    }
+                    self.reconcile_published_configuration();
+                }
                 Err(error) => eprintln!("thing: cannot update output scale: {error}"),
             }
         }
@@ -1303,6 +1447,167 @@ impl App {
             .position(|surface| surface.role.surface() == wl)
     }
 
+    fn apply_pending_ui_actions(&mut self, missing: MissingSurfacePolicy) -> Result<(), String> {
+        self.assign_pending_ui_actions(missing);
+        let keyboard_surface = self.keyboard_surface.clone();
+        for index in 0..self.surfaces.len() {
+            let keyboard_focused =
+                keyboard_surface.as_ref() == Some(self.surfaces[index].role.surface());
+            if self.surfaces[index].ui_actions.is_empty()
+                && !(keyboard_focused && self.surfaces[index].pending_focus.is_some())
+            {
+                continue;
+            }
+            let output = self.surfaces[index].output.clone();
+            let surface_root = self.surfaces[index].root;
+            let mut actions = std::mem::take(&mut self.surfaces[index].ui_actions);
+            if keyboard_focused && let Some(target) = self.surfaces[index].pending_focus.take() {
+                actions.insert(0, HostUiAction::Focus(target));
+            }
+
+            let mut active = Vec::new();
+            for action in actions {
+                let target = action.target();
+                let current = self.scoped_target_is_current(&output, target)
+                    && self
+                        .configurations
+                        .rendered_surface_root(&output, target.target.node())
+                        == Some(surface_root);
+                if !current {
+                    continue;
+                }
+                if action.is_focus() && !keyboard_focused {
+                    self.surfaces[index].pending_focus = Some(target.clone());
+                } else {
+                    active.push(action);
+                }
+            }
+            if active.is_empty() {
+                continue;
+            }
+
+            let Some(root) = self
+                .configurations
+                .surface_root(&output, &self.surfaces[index].key)
+                .and_then(|root| root.find(surface_root))
+                .cloned()
+            else {
+                continue;
+            };
+            let size = self.surfaces[index].size;
+            let mut scroll = self.surfaces[index].scroll.clone();
+            let mut layout = self.render.layout(
+                &root,
+                Size {
+                    width: size.0 as f32,
+                    height: size.1 as f32,
+                },
+                &mut scroll,
+            )?;
+            let mut changed = false;
+            let mut focus = None;
+            for action in active {
+                let target = action.target().clone();
+                let id = target.target.node();
+                match action {
+                    HostUiAction::Focus(_) => {
+                        if layout.focus_order().any(|candidate| candidate == id) {
+                            changed |= layout.reveal_y(id, &mut scroll);
+                            focus = Some(target);
+                        }
+                    }
+                    HostUiAction::Reveal(_) => {
+                        changed |= layout.reveal_y(id, &mut scroll);
+                    }
+                }
+            }
+            if changed {
+                layout = self.render.layout(
+                    &root,
+                    Size {
+                        width: size.0 as f32,
+                        height: size.1 as f32,
+                    },
+                    &mut scroll,
+                )?;
+            }
+            let surface = &mut self.surfaces[index];
+            surface.scroll = scroll;
+            surface.layouts.stage_input(layout);
+            surface.dirty = true;
+            if let Some(target) = focus {
+                self.focus_from_keyboard(index, target);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_pending_ui_actions_now(&mut self) {
+        if let Err(error) = self.apply_pending_ui_actions(MissingSurfacePolicy::WaitForSameCycle) {
+            self.error = Some(error);
+        }
+    }
+
+    fn prepare_invalidated_input_layouts(&mut self) -> Result<(), String> {
+        let keyboard_surface = self.keyboard_surface.clone();
+        let indices: Vec<_> = self
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, surface)| {
+                surface.layouts.input_needs_refresh()
+                    && (surface.input.focused.is_some()
+                        || keyboard_surface.as_ref() == Some(surface.role.surface()))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in indices {
+            let output = self.surfaces[index].output.clone();
+            let surface_root = self.surfaces[index].root;
+            let Some(root) = self
+                .configurations
+                .surface_root(&output, &self.surfaces[index].key)
+                .and_then(|root| root.find(surface_root))
+                .cloned()
+            else {
+                self.surfaces[index].layouts.clear_input();
+                continue;
+            };
+            let size = self.surfaces[index].size;
+            let mut scroll = self.surfaces[index].scroll.clone();
+            let mut layout = self.render.layout(
+                &root,
+                Size {
+                    width: size.0 as f32,
+                    height: size.1 as f32,
+                },
+                &mut scroll,
+            )?;
+            let focused = self.surfaces[index].input.keyboard_focused();
+            if focused.is_some_and(|id| layout.reveal_y(id, &mut scroll)) {
+                layout = self.render.layout(
+                    &root,
+                    Size {
+                        width: size.0 as f32,
+                        height: size.1 as f32,
+                    },
+                    &mut scroll,
+                )?;
+            }
+            let surface = &mut self.surfaces[index];
+            surface.scroll = scroll;
+            surface.layouts.stage_input(layout);
+            surface.dirty = true;
+        }
+        Ok(())
+    }
+
+    fn prepare_invalidated_input_layouts_now(&mut self) {
+        if let Err(error) = self.prepare_invalidated_input_layouts() {
+            self.error = Some(error);
+        }
+    }
+
     fn draw(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
         self.render.check_error()?;
         let now = Instant::now();
@@ -1340,6 +1645,7 @@ impl App {
                 }
             }
         }
+        self.apply_pending_ui_actions(MissingSurfacePolicy::Expire)?;
         let configurations = &self.configurations;
         let keyboard_surface = self.keyboard_surface.clone();
         let mut presented = Vec::new();
@@ -1405,6 +1711,10 @@ impl App {
                     .expect("the active text input was checked")
                     .editor
             });
+            let input = paint_interaction(
+                surface.input,
+                keyboard_surface.as_ref() == Some(surface.role.surface()),
+            );
             let result = self.render.draw(
                 window,
                 PaintFrame {
@@ -1412,7 +1722,7 @@ impl App {
                     layout: &layout,
                     physical,
                     scale: surface.scale.factor(),
-                    input: surface.input,
+                    input,
                     text_input,
                 },
                 || {
@@ -1430,7 +1740,7 @@ impl App {
                     let animating = configurations.layout_is_animating(&surface.output, &layout);
                     surface.waiting = true;
                     surface.scroll = scroll;
-                    surface.layout = Some(layout);
+                    surface.layouts.publish(layout);
                     surface.dirty = redraw || animating;
                     presented.push(index);
                 }
@@ -1438,10 +1748,12 @@ impl App {
                 FrameResult::RetryAfter(delay) => {
                     surface.waiting = false;
                     surface.dirty = true;
+                    surface.layouts.stage_input(layout);
                     surface.retry_at = Some(Instant::now() + delay);
                 }
             }
         }
+        self.reconcile_layout_focus();
         let mut owners: Vec<(SurfaceOwner, bool)> = Vec::new();
         for surface in presented
             .iter()
@@ -1527,7 +1839,7 @@ impl App {
         })?;
         let popup_surface = &self.surfaces[index];
         // reposition applies only after the popup's first buffer has been mapped.
-        popup_surface.layout.as_ref()?;
+        popup_surface.layouts.presented()?;
         let Role::Popup(role) = &popup_surface.role else {
             return None;
         };
@@ -1548,8 +1860,8 @@ impl App {
         };
         let trigger = match anchor {
             Some(anchor) => parent
-                .layout
-                .as_ref()?
+                .layouts
+                .presented()?
                 .get(anchor)
                 .map(|placement| placement.bounds)?,
             None => Rect {
@@ -1587,19 +1899,20 @@ impl App {
                 validate_surface_capabilities(surfaces, layer_shell_version)
             });
         self.update_watch();
-        let (changed, actions) = match result {
+        let outcome = match result {
             Ok(result) => result,
             Err(error) => {
                 eprintln!("thing: {error}");
                 // hover cleanup can fail after its first valid refresh was
                 // published, so reconcile whichever snapshot remains.
                 self.invalidate_output(&output);
+                self.reconcile_published_configuration();
                 return;
             }
         };
         // a successful handler can remove its own popup. request activation
         // before invalidation destroys the surface that received the input.
-        for action in actions {
+        for action in outcome.actions {
             let result = match action {
                 Action::Niri(action) => self.niri.send(action),
                 Action::Media { action, player } => self
@@ -1656,8 +1969,236 @@ impl App {
                 eprintln!("thing: {error}");
             }
         }
-        if changed {
+        if let Some(consumer) = consumer {
+            self.queue_ui_actions(output.clone(), consumer, outcome.ui_actions);
+        }
+        if outcome.changed {
             self.invalidate_output(&output);
+        }
+        self.reconcile_published_configuration();
+    }
+
+    fn queue_ui_actions(
+        &mut self,
+        output: wl_output::WlOutput,
+        consumer: String,
+        actions: Vec<UiAction>,
+    ) {
+        for action in actions {
+            let action = match action {
+                UiAction::Focus(target) => HostUiAction::Focus(ScopedUiTarget {
+                    consumer: consumer.clone(),
+                    target,
+                }),
+                UiAction::Reveal(target) => HostUiAction::Reveal(ScopedUiTarget {
+                    consumer: consumer.clone(),
+                    target,
+                }),
+            };
+            if action.is_focus() {
+                self.pending_ui_actions.retain(|pending| {
+                    pending.output != output
+                        || pending.action.target().consumer != consumer
+                        || !pending.action.is_focus()
+                });
+                for surface in self
+                    .surfaces
+                    .iter_mut()
+                    .filter(|surface| surface.output == output)
+                {
+                    surface.ui_actions.retain(|pending| {
+                        pending.target().consumer != consumer || !pending.is_focus()
+                    });
+                    if surface
+                        .pending_focus
+                        .as_ref()
+                        .is_some_and(|pending| pending.consumer == consumer)
+                    {
+                        surface.pending_focus = None;
+                    }
+                }
+            }
+            self.pending_ui_actions.push(PendingUiAction {
+                output: output.clone(),
+                action,
+            });
+            if self.pending_ui_actions.len() > MAX_PENDING_UI_ACTIONS {
+                self.pending_ui_actions.remove(0);
+            }
+        }
+        // bind actions to an existing surface immediately so removing that
+        // surface also retires the actions. a popup created by this event is
+        // allowed to claim an action later in the same cycle.
+        self.assign_pending_ui_actions(MissingSurfacePolicy::WaitForSameCycle);
+    }
+
+    fn cancel_queued_focus(&mut self, output: &wl_output::WlOutput) {
+        let Some(consumer) = self.configurations.consumer(output).map(str::to_owned) else {
+            return;
+        };
+        self.pending_ui_actions.retain(|pending| {
+            &pending.output != output
+                || pending.action.target().consumer != consumer
+                || !pending.action.is_focus()
+        });
+        for surface in self
+            .surfaces
+            .iter_mut()
+            .filter(|surface| &surface.output == output)
+        {
+            surface
+                .ui_actions
+                .retain(|action| action.target().consumer != consumer || !action.is_focus());
+            if surface
+                .pending_focus
+                .as_ref()
+                .is_some_and(|target| target.consumer == consumer)
+            {
+                surface.pending_focus = None;
+            }
+        }
+    }
+
+    fn cancel_all_queued_focus(&mut self) {
+        retain_non_focus_actions(&mut self.pending_ui_actions, |pending| {
+            pending.action.is_focus()
+        });
+        for surface in &mut self.surfaces {
+            retain_non_focus_actions(&mut surface.ui_actions, HostUiAction::is_focus);
+            surface.pending_focus = None;
+        }
+    }
+
+    fn assign_pending_ui_actions(&mut self, missing: MissingSurfacePolicy) {
+        let mut retained = Vec::new();
+        for pending in std::mem::take(&mut self.pending_ui_actions) {
+            let target = pending.action.target();
+            if self.configurations.consumer(&pending.output) != Some(target.consumer.as_str())
+                || !self
+                    .configurations
+                    .ui_target_is_current(&pending.output, &target.target)
+            {
+                continue;
+            }
+            let Some(root) = self
+                .configurations
+                .rendered_surface_root(&pending.output, target.target.node())
+            else {
+                continue;
+            };
+            let surface = self
+                .surfaces
+                .iter()
+                .position(|surface| surface.output == pending.output && surface.root == root);
+            match surface_action_route(surface, missing) {
+                SurfaceActionRoute::Assign(index) => {
+                    let surface = &mut self.surfaces[index];
+                    surface.ui_actions.push(pending.action);
+                    if surface.ui_actions.len() > MAX_PENDING_UI_ACTIONS {
+                        surface.ui_actions.remove(0);
+                    }
+                    surface.dirty = true;
+                }
+                SurfaceActionRoute::Retain => retained.push(pending),
+                SurfaceActionRoute::Drop => {}
+            }
+        }
+        self.pending_ui_actions = retained;
+    }
+
+    fn reconcile_focus_targets(&mut self) {
+        let mut cancelled = Vec::new();
+        let mut clear_repeat = false;
+        for index in 0..self.surfaces.len() {
+            let output = self.surfaces[index].output.clone();
+            let surface_root = self.surfaces[index].root;
+            let focused = self.surfaces[index].input.focused;
+            let focus_is_current = focused.is_none()
+                || self.surfaces[index]
+                    .focus_target
+                    .as_ref()
+                    .is_some_and(|target| {
+                        focused == Some(target.target.node())
+                            && self.scoped_target_is_current(&output, target)
+                            && self
+                                .configurations
+                                .rendered_surface_root(&output, target.target.node())
+                                == Some(surface_root)
+                    });
+            if !focus_is_current {
+                let surface = &mut self.surfaces[index];
+                surface.input.focus_from_pointer(None);
+                surface.focus_target = None;
+                surface.text_input = None;
+                surface.dirty = true;
+                cancelled.push(surface.role.surface().clone());
+                clear_repeat |= self.keyboard_surface.as_ref() == Some(surface.role.surface());
+            }
+
+            let pending_is_current =
+                self.surfaces[index]
+                    .pending_focus
+                    .as_ref()
+                    .is_none_or(|target| {
+                        self.scoped_target_is_current(&output, target)
+                            && self
+                                .configurations
+                                .rendered_surface_root(&output, target.target.node())
+                                == Some(surface_root)
+                    });
+            if !pending_is_current {
+                self.surfaces[index].pending_focus = None;
+            }
+            let actions = std::mem::take(&mut self.surfaces[index].ui_actions);
+            let actions = actions
+                .into_iter()
+                .filter(|action| {
+                    let target = action.target();
+                    self.scoped_target_is_current(&output, target)
+                        && self
+                            .configurations
+                            .rendered_surface_root(&output, target.target.node())
+                            == Some(surface_root)
+                })
+                .collect();
+            self.surfaces[index].ui_actions = actions;
+        }
+        if clear_repeat {
+            self.clear_key_repeat();
+        }
+        for surface in cancelled {
+            self.cancel_input_method_composition(&surface);
+        }
+    }
+
+    fn reconcile_layout_focus(&mut self) {
+        let invalid: Vec<_> = self
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, surface)| {
+                let id = surface.input.focused?;
+                surface.layouts.input().and_then(|layout| {
+                    (!layout.focus_order().any(|candidate| candidate == id)).then_some(index)
+                })
+            })
+            .collect();
+        let mut clear_repeat = false;
+        let mut cancelled = Vec::new();
+        for index in invalid {
+            let surface = &mut self.surfaces[index];
+            surface.input.focus_from_pointer(None);
+            surface.focus_target = None;
+            surface.text_input = None;
+            surface.dirty = true;
+            cancelled.push(surface.role.surface().clone());
+            clear_repeat |= self.keyboard_surface.as_ref() == Some(surface.role.surface());
+        }
+        if clear_repeat {
+            self.clear_key_repeat();
+        }
+        for surface in cancelled {
+            self.cancel_input_method_composition(&surface);
         }
     }
 
@@ -1739,6 +2280,7 @@ impl App {
             .iter_mut()
             .filter(|surface| &surface.output == output)
         {
+            surface.layouts.invalidate_input();
             surface.dirty = true;
         }
         self.reconcile_hover_intent();
@@ -1758,8 +2300,8 @@ impl App {
             return;
         }
         let Some(bounds) = self.surfaces[surface]
-            .layout
-            .as_ref()
+            .layouts
+            .presented()
             .and_then(|layout| layout.get(id))
             .map(|p| p.bounds)
         else {
@@ -1802,7 +2344,12 @@ impl App {
         }
     }
 
-    fn text_input_node_and_bounds(&self, surface: usize, id: NodeId) -> Option<(Node, Rect)> {
+    fn text_input_node_and_bounds(
+        &self,
+        surface: usize,
+        id: NodeId,
+        snapshot: LayoutSnapshot,
+    ) -> Option<(Node, Rect)> {
         let surface = self.surfaces.get(surface)?;
         let node = self
             .configurations
@@ -1811,8 +2358,74 @@ impl App {
         if node.kind != Kind::TextInput {
             return None;
         }
-        let bounds = surface.layout.as_ref()?.get(id)?.bounds;
+        let bounds = surface.layouts.snapshot(snapshot)?.get(id)?.bounds;
         Some((node.clone(), bounds))
+    }
+
+    fn scoped_focus_target(
+        &self,
+        output: &wl_output::WlOutput,
+        id: NodeId,
+    ) -> Option<ScopedUiTarget> {
+        Some(ScopedUiTarget {
+            consumer: self.configurations.consumer(output)?.to_owned(),
+            target: self.configurations.focus_target(output, id)?,
+        })
+    }
+
+    fn scoped_target_is_current(
+        &self,
+        output: &wl_output::WlOutput,
+        target: &ScopedUiTarget,
+    ) -> bool {
+        self.configurations.consumer(output) == Some(target.consumer.as_str())
+            && self
+                .configurations
+                .ui_target_is_current(output, &target.target)
+    }
+
+    fn focus_from_pointer(&mut self, surface: usize, id: Option<NodeId>) {
+        let output = self.surfaces[surface].output.clone();
+        self.cancel_queued_focus(&output);
+        let target = id.and_then(|id| self.scoped_focus_target(&output, id));
+        let next = target.as_ref().map(|target| target.target.node());
+        let previous = self.surfaces[surface].input.focused;
+        if previous != next {
+            let wl = self.surfaces[surface].role.surface().clone();
+            self.cancel_input_method_composition(&wl);
+            self.surfaces[surface].text_input = None;
+        }
+        let surface = &mut self.surfaces[surface];
+        surface.layouts.clear_input();
+        surface.focus_target = target;
+        surface.pending_focus = None;
+        surface.input.focus_from_pointer(next);
+        surface.dirty = true;
+    }
+
+    fn focus_from_keyboard(&mut self, surface: usize, target: ScopedUiTarget) -> bool {
+        let id = target.target.node();
+        let focusable = self.surfaces[surface]
+            .layouts
+            .input()
+            .is_some_and(|layout| layout.focus_order().any(|candidate| candidate == id));
+        if !focusable {
+            return false;
+        }
+        let previous = self.surfaces[surface].input.focused;
+        if previous != Some(id) {
+            self.clear_key_repeat();
+            let wl = self.surfaces[surface].role.surface().clone();
+            self.cancel_input_method_composition(&wl);
+            self.surfaces[surface].text_input = None;
+        }
+        let surface_state = &mut self.surfaces[surface];
+        surface_state.focus_target = Some(target);
+        surface_state.pending_focus = None;
+        surface_state.input.focus_from_keyboard(id);
+        surface_state.dirty = true;
+        self.focus_text_input(surface, id, None, false);
+        true
     }
 
     fn allocate_text_input_generation(&mut self) -> Option<u64> {
@@ -1831,7 +2444,12 @@ impl App {
         point: Option<Point>,
         extend: bool,
     ) -> bool {
-        let Some((node, bounds)) = self.text_input_node_and_bounds(surface, id) else {
+        let snapshot = if point.is_some() {
+            LayoutSnapshot::Presented
+        } else {
+            LayoutSnapshot::Input
+        };
+        let Some((node, bounds)) = self.text_input_node_and_bounds(surface, id, snapshot) else {
             self.surfaces[surface].text_input = None;
             return false;
         };
@@ -1887,12 +2505,12 @@ impl App {
                 &self.surfaces[surface_index].output,
                 &self.surfaces[surface_index].key,
             ),
-            self.surfaces[surface_index].layout.as_ref(),
+            self.surfaces[surface_index].layouts.input(),
             self.surfaces[surface_index].input.focused,
             id,
         );
         let Some((node, bounds)) = interactive
-            .then(|| self.text_input_node_and_bounds(surface_index, id))
+            .then(|| self.text_input_node_and_bounds(surface_index, id, LayoutSnapshot::Input))
             .flatten()
         else {
             self.surfaces[surface_index].text_input = None;
@@ -1997,7 +2615,7 @@ impl App {
                     &self.surfaces[surface_index].output,
                     &self.surfaces[surface_index].key,
                 ),
-                self.surfaces[surface_index].layout.as_ref(),
+                self.surfaces[surface_index].layouts.input(),
                 self.surfaces[surface_index].input.focused,
                 id,
             )
@@ -2006,7 +2624,9 @@ impl App {
             self.surfaces[surface_index].dirty = true;
             return InputMethodChangeCause::Other;
         }
-        let Some((node, bounds)) = self.text_input_node_and_bounds(surface_index, id) else {
+        let Some((node, bounds)) =
+            self.text_input_node_and_bounds(surface_index, id, LayoutSnapshot::Input)
+        else {
             return InputMethodChangeCause::Other;
         };
         let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
@@ -2062,7 +2682,9 @@ impl App {
         let Some(surface_index) = self.index(&entered) else {
             return InputMethodChangeCause::Other;
         };
-        let Some((node, bounds)) = self.text_input_node_and_bounds(surface_index, id) else {
+        let Some((node, bounds)) =
+            self.text_input_node_and_bounds(surface_index, id, LayoutSnapshot::Input)
+        else {
             self.surfaces[surface_index].text_input = None;
             return InputMethodChangeCause::Other;
         };
@@ -2165,7 +2787,9 @@ impl App {
         let Some(surface) = self.index(&wl) else {
             return repeats;
         };
-        let Some((node, bounds)) = self.text_input_node_and_bounds(surface, id) else {
+        let Some((node, bounds)) =
+            self.text_input_node_and_bounds(surface, id, LayoutSnapshot::Input)
+        else {
             self.surfaces[surface].text_input = None;
             return repeats;
         };
@@ -2335,8 +2959,8 @@ impl App {
         let anchor = match anchor_id {
             Some(id) => {
                 let Some(anchor) = parent
-                    .layout
-                    .as_ref()
+                    .layouts
+                    .presented()
                     .and_then(|layout| layout.get(id))
                     .map(|placement| placement.bounds)
                 else {
@@ -2535,8 +3159,8 @@ impl App {
             .is_some_and(|surface| {
                 !surface.dirty
                     && surface
-                        .layout
-                        .as_ref()
+                        .layouts
+                        .presented()
                         .is_some_and(|layout| layout.get(key.anchor).is_some())
             })
     }
@@ -2567,8 +3191,8 @@ impl App {
             };
             let hit = surface.pointer_position.and_then(|point| {
                 surface
-                    .layout
-                    .as_ref()
+                    .layouts
+                    .presented()
                     .and_then(|layout| layout.hit_test(point))
             });
             let mut path = hit
@@ -2733,6 +3357,34 @@ impl App {
         self.set_keyboard_surface(None);
     }
 
+    fn schedule_autofocus(&mut self, index: usize) {
+        let should_autofocus = {
+            let surface = &mut self.surfaces[index];
+            let pending = surface.pending_focus.is_some()
+                || surface.ui_actions.iter().any(HostUiAction::is_focus);
+            claim_autofocus(
+                &mut surface.autofocus_pending,
+                surface.input.focused,
+                pending,
+            )
+        };
+        if !should_autofocus {
+            return;
+        }
+        let output = self.surfaces[index].output.clone();
+        let root = self.surfaces[index].root;
+        if let (Some(consumer), Some(target)) = (
+            self.configurations.consumer(&output),
+            self.configurations.autofocus_target(&output, root),
+        ) {
+            self.surfaces[index].pending_focus = Some(ScopedUiTarget {
+                consumer: consumer.to_owned(),
+                target,
+            });
+            self.surfaces[index].dirty = true;
+        }
+    }
+
     fn set_keyboard_surface(&mut self, next: Option<wl_surface::WlSurface>) {
         self.clear_key_repeat();
         let previous = std::mem::replace(&mut self.keyboard_surface, next);
@@ -2751,6 +3403,17 @@ impl App {
                 surface.dirty = true;
             }
         }
+        if let Some(index) = self
+            .keyboard_surface
+            .as_ref()
+            .and_then(|surface| self.index(surface))
+        {
+            self.schedule_autofocus(index);
+            self.surfaces[index].dirty = true;
+        }
+        self.apply_pending_ui_actions_now();
+        self.prepare_invalidated_input_layouts_now();
+        self.reconcile_layout_focus();
         self.reconcile_input_method(InputMethodChangeCause::Other);
     }
 
@@ -2794,6 +3457,14 @@ impl App {
             None => RepeatTimerAction::None,
         };
         self.apply_repeat_timer(action);
+    }
+
+    fn keyboard_focus_owner(&self) -> Option<(wl_surface::WlSurface, Option<NodeId>)> {
+        let surface = self.keyboard_surface.clone()?;
+        let focused = self
+            .index(&surface)
+            .and_then(|index| self.surfaces[index].input.focused);
+        Some((surface, focused))
     }
 
     fn physical_key_repeats(&self, raw_code: u32) -> bool {
@@ -2867,15 +3538,14 @@ impl App {
                 return false;
             }
         }
-        let surface = &mut self.surfaces[index];
         if direct && (event.keysym == Keysym::Tab || event.keysym == Keysym::ISO_Left_Tab) {
-            let order: Vec<_> = surface
-                .layout
-                .as_ref()
+            let order: Vec<_> = self.surfaces[index]
+                .layouts
+                .input()
                 .map(|layout| layout.focus_order().collect())
                 .unwrap_or_default();
             if !order.is_empty() {
-                let current = surface
+                let current = self.surfaces[index]
                     .input
                     .focused
                     .and_then(|id| order.iter().position(|candidate| *candidate == id));
@@ -2885,18 +3555,23 @@ impl App {
                     current.map_or(0, |n| (n + 1) % order.len())
                 };
                 let focused = order[next];
-                surface.input.focus_from_keyboard(focused);
-                surface.dirty = true;
-                self.focus_text_input(index, focused, None, false);
+                let output = self.surfaces[index].output.clone();
+                self.cancel_queued_focus(&output);
+                if let Some(target) = self.scoped_focus_target(&output, focused) {
+                    self.surfaces[index].pending_focus = Some(target);
+                    self.surfaces[index].dirty = true;
+                }
             }
+            self.apply_pending_ui_actions_now();
             self.reconcile_hover_intent();
             self.reconcile_input_method(InputMethodChangeCause::Other);
             return false;
         }
+        let surface = &mut self.surfaces[index];
         let Some(id) = surface.input.focused else {
             return false;
         };
-        if !focused_widget_is_interactive(surface.layout.as_ref(), id) {
+        if !focused_widget_is_interactive(surface.layouts.input(), id) {
             return false;
         }
         let output = surface.output.clone();
@@ -3106,6 +3781,27 @@ fn ceil_i32(value: f32) -> i32 {
 
 fn direct_input_serial(direct: bool, serial: u32) -> Option<u32> {
     direct.then_some(serial)
+}
+
+fn claim_autofocus(available: &mut bool, focused: Option<NodeId>, has_pending_focus: bool) -> bool {
+    let claim = *available && focused.is_none() && !has_pending_focus;
+    *available = false;
+    claim
+}
+
+fn paint_interaction(mut input: Interaction, surface_has_keyboard_focus: bool) -> Interaction {
+    if !surface_has_keyboard_focus {
+        input.hide_keyboard_focus();
+    }
+    input
+}
+
+fn repeat_action_is_current<T: PartialEq>(
+    action_repeats: bool,
+    before: &Option<T>,
+    after: &Option<T>,
+) -> bool {
+    action_repeats && before == after
 }
 
 fn keyboard_focus_transition_affects<T: PartialEq>(
@@ -3571,11 +4267,12 @@ mod output_tests {
             KeyboardMode::None
         );
 
-        let (changed, actions) = configurations
+        let outcome = configurations
             .dispatch_checked(&1, button, Event::Click, validate)
             .unwrap();
-        assert!(!changed);
-        assert!(actions.is_empty());
+        assert!(!outcome.changed);
+        assert!(outcome.actions.is_empty());
+        assert!(outcome.ui_actions.is_empty());
         assert_eq!(
             configurations.root(&1).unwrap().panel.keyboard_mode,
             KeyboardMode::None
@@ -3811,8 +4508,12 @@ impl OutputHandler for App {
             });
         self.update_watch();
         match result {
-            Ok(true) => self.invalidate_output(&output),
-            Ok(false) => {}
+            Ok(changed) => {
+                if changed {
+                    self.invalidate_output(&output);
+                }
+                self.reconcile_published_configuration();
+            }
             Err(error) => eprintln!("thing: cannot update output: {error}"),
         }
     }
@@ -3839,6 +4540,8 @@ impl OutputHandler for App {
             self.remove_popup(index, false, false);
         }
         self.closed_surfaces.retain(|owner| owner.output != output);
+        self.pending_ui_actions
+            .retain(|pending| pending.output != output);
         if let Some(consumer) = self.configurations.remove(&output)
             && let Err(error) = release_system_tray_consumer(self.system_tray.as_ref(), &consumer)
         {
@@ -4019,6 +4722,7 @@ impl SeatHandler for App {
             }
             self.repeat.settings = None;
             self.keyboard_keymap = None;
+            self.cancel_all_queued_focus();
             self.clear_keyboard_focus();
             self.input_method.detach_seat();
             self.reconcile_hover_intent();
@@ -4038,11 +4742,17 @@ impl SeatHandler for App {
             }
             self.repeat.settings = None;
             self.keyboard_keymap = None;
+            self.cancel_all_queued_focus();
             self.clear_keyboard_focus();
             self.input_method.detach_seat();
             self.clear_pointer_state(false);
+            // pointer and popup cleanup handlers may queue new focus requests.
+            self.cancel_all_queued_focus();
             for surface in &mut self.surfaces {
                 surface.input = Interaction::default();
+                surface.focus_target = None;
+                surface.pending_focus = None;
+                surface.text_input = None;
                 surface.dirty = true;
             }
         }
@@ -4066,8 +4776,8 @@ impl PointerHandler for App {
                 y: event.position.1 as f32,
             };
             let hit = self.surfaces[index]
-                .layout
-                .as_ref()
+                .layouts
+                .presented()
                 .and_then(|layout| layout.hit_test(point));
             match event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
@@ -4105,14 +4815,14 @@ impl PointerHandler for App {
                     surface.input.pressed = hit;
                     surface.pressed_button = Some(button);
                     surface.press_serial = Some(serial);
-                    surface.input.focus_from_pointer(hit);
                     surface.dirty = true;
+                    self.focus_from_pointer(index, hit);
                     if button == 0x110
                         && let Some(id) = hit
                     {
-                        let output = surface.output.clone();
-                        let key = surface.key.clone();
-                        let event_surface = surface.role.surface().clone();
+                        let output = self.surfaces[index].output.clone();
+                        let key = self.surfaces[index].key.clone();
+                        let event_surface = self.surfaces[index].role.surface().clone();
                         let kind = self
                             .configurations
                             .surface_root(&output, &key)
@@ -4187,15 +4897,15 @@ impl PointerHandler for App {
                     }
                     let output = self.surfaces[index].output.clone();
                     let handler = self.surfaces[index]
-                        .layout
-                        .as_ref()
+                        .layouts
+                        .presented()
                         .and_then(|layout| layout.scroll_event_target(point))
                         .filter(|id| self.configurations.has_scroll_handler(&output, *id));
                     if let Some(id) = handler {
                         self.dispatch(output, id, Event::Scroll { x, y }, None);
                     } else if let Some(delta) = scroll_distance(y) {
                         let surface = &mut self.surfaces[index];
-                        let changed = surface.layout.as_ref().is_some_and(|layout| {
+                        let changed = surface.layouts.presented().is_some_and(|layout| {
                             layout.scroll_y(point, delta, &mut surface.scroll)
                         });
                         if changed {
@@ -4236,14 +4946,16 @@ mod input_tests {
     use thing_ui::{Layout, Measurer, Size, TextInputEditor};
 
     use super::{
-        ActiveTextInput, GenerationReset, RepeatSession, RepeatTimerAction, SliderKeyAction,
-        TextKeyAction, WidgetKeyAction, active_text_input_is_current,
-        allocate_text_input_generation, cancel_active_text_input_composition, direct_input_serial,
+        ActiveTextInput, GenerationReset, MissingSurfacePolicy, RepeatSession, RepeatTimerAction,
+        SliderKeyAction, SurfaceActionRoute, SurfaceLayouts, TextKeyAction, WidgetKeyAction,
+        active_text_input_is_current, allocate_text_input_generation,
+        cancel_active_text_input_composition, claim_autofocus, direct_input_serial,
         focused_widget_is_interactive, input_method_cursor_rectangle,
         input_method_surface_has_keyboard_focus, keyboard_focus_transition_affects,
-        keyboard_leave_matches, prepare_text_input_submit, reconcile_controlled_text_edit,
-        reset_active_text_input_generation, reveal_text_input_focus, scroll_distance,
-        text_key_action, widget_key_action,
+        keyboard_leave_matches, paint_interaction, prepare_text_input_submit,
+        reconcile_controlled_text_edit, repeat_action_is_current,
+        reset_active_text_input_generation, retain_non_focus_actions, reveal_text_input_focus,
+        scroll_distance, surface_action_route, text_key_action, widget_key_action,
     };
 
     struct FixedMeasurer;
@@ -4264,6 +4976,125 @@ mod input_tests {
         assert_eq!(next, 0);
         assert_eq!(allocate_text_input_generation(&mut next), None);
         assert_eq!(next, 0);
+    }
+
+    #[test]
+    fn autofocus_is_claimed_once_and_never_overrides_a_choice() {
+        let mut available = true;
+        assert!(claim_autofocus(&mut available, None, false));
+        assert!(!claim_autofocus(&mut available, None, false));
+
+        let mut available = true;
+        assert!(!claim_autofocus(&mut available, Some(NodeId(1)), false));
+        assert!(!available);
+
+        let mut available = true;
+        assert!(!claim_autofocus(&mut available, None, true));
+        assert!(!available);
+    }
+
+    #[test]
+    fn popup_actions_wait_for_same_cycle_creation_and_then_expire() {
+        assert_eq!(
+            surface_action_route(None, MissingSurfacePolicy::WaitForSameCycle),
+            SurfaceActionRoute::Retain
+        );
+        assert_eq!(
+            surface_action_route(Some(4), MissingSurfacePolicy::WaitForSameCycle),
+            SurfaceActionRoute::Assign(4)
+        );
+        assert_eq!(
+            surface_action_route(None, MissingSurfacePolicy::Expire),
+            SurfaceActionRoute::Drop
+        );
+    }
+
+    #[test]
+    fn keyboard_loss_cancels_focus_requests_but_keeps_reveals() {
+        let mut actions = vec![("focus", true), ("reveal", false), ("focus", true)];
+        retain_non_focus_actions(&mut actions, |(_, focus)| *focus);
+        assert_eq!(actions, [("reveal", false)]);
+    }
+
+    #[test]
+    fn painting_hides_focus_without_changing_its_input_origin() {
+        let mut keyboard = thing_ui::Interaction::default();
+        keyboard.focus_from_keyboard(NodeId(1));
+        assert_eq!(paint_interaction(keyboard, false).keyboard_focused(), None);
+        assert_eq!(keyboard.keyboard_focused(), Some(NodeId(1)));
+        assert_eq!(
+            paint_interaction(keyboard, true).keyboard_focused(),
+            Some(NodeId(1))
+        );
+
+        let mut pointer = thing_ui::Interaction::default();
+        pointer.focus_from_pointer(Some(NodeId(2)));
+        assert_eq!(paint_interaction(pointer, true).keyboard_focused(), None);
+    }
+
+    #[test]
+    fn input_layouts_do_not_replace_pointer_geometry_before_presentation() {
+        let mut layouts = SurfaceLayouts::default();
+        layouts.publish(slider_layout(false, true));
+        assert!(
+            !layouts
+                .presented()
+                .unwrap()
+                .focus_order()
+                .any(|id| id == NodeId(3))
+        );
+
+        layouts.stage_input(slider_layout(true, true));
+        assert!(
+            !layouts
+                .presented()
+                .unwrap()
+                .focus_order()
+                .any(|id| id == NodeId(3))
+        );
+        assert!(
+            layouts
+                .input()
+                .unwrap()
+                .focus_order()
+                .any(|id| id == NodeId(3))
+        );
+
+        layouts.invalidate_input();
+        assert!(layouts.input_needs_refresh());
+        assert!(
+            !layouts
+                .input()
+                .unwrap()
+                .focus_order()
+                .any(|id| id == NodeId(3))
+        );
+
+        layouts.stage_input(slider_layout(true, true));
+        assert!(!layouts.input_needs_refresh());
+        assert!(
+            layouts
+                .input()
+                .unwrap()
+                .focus_order()
+                .any(|id| id == NodeId(3))
+        );
+    }
+
+    #[test]
+    fn a_focus_change_during_dispatch_cannot_rearm_key_repeat() {
+        assert!(repeat_action_is_current(true, &Some((1, 2)), &Some((1, 2))));
+        assert!(!repeat_action_is_current(
+            true,
+            &Some((1, 2)),
+            &Some((1, 3))
+        ));
+        assert!(!repeat_action_is_current(true, &Some((1, 2)), &None));
+        assert!(!repeat_action_is_current(
+            false,
+            &Some((1, 2)),
+            &Some((1, 2))
+        ));
     }
 
     #[test]
@@ -4883,9 +5714,14 @@ impl KeyboardHandler for App {
         serial: u32,
         event: KeyEvent,
     ) {
+        let focus_owner = self.keyboard_focus_owner();
         let key_repeats = self.physical_key_repeats(event.raw_code);
         let action_repeats = self.key(event.clone(), serial, true, qh);
-        self.finish_key_press(event, key_repeats, action_repeats);
+        self.finish_key_press(
+            event,
+            key_repeats,
+            repeat_action_is_current(action_repeats, &focus_owner, &self.keyboard_focus_owner()),
+        );
     }
     fn repeat_key(
         &mut self,
@@ -5155,11 +5991,9 @@ impl Dispatch<ZwpTextInputV3, ()> for App {
                 app.input_method.enter(surface);
                 app.reconcile_input_method(InputMethodChangeCause::InputMethod);
             }
-            zwp_text_input_v3::Event::Leave { surface } => {
-                if app.input_method.leave(&surface) {
-                    app.cancel_input_method_composition(&surface);
-                    app.reconcile_input_method(InputMethodChangeCause::InputMethod);
-                }
+            zwp_text_input_v3::Event::Leave { surface } if app.input_method.leave(&surface) => {
+                app.cancel_input_method_composition(&surface);
+                app.reconcile_input_method(InputMethodChangeCause::InputMethod);
             }
             zwp_text_input_v3::Event::PreeditString {
                 text,
