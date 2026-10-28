@@ -1785,6 +1785,8 @@ impl App {
         let select = self.modifiers.shift;
         let word = self.modifiers.ctrl && !self.modifiers.alt;
         let repeats = action.repeats();
+        let surface_state = &mut self.surfaces[surface];
+        reveal_text_input_focus(&mut surface_state.input, &mut surface_state.dirty);
 
         if action == TextKeyAction::Submit {
             let value = self.surfaces[surface]
@@ -1830,8 +1832,6 @@ impl App {
             TextKeyAction::Submit => unreachable!(),
         };
         let proposed = changed.then(|| active.editor.value().to_owned());
-        self.surfaces[surface].input.reveal_keyboard_focus();
-        self.surfaces[surface].dirty = true;
 
         let Some(proposed) = proposed else {
             return repeats;
@@ -2696,6 +2696,11 @@ fn keyboard_focus_transition_affects<T: PartialEq>(
 
 fn keyboard_leave_matches<T: PartialEq>(current: Option<&T>, leaving: &T) -> bool {
     current == Some(leaving)
+}
+
+fn reveal_text_input_focus(input: &mut Interaction, dirty: &mut bool) {
+    input.reveal_keyboard_focus();
+    *dirty = true;
 }
 
 fn focused_widget_is_interactive(layout: Option<&Layout>, id: NodeId) -> bool {
@@ -3734,8 +3739,8 @@ mod input_tests {
     use super::{
         RepeatSession, RepeatTimerAction, SliderKeyAction, TextKeyAction, WidgetKeyAction,
         direct_input_serial, focused_widget_is_interactive, keyboard_focus_transition_affects,
-        keyboard_leave_matches, reconcile_controlled_text_edit, scroll_distance, text_key_action,
-        widget_key_action,
+        keyboard_leave_matches, reconcile_controlled_text_edit, reveal_text_input_focus,
+        scroll_distance, text_key_action, widget_key_action,
     };
 
     struct FixedMeasurer;
@@ -3928,6 +3933,19 @@ mod input_tests {
         node.text = "accepted".into();
         reconcile_controlled_text_edit(&mut editor, &node, 100.0, "accepted", checkpoint);
         assert_eq!(editor.value(), "accepted");
+    }
+
+    #[test]
+    fn every_text_key_action_reveals_keyboard_focus() {
+        let mut input = thing_ui::Interaction::default();
+        input.focus_from_pointer(Some(NodeId(1)));
+        assert_eq!(input.keyboard_focused(), None);
+        let mut dirty = false;
+
+        reveal_text_input_focus(&mut input, &mut dirty);
+
+        assert_eq!(input.keyboard_focused(), Some(NodeId(1)));
+        assert!(dirty);
     }
 
     #[test]
