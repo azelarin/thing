@@ -400,10 +400,19 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "fit" if node.kind == Kind::Image => node.image_fit = image_fit(value, name)?,
         "visible" => node.visible = boolean(value, name)?,
         "enabled" => node.enabled = boolean(value, name)?,
-        "value" if node.kind == Kind::Slider => node.slider.value = number(value, name)?,
-        "min" if node.kind == Kind::Slider => node.slider.min = number(value, name)?,
-        "max" if node.kind == Kind::Slider => node.slider.max = number(value, name)?,
-        "step" if node.kind == Kind::Slider => node.slider.step = number(value, name)?,
+        "value" if matches!(node.kind, Kind::Slider | Kind::Range) => {
+            node.slider.value = number(value, name)?
+        }
+        "min" if matches!(node.kind, Kind::Slider | Kind::Range) => {
+            node.slider.min = number(value, name)?
+        }
+        "max" if matches!(node.kind, Kind::Slider | Kind::Range) => {
+            node.slider.max = number(value, name)?
+        }
+        "step" if matches!(node.kind, Kind::Slider | Kind::Range) => {
+            node.slider.step = number(value, name)?
+        }
+        "inset" if node.kind == Kind::Range => node.range_inset = number(value, name)? as f32,
         "open_on_hover" if node.kind == Kind::Popup => {
             node.popup.open_on_hover = boolean(value, name)?
         }

@@ -237,6 +237,7 @@ widget kind; unkeyed children match by position and kind.
 | `image` | one of `source`, `icon`, `app_id`; optional `icon_theme` and `fit` |
 | `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll`, `on_hover` |
 | `slider` | `min`, `max`, `value`, `step`, `on_change`, `on_hover` |
+| `range` | `children`, `min`, `max`, `value`, `step`, `inset`, `on_change`, `on_hover`, `on_pressed` |
 | `popup` | `visible`, `open_on_hover`, `open_on_click`, `open_delay`, `close_delay`, `anchor`, `alignment`, `offset`, `constraints`, `on_hover`, `on_close` |
 | containers | `children`: array of widgets, or a function returning one |
 
@@ -286,6 +287,49 @@ slider defaults are 0–1, value 0, and step 0.01. a step of zero means continuo
 input. the range must be finite and increasing. pointer input clamps to the range;
 the endpoints remain reachable when the range is not a multiple of the step.
 
+`range` provides the same value and keyboard behavior without a built-in
+appearance. its ordinary visual children form a horizontal flex container. the
+configuration remains responsible for updating `value` from `on_change`:
+
+```luau
+local amount = ui.state(0.4)
+
+ui.range {
+    value = function() return amount:get() end,
+    inset = 6,
+    on_change = function(value) amount:set(value) end,
+    style = { width = 180, height = 24 },
+    children = {
+        ui.row {
+            style = {
+                width_fraction = function() return amount:get() end,
+                min_width = 12,
+                height = 12,
+                radius = 6,
+                background = '#89b4fa',
+            },
+        },
+        ui.row {
+            style = {
+                width = 0,
+                grow = 1,
+                height = 12,
+            },
+        },
+    },
+}
+```
+
+`inset` defaults to zero and moves the two pointer endpoints inward in logical
+pixels. rows, columns, center boxes, stacks, text, and images may appear below a
+range. interactive widgets, popups, panels, and scroll views may not. keys on
+visual children follow the same sibling identity rules as other containers.
+
+`on_pressed(down)` reports a primary pointer drag while the current configuration
+remains loaded. release, removal, hiding, disabling, or loss of pointer input
+reports `false`. replacing the complete configuration discards its local state
+and handlers without running teardown callbacks.
+
 for live lists, create widgets in a `children` function:
 
 ```luau
@@ -314,10 +358,10 @@ for continuous devices without wheel-step data, 15 compositor-reported pixels
 count as one step. a scroll gesture does not open a grabbed popup. buttons remain
 keyboard-activatable through the primary `on_click` handler.
 
-`on_hover(inside)` receives `true` when the pointer enters a button, slider, or
-popup and `false` when it leaves. moving between a control and its descendants
-does not produce a false leave. the callback runs on edges, not on every pointer
-motion.
+`on_hover(inside)` receives `true` when the pointer enters a button, slider,
+range, or popup and `false` when it leaves. moving between a control and its
+descendants does not produce a false leave. the callback runs on edges, not on
+every pointer motion.
 
 ## images and desktop icons
 
@@ -1069,9 +1113,9 @@ open hover popup is recreated in grabbed mode.
 
 the host supports one grabbed popup at a time. an input event is required to open
 it. outside clicks and escape dismiss it and call `on_close`. tab/shift+tab move
-focus; return/space activate a focused button. slider arrows adjust by `step`
-(or 1% of the range when step is zero); home/end reach the endpoints. thing uses
-the compositor's rate and delay for its own repeat clock. if the compositor takes
-over repetition, thing honors those repeated key events instead. held slider
-arrows repeat. tab, escape, return/space on buttons, and slider home/end act once
-per press.
+focus; return/space activate a focused button. slider and range arrows adjust by
+`step` (or 1% of the range when step is zero); home/end reach the endpoints.
+thing uses the compositor's rate and delay for its own repeat clock. if the
+compositor takes over repetition, thing honors those repeated key events instead.
+held slider and range arrows repeat. tab, escape, return/space on buttons, and
+slider or range home/end act once per press.

@@ -1379,4 +1379,99 @@ mod tests {
         assert!(layout.scroll_y(visible, 20.0, &mut state));
         assert_eq!(state.offset(NodeId(3)), 20.0);
     }
+
+    fn pill_range(fraction: f32) -> Layout {
+        let mut panel = fixed(1, Kind::Panel, 240.0, 36.0);
+        let mut range = fixed(2, Kind::Range, 240.0, 36.0);
+        let mut track = fixed(3, Kind::Row, 0.0, 16.0);
+        track.style.grow = 1.0;
+
+        let mut fill = fixed(4, Kind::Row, 0.0, 16.0);
+        fill.style.width = None;
+        fill.style.width_fraction = Some(fraction);
+        fill.style.min_width = Some(16.0);
+        fill.style.padding_x = Some(5.0);
+        fill.style.justify = MainAlign::End;
+        fill.children.push(fixed(5, Kind::Row, 6.0, 6.0));
+
+        let mut remainder = fixed(6, Kind::Row, 0.0, 16.0);
+        remainder.style.grow = 1.0;
+        track.children = vec![fill, remainder];
+        range.children.push(track);
+        panel.children.push(range);
+        Layout::compute(
+            &panel,
+            Size {
+                width: 240.0,
+                height: 36.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn custom_range_flex_recreates_a_full_track_fill_and_inset_dot() {
+        let layout = pill_range(0.62);
+        let track = layout.get(NodeId(3)).unwrap().bounds;
+        let fill = layout.get(NodeId(4)).unwrap().bounds;
+        let dot = layout.get(NodeId(5)).unwrap().bounds;
+        let remainder = layout.get(NodeId(6)).unwrap().bounds;
+        assert_eq!(
+            track,
+            Rect {
+                y: 10.0,
+                width: 240.0,
+                height: 16.0,
+                ..Rect::default()
+            }
+        );
+        assert!((fill.width - 148.8).abs() < 0.01, "{fill:?}");
+        assert!((remainder.width - 91.2).abs() < 0.01, "{remainder:?}");
+        assert!((dot.x + dot.width / 2.0 - (fill.x + fill.width - 8.0)).abs() < 0.01);
+        assert_eq!(
+            layout.hit_test(Point {
+                x: dot.x + 1.0,
+                y: 18.0
+            }),
+            Some(NodeId(2))
+        );
+        assert_eq!(layout.focus_order().collect::<Vec<_>>(), vec![NodeId(2)]);
+
+        let empty = pill_range(0.0);
+        assert!((empty.get(NodeId(4)).unwrap().bounds.width - 16.0).abs() < 0.01);
+        assert!((empty.get(NodeId(6)).unwrap().bounds.width - 224.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn custom_range_flex_supports_a_segmented_meter() {
+        let mut panel = fixed(1, Kind::Panel, 180.0, 40.0);
+        let mut range = fixed(2, Kind::Range, 180.0, 40.0);
+        range.style.padding_x = Some(8.0);
+        range.style.padding_y = Some(4.0);
+        range.style.gap = 5.0;
+        range.style.align = CrossAlign::End;
+        for (index, height) in [12.0, 16.0, 20.0, 24.0, 28.0].into_iter().enumerate() {
+            let mut segment = fixed(index as u64 + 3, Kind::Row, 0.0, height);
+            segment.style.grow = 1.0;
+            range.children.push(segment);
+        }
+        panel.children.push(range);
+        let layout = Layout::compute(
+            &panel,
+            Size {
+                width: 180.0,
+                height: 40.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+
+        for (index, expected_y) in [24.0, 20.0, 16.0, 12.0, 8.0].into_iter().enumerate() {
+            let bounds = layout.get(NodeId(index as u64 + 3)).unwrap().bounds;
+            assert!((bounds.width - 28.8).abs() < 0.01);
+            assert!((bounds.y - expected_y).abs() < 0.01);
+        }
+        assert_eq!(layout.hit_test(Point { x: 90.0, y: 20.0 }), Some(NodeId(2)));
+    }
 }

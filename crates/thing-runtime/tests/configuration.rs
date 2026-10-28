@@ -228,6 +228,291 @@ fn rejects_invalid_or_non_image_fit() {
 }
 
 #[test]
+fn range_parses_behavior_and_visual_children() {
+    let (_directory, path) = fixture(
+        r#"
+        return ui.panel { children = { ui.range {
+            key = 'volume', min = -1, max = 2, value = 0.5, step = 0,
+            inset = 6, style = { width = 180, height = 36 },
+            on_change = function(_) end,
+            on_hover = function(_) end,
+            on_pressed = function(_) end,
+            children = { ui.row { key = 'track', children = {
+                ui.text { key = 'label', text = 'level' },
+                ui.image { key = 'icon', icon = 'audio-volume-high' },
+            } } },
+        } } }
+        "#,
+    );
+    let runtime = Runtime::load(path).unwrap();
+    let range = &runtime.root().unwrap().children[0];
+    assert_eq!(range.kind, Kind::Range);
+    assert_eq!(range.key.as_deref(), Some("volume"));
+    assert_eq!(range.slider.min, -1.0);
+    assert_eq!(range.slider.max, 2.0);
+    assert_eq!(range.slider.value, 0.5);
+    assert_eq!(range.slider.step, 0.0);
+    assert_eq!(range.range_inset, 6.0);
+    assert_eq!(range.children[0].key.as_deref(), Some("track"));
+    assert_eq!(range.children[0].children[0].kind, Kind::Text);
+    assert_eq!(range.children[0].children[1].kind, Kind::Image);
+}
+
+#[test]
+fn range_rejects_interactive_descendants_and_invalid_reactive_insets() {
+    for child in [
+        "ui.button {}",
+        "ui.slider {}",
+        "ui.range {}",
+        "ui.scroll {}",
+        "ui.popup {}",
+    ] {
+        let source = format!(
+            "return ui.panel {{ children = {{ ui.range {{ children = {{ ui.row {{ children = {{ {child} }} }} }} }} }} }}"
+        );
+        let (_directory, path) = fixture(&source);
+        let error = match Runtime::load(path) {
+            Ok(_) => panic!("interactive range child should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("visual widgets"));
+    }
+
+    let (_directory, path) = fixture(
+        r#"
+        local inset = ui.state(4)
+        return ui.panel { children = {
+            ui.range {
+                inset = function() return inset:get() end,
+                children = { ui.row {} },
+            },
+            ui.button { on_click = function() inset:set(-1) end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let button = runtime.root().unwrap().children[1].id;
+    assert!(runtime.dispatch(button, Event::Click).is_err());
+    assert_eq!(runtime.root().unwrap().children[0].range_inset, 4.0);
+}
+
+#[test]
+fn range_press_callbacks_are_balanced_while_the_runtime_is_live() {
+    let (_directory, path) = fixture(
+        r#"
+        local pressed = ui.state(false)
+        return ui.panel { children = { ui.range {
+            on_pressed = function(down) pressed:set(down) end,
+            style = { opacity = function() return if pressed:get() then 0.5 else 1 end },
+            children = { ui.row {} },
+        } } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let id = runtime.root().unwrap().children[0].id;
+    assert!(runtime.dispatch(id, Event::Pressed(true)).unwrap());
+    assert!(runtime.has_active_press(id));
+    assert_eq!(runtime.root().unwrap().children[0].style.opacity, 0.5);
+    assert!(runtime.dispatch(id, Event::Pressed(false)).unwrap());
+    assert!(!runtime.has_active_press(id));
+    assert_eq!(runtime.root().unwrap().children[0].style.opacity, 1.0);
+}
+
+#[test]
+fn range_without_a_press_handler_still_tracks_its_drag() {
+    let (_directory, path) =
+        fixture("return ui.panel { children = { ui.range { children = { ui.row {} } } } }");
+    let mut runtime = Runtime::load(path).unwrap();
+    let id = runtime.root().unwrap().children[0].id;
+
+    assert!(!runtime.dispatch(id, Event::Pressed(true)).unwrap());
+    assert!(runtime.has_active_press(id));
+    assert!(!runtime.dispatch(id, Event::Pressed(false)).unwrap());
+    assert!(!runtime.has_active_press(id));
+}
+
+#[test]
+fn service_refreshes_leave_press_cleanup_to_the_live_host() {
+    let (_directory, path) = fixture(
+        r#"
+        local released = ui.state(false)
+        return ui.panel { children = {
+            ui.range {
+                visible = function() return not services.audio.muted:get() end,
+                on_pressed = function(down)
+                    if not down then released:set(true) end
+                end,
+                children = { ui.row {} },
+            },
+            ui.text { text = function() return tostring(released:get()) end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let id = runtime.root().unwrap().children[0].id;
+    assert!(!runtime.dispatch(id, Event::Pressed(true)).unwrap());
+    assert!(runtime.active_press_is_available(id));
+
+    runtime
+        .set_service("audio.muted", Scalar::Boolean(true))
+        .unwrap();
+    assert!(runtime.refresh().unwrap());
+    assert!(runtime.has_active_press(id));
+    assert!(!runtime.active_press_is_available(id));
+
+    assert!(runtime.dispatch(id, Event::Pressed(false)).unwrap());
+    assert!(!runtime.has_active_press(id));
+    assert_eq!(runtime.root().unwrap().children[1].text, "true");
+}
+
+#[test]
+fn removing_a_pressed_range_runs_its_captured_cleanup() {
+    let (_directory, path) = fixture(
+        r#"
+        local pressed = ui.state(false)
+        local events = ui.state('')
+        return ui.panel { children = {
+            ui.range {
+                visible = function() return not pressed:get() end,
+                on_pressed = function(down)
+                    events:set(events:get() .. (if down then 'T' else 'F'))
+                    pressed:set(down)
+                end,
+                children = { ui.row {} },
+            },
+            ui.text { text = function() return events:get() end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let id = runtime.root().unwrap().children[0].id;
+    assert!(runtime.dispatch(id, Event::Pressed(true)).unwrap());
+    assert!(!runtime.has_active_press(id));
+    assert!(runtime.root().unwrap().children[0].visible);
+    assert_eq!(runtime.root().unwrap().children[1].text, "TF");
+}
+
+#[test]
+fn failed_press_and_release_callbacks_cannot_leave_an_active_session() {
+    let (_directory, path) = fixture(
+        r#"
+        local pressed = ui.state(false)
+        local fail_on_down = ui.state(true)
+        local fail_on_up = ui.state(false)
+        return ui.panel { children = { ui.range {
+            on_pressed = function(down)
+                pressed:set(down)
+                if down and fail_on_down:get() then
+                    services.audio.set_muted(true)
+                    fail_on_down:set(false)
+                    error('down failed')
+                end
+                if not down and fail_on_up:get() then
+                    services.audio.set_muted(true)
+                    error('up failed')
+                end
+            end,
+            on_change = function(_) fail_on_up:set(true) end,
+            style = { opacity = function() return if pressed:get() then 0.5 else 1 end },
+            children = { ui.row {} },
+        } } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let id = runtime.root().unwrap().children[0].id;
+    assert!(runtime.dispatch(id, Event::Pressed(true)).is_err());
+    assert!(!runtime.has_active_press(id));
+    assert_eq!(runtime.root().unwrap().children[0].style.opacity, 1.0);
+    assert!(runtime.take_actions().is_empty());
+
+    assert!(runtime.dispatch(id, Event::Pressed(true)).unwrap());
+    assert!(runtime.dispatch(id, Event::Change(0.4)).is_ok());
+    assert!(runtime.dispatch(id, Event::Pressed(false)).is_err());
+    assert!(!runtime.has_active_press(id));
+    assert_eq!(runtime.root().unwrap().children[0].style.opacity, 0.5);
+    assert!(runtime.take_actions().is_empty());
+    assert!(runtime.refresh().unwrap());
+    assert_eq!(runtime.root().unwrap().children[0].style.opacity, 1.0);
+}
+
+#[test]
+fn visual_child_updates_do_not_interrupt_a_range_press() {
+    let (_directory, path) = fixture(
+        r#"
+        local alternate = ui.state(false)
+        return ui.panel { children = {
+            ui.range {
+                key = 'range',
+                on_pressed = function(_) end,
+                children = function()
+                    return { ui.row { key = 'track', children = {
+                        ui.text { key = 'label', text = if alternate:get() then 'b' else 'a' },
+                    } } }
+                end,
+            },
+            ui.button { on_click = function() alternate:set(not alternate:get()) end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let range = runtime.root().unwrap().children[0].id;
+    let track = runtime.root().unwrap().children[0].children[0].id;
+    assert!(!runtime.dispatch(range, Event::Pressed(true)).unwrap());
+    assert!(runtime.has_active_press(range));
+
+    let button = runtime.root().unwrap().children[1].id;
+    assert!(runtime.dispatch(button, Event::Click).unwrap());
+    assert!(runtime.has_active_press(range));
+    assert_eq!(runtime.root().unwrap().children[0].children[0].id, track);
+    assert_eq!(
+        runtime.root().unwrap().children[0].children[0].children[0].text,
+        "b"
+    );
+    assert!(!runtime.dispatch(range, Event::Pressed(false)).unwrap());
+    assert!(!runtime.has_active_press(range));
+}
+
+#[test]
+fn reload_drops_a_press_without_running_old_handlers() {
+    let (_directory, path) = fixture(
+        r#"
+        local pressed = ui.state(false)
+        return ui.panel { children = { ui.range {
+            on_pressed = function(down)
+                pressed:set(down)
+                if not down then services.audio.set_muted(true) end
+            end,
+            style = { opacity = function() return if pressed:get() then 0.5 else 1 end },
+            children = { ui.row {} },
+        } } }
+        "#,
+    );
+    let mut runtime = Runtime::load(&path).unwrap();
+    let old = runtime.root().unwrap().children[0].id;
+    assert!(runtime.dispatch(old, Event::Pressed(true)).unwrap());
+    assert!(runtime.has_active_press(old));
+    fs::write(
+        &path,
+        "return ui.panel { children = { ui.range { unknown = true } } }",
+    )
+    .unwrap();
+    assert!(runtime.reload(&path).is_err());
+    assert!(runtime.has_active_press(old));
+    assert_eq!(runtime.root().unwrap().children[0].style.opacity, 0.5);
+    assert!(runtime.take_actions().is_empty());
+
+    fs::write(
+        &path,
+        "return ui.panel { children = { ui.range { children = { ui.row {} } } } }",
+    )
+    .unwrap();
+    runtime.reload(path).unwrap();
+    assert!(!runtime.has_active_press(old));
+    assert_eq!(runtime.root().unwrap().children[0].style.opacity, 1.0);
+    assert!(runtime.take_actions().is_empty());
+}
+
+#[test]
 fn subscriptions_follow_conditional_reads() {
     let (_directory, path) = fixture(
         r#"

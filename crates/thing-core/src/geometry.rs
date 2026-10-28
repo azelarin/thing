@@ -36,6 +36,53 @@ impl Rect {
     }
 }
 
+/// the horizontal span used to paint and operate a range input.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HorizontalRange {
+    start: f32,
+    length: f32,
+}
+
+impl HorizontalRange {
+    /// keep an inset inside the widget while leaving a usable input span.
+    pub fn inset(bounds: Rect, inset: f32) -> Self {
+        let inset = inset.min(((bounds.width - 1.0) / 2.0).max(0.0));
+        Self {
+            start: bounds.x + inset,
+            length: (bounds.width - 2.0 * inset).max(0.0),
+        }
+    }
+
+    /// apply an inset without changing the behavior of narrow legacy controls.
+    pub fn unclamped_inset(bounds: Rect, inset: f32) -> Self {
+        Self {
+            start: bounds.x + inset,
+            length: (bounds.width - 2.0 * inset).max(0.0),
+        }
+    }
+
+    pub fn start(self) -> f32 {
+        self.start
+    }
+
+    pub fn length(self) -> f32 {
+        self.length
+    }
+
+    pub fn fraction_at(self, x: f32) -> f32 {
+        let fraction = (x - self.start) / self.length.max(1.0);
+        if fraction.is_finite() {
+            fraction.clamp(0.0, 1.0)
+        } else {
+            fraction
+        }
+    }
+
+    pub fn position(self, fraction: f32) -> f32 {
+        self.start + self.length * fraction.clamp(0.0, 1.0)
+    }
+}
+
 /// a validated output scale, expressed in wayland's 120ths of a logical pixel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Scale(u32);
@@ -100,5 +147,39 @@ mod tests {
         assert_eq!(scale.physical_size(u32::MAX), None);
         assert_eq!(scale.physical_size(0), None);
         assert!(Scale::from_120ths(0).is_none());
+    }
+
+    #[test]
+    fn range_insets_keep_custom_controls_usable_without_changing_legacy_geometry() {
+        let ordinary = HorizontalRange::unclamped_inset(
+            Rect {
+                x: 20.0,
+                width: 100.0,
+                height: 20.0,
+                ..Rect::default()
+            },
+            8.0,
+        );
+        assert_eq!(ordinary.start(), 28.0);
+        assert_eq!(ordinary.length(), 84.0);
+        assert_eq!(ordinary.fraction_at(70.0), 0.5);
+
+        let bounds = Rect {
+            x: 20.0,
+            width: 10.0,
+            height: 20.0,
+            ..Rect::default()
+        };
+        let custom = HorizontalRange::inset(bounds, 8.0);
+        assert_eq!(custom.start(), 24.5);
+        assert_eq!(custom.length(), 1.0);
+        assert_eq!(custom.fraction_at(24.5), 0.0);
+        assert_eq!(custom.fraction_at(25.5), 1.0);
+
+        let legacy = HorizontalRange::unclamped_inset(bounds, 8.0);
+        assert_eq!(legacy.start(), 28.0);
+        assert_eq!(legacy.length(), 0.0);
+        assert_eq!(legacy.fraction_at(28.5), 0.5);
+        assert_eq!(legacy.position(1.0), 28.0);
     }
 }
