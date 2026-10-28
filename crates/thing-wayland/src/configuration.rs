@@ -1,10 +1,11 @@
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{collections::BTreeSet, path::PathBuf, time::Instant};
 
 use thing_core::{Node, NodeId};
 use thing_runtime::{
     Action, AudioSnapshot, Event, MediaSnapshot, NiriState, OutputContext, Runtime, Scalar,
     ServiceSnapshot,
 };
+use thing_ui::Layout;
 
 struct Instance<K> {
     key: K,
@@ -70,6 +71,12 @@ impl<K: Clone + Eq> Configurations<K> {
             .is_some_and(|runtime| runtime.has_scroll_handler(id))
     }
 
+    pub(crate) fn layout_is_animating(&self, key: &K, layout: &Layout) -> bool {
+        self.runtime(key).is_some_and(|runtime| {
+            runtime.is_any_animating(layout.placements().iter().map(|placement| placement.id))
+        })
+    }
+
     pub(crate) fn output(&self, key: &K) -> Option<&OutputContext> {
         self.instances
             .iter()
@@ -82,6 +89,14 @@ impl<K: Clone + Eq> Configurations<K> {
             .iter_mut()
             .find(|instance| &instance.key == key)
             .map(|instance| &mut instance.runtime)
+    }
+
+    pub(crate) fn advance(&mut self, key: &K, now: Instant) -> Result<bool, String> {
+        self.runtime_mut(key)
+            .map(|runtime| runtime.advance(now))
+            .transpose()
+            .map(|changed| changed.unwrap_or(false))
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn set_output(&mut self, key: &K, output: OutputContext) -> Result<bool, String> {
@@ -237,11 +252,12 @@ impl<K: Clone + Eq> Configurations<K> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, time::Duration};
 
     use tempfile::tempdir;
     use thing_core::{Kind, Scale};
     use thing_runtime::{AudioDevice, AudioSource, AudioStream, MediaPlayer};
+    use thing_ui::{Layout, Measurer, Size};
 
     use super::*;
 
@@ -262,6 +278,17 @@ mod tests {
             node.children.iter().find_map(find)
         }
         find(configurations.root(&key).unwrap()).unwrap()
+    }
+
+    struct FixedText;
+
+    impl Measurer for FixedText {
+        fn measure(&mut self, _: &Node, _: Option<f32>) -> Size {
+            Size {
+                width: 30.0,
+                height: 12.0,
+            }
+        }
     }
 
     #[test]
@@ -291,6 +318,109 @@ mod tests {
         assert!(configurations.dispatch(&1, button, Event::Click).unwrap().0);
         assert_eq!(text(&configurations, 1), "DP-1:1920:1");
         assert_eq!(text(&configurations, 2), "DP-2:2560:0");
+    }
+
+    #[test]
+    fn transitions_are_paced_only_for_their_output_and_visible_layout() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            local expanded = ui.state(false)
+            return ui.panel { children = { ui.button {
+                on_click = function() expanded:set(true) end,
+                style = { width = ui.transition(function()
+                    return expanded:get() and 200 or 100
+                end, { duration = 100, easing = 'linear' }) },
+            } } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        configurations.add(2, output("DP-2", 2560)).unwrap();
+        let first = configurations.root(&1).unwrap().children[0].id;
+        let second = configurations.root(&2).unwrap().children[0].id;
+
+        assert!(configurations.dispatch(&1, first, Event::Click).unwrap().0);
+        assert!(configurations.runtime(&1).unwrap().is_animating(first));
+        assert!(!configurations.runtime(&2).unwrap().is_animating(second));
+        let layout = Layout::compute(
+            configurations.root(&1).unwrap(),
+            Size {
+                width: 300.0,
+                height: 40.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        assert!(configurations.layout_is_animating(&1, &layout));
+
+        configurations
+            .advance(&1, Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        let layout = Layout::compute(
+            configurations.root(&1).unwrap(),
+            Size {
+                width: 300.0,
+                height: 40.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        assert!(!configurations.layout_is_animating(&1, &layout));
+        assert_eq!(
+            configurations.root(&1).unwrap().children[0].style.width,
+            Some(200.0)
+        );
+        assert_eq!(
+            configurations.root(&2).unwrap().children[0].style.width,
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn hidden_transitions_do_not_keep_a_surface_drawing() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            local expanded = ui.state(false)
+            local visible = ui.state(true)
+            return ui.panel { children = {
+                ui.button { on_click = function()
+                    expanded:set(true)
+                    visible:set(false)
+                end },
+                ui.row {
+                    visible = function() return visible:get() end,
+                    style = { width = ui.transition(function()
+                        return expanded:get() and 200 or 100
+                    end, { duration = 1000 }) },
+                },
+            } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        let button = configurations.root(&1).unwrap().children[0].id;
+        let animated = configurations.root(&1).unwrap().children[1].id;
+
+        configurations.dispatch(&1, button, Event::Click).unwrap();
+        assert!(configurations.runtime(&1).unwrap().is_animating(animated));
+        let layout = Layout::compute(
+            configurations.root(&1).unwrap(),
+            Size {
+                width: 300.0,
+                height: 40.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        assert!(!configurations.layout_is_animating(&1, &layout));
     }
 
     #[test]
