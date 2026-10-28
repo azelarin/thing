@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf, time::Duration};
 use tempfile::TempDir;
 use thing_core::Kind;
-use thing_runtime::{Action, AudioDevice, Event, Limits, Runtime, Scalar};
+use thing_runtime::{Action, AudioDevice, AudioSnapshot, Event, Limits, Runtime, Scalar};
 
 fn fixture(source: &str) -> (TempDir, PathBuf) {
     let directory = tempfile::tempdir().unwrap();
@@ -498,4 +498,80 @@ fn audio_controls_follow_server_updates_and_dismiss_popups() {
     );
     runtime.dispatch(popup, Event::Close).unwrap();
     assert!(!runtime.root().find(popup).unwrap().visible);
+}
+
+#[test]
+fn microphone_state_is_reactive_preserved_and_controllable() {
+    let (_directory, path) = fixture(
+        r#"
+        local audio = services.audio
+        return ui.panel { children = {
+            ui.text { text = function()
+                local sources = audio.sources:get()
+                local description = if #sources == 0 then 'none' else sources[1].description
+                return `{audio.source_available:get()}:{audio.source_volume:get()}:{audio.source_muted:get()}:{audio.source_device:get()}:{description}`
+            end },
+            ui.button { on_click = function() audio.set_source_volume(0.8) end },
+            ui.button { on_click = function() audio.set_source_muted(false) end },
+            ui.button { on_click = function() audio.set_default_source('webcam') end },
+            ui.button { on_click = function() audio.set_source_volume(1.1) end },
+            ui.button { on_click = function() audio.sources:get()[1].name = 'changed' end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(&path).unwrap();
+    runtime
+        .set_audio(AudioSnapshot {
+            source_available: true,
+            source_volume: 1.25,
+            source_muted: true,
+            source_device: "microphone".into(),
+            sources: vec![
+                AudioDevice {
+                    name: "microphone".into(),
+                    description: "Microphone".into(),
+                },
+                AudioDevice {
+                    name: "webcam".into(),
+                    description: "Webcam".into(),
+                },
+            ],
+            ..AudioSnapshot::default()
+        })
+        .unwrap();
+    assert!(runtime.refresh().unwrap());
+    assert_eq!(
+        runtime.root().children[0].text,
+        "true:1.25:true:microphone:Microphone"
+    );
+
+    for index in 1..=3 {
+        runtime
+            .dispatch(runtime.root().children[index].id, Event::Click)
+            .unwrap();
+    }
+    assert!(
+        runtime
+            .dispatch(runtime.root().children[4].id, Event::Click)
+            .is_err()
+    );
+    assert!(
+        runtime
+            .dispatch(runtime.root().children[5].id, Event::Click)
+            .is_err()
+    );
+    assert_eq!(
+        runtime.take_actions(),
+        vec![
+            Action::SetSourceVolume(0.8),
+            Action::SetSourceMuted(false),
+            Action::SetDefaultSource("webcam".into()),
+        ]
+    );
+
+    runtime.reload(path).unwrap();
+    assert_eq!(
+        runtime.root().children[0].text,
+        "true:1.25:true:microphone:Microphone"
+    );
 }

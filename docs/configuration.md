@@ -324,6 +324,11 @@ read them inside property functions to subscribe to updates.
 | `services.audio.muted` | default output mute state |
 | `services.audio.device` | default output's server name |
 | `services.audio.devices` | immutable array of `{ name, description }` records |
+| `services.audio.source_available` | whether a default input is available |
+| `services.audio.source_volume` | default input volume; `1` is 100%, server values may exceed it |
+| `services.audio.source_muted` | default input mute state |
+| `services.audio.source_device` | default input's server name |
+| `services.audio.sources` | immutable array of selectable `{ name, description }` input records |
 | `services.audio.error` | connection failure message, or an empty string |
 
 use actions in event handlers to change audio:
@@ -342,11 +347,19 @@ return ui.panel {
 ```
 
 `set_volume(number)` accepts 0–1; `set_muted(boolean)` sets mute; and
-`set_default_sink(name)` selects an output. selecting an output changes the server
-default; moving existing streams depends on the audio server's policy. actions
-are forbidden during load and property evaluation. a failed event or reactive
-update discards actions queued by that event. local state changes are not rolled
-back. displayed values follow server replies.
+`set_default_sink(name)` selects an output. the corresponding input actions are
+`set_source_volume(number)`, `set_source_muted(boolean)`, and
+`set_default_source(name)`. selecting a device changes the server default;
+moving existing playback or recording streams depends on the audio server's
+policy.
+
+`sources` leaves out the monitor devices that audio servers create for recording
+an output. if a monitor is already the default input, it remains in the list so
+the current selection is still visible.
+
+actions are forbidden during load and property evaluation. a failed event or
+reactive update discards actions queued by that event. local state changes are
+not rolled back. displayed values follow server replies.
 
 volume changes preserve channel balance. the service reconnects after a server
 failure and discards commands from the old connection.

@@ -14,21 +14,71 @@ pub enum Action {
     SetVolume(f64),
     SetMuted(bool),
     SetDefaultSink(String),
+    SetSourceVolume(f64),
+    SetSourceMuted(bool),
+    SetDefaultSource(String),
     Niri(NiriAction),
 }
 
-/// an output device identified by its stable server name.
+/// an audio device identified by its stable server name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioDevice {
     pub name: String,
     pub description: String,
 }
 
+/// one confirmed generation of output and input audio state.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioSnapshot {
+    pub available: bool,
+    pub volume: f64,
+    pub muted: bool,
+    pub device: String,
+    pub devices: Vec<AudioDevice>,
+    pub source_available: bool,
+    pub source_volume: f64,
+    pub source_muted: bool,
+    pub source_device: String,
+    pub sources: Vec<AudioDevice>,
+    pub error: String,
+}
+
+impl AudioSnapshot {
+    fn values(&self) -> [(&'static str, Scalar); 9] {
+        [
+            ("audio.available", Scalar::Boolean(self.available)),
+            ("audio.volume", Scalar::Number(self.volume)),
+            ("audio.muted", Scalar::Boolean(self.muted)),
+            ("audio.device", Scalar::String(self.device.clone())),
+            (
+                "audio.source_available",
+                Scalar::Boolean(self.source_available),
+            ),
+            ("audio.source_volume", Scalar::Number(self.source_volume)),
+            ("audio.source_muted", Scalar::Boolean(self.source_muted)),
+            (
+                "audio.source_device",
+                Scalar::String(self.source_device.clone()),
+            ),
+            ("audio.error", Scalar::String(self.error.clone())),
+        ]
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (name, value) in self.values() {
+            validate_service(name, &value)?;
+        }
+        validate_devices(&self.devices)?;
+        validate_devices(&self.sources)
+    }
+}
+
 /// desktop service values used when loading a runtime.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ServiceSnapshot {
     pub(crate) values: BTreeMap<String, Scalar>,
     pub(crate) devices: Vec<AudioDevice>,
+    pub(crate) sources: Vec<AudioDevice>,
     pub(crate) niri: NiriState,
 }
 
@@ -42,6 +92,22 @@ impl ServiceSnapshot {
     pub fn set_audio_devices(&mut self, devices: Vec<AudioDevice>) -> Result<()> {
         validate_devices(&devices)?;
         self.devices = devices;
+        Ok(())
+    }
+
+    pub fn set_audio_sources(&mut self, sources: Vec<AudioDevice>) -> Result<()> {
+        validate_devices(&sources)?;
+        self.sources = sources;
+        Ok(())
+    }
+
+    pub fn set_audio(&mut self, audio: AudioSnapshot) -> Result<()> {
+        audio.validate()?;
+        for (name, value) in audio.values() {
+            self.values.insert(name.into(), value);
+        }
+        self.devices = audio.devices;
+        self.sources = audio.sources;
         Ok(())
     }
 
@@ -83,12 +149,15 @@ pub(crate) struct Services {
     allowed: Rc<Cell<bool>>,
     devices: Rc<RefCell<Vec<AudioDevice>>>,
     devices_revision: usize,
+    sources: Rc<RefCell<Vec<AudioDevice>>>,
+    sources_revision: usize,
     niri: NiriData,
 }
 
 impl Services {
     pub fn install(lua: &Lua, tracker: Rc<RefCell<Tracker>>) -> Result<Self> {
         let devices_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
+        let sources_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let niri = lua.create_table()?;
         let niri_data = NiriData::install(&niri, tracker.clone())?;
         let mut result = Self {
@@ -98,6 +167,8 @@ impl Services {
             allowed: Rc::default(),
             devices: Rc::default(),
             devices_revision,
+            sources: Rc::default(),
+            sources_revision,
             niri: niri_data,
         };
         let services = lua.create_table()?;
@@ -112,11 +183,23 @@ impl Services {
                 devices: result.devices.clone(),
             },
         )?;
+        audio.set(
+            "sources",
+            DeviceList {
+                tracker: result.tracker.clone(),
+                revision: sources_revision,
+                devices: result.sources.clone(),
+            },
+        )?;
         for (name, value) in [
             ("audio.available", Scalar::Boolean(false)),
             ("audio.volume", Scalar::Number(0.0)),
             ("audio.muted", Scalar::Boolean(false)),
             ("audio.device", Scalar::String(String::new())),
+            ("audio.source_available", Scalar::Boolean(false)),
+            ("audio.source_volume", Scalar::Number(0.0)),
+            ("audio.source_muted", Scalar::Boolean(false)),
+            ("audio.source_device", Scalar::String(String::new())),
             ("audio.error", Scalar::String(String::new())),
             ("clock.time", Scalar::String("--:--".into())),
             ("clock.date", Scalar::String(String::new())),
@@ -179,6 +262,41 @@ impl Services {
                     ));
                 }
                 enqueue(&actions, &allowed, Action::SetDefaultSink(name))
+            })?,
+        )?;
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        audio.set(
+            "set_source_volume",
+            lua.create_function(move |_, value: f64| {
+                if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                    return Err(Error::runtime("source volume must be between 0 and 1"));
+                }
+                enqueue(&actions, &allowed, Action::SetSourceVolume(value))
+            })?,
+        )?;
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        audio.set(
+            "set_source_muted",
+            lua.create_function(move |_, value: Value| {
+                let Value::Boolean(value) = value else {
+                    return Err(Error::runtime("source mute must be a boolean"));
+                };
+                enqueue(&actions, &allowed, Action::SetSourceMuted(value))
+            })?,
+        )?;
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        audio.set(
+            "set_default_source",
+            lua.create_function(move |_, name: String| {
+                if name.is_empty() || name.contains('\0') {
+                    return Err(Error::runtime(
+                        "source name must be nonempty and contain no NUL",
+                    ));
+                }
+                enqueue(&actions, &allowed, Action::SetDefaultSource(name))
             })?,
         )?;
         audio.set_readonly(true);
@@ -247,6 +365,56 @@ impl Services {
         Ok(())
     }
 
+    pub fn set_sources(&self, sources: Vec<AudioDevice>) -> Result<()> {
+        validate_devices(&sources)?;
+        if *self.sources.borrow() != sources {
+            *self.sources.borrow_mut() = sources;
+            let mut tracker = self.tracker.borrow_mut();
+            let revision = tracker.read(self.sources_revision);
+            tracker.write(
+                self.sources_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn set_audio(&self, audio: AudioSnapshot) -> Result<()> {
+        audio.validate()?;
+        let devices_changed = *self.devices.borrow() != audio.devices;
+        let sources_changed = *self.sources.borrow() != audio.sources;
+        let mut devices = self.devices.borrow_mut();
+        let mut sources = self.sources.borrow_mut();
+        let mut tracker = self.tracker.borrow_mut();
+        let mut updates = audio
+            .values()
+            .into_iter()
+            .map(|(name, value)| (self.signals[name], value))
+            .collect::<Vec<_>>();
+        if devices_changed {
+            let revision = tracker.read(self.devices_revision);
+            updates.push((
+                self.devices_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            ));
+        }
+        if sources_changed {
+            let revision = tracker.read(self.sources_revision);
+            updates.push((
+                self.sources_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            ));
+        }
+        tracker.write_batch(updates)?;
+        if devices_changed {
+            *devices = audio.devices;
+        }
+        if sources_changed {
+            *sources = audio.sources;
+        }
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> ServiceSnapshot {
         let mut tracker = self.tracker.borrow_mut();
         let values = self
@@ -258,6 +426,7 @@ impl Services {
         ServiceSnapshot {
             values,
             devices: self.devices.borrow().clone(),
+            sources: self.sources.borrow().clone(),
             niri: self.niri.snapshot(),
         }
     }
@@ -288,10 +457,24 @@ impl Services {
 
 fn validate_service(name: &str, value: &Scalar) -> Result<()> {
     let valid = match (name, value) {
-        ("audio.available" | "audio.muted" | "niri.available", Scalar::Boolean(_)) => true,
-        ("audio.volume", Scalar::Number(value)) => value.is_finite() && *value >= 0.0,
         (
-            "audio.device" | "audio.error" | "clock.time" | "clock.date" | "niri.error",
+            "audio.available"
+            | "audio.muted"
+            | "audio.source_available"
+            | "audio.source_muted"
+            | "niri.available",
+            Scalar::Boolean(_),
+        ) => true,
+        ("audio.volume" | "audio.source_volume", Scalar::Number(value)) => {
+            value.is_finite() && *value >= 0.0
+        }
+        (
+            "audio.device"
+            | "audio.source_device"
+            | "audio.error"
+            | "clock.time"
+            | "clock.date"
+            | "niri.error",
             Scalar::String(value),
         ) => value.len() <= 4096 && !value.contains('\0'),
         _ => false,
@@ -335,4 +518,71 @@ fn enqueue(actions: &RefCell<Vec<Action>>, allowed: &Cell<bool>, action: Action)
     }
     actions.push(action);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(name: &str) -> AudioDevice {
+        AudioDevice {
+            name: name.into(),
+            description: name.into(),
+        }
+    }
+
+    #[test]
+    fn output_and_input_lists_have_independent_revisions() {
+        let lua = Lua::new();
+        let tracker = Rc::new(RefCell::new(Tracker::default()));
+        let services = Services::install(&lua, tracker.clone()).unwrap();
+
+        tracker.borrow_mut().begin(1);
+        lua.load("return services.audio.devices:get()")
+            .eval::<Value>()
+            .unwrap();
+        tracker.borrow_mut().finish(1);
+        tracker.borrow_mut().begin(2);
+        lua.load("return services.audio.sources:get()")
+            .eval::<Value>()
+            .unwrap();
+        tracker.borrow_mut().finish(2);
+
+        services.set_sources(vec![device("microphone")]).unwrap();
+        assert_eq!(tracker.borrow().dirty, BTreeSet::from([2]));
+        tracker.borrow_mut().dirty.clear();
+        services.set_devices(vec![device("speakers")]).unwrap();
+        assert_eq!(tracker.borrow().dirty, BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn invalid_audio_snapshot_does_not_change_any_audio_state() {
+        let lua = Lua::new();
+        let tracker = Rc::new(RefCell::new(Tracker::default()));
+        let services = Services::install(&lua, tracker).unwrap();
+        services
+            .set_audio(AudioSnapshot {
+                available: true,
+                volume: 0.4,
+                device: "speakers".into(),
+                devices: vec![device("speakers")],
+                source_available: true,
+                source_volume: 0.6,
+                source_device: "microphone".into(),
+                sources: vec![device("microphone")],
+                ..AudioSnapshot::default()
+            })
+            .unwrap();
+        let before = services.snapshot();
+
+        let invalid = AudioSnapshot {
+            available: false,
+            devices: vec![device("headphones")],
+            sources: vec![device("webcam")],
+            error: "bad\0error".into(),
+            ..AudioSnapshot::default()
+        };
+        assert!(services.set_audio(invalid).is_err());
+        assert_eq!(services.snapshot(), before);
+    }
 }

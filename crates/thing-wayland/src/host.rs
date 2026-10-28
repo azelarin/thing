@@ -318,20 +318,7 @@ impl App {
         let Some(snapshot) = self.audio.take_snapshot() else {
             return;
         };
-        let update = (|| -> Result<(), String> {
-            self.configurations.set_audio_devices(snapshot.devices)?;
-            for (name, value) in [
-                ("audio.available", Scalar::Boolean(snapshot.available)),
-                ("audio.volume", Scalar::Number(snapshot.volume)),
-                ("audio.muted", Scalar::Boolean(snapshot.muted)),
-                ("audio.device", Scalar::String(snapshot.device)),
-                ("audio.error", Scalar::String(snapshot.error)),
-            ] {
-                self.configurations.set_service(name, value)?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = update {
+        if let Err(error) = self.configurations.set_audio(snapshot) {
             eprintln!("thing: {error}");
         }
         self.refresh();

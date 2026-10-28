@@ -43,7 +43,7 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [ ] text input and keyboard repeat
 - [ ] vulkan rendering alongside opengl
 - [ ] drag and drop, animations, and custom shapes
-- [ ] microphone controls
+- [x] microphone controls
 - [ ] per-application audio controls
 - [ ] media, tray, clipboard, and notification services
 - [ ] session locking and idle inhibition

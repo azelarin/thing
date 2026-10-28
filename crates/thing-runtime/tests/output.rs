@@ -188,6 +188,10 @@ fn service_snapshot_rejects_invalid_replacements_atomically() {
                 return devices[1].description
             end },
             ui.text { text = function()
+                local sources = services.audio.sources:get()
+                return sources[1].description
+            end },
+            ui.text { text = function()
                 local windows = services.niri.windows:get()
                 return windows[1].title
             end },
@@ -201,6 +205,26 @@ fn service_snapshot_rejects_invalid_replacements_atomically() {
     assert!(
         snapshot
             .set_service("clock.time", Scalar::Number(1234.0))
+            .is_err()
+    );
+    snapshot
+        .set_audio_sources(vec![AudioDevice {
+            name: "microphone".into(),
+            description: "Microphone".into(),
+        }])
+        .unwrap();
+    assert!(
+        snapshot
+            .set_audio_sources(vec![
+                AudioDevice {
+                    name: "duplicate".into(),
+                    description: "First".into(),
+                },
+                AudioDevice {
+                    name: "duplicate".into(),
+                    description: "Second".into(),
+                },
+            ])
             .is_err()
     );
     snapshot
@@ -267,5 +291,6 @@ fn service_snapshot_rejects_invalid_replacements_atomically() {
         Runtime::load_for_output(path, output("DP-1", 1920, 1080, 120), &snapshot).unwrap();
     assert_eq!(runtime.root().children[0].text, "12:34");
     assert_eq!(runtime.root().children[1].text, "Speakers");
-    assert_eq!(runtime.root().children[2].text, "Terminal");
+    assert_eq!(runtime.root().children[2].text, "Microphone");
+    assert_eq!(runtime.root().children[3].text, "Terminal");
 }

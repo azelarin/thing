@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, path::PathBuf};
 
 use thing_core::{Node, NodeId};
 use thing_runtime::{
-    Action, AudioDevice, Event, NiriState, OutputContext, Runtime, Scalar, ServiceSnapshot,
+    Action, AudioSnapshot, Event, NiriState, OutputContext, Runtime, Scalar, ServiceSnapshot,
 };
 
 struct Instance<K> {
@@ -113,16 +113,18 @@ impl<K: Clone + Eq> Configurations<K> {
         Ok(())
     }
 
-    pub(crate) fn set_audio_devices(&mut self, devices: Vec<AudioDevice>) -> Result<(), String> {
-        self.services
-            .set_audio_devices(devices.clone())
+    pub(crate) fn set_audio(&mut self, audio: AudioSnapshot) -> Result<(), String> {
+        let mut services = self.services.clone();
+        services
+            .set_audio(audio.clone())
             .map_err(|error| error.to_string())?;
         for instance in &mut self.instances {
             instance
                 .runtime
-                .set_audio_devices(devices.clone())
+                .set_audio(audio.clone())
                 .map_err(|error| error.to_string())?;
         }
+        self.services = services;
         Ok(())
     }
 
@@ -218,6 +220,7 @@ mod tests {
 
     use tempfile::tempdir;
     use thing_core::{Kind, Scale};
+    use thing_runtime::AudioDevice;
 
     use super::*;
 
@@ -396,6 +399,62 @@ mod tests {
 
         configurations.add(1, output("DP-1", 1920)).unwrap();
         assert_eq!(text(&configurations, 1), "12:35");
+    }
+
+    #[test]
+    fn audio_updates_reach_every_output_as_one_validated_snapshot() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            return ui.panel { children = { ui.text { text = function()
+                local sources = services.audio.sources:get()
+                local description = if #sources == 0 then 'none' else sources[1].description
+                return `{services.audio.volume:get()}:{services.audio.source_volume:get()}:{description}`
+            end } } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        configurations
+            .set_audio(AudioSnapshot {
+                available: true,
+                volume: 0.4,
+                source_available: true,
+                source_volume: 0.7,
+                sources: vec![AudioDevice {
+                    name: "microphone".into(),
+                    description: "Microphone".into(),
+                }],
+                ..AudioSnapshot::default()
+            })
+            .unwrap();
+        assert_eq!(configurations.refresh(), vec![1]);
+        assert_eq!(text(&configurations, 1), "0.4:0.7:Microphone");
+
+        configurations.add(2, output("DP-2", 2560)).unwrap();
+        assert_eq!(text(&configurations, 2), "0.4:0.7:Microphone");
+        assert!(
+            configurations
+                .set_audio(AudioSnapshot {
+                    volume: 0.9,
+                    source_volume: 0.2,
+                    sources: vec![AudioDevice {
+                        name: "webcam".into(),
+                        description: "Webcam".into(),
+                    }],
+                    error: "bad\0error".into(),
+                    ..AudioSnapshot::default()
+                })
+                .is_err()
+        );
+        assert!(configurations.refresh().is_empty());
+        assert_eq!(text(&configurations, 1), "0.4:0.7:Microphone");
+        assert_eq!(text(&configurations, 2), "0.4:0.7:Microphone");
+        configurations.add(3, output("DP-3", 1920)).unwrap();
+        assert_eq!(text(&configurations, 3), "0.4:0.7:Microphone");
     }
 
     #[test]

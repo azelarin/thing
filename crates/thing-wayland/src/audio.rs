@@ -24,17 +24,7 @@ use libpulse_binding::{
     time::MicroSeconds,
     volume::{ChannelVolumes, Volume},
 };
-use thing_runtime::{Action, AudioDevice};
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct Snapshot {
-    pub available: bool,
-    pub volume: f64,
-    pub muted: bool,
-    pub device: String,
-    pub devices: Vec<AudioDevice>,
-    pub error: String,
-}
+use thing_runtime::{Action, AudioDevice, AudioSnapshot};
 
 #[derive(Default)]
 struct Inbox {
@@ -47,7 +37,7 @@ struct Shared {
     inbox: Mutex<Inbox>,
     retry: Condvar,
     online: AtomicBool,
-    latest: Mutex<Option<Snapshot>>,
+    latest: Mutex<Option<AudioSnapshot>>,
 }
 
 pub(crate) struct Audio {
@@ -70,7 +60,7 @@ impl Audio {
         let worker = thread::Builder::new()
             .name("thing-audio".into())
             .spawn(move || {
-                let mut previous = Snapshot::default();
+                let mut previous = AudioSnapshot::default();
                 let mut last_error = String::new();
                 loop {
                     if lock(&state.inbox).stop {
@@ -94,9 +84,9 @@ impl Audio {
                         eprintln!("thing: audio unavailable: {error}; retrying in 2 seconds");
                         last_error = error.clone();
                     }
-                    let unavailable = Snapshot {
+                    let unavailable = AudioSnapshot {
                         error,
-                        ..Snapshot::default()
+                        ..AudioSnapshot::default()
                     };
                     if previous != unavailable {
                         previous = unavailable;
@@ -120,7 +110,7 @@ impl Audio {
         })
     }
 
-    pub fn take_snapshot(&self) -> Option<Snapshot> {
+    pub fn take_snapshot(&self) -> Option<AudioSnapshot> {
         lock(&self.shared.latest).take()
     }
 
@@ -178,8 +168,11 @@ fn drain(mut stream: &UnixStream) {
 fn enqueue(queue: &mut VecDeque<Action>, action: Action) -> Result<(), &'static str> {
     // consecutive drag updates can replace one another. do not move them past
     // a device switch or mute action, where ordering changes their meaning.
-    if matches!(action, Action::SetVolume(_)) && matches!(queue.back(), Some(Action::SetVolume(_)))
-    {
+    if matches!(
+        (&action, queue.back()),
+        (Action::SetVolume(_), Some(Action::SetVolume(_)))
+            | (Action::SetSourceVolume(_), Some(Action::SetSourceVolume(_)))
+    ) {
         queue.pop_back();
     }
     if queue.len() >= 128 {
@@ -196,12 +189,28 @@ struct Sink {
     muted: bool,
 }
 
+#[derive(Clone)]
+struct Source {
+    device: AudioDevice,
+    volume: ChannelVolumes,
+    muted: bool,
+    monitor: bool,
+}
+
+#[derive(Default)]
+struct ServerState {
+    default_sink: String,
+    default_source: String,
+    sinks: BTreeMap<String, Sink>,
+    sources: BTreeMap<String, Source>,
+}
+
 #[derive(Default)]
 struct Query {
-    default: String,
-    sinks: BTreeMap<String, Sink>,
+    state: ServerState,
     server_done: bool,
     sinks_done: bool,
+    sources_done: bool,
     failed: bool,
 }
 
@@ -209,7 +218,7 @@ fn session(
     shared: &Shared,
     reader: &UnixStream,
     server: Option<&str>,
-    mut publish: impl FnMut(Snapshot),
+    mut publish: impl FnMut(AudioSnapshot),
 ) -> Result<(), String> {
     let mut mainloop = Mainloop::new().ok_or("cannot create audio event loop")?;
     let mut context = Context::new(&mainloop, "thing").ok_or("cannot create audio context")?;
@@ -233,8 +242,7 @@ fn session(
         let mut subscribed = false;
         let mut query: Option<Rc<RefCell<Query>>> = None;
         let mut deadline = Some(Instant::now() + Duration::from_secs(5));
-        let mut sinks = BTreeMap::new();
-        let mut default = String::new();
+        let mut server_state = ServerState::default();
         loop {
             if lock(&shared.inbox).stop {
                 return Ok(());
@@ -245,7 +253,9 @@ fn session(
                     if !subscribed {
                         let failed = failed.clone();
                         context.subscribe(
-                            InterestMaskSet::SINK | InterestMaskSet::SERVER,
+                            InterestMaskSet::SINK
+                                | InterestMaskSet::SOURCE
+                                | InterestMaskSet::SERVER,
                             move |success| failed.set(!success),
                         );
                         subscribed = true;
@@ -257,30 +267,19 @@ fn session(
                     }
                     if query.as_ref().is_some_and(|q| {
                         let q = q.borrow();
-                        q.failed || (q.server_done && q.sinks_done)
+                        q.failed || (q.server_done && q.sinks_done && q.sources_done)
                     }) {
                         let q = query.take().expect("completed query exists");
                         let mut q = q.borrow_mut();
                         if q.failed {
-                            return Err("could not read audio outputs".into());
+                            return Err("could not read audio devices".into());
                         }
-                        sinks = std::mem::take(&mut q.sinks);
-                        default = std::mem::take(&mut q.default);
-                        let sink = sinks.get(&default);
-                        publish(Snapshot {
-                            available: sink.is_some(),
-                            volume: sink.map_or(0.0, |sink| {
-                                f64::from(sink.volume.max().0) / f64::from(Volume::NORMAL.0)
-                            }),
-                            muted: sink.is_some_and(|sink| sink.muted),
-                            device: default.clone(),
-                            devices: sinks.values().map(|sink| sink.device.clone()).collect(),
-                            error: String::new(),
-                        });
+                        server_state = std::mem::take(&mut q.state);
+                        publish(audio_snapshot(&server_state));
                         deadline = None;
                     }
                     if query.is_none() && !busy.get() && dirty.replace(false) {
-                        query = Some(query_outputs(&context));
+                        query = Some(query_devices(&context));
                         deadline = Some(Instant::now() + Duration::from_secs(5));
                     }
                     // refresh after each operation so controls following a
@@ -291,8 +290,7 @@ fn session(
                             busy.set(true);
                             if apply(
                                 &mut context,
-                                &sinks,
-                                &default,
+                                &server_state,
                                 command,
                                 dirty.clone(),
                                 busy.clone(),
@@ -327,13 +325,18 @@ fn session(
     result
 }
 
-fn query_outputs(context: &Context) -> Rc<RefCell<Query>> {
+fn query_devices(context: &Context) -> Rc<RefCell<Query>> {
     let query = Rc::new(RefCell::new(Query::default()));
     let server = query.clone();
     context.introspect().get_server_info(move |info| {
         let mut query = server.borrow_mut();
-        query.default = info
+        query.state.default_sink = info
             .default_sink_name
+            .as_deref()
+            .unwrap_or_default()
+            .to_owned();
+        query.state.default_source = info
+            .default_source_name
             .as_deref()
             .unwrap_or_default()
             .to_owned();
@@ -345,11 +348,11 @@ fn query_outputs(context: &Context) -> Rc<RefCell<Query>> {
         match result {
             ListResult::Item(info) => {
                 if let Some(name) = &info.name {
-                    if query.sinks.len() >= 512 {
+                    if query.state.sinks.len() >= 512 {
                         query.failed = true;
                         return;
                     }
-                    query.sinks.insert(
+                    query.state.sinks.insert(
                         name.to_string(),
                         Sink {
                             device: AudioDevice {
@@ -366,13 +369,73 @@ fn query_outputs(context: &Context) -> Rc<RefCell<Query>> {
             ListResult::Error => query.failed = true,
         }
     });
+    let inputs = query.clone();
+    context.introspect().get_source_info_list(move |result| {
+        let mut query = inputs.borrow_mut();
+        match result {
+            ListResult::Item(info) => {
+                if let Some(name) = &info.name {
+                    if query.state.sources.len() >= 512 {
+                        query.failed = true;
+                        return;
+                    }
+                    query.state.sources.insert(
+                        name.to_string(),
+                        Source {
+                            device: AudioDevice {
+                                name: name.to_string(),
+                                description: info.description.as_deref().unwrap_or(name).to_owned(),
+                            },
+                            volume: info.volume,
+                            muted: info.mute,
+                            monitor: info.monitor_of_sink.is_some(),
+                        },
+                    );
+                }
+            }
+            ListResult::End => query.sources_done = true,
+            ListResult::Error => query.failed = true,
+        }
+    });
     query
+}
+
+fn audio_snapshot(state: &ServerState) -> AudioSnapshot {
+    let sink = state.sinks.get(&state.default_sink);
+    let source = state.sources.get(&state.default_source);
+    AudioSnapshot {
+        available: sink.is_some(),
+        volume: sink.map_or(0.0, |sink| volume(&sink.volume)),
+        muted: sink.is_some_and(|sink| sink.muted),
+        device: state.default_sink.clone(),
+        devices: state
+            .sinks
+            .values()
+            .map(|sink| sink.device.clone())
+            .collect(),
+        source_available: source.is_some(),
+        source_volume: source.map_or(0.0, |source| volume(&source.volume)),
+        source_muted: source.is_some_and(|source| source.muted),
+        source_device: state.default_source.clone(),
+        // output monitors are useful for recording desktop audio, but make a
+        // microphone picker noisy. retain one only while it is the default.
+        sources: state
+            .sources
+            .values()
+            .filter(|source| !source.monitor || source.device.name == state.default_source)
+            .map(|source| source.device.clone())
+            .collect(),
+        error: String::new(),
+    }
+}
+
+fn volume(channels: &ChannelVolumes) -> f64 {
+    f64::from(channels.max().0) / f64::from(Volume::NORMAL.0)
 }
 
 fn apply(
     context: &mut Context,
-    sinks: &BTreeMap<String, Sink>,
-    default: &str,
+    state: &ServerState,
     action: Action,
     dirty: Rc<Cell<bool>>,
     busy: Rc<Cell<bool>>,
@@ -385,19 +448,19 @@ fn apply(
         }
     };
     match action {
-        Action::SetDefaultSink(name) if sinks.contains_key(&name) => {
+        Action::SetDefaultSink(name) if state.sinks.contains_key(&name) => {
             context.set_default_sink(&name, completed);
             return true;
         }
         Action::SetVolume(value) if value.is_finite() && (0.0..=1.0).contains(&value) => {
-            if let Some(sink) = sinks.get(default) {
+            if let Some(sink) = state.sinks.get(&state.default_sink) {
                 let mut volume = sink.volume;
                 if volume
                     .scale(Volume((value * f64::from(Volume::NORMAL.0)).round() as u32))
                     .is_some()
                 {
                     context.introspect().set_sink_volume_by_name(
-                        default,
+                        &state.default_sink,
                         &volume,
                         Some(Box::new(completed)),
                     );
@@ -405,13 +468,43 @@ fn apply(
                 }
             }
         }
-        Action::SetMuted(muted) if sinks.contains_key(default) => {
-            context
-                .introspect()
-                .set_sink_mute_by_name(default, muted, Some(Box::new(completed)));
+        Action::SetMuted(muted) if state.sinks.contains_key(&state.default_sink) => {
+            context.introspect().set_sink_mute_by_name(
+                &state.default_sink,
+                muted,
+                Some(Box::new(completed)),
+            );
             return true;
         }
-        _ => eprintln!("thing: audio request refers to an unavailable output or invalid volume"),
+        Action::SetDefaultSource(name) if state.sources.contains_key(&name) => {
+            context.set_default_source(&name, completed);
+            return true;
+        }
+        Action::SetSourceVolume(value) if value.is_finite() && (0.0..=1.0).contains(&value) => {
+            if let Some(source) = state.sources.get(&state.default_source) {
+                let mut volume = source.volume;
+                if volume
+                    .scale(Volume((value * f64::from(Volume::NORMAL.0)).round() as u32))
+                    .is_some()
+                {
+                    context.introspect().set_source_volume_by_name(
+                        &state.default_source,
+                        &volume,
+                        Some(Box::new(completed)),
+                    );
+                    return true;
+                }
+            }
+        }
+        Action::SetSourceMuted(muted) if state.sources.contains_key(&state.default_source) => {
+            context.introspect().set_source_mute_by_name(
+                &state.default_source,
+                muted,
+                Some(Box::new(completed)),
+            );
+            return true;
+        }
+        _ => eprintln!("thing: audio request refers to an unavailable device or invalid volume"),
     }
     false
 }
@@ -425,16 +518,73 @@ mod tests {
         let mut queue = VecDeque::new();
         enqueue(&mut queue, Action::SetVolume(0.1)).unwrap();
         enqueue(&mut queue, Action::SetVolume(0.2)).unwrap();
+        enqueue(&mut queue, Action::SetSourceVolume(0.4)).unwrap();
+        enqueue(&mut queue, Action::SetSourceVolume(0.5)).unwrap();
+        enqueue(&mut queue, Action::SetDefaultSource("webcam".into())).unwrap();
+        enqueue(&mut queue, Action::SetSourceVolume(0.6)).unwrap();
+        enqueue(&mut queue, Action::SetSourceVolume(0.7)).unwrap();
         enqueue(&mut queue, Action::SetDefaultSink("headphones".into())).unwrap();
         enqueue(&mut queue, Action::SetVolume(0.3)).unwrap();
         assert_eq!(
             queue.into_iter().collect::<Vec<_>>(),
             vec![
                 Action::SetVolume(0.2),
+                Action::SetSourceVolume(0.5),
+                Action::SetDefaultSource("webcam".into()),
+                Action::SetSourceVolume(0.7),
                 Action::SetDefaultSink("headphones".into()),
                 Action::SetVolume(0.3)
             ]
         );
+    }
+
+    #[test]
+    fn snapshot_hides_nondefault_monitors_and_preserves_server_volume() {
+        let mut channels = ChannelVolumes::default();
+        channels.set(1, Volume(Volume::NORMAL.0 * 3 / 2));
+        let source = |name: &str, monitor| Source {
+            device: AudioDevice {
+                name: name.into(),
+                description: name.into(),
+            },
+            volume: channels,
+            muted: false,
+            monitor,
+        };
+        let sources = BTreeMap::from([
+            ("microphone".into(), source("microphone", false)),
+            ("monitor-a".into(), source("monitor-a", true)),
+            ("monitor-b".into(), source("monitor-b", true)),
+        ]);
+
+        let snapshot = audio_snapshot(&ServerState {
+            default_sink: "missing".into(),
+            default_source: "monitor-a".into(),
+            sources: sources.clone(),
+            ..ServerState::default()
+        });
+        assert!(!snapshot.available);
+        assert_eq!(snapshot.device, "missing");
+        assert!(snapshot.source_available);
+        assert_eq!(snapshot.source_volume, 1.5);
+        assert_eq!(
+            snapshot
+                .sources
+                .iter()
+                .map(|source| source.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["microphone", "monitor-a"]
+        );
+
+        let snapshot = audio_snapshot(&ServerState {
+            default_source: "missing".into(),
+            sources: sources.clone(),
+            ..ServerState::default()
+        });
+        assert!(!snapshot.source_available);
+        assert_eq!(snapshot.source_volume, 0.0);
+        assert_eq!(snapshot.source_device, "missing");
+        assert_eq!(snapshot.sources.len(), 1);
     }
 
     #[test]
@@ -467,6 +617,7 @@ mod tests {
         loop {
             if let Some(snapshot) = audio.take_snapshot() {
                 assert!(!snapshot.available);
+                assert!(!snapshot.source_available);
                 assert!(!snapshot.error.is_empty());
                 break;
             }
@@ -483,5 +634,40 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "shutdown waited for reconnect timeout"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a running pulseaudio-compatible server; reads state only"]
+    fn reads_live_audio_state_without_sending_actions() {
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let audio = Audio::start(ping).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(snapshot) = audio.take_snapshot() {
+                assert!(snapshot.error.is_empty(), "{}", snapshot.error);
+                if snapshot.available {
+                    assert!(
+                        snapshot
+                            .devices
+                            .iter()
+                            .any(|device| device.name == snapshot.device)
+                    );
+                }
+                if snapshot.source_available {
+                    assert!(
+                        snapshot
+                            .sources
+                            .iter()
+                            .any(|source| source.name == snapshot.source_device)
+                    );
+                }
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker did not report live audio state"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
