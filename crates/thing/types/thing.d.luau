@@ -167,6 +167,47 @@ export type ThingTextStyle = {
     opacity: ThingAnimatedNumber?,
 }
 
+export type ThingTextInputStyle = {
+    width: ThingAnimatedOptionalNumber?,
+    height: ThingAnimatedOptionalNumber?,
+    width_fraction: ThingReactive<number?>?,
+    height_fraction: ThingReactive<number?>?,
+    min_width: ThingReactive<number?>?,
+    max_width: ThingReactive<number?>?,
+    min_height: ThingReactive<number?>?,
+    max_height: ThingReactive<number?>?,
+    padding: ThingAnimatedNumber?,
+    padding_x: ThingAnimatedOptionalNumber?,
+    padding_y: ThingAnimatedOptionalNumber?,
+    gap: ThingAnimatedNumber?,
+    grow: ThingAnimatedNumber?,
+    shrink: ThingReactive<number?>?,
+    align: ThingReactive<ThingCrossAlign>?,
+    align_self: ThingReactive<ThingCrossAlign?>?,
+    align_content: ThingReactive<ThingCrossAlign>?,
+    justify: ThingReactive<ThingMainAlign>?,
+    wrap: ThingReactive<boolean>?,
+    radius: ThingAnimatedNumber?,
+    border_width: ThingAnimatedNumber?,
+    border_color: ThingAnimatedColor?,
+    hover_overlay: ThingAnimatedColor?,
+    pressed_overlay: ThingAnimatedColor?,
+    disabled_opacity: ThingReactive<number>?,
+    focus_ring_color: ThingAnimatedColor?,
+    focus_ring_width: ThingReactive<number>?,
+    font_size: ThingReactive<number>?,
+    font_weight: ThingReactive<number>?,
+    font_family: ThingReactive<string>?,
+    text_align: ThingReactive<ThingTextAlign>?,
+    tabular_digits: ThingReactive<boolean>?,
+    placeholder_color: ThingReactive<string>?,
+    selection_color: ThingReactive<string>?,
+    caret_color: ThingReactive<string>?,
+    background: ThingAnimatedColor?,
+    foreground: ThingAnimatedColor?,
+    opacity: ThingAnimatedNumber?,
+}
+
 export type ThingChildren = { ThingWidget } | (() -> { ThingWidget })
 
 export type ThingPanelProperties = {
@@ -201,6 +242,18 @@ export type ThingTextProperties = {
     text: ThingReactive<string>?,
     max_lines: ThingReactive<number?>?,
     overflow: ThingReactive<ThingTextOverflow>?,
+}
+
+export type ThingTextInputProperties = {
+    key: string?,
+    visible: ThingReactive<boolean>?,
+    enabled: ThingReactive<boolean>?,
+    style: ThingTextInputStyle?,
+    value: ThingReactive<string>,
+    placeholder: ThingReactive<string>?,
+    on_change: (value: string) -> (),
+    on_submit: ((value: string) -> ())?,
+    on_hover: ((inside: boolean) -> ())?,
 }
 
 export type ThingImageProperties = {
@@ -541,6 +594,7 @@ declare ui: {
     stack: (properties: ThingContainerProperties) -> ThingWidget,
     scroll: (properties: ThingContainerProperties) -> ThingWidget,
     text: (properties: ThingTextProperties) -> ThingWidget,
+    text_input: (properties: ThingTextInputProperties) -> ThingWidget,
     image: (properties: ThingImageProperties) -> ThingWidget,
     path: (properties: ThingPathProperties) -> ThingWidget,
     button: (properties: ThingButtonProperties) -> ThingWidget,
