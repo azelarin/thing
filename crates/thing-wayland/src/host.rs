@@ -1859,7 +1859,7 @@ impl App {
                 .expect("the focused text input was initialized")
                 .editor
                 .value()
-                .to_owned();
+                .into_owned();
             self.dispatch(output, id, Event::Submit(value), origin);
             return false;
         }
@@ -1895,7 +1895,7 @@ impl App {
             }
             TextKeyAction::Submit => unreachable!(),
         };
-        let proposed = changed.then(|| active.editor.value().to_owned());
+        let proposed = changed.then(|| active.editor.value().into_owned());
 
         let Some(proposed) = proposed else {
             return repeats;
