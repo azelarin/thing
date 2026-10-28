@@ -45,7 +45,9 @@ use thing_runtime::{
     Action, Event, OutputContext, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree,
     SystemTrayAction,
 };
-use thing_ui::{Interaction, Layout, PaintFrame, ScrollState, Size};
+use thing_ui::{
+    Interaction, Layout, PaintFrame, ScrollState, Size, TextInputCheckpoint, TextInputEditor,
+};
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop, event_created_child,
     globals::registry_queue_init,
@@ -412,6 +414,32 @@ enum SliderKeyAction {
     Maximum,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TextKeyAction {
+    Insert(String),
+    Backspace,
+    Delete,
+    MoveLeft,
+    MoveRight,
+    MoveToStart,
+    MoveToEnd,
+    SelectAll,
+    Submit,
+}
+
+impl TextKeyAction {
+    fn repeats(&self) -> bool {
+        matches!(
+            self,
+            Self::Insert(_) | Self::Backspace | Self::Delete | Self::MoveLeft | Self::MoveRight
+        )
+    }
+
+    fn changes_value(&self) -> bool {
+        matches!(self, Self::Insert(_) | Self::Backspace | Self::Delete)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RepeatSettings {
     delay: Duration,
@@ -583,6 +611,7 @@ struct Surface {
     layout: Option<Layout>,
     scroll: ScrollState,
     input: Interaction,
+    text_input: Option<ActiveTextInput>,
     pointer_position: Option<Point>,
     hover_path: Vec<NodeId>,
     press_serial: Option<u32>,
@@ -592,6 +621,11 @@ struct Surface {
     dirty: bool,
     waiting: bool,
     retry_at: Option<Instant>,
+}
+
+struct ActiveTextInput {
+    id: NodeId,
+    editor: TextInputEditor,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -956,6 +990,7 @@ impl App {
             layout: None,
             scroll: ScrollState::default(),
             input: Interaction::default(),
+            text_input: None,
             pointer_position: None,
             hover_path: Vec::new(),
             press_serial: None,
@@ -1122,6 +1157,7 @@ impl App {
             surface.layout = None;
             surface.scroll = ScrollState::default();
             surface.input = Interaction::default();
+            surface.text_input = None;
             surface.pointer_position = None;
             surface.hover_path.clear();
             surface.press_serial = None;
@@ -1276,6 +1312,7 @@ impl App {
             }
         }
         let configurations = &self.configurations;
+        let keyboard_surface = self.keyboard_surface.clone();
         let mut presented = Vec::new();
         for (index, surface) in self.surfaces.iter_mut().enumerate() {
             if !surface.configured || !surface.dirty || surface.waiting {
@@ -1325,6 +1362,20 @@ impl App {
             let viewport = surface.viewport.clone();
             let logical = surface.size;
             let buffer_scale = surface.scale.factor().round() as i32;
+            let text_input = (keyboard_surface.as_ref() == Some(surface.role.surface())
+                && surface.text_input.as_ref().is_some_and(|active| {
+                    Some(active.id) == surface.input.focused
+                        && layout
+                            .get(active.id)
+                            .is_some_and(|placement| placement.interactive)
+                }))
+            .then(|| {
+                &mut surface
+                    .text_input
+                    .as_mut()
+                    .expect("the active text input was checked")
+                    .editor
+            });
             let result = self.render.draw(
                 window,
                 PaintFrame {
@@ -1333,6 +1384,7 @@ impl App {
                     physical,
                     scale: surface.scale.factor(),
                     input: surface.input,
+                    text_input,
                 },
                 || {
                     if let Some(viewport) = &viewport {
@@ -1711,6 +1763,151 @@ impl App {
                 self.dispatch(output.clone(), id, Event::Pressed(false), None);
             }
         }
+    }
+
+    fn text_input_node_and_bounds(&self, surface: usize, id: NodeId) -> Option<(Node, Rect)> {
+        let surface = self.surfaces.get(surface)?;
+        let node = self
+            .configurations
+            .surface_root(&surface.output, &surface.key)?
+            .find(id)?;
+        if node.kind != Kind::TextInput {
+            return None;
+        }
+        let bounds = surface.layout.as_ref()?.get(id)?.bounds;
+        Some((node.clone(), bounds))
+    }
+
+    fn focus_text_input(
+        &mut self,
+        surface: usize,
+        id: NodeId,
+        point: Option<Point>,
+        extend: bool,
+    ) -> bool {
+        let Some((node, bounds)) = self.text_input_node_and_bounds(surface, id) else {
+            self.surfaces[surface].text_input = None;
+            return false;
+        };
+        let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
+        let padding_y = node.style.padding_y.unwrap_or(node.style.padding);
+        let width = (bounds.width - 2.0 * padding_x).max(0.0);
+        let was_active = self.surfaces[surface]
+            .text_input
+            .as_ref()
+            .is_some_and(|active| active.id == id);
+        if !was_active {
+            self.surfaces[surface].text_input = Some(ActiveTextInput {
+                id,
+                editor: TextInputEditor::new(&node, width),
+            });
+        }
+        let active = self.surfaces[surface]
+            .text_input
+            .as_mut()
+            .expect("the focused text input was initialized");
+        active.editor.prepare(&node, width);
+        if let Some(point) = point {
+            let x = point.x - bounds.x - padding_x;
+            let content_height = (bounds.height - 2.0 * padding_y).max(0.0);
+            let offset_y = ((content_height - active.editor.layout().height()) / 2.0).max(0.0);
+            let y = point.y - bounds.y - padding_y - offset_y;
+            if extend && was_active {
+                active.editor.extend_selection_to_point(x, y);
+            } else {
+                active.editor.move_to_point(x, y);
+            }
+        }
+        true
+    }
+
+    fn text_input_key(
+        &mut self,
+        surface: usize,
+        id: NodeId,
+        action: TextKeyAction,
+        origin: Option<InputOrigin>,
+    ) -> bool {
+        if !self.focus_text_input(surface, id, None, false) {
+            return false;
+        }
+        let output = self.surfaces[surface].output.clone();
+        let wl = self.surfaces[surface].role.surface().clone();
+        let select = self.modifiers.shift;
+        let word = self.modifiers.ctrl && !self.modifiers.alt;
+        let repeats = action.repeats();
+        let surface_state = &mut self.surfaces[surface];
+        reveal_text_input_focus(&mut surface_state.input, &mut surface_state.dirty);
+
+        if action == TextKeyAction::Submit {
+            let value = self.surfaces[surface]
+                .text_input
+                .as_ref()
+                .expect("the focused text input was initialized")
+                .editor
+                .value()
+                .to_owned();
+            self.dispatch(output, id, Event::Submit(value), origin);
+            return false;
+        }
+
+        let active = self.surfaces[surface]
+            .text_input
+            .as_mut()
+            .expect("the focused text input was initialized");
+        let checkpoint = action.changes_value().then(|| active.editor.checkpoint());
+        let changed = match action {
+            TextKeyAction::Insert(text) => active.editor.replace_selection(&text),
+            TextKeyAction::Backspace => active.editor.backspace(word),
+            TextKeyAction::Delete => active.editor.delete(word),
+            TextKeyAction::MoveLeft => {
+                active.editor.move_left(select, word);
+                false
+            }
+            TextKeyAction::MoveRight => {
+                active.editor.move_right(select, word);
+                false
+            }
+            TextKeyAction::MoveToStart => {
+                active.editor.move_to_start(select);
+                false
+            }
+            TextKeyAction::MoveToEnd => {
+                active.editor.move_to_end(select);
+                false
+            }
+            TextKeyAction::SelectAll => {
+                active.editor.select_all();
+                false
+            }
+            TextKeyAction::Submit => unreachable!(),
+        };
+        let proposed = changed.then(|| active.editor.value().to_owned());
+
+        let Some(proposed) = proposed else {
+            return repeats;
+        };
+        let checkpoint = checkpoint.expect("value-changing edits create a rollback checkpoint");
+        self.dispatch(output, id, Event::TextChange(proposed.clone()), origin);
+
+        let Some(surface) = self.index(&wl) else {
+            return repeats;
+        };
+        let Some((node, bounds)) = self.text_input_node_and_bounds(surface, id) else {
+            self.surfaces[surface].text_input = None;
+            return repeats;
+        };
+        let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
+        let width = (bounds.width - 2.0 * padding_x).max(0.0);
+        let Some(active) = self.surfaces[surface]
+            .text_input
+            .as_mut()
+            .filter(|active| active.id == id)
+        else {
+            return repeats;
+        };
+        reconcile_controlled_text_edit(&mut active.editor, &node, width, &proposed, checkpoint);
+        repeats
     }
 
     fn remove_popup(&mut self, index: usize, notify_runtime: bool, suppress_hover: bool) {
@@ -2257,9 +2454,22 @@ impl App {
     }
 
     fn clear_keyboard_focus(&mut self) {
+        self.set_keyboard_surface(None);
+    }
+
+    fn set_keyboard_surface(&mut self, next: Option<wl_surface::WlSurface>) {
         self.clear_key_repeat();
-        self.keyboard_surface = None;
+        let previous = std::mem::replace(&mut self.keyboard_surface, next);
         self.modifiers = Modifiers::default();
+        for surface in &mut self.surfaces {
+            if keyboard_focus_transition_affects(
+                previous.as_ref(),
+                self.keyboard_surface.as_ref(),
+                surface.role.surface(),
+            ) {
+                surface.dirty = true;
+            }
+        }
     }
 
     fn clear_key_repeat(&mut self) {
@@ -2392,8 +2602,10 @@ impl App {
                 } else {
                     current.map_or(0, |n| (n + 1) % order.len())
                 };
-                surface.input.focus_from_keyboard(order[next]);
+                let focused = order[next];
+                surface.input.focus_from_keyboard(focused);
                 surface.dirty = true;
+                self.focus_text_input(index, focused, None, false);
             }
             self.reconcile_hover_intent();
             return false;
@@ -2416,6 +2628,12 @@ impl App {
         let event_surface = self.surfaces[index].role.surface().clone();
         let origin = direct_input_serial(direct, serial)
             .and_then(|serial| self.input_origin(event_surface.clone(), serial));
+        if node.kind == Kind::TextInput {
+            let Some(action) = text_key_action(&event, self.modifiers, direct) else {
+                return false;
+            };
+            return self.text_input_key(index, id, action, origin);
+        }
         let Some(action) = widget_key_action(node.kind, event.keysym, direct) else {
             return false;
         };
@@ -2474,8 +2692,66 @@ fn widget_key_action(kind: Kind, keysym: Keysym, direct: bool) -> Option<WidgetK
     }
 }
 
+fn text_key_action(event: &KeyEvent, modifiers: Modifiers, direct: bool) -> Option<TextKeyAction> {
+    if modifiers.logo || (modifiers.alt && !modifiers.ctrl) {
+        return None;
+    }
+    match event.keysym {
+        Keysym::BackSpace => return Some(TextKeyAction::Backspace),
+        Keysym::Delete => return Some(TextKeyAction::Delete),
+        Keysym::Left => return Some(TextKeyAction::MoveLeft),
+        Keysym::Right => return Some(TextKeyAction::MoveRight),
+        Keysym::Home if direct => return Some(TextKeyAction::MoveToStart),
+        Keysym::End if direct => return Some(TextKeyAction::MoveToEnd),
+        Keysym::Return | Keysym::KP_Enter if direct => return Some(TextKeyAction::Submit),
+        Keysym::a | Keysym::A if direct && modifiers.ctrl && !modifiers.alt => {
+            return Some(TextKeyAction::SelectAll);
+        }
+        _ => {}
+    }
+    if modifiers.ctrl && !modifiers.alt {
+        return None;
+    }
+    let text = event.utf8.as_ref()?;
+    (!text.is_empty()
+        && !text.chars().any(|character| {
+            character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
+        }))
+    .then(|| TextKeyAction::Insert(text.clone()))
+}
+
+fn reconcile_controlled_text_edit(
+    editor: &mut TextInputEditor,
+    node: &Node,
+    width: f32,
+    proposed: &str,
+    checkpoint: TextInputCheckpoint,
+) {
+    if node.text != proposed {
+        editor.restore(checkpoint);
+    }
+    editor.prepare(node, width);
+}
+
 fn direct_input_serial(direct: bool, serial: u32) -> Option<u32> {
     direct.then_some(serial)
+}
+
+fn keyboard_focus_transition_affects<T: PartialEq>(
+    previous: Option<&T>,
+    next: Option<&T>,
+    candidate: &T,
+) -> bool {
+    previous == Some(candidate) || next == Some(candidate)
+}
+
+fn keyboard_leave_matches<T: PartialEq>(current: Option<&T>, leaving: &T) -> bool {
+    current == Some(leaving)
+}
+
+fn reveal_text_input_focus(input: &mut Interaction, dirty: &mut bool) {
+    input.reveal_keyboard_focus();
+    *dirty = true;
 }
 
 fn focused_widget_is_interactive(layout: Option<&Layout>, id: NodeId) -> bool {
@@ -3362,8 +3638,18 @@ impl PointerHandler for App {
                         && let Some(id) = surface.input.pressed
                     {
                         let output = surface.output.clone();
+                        let event_surface = surface.role.surface().clone();
                         self.range_input(index, id, point.x);
                         self.reconcile_range_presses(&output);
+                        if let Some(index) = self.index(&event_surface)
+                            && self.surfaces[index]
+                                .text_input
+                                .as_ref()
+                                .is_some_and(|active| active.id == id)
+                        {
+                            self.focus_text_input(index, id, Some(point), true);
+                            self.surfaces[index].dirty = true;
+                        }
                     }
                 }
                 PointerEventKind::Leave { .. } => {
@@ -3406,6 +3692,11 @@ impl PointerHandler for App {
                             self.range_input(index, id, point.x);
                             self.reconcile_range_presses(&output);
                         }
+                        if let Some(index) = self.index(&event_surface) {
+                            self.focus_text_input(index, id, Some(point), self.modifiers.shift);
+                        }
+                    } else if button == 0x110 {
+                        self.surfaces[index].text_input = None;
                     }
                 }
                 PointerEventKind::Release {
@@ -3500,13 +3791,15 @@ fn scroll_distance(steps: f64) -> Option<f32> {
 mod input_tests {
     use std::{num::NonZeroU32, time::Duration};
 
-    use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym, RepeatInfo};
+    use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym, Modifiers, RepeatInfo};
     use thing_core::{Kind, Node, NodeId};
-    use thing_ui::{Layout, Measurer, Size};
+    use thing_ui::{Layout, Measurer, Size, TextInputEditor};
 
     use super::{
-        RepeatSession, RepeatTimerAction, SliderKeyAction, WidgetKeyAction, direct_input_serial,
-        focused_widget_is_interactive, scroll_distance, widget_key_action,
+        RepeatSession, RepeatTimerAction, SliderKeyAction, TextKeyAction, WidgetKeyAction,
+        direct_input_serial, focused_widget_is_interactive, keyboard_focus_transition_affects,
+        keyboard_leave_matches, reconcile_controlled_text_edit, reveal_text_input_focus,
+        scroll_distance, text_key_action, widget_key_action,
     };
 
     struct FixedMeasurer;
@@ -3630,6 +3923,106 @@ mod input_tests {
     }
 
     #[test]
+    fn text_actions_separate_editing_shortcuts_from_direct_text() {
+        let mut event = key_event(30, Keysym::e);
+        event.utf8 = Some("é".into());
+        let insert = text_key_action(&event, Modifiers::default(), true).unwrap();
+        assert_eq!(insert, TextKeyAction::Insert("é".into()));
+        assert!(insert.repeats());
+        assert!(insert.changes_value());
+
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        let select = text_key_action(&key_event(30, Keysym::a), ctrl, true).unwrap();
+        assert_eq!(select, TextKeyAction::SelectAll);
+        assert!(!select.repeats());
+        assert!(!select.changes_value());
+        assert_eq!(text_key_action(&event, ctrl, true), None);
+
+        let alt_gr = Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            text_key_action(&event, alt_gr, true),
+            Some(TextKeyAction::Insert("é".into()))
+        );
+        assert_eq!(
+            text_key_action(&key_event(28, Keysym::Return), Modifiers::default(), true),
+            Some(TextKeyAction::Submit)
+        );
+        assert_eq!(
+            text_key_action(&key_event(28, Keysym::Return), Modifiers::default(), false),
+            None
+        );
+        for action in [
+            TextKeyAction::MoveLeft,
+            TextKeyAction::MoveRight,
+            TextKeyAction::MoveToStart,
+            TextKeyAction::MoveToEnd,
+        ] {
+            assert!(!action.changes_value());
+        }
+
+        let mut separator = key_event(30, Keysym::e);
+        separator.utf8 = Some("\u{2028}".into());
+        assert_eq!(
+            text_key_action(&separator, Modifiers::default(), true),
+            None
+        );
+    }
+
+    #[test]
+    fn controlled_edits_keep_only_the_runtime_value() {
+        let mut node = Node::new(NodeId(1), Kind::TextInput);
+        node.text = "old".into();
+        let mut editor = TextInputEditor::new(&node, 100.0);
+        let checkpoint = editor.checkpoint();
+        editor.select_all();
+        assert!(editor.replace_selection("proposed"));
+        reconcile_controlled_text_edit(&mut editor, &node, 100.0, "proposed", checkpoint);
+        assert_eq!(editor.value(), "old");
+
+        let checkpoint = editor.checkpoint();
+        editor.select_all();
+        assert!(editor.replace_selection("accepted"));
+        node.text = "accepted".into();
+        reconcile_controlled_text_edit(&mut editor, &node, 100.0, "accepted", checkpoint);
+        assert_eq!(editor.value(), "accepted");
+    }
+
+    #[test]
+    fn every_text_key_action_reveals_keyboard_focus() {
+        let mut input = thing_ui::Interaction::default();
+        input.focus_from_pointer(Some(NodeId(1)));
+        assert_eq!(input.keyboard_focused(), None);
+        let mut dirty = false;
+
+        reveal_text_input_focus(&mut input, &mut dirty);
+
+        assert_eq!(input.keyboard_focused(), Some(NodeId(1)));
+        assert!(dirty);
+    }
+
+    #[test]
+    fn keyboard_focus_transitions_dirty_only_old_and_new_surfaces() {
+        assert!(keyboard_focus_transition_affects(Some(&1), Some(&2), &1));
+        assert!(keyboard_focus_transition_affects(Some(&1), Some(&2), &2));
+        assert!(!keyboard_focus_transition_affects(Some(&1), Some(&2), &3));
+
+        assert!(keyboard_focus_transition_affects(Some(&1), Some(&1), &1));
+        assert!(keyboard_focus_transition_affects(Some(&1), None, &1));
+        assert!(!keyboard_focus_transition_affects(Some(&1), None, &2));
+
+        assert!(keyboard_leave_matches(Some(&1), &1));
+        assert!(!keyboard_leave_matches(Some(&1), &2));
+        assert!(!keyboard_leave_matches::<u8>(None, &1));
+    }
+
+    #[test]
     fn keyboard_actions_require_an_interactive_focused_placement() {
         let enabled = slider_layout(true, true);
         assert!(focused_widget_is_interactive(Some(&enabled), NodeId(3)));
@@ -3731,8 +4124,7 @@ impl KeyboardHandler for App {
         _: &[u32],
         _: &[Keysym],
     ) {
-        self.clear_keyboard_focus();
-        self.keyboard_surface = Some(surface.clone());
+        self.set_keyboard_surface(Some(surface.clone()));
         self.reconcile_hover_intent();
     }
     fn leave(
@@ -3743,7 +4135,7 @@ impl KeyboardHandler for App {
         surface: &wl_surface::WlSurface,
         _: u32,
     ) {
-        if self.keyboard_surface.as_ref() == Some(surface) {
+        if keyboard_leave_matches(self.keyboard_surface.as_ref(), surface) {
             self.clear_keyboard_focus();
         }
         self.reconcile_hover_intent();

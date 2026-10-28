@@ -86,7 +86,7 @@ impl Default for Limits {
 }
 
 /// input events are separate from pure property functions.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Event {
     Click,
     MiddleClick,
@@ -98,6 +98,8 @@ pub enum Event {
     },
     Change(f64),
     Pressed(bool),
+    TextChange(String),
+    Submit(String),
     Hover(bool),
     Close,
 }
@@ -355,16 +357,17 @@ impl Runtime {
                 self.end_press_checked(id, now, validate)
             };
         }
-        if matches!(event, Event::Hover(false)) && self.ended_hovers.remove(&id) {
+        if matches!(&event, Event::Hover(false)) && self.ended_hovers.remove(&id) {
             return Ok(false);
         }
-        if matches!(event, Event::Hover(true)) && self.ended_hovers.contains(&id) {
+        if matches!(&event, Event::Hover(true)) && self.ended_hovers.contains(&id) {
             return Ok(false);
         }
-        if !matches!(event, Event::Close | Event::Hover(false)) && !self.is_available(id) {
+        if !matches!(&event, Event::Close | Event::Hover(false)) && !self.is_available(id) {
             return Ok(false);
         }
-        let name = match event {
+        let hover_started = matches!(&event, Event::Hover(true));
+        let name = match &event {
             Event::Click => "on_click",
             Event::MiddleClick => "on_middle_click",
             Event::SecondaryClick => "on_secondary_click",
@@ -375,6 +378,10 @@ impl Runtime {
             Event::Change(value) if value.is_finite() => "on_change",
             Event::Change(_) => return Err(Error::runtime("input value must be finite")),
             Event::Pressed(_) => unreachable!("press events are handled above"),
+            Event::TextChange(value) if valid_text_input_event(value) => "on_change",
+            Event::TextChange(_) => return Err(Error::runtime("invalid text input value")),
+            Event::Submit(value) if valid_text_input_event(value) => "on_submit",
+            Event::Submit(_) => return Err(Error::runtime("invalid text input value")),
         };
         let Some(handler) = self.handlers.get(&(id, name)).cloned() else {
             return Ok(false);
@@ -388,6 +395,7 @@ impl Runtime {
             }
             Event::Scroll { x, y } => handler.call::<()>((x, y)),
             Event::Change(value) => handler.call::<()>(value),
+            Event::TextChange(value) | Event::Submit(value) => handler.call::<()>(value),
             Event::Hover(inside) => handler.call::<()>(inside),
             Event::Pressed(_) => unreachable!("press events are handled above"),
         };
@@ -396,7 +404,7 @@ impl Runtime {
         let result = result.and_then(|()| self.refresh_at_checked(now, validate));
         let result = match result {
             Ok(changed)
-                if matches!(event, Event::Hover(true))
+                if hover_started
                     && (self.find(id).is_none()
                         || !self.handlers.contains_key(&(id, "on_hover"))) =>
             {
@@ -899,6 +907,14 @@ impl Runtime {
             ));
         }
         let kind = kind(&table.raw_get::<String>("_kind")?)?;
+        if kind == Kind::TextInput {
+            if table.raw_get::<Value>("value")?.is_nil() {
+                return Err(Error::runtime("text_input requires value"));
+            }
+            if table.raw_get::<Value>("on_change")?.is_nil() {
+                return Err(Error::runtime("text_input requires on_change"));
+            }
+        }
         if depth == 0
             && !table.raw_get::<Value>("edge")?.is_nil()
             && !table.raw_get::<Value>("anchors")?.is_nil()
@@ -929,13 +945,15 @@ impl Runtime {
                 }
                 "key" => node.key = Some(properties::string(value, "key")?),
                 "on_click" | "on_middle_click" | "on_secondary_click" | "on_scroll"
-                | "on_change" | "on_pressed" | "on_hover" | "on_close" => {
+                | "on_change" | "on_pressed" | "on_submit" | "on_hover" | "on_close" => {
                     if (matches!(
                         key.as_str(),
                         "on_click" | "on_middle_click" | "on_secondary_click" | "on_scroll"
                     ) && kind != Kind::Button)
-                        || (key == "on_change" && !matches!(kind, Kind::Slider | Kind::Range))
+                        || (key == "on_change"
+                            && !matches!(kind, Kind::Slider | Kind::Range | Kind::TextInput))
                         || (key == "on_pressed" && kind != Kind::Range)
+                        || (key == "on_submit" && kind != Kind::TextInput)
                         || (key == "on_hover" && kind != Kind::Popup && !kind.is_interactive())
                         || (key == "on_close" && kind != Kind::Popup)
                     {
@@ -953,6 +971,7 @@ impl Runtime {
                         "on_scroll" => "on_scroll",
                         "on_change" => "on_change",
                         "on_pressed" => "on_pressed",
+                        "on_submit" => "on_submit",
                         "on_hover" => "on_hover",
                         _ => "on_close",
                     };
@@ -1165,6 +1184,13 @@ fn validate_surface_string(value: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn valid_text_input_event(value: &str) -> bool {
+    value.len() <= 1024 * 1024
+        && !value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
+}
+
 fn is_available(node: &Node, id: NodeId) -> bool {
     node.visible
         && node.enabled
@@ -1181,6 +1207,7 @@ fn kind(name: &str) -> Result<Kind> {
         "stack" => Ok(Kind::Stack),
         "scroll" => Ok(Kind::Scroll),
         "text" => Ok(Kind::Text),
+        "text_input" => Ok(Kind::TextInput),
         "image" => Ok(Kind::Image),
         "path" => Ok(Kind::Path),
         "button" => Ok(Kind::Button),
@@ -1202,6 +1229,7 @@ fn install_ui(lua: &Lua, tracker: Rc<RefCell<Tracker>>) -> Result<()> {
         "stack",
         "scroll",
         "text",
+        "text_input",
         "image",
         "path",
         "button",

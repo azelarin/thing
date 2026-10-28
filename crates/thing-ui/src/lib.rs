@@ -1,9 +1,11 @@
 //! logical-pixel layout and input, independent of the window system and renderer.
 
+mod editor;
 mod images;
 mod layout;
 mod paint;
 mod text;
+pub use editor::{TextInputCheckpoint, TextInputEditor};
 pub use femtovg::renderer::OpenGl;
 #[cfg(feature = "wgpu")]
 pub use femtovg::renderer::{WGPURenderOutput, WGPURenderer};
