@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf, time::Duration};
 use tempfile::TempDir;
-use thing_core::Kind;
+use thing_core::{Kind, TextAlign, TextOverflow};
 use thing_runtime::{Action, AudioDevice, AudioSnapshot, Event, Limits, Runtime, Scalar};
 
 fn fixture(source: &str) -> (TempDir, PathBuf) {
@@ -278,6 +278,43 @@ fn reports_scroll_handlers_even_when_they_do_not_change_state() {
             .dispatch(buttons[0].id, Event::Scroll { x: 0.0, y: 1.0 })
             .unwrap()
     );
+}
+
+#[test]
+fn parses_text_overflow_alignment_and_tabular_digits() {
+    let (_directory, path) = fixture(
+        r#"
+        return ui.panel { children = { ui.text {
+            text = 'a long device description',
+            max_lines = 1,
+            overflow = 'ellipsis',
+            style = { width = 96, text_align = 'end', tabular_digits = true },
+        } } }
+        "#,
+    );
+    let runtime = Runtime::load(path).unwrap();
+    let text = &runtime.root().children[0];
+
+    assert_eq!(text.max_lines, Some(1));
+    assert_eq!(text.text_overflow, TextOverflow::Ellipsis);
+    assert_eq!(text.style.text_align, TextAlign::End);
+    assert!(text.style.tabular_digits);
+}
+
+#[test]
+fn rejects_invalid_text_layout_options() {
+    for source in [
+        "return ui.panel { children = { ui.text { max_lines = 0 } } }",
+        "return ui.panel { children = { ui.text { max_lines = 1.5 } } }",
+        "return ui.panel { children = { ui.text { overflow = 'fade' } } }",
+        "return ui.panel { children = { ui.text { overflow = 'ellipsis' } } }",
+        "return ui.panel { children = { ui.text { max_lines = 2, overflow = 'ellipsis' } } }",
+        "return ui.panel { children = { ui.text { style = { text_align = 'right' } } } }",
+        "return ui.panel { children = { ui.text { style = { tabular_digits = 1 } } } }",
+    ] {
+        let (_directory, path) = fixture(source);
+        assert!(Runtime::load(path).is_err(), "accepted {source}");
+    }
 }
 
 #[test]

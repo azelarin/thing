@@ -154,12 +154,25 @@ widget kind; unkeyed children match by position and kind.
 
 | widget | additional properties |
 | --- | --- |
-| `text` | `text`: utf-8 string |
+| `text` | `text`: utf-8 string; optional `max_lines` and `overflow` |
 | `image` | one of `source`, `icon`, `app_id`; optional `icon_theme` |
 | `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll`, `on_hover` |
 | `slider` | `min`, `max`, `value`, `step`, `on_change`, `on_hover` |
 | `popup` | `visible`, `open_on_hover`, `open_on_click`, `open_delay`, `close_delay`, `on_hover`, `on_close` |
 | containers | `children`: array of widgets, or a function returning one |
+
+use a positive `max_lines` to limit a text widget. omitted lines are clipped by
+default. `overflow = 'ellipsis'` adds an ellipsis, but currently supports only
+`max_lines = 1`:
+
+```luau
+ui.text {
+    text = 'a long device description',
+    max_lines = 1,
+    overflow = 'ellipsis',
+    style = { width = 96 },
+}
+```
 
 `centerbox` takes exactly three non-popup children: start, center, and end. give
 it an explicit height and width (or `grow = 1` inside a row). the middle child
@@ -356,13 +369,16 @@ put layout and paint values in `style`. dimensions use logical pixels.
 | `font_size` | `14` |
 | `font_weight` | `400`; a number from `1` to `1000`, with `700` for bold |
 | `font_family` | `sans-serif`, resolved through fontconfig |
+| `text_align` | `start`; also accepts `center` or `end` |
+| `tabular_digits` | `false`; requests equal-width digits from fonts that support them |
 | `background` | transparent |
 | `foreground` | white |
 | `opacity` | `1` |
 
 colors use `#RRGGBB` or `#RRGGBBAA`. numeric style values must be finite and between
 0 and 100,000; opacity is between 0 and 1. parent opacity multiplies child opacity.
-other style values do not inherit implicitly.
+`start` and `end` text alignment follow the text direction. other style values do
+not inherit implicitly.
 individual style values can be functions, just like widget properties.
 
 a theme is an ordinary table returned from a module. for example, save this as
