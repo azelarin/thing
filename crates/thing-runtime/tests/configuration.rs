@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf, time::Duration};
 use tempfile::TempDir;
-use thing_core::{Color, Kind, TextAlign, TextOverflow};
+use thing_core::{Color, CrossAlign, Kind, MainAlign, TextAlign, TextOverflow};
 use thing_runtime::{
     Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, Event, Limits, Runtime, Scalar,
 };
@@ -356,6 +356,81 @@ fn rejects_invalid_text_layout_options() {
         "return ui.panel { children = { ui.text { max_lines = 2, overflow = 'ellipsis' } } }",
         "return ui.panel { children = { ui.text { style = { text_align = 'right' } } } }",
         "return ui.panel { children = { ui.text { style = { tabular_digits = 1 } } } }",
+    ] {
+        let (_directory, path) = fixture(source);
+        assert!(Runtime::load(path).is_err(), "accepted {source}");
+    }
+}
+
+#[test]
+fn parses_flex_layout_controls() {
+    let (_directory, path) = fixture(
+        r#"
+        return ui.panel { children = { ui.row {
+            style = {
+                min_width = 40, max_width = 240,
+                min_height = 20, max_height = 80,
+                grow = 1, shrink = 2, wrap = true,
+                align = 'end', align_self = 'stretch', align_content = 'center',
+                justify = 'space_between',
+            },
+        } } }
+        "#,
+    );
+    let runtime = Runtime::load(path).unwrap();
+    let style = &runtime.root().children[0].style;
+
+    assert_eq!(style.min_width, Some(40.0));
+    assert_eq!(style.max_width, Some(240.0));
+    assert_eq!(style.min_height, Some(20.0));
+    assert_eq!(style.max_height, Some(80.0));
+    assert_eq!(style.grow, 1.0);
+    assert_eq!(style.shrink, Some(2.0));
+    assert!(style.wrap);
+    assert_eq!(style.align, CrossAlign::End);
+    assert_eq!(style.align_self, Some(CrossAlign::Stretch));
+    assert_eq!(style.align_content, CrossAlign::Center);
+    assert_eq!(style.justify, MainAlign::SpaceBetween);
+}
+
+#[test]
+fn flex_layout_properties_recover_after_an_invalid_reactive_value() {
+    let (_directory, path) = fixture(
+        r#"
+        local align = ui.state('start')
+        return ui.panel { children = {
+            ui.row { style = { align = function() return align:get() end } },
+            ui.button { on_click = function() align:set('baseline') end },
+            ui.button { on_click = function() align:set('end') end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    assert_eq!(runtime.root().children[0].style.align, CrossAlign::Start);
+
+    let invalid = runtime.root().children[1].id;
+    assert!(runtime.dispatch(invalid, Event::Click).is_err());
+    assert_eq!(runtime.root().children[0].style.align, CrossAlign::Start);
+    assert!(!runtime.refresh().unwrap());
+
+    let valid = runtime.root().children[2].id;
+    assert!(runtime.dispatch(valid, Event::Click).unwrap());
+    assert_eq!(runtime.root().children[0].style.align, CrossAlign::End);
+}
+
+#[test]
+fn rejects_invalid_flex_layout_options() {
+    for source in [
+        "return ui.panel { children = { ui.row { style = { align = 'baseline' } } } }",
+        "return ui.panel { children = { ui.row { style = { align_content = 'space_between' } } } }",
+        "return ui.panel { children = { ui.row { style = { justify = 'stretch' } } } }",
+        "return ui.panel { children = { ui.row { style = { wrap = 1 } } } }",
+        "return ui.panel { children = { ui.row { style = { shrink = -1 } } } }",
+        "return ui.panel { children = { ui.row { style = { min_width = 20, max_width = 10 } } } }",
+        "return ui.panel { children = { ui.scroll { style = { wrap = true } } } }",
+        "return ui.panel { style = { max_width = 800 } }",
+        "return ui.panel { children = { ui.button { children = { ui.popup { style = { min_width = 200 } } } } } }",
+        "return ui.panel { children = { ui.centerbox { style = { justify = 'center' }, children = { ui.row {}, ui.row {}, ui.row {} } } } }",
     ] {
         let (_directory, path) = fixture(source);
         assert!(Runtime::load(path).is_err(), "accepted {source}");

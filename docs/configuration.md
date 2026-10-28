@@ -178,7 +178,14 @@ ui.text {
 it an explicit height and width (or `grow = 1` inside a row). the middle child
 stays centered even when the side groups have different widths. hidden children
 keep their slot. groups can overlap if they exceed the available space; choose
-which content to hide in your configuration on narrow outputs.
+which content to hide in your configuration on narrow outputs. `align` and
+`align_self` still control their cross-axis placement, but `justify` and `wrap`
+are not available because centerbox owns the main-axis positions.
+
+`stack` takes its children out of normal flow and paints them in order at the
+same layer position. use `align` and `justify` on the stack, or `align_self` on a
+child, to place overlays within it. min and max dimensions still constrain each
+overlay. stack children never wrap.
 
 `scroll` lays out its children vertically and clips them to its bounds. give it
 an explicit height, or use `grow = 1` inside a column whose height is already
@@ -192,7 +199,9 @@ the offset stays with the scroll widget while reactive updates preserve its
 identity, including while it is hidden, and is clamped when its content shrinks.
 a successful configuration reload and closing a popup reset their offsets.
 scrollbars, horizontal scrolling, touch dragging, and programmatic movement are
-not available yet.
+not available yet. scroll children stay in one column, so `wrap` is not available.
+when centered or end-justified content becomes taller than its viewport, it
+falls back to the start edge so the beginning remains reachable.
 
 slider defaults are 0–1, value 0, and step 0.01. a step of zero means continuous
 input. the range must be finite and increasing. pointer input clamps to the range;
@@ -363,7 +372,14 @@ put layout and paint values in `style`. dimensions use logical pixels.
 | property | default |
 | --- | --- |
 | `width`, `height` | unspecified |
+| `min_width`, `max_width`, `min_height`, `max_height` | unspecified |
 | `padding`, `gap`, `grow`, `radius` | `0` |
+| `shrink` | unspecified; `1` for scroll and `0` elsewhere |
+| `align` | `center` |
+| `align_self` | unspecified; inherits the parent's `align` |
+| `align_content` | `start` |
+| `justify` | `start` |
+| `wrap` | `false` |
 | `border_width`, `border_color` | `0`, transparent; border paints inside the box |
 | `padding_x`, `padding_y` | unspecified; override `padding` on that axis |
 | `hover_overlay`, `pressed_overlay` | `#ffffff14`, `#ffffff28`; interactive control feedback |
@@ -385,6 +401,31 @@ whole branch without compounding it at every descendant.
 `start` and `end` text alignment follow the text direction. other style values do
 not inherit implicitly.
 individual style values can be functions, just like widget properties.
+
+rows, panels, popups, buttons, and stacks have a horizontal main axis and a
+vertical cross axis. columns and scrolls swap those axes. `justify` places or
+distributes children on the main axis and accepts `start`, `center`, `end`,
+`space_between`, `space_around`, or `space_evenly`. `align` places children on
+the cross axis and accepts `start`, `center`, `end`, or `stretch`; `align_self`
+overrides it for one child.
+
+set `wrap = true` on a row or column to move children onto another line when the
+main axis fills. it is also available on panels, popups, and buttons. `gap`
+separates both children and wrapped lines. `align_content` places the complete
+set of lines on the cross axis using `start`, `center`, `end`, or `stretch`,
+without changing how `align` places children within each line. wrapping moves
+widgets; text still wraps according to the width available to its own widget.
+
+`grow` shares spare main-axis space, while `shrink` chooses how an item gives up
+space when its row or column is too small. larger values take a larger share. an
+explicit positive `shrink` may reduce an item below its intrinsic content size;
+set a min dimension when it needs a floor. min and max dimensions also clamp an
+explicit size and the result of `grow`.
+
+min and max dimensions are for widgets inside a surface. they are rejected on a
+root panel or popup because wayland surfaces are either given an exact size or
+filled by the compositor. use `width` and `height` for the surface, then put the
+constraint on an inner container.
 
 set an overlay color to transparent or the focus ring width to `0` to remove that
 part of the built-in interaction appearance. for example, this keeps only a thin

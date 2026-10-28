@@ -5,7 +5,7 @@ use taffy::{
     prelude as tf,
     style::{Overflow, Position},
 };
-use thing_core::{Kind, Node, NodeId, Point, Rect};
+use thing_core::{CrossAlign, Kind, MainAlign, Node, NodeId, Point, Rect};
 
 /// a size in logical pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -419,6 +419,9 @@ fn build(
         }
     }
     let style = &node.style;
+    let explicit_shrink = style.shrink.is_some_and(|value| value > 0.0);
+    let min_width = style.min_width.or_else(|| explicit_shrink.then_some(0.0));
+    let min_height = style.min_height.or_else(|| explicit_shrink.then_some(0.0));
     let taffy_style = tf::Style {
         display: if node.visible {
             tf::Display::Flex
@@ -438,13 +441,40 @@ fn build(
                 .height
                 .map_or(tf::Dimension::auto(), tf::Dimension::length),
         },
+        min_size: tf::Size {
+            width: min_width.map_or(
+                tf::LengthPercentageAuto::auto(),
+                tf::LengthPercentageAuto::length,
+            ),
+            height: min_height.map_or(
+                tf::LengthPercentageAuto::auto(),
+                tf::LengthPercentageAuto::length,
+            ),
+        },
+        max_size: tf::Size {
+            width: style.max_width.map_or(
+                tf::LengthPercentageAuto::auto(),
+                tf::LengthPercentageAuto::length,
+            ),
+            height: style.max_height.map_or(
+                tf::LengthPercentageAuto::auto(),
+                tf::LengthPercentageAuto::length,
+            ),
+        },
         flex_direction: if matches!(node.kind, Kind::Column | Kind::Scroll) {
             tf::FlexDirection::Column
         } else {
             tf::FlexDirection::Row
         },
+        flex_wrap: if style.wrap {
+            tf::FlexWrap::Wrap
+        } else {
+            tf::FlexWrap::NoWrap
+        },
         flex_grow: style.grow,
-        flex_shrink: if node.kind == Kind::Scroll { 1.0 } else { 0.0 },
+        flex_shrink: style
+            .shrink
+            .unwrap_or(if node.kind == Kind::Scroll { 1.0 } else { 0.0 }),
         overflow: TaffyPoint {
             x: Overflow::Clip,
             y: if node.kind == Kind::Scroll {
@@ -453,11 +483,13 @@ fn build(
                 Overflow::Clip
             },
         },
-        align_items: tf::AlignItems::CENTER,
+        align_items: align_items(style.align),
+        align_self: style.align_self.map(align_items),
+        align_content: align_content(style.align_content),
         justify_content: if node.kind == Kind::CenterBox {
             tf::JustifyContent::CENTER
         } else {
-            tf::JustifyContent::FLEX_START
+            justify_content(style.justify, node.kind == Kind::Scroll)
         },
         gap: tf::Size {
             width: tf::LengthPercentage::length(style.gap),
@@ -480,6 +512,38 @@ fn build(
     Ok(id)
 }
 
+fn align_items(value: CrossAlign) -> tf::AlignItems {
+    match value {
+        CrossAlign::Start => tf::AlignItems::FLEX_START,
+        CrossAlign::Center => tf::AlignItems::CENTER,
+        CrossAlign::End => tf::AlignItems::FLEX_END,
+        CrossAlign::Stretch => tf::AlignItems::STRETCH,
+    }
+}
+
+fn align_content(value: CrossAlign) -> tf::AlignContent {
+    match value {
+        CrossAlign::Start => tf::AlignContent::FLEX_START,
+        CrossAlign::Center => tf::AlignContent::SAFE_CENTER,
+        CrossAlign::End => tf::AlignContent::SAFE_FLEX_END,
+        CrossAlign::Stretch => tf::AlignContent::STRETCH,
+    }
+}
+
+fn justify_content(value: MainAlign, safe: bool) -> tf::JustifyContent {
+    match value {
+        MainAlign::Start if safe => tf::JustifyContent::SAFE_FLEX_START,
+        MainAlign::Center if safe => tf::JustifyContent::SAFE_CENTER,
+        MainAlign::End if safe => tf::JustifyContent::SAFE_FLEX_END,
+        MainAlign::Start => tf::JustifyContent::FLEX_START,
+        MainAlign::Center => tf::JustifyContent::CENTER,
+        MainAlign::End => tf::JustifyContent::FLEX_END,
+        MainAlign::SpaceBetween => tf::JustifyContent::SPACE_BETWEEN,
+        MainAlign::SpaceAround => tf::JustifyContent::SPACE_AROUND,
+        MainAlign::SpaceEvenly => tf::JustifyContent::SPACE_EVENLY,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +555,18 @@ mod tests {
             Size {
                 width: 30.0,
                 height: 10.0,
+            }
+        }
+    }
+
+    struct WrappingText;
+    impl Measurer for WrappingText {
+        fn measure(&mut self, _: &Node, max_width: Option<f32>) -> Size {
+            let width = max_width.unwrap_or(80.0).min(80.0);
+            let lines = (80.0 / width.max(1.0)).ceil();
+            Size {
+                width,
+                height: lines * 10.0,
             }
         }
     }
@@ -547,6 +623,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(layout.get(NodeId(3)).unwrap().bounds.x, 360.0);
+    }
+
+    #[test]
+    fn centerbox_keeps_main_axis_placement_with_cross_axis_overrides() {
+        let mut root = Node::new(NodeId(1), Kind::CenterBox);
+        root.style.align = CrossAlign::End;
+        for id in 2..=4 {
+            root.children.push(fixed(id, Kind::Button, 10.0, 10.0));
+        }
+        root.children[1].style.align_self = Some(CrossAlign::Start);
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 100.0,
+                height: 60.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+
+        assert_eq!(
+            layout.get(NodeId(2)).unwrap().bounds,
+            Rect {
+                x: 0.0,
+                y: 50.0,
+                width: 10.0,
+                height: 10.0,
+            }
+        );
+        assert_eq!(
+            layout.get(NodeId(3)).unwrap().bounds,
+            Rect {
+                x: 45.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            }
+        );
+        assert_eq!(
+            layout.get(NodeId(4)).unwrap().bounds,
+            Rect {
+                x: 90.0,
+                y: 50.0,
+                width: 10.0,
+                height: 10.0,
+            }
+        );
     }
 
     #[test]
@@ -616,6 +739,247 @@ mod tests {
         root.children[0].style.width = Some(80.0);
         let layout = Layout::compute(&root, size, &mut FixedText).unwrap();
         assert_eq!(layout.hit_test(Point { x: 60.0, y: 10.0 }), Some(NodeId(2)));
+    }
+
+    #[test]
+    fn wraps_rows_and_columns_without_counting_hidden_children() {
+        let mut row = Node::new(NodeId(1), Kind::Row);
+        row.style.wrap = true;
+        row.style.align = CrossAlign::Start;
+        row.style.gap = 5.0;
+        for id in 2..=4 {
+            row.children.push(fixed(id, Kind::Button, 30.0, 10.0));
+        }
+        let size = Size {
+            width: 70.0,
+            height: 100.0,
+        };
+        let layout = Layout::compute(&row, size, &mut FixedText).unwrap();
+        assert_eq!(layout.get(NodeId(2)).unwrap().bounds.x, 0.0);
+        assert_eq!(layout.get(NodeId(3)).unwrap().bounds.x, 35.0);
+        assert_eq!(
+            layout.get(NodeId(4)).unwrap().bounds,
+            Rect {
+                x: 0.0,
+                y: 15.0,
+                width: 30.0,
+                height: 10.0,
+            }
+        );
+
+        row.children[1].visible = false;
+        let layout = Layout::compute(&row, size, &mut FixedText).unwrap();
+        assert!(layout.get(NodeId(3)).is_none());
+        assert_eq!(layout.get(NodeId(4)).unwrap().bounds.x, 35.0);
+        assert_eq!(layout.get(NodeId(4)).unwrap().bounds.y, 0.0);
+
+        let mut column = Node::new(NodeId(5), Kind::Column);
+        column.style.wrap = true;
+        column.style.align = CrossAlign::Start;
+        column.style.gap = 5.0;
+        for id in 6..=8 {
+            column.children.push(fixed(id, Kind::Button, 10.0, 30.0));
+        }
+        let layout = Layout::compute(
+            &column,
+            Size {
+                width: 100.0,
+                height: 70.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        assert_eq!(layout.get(NodeId(6)).unwrap().bounds.y, 0.0);
+        assert_eq!(layout.get(NodeId(7)).unwrap().bounds.y, 35.0);
+        assert_eq!(layout.get(NodeId(8)).unwrap().bounds.x, 15.0);
+        assert_eq!(layout.get(NodeId(8)).unwrap().bounds.y, 0.0);
+    }
+
+    #[test]
+    fn aligns_items_lines_and_main_axis_independently() {
+        let mut root = Node::new(NodeId(1), Kind::Row);
+        root.style.width = Some(100.0);
+        root.style.height = Some(60.0);
+        root.style.align = CrossAlign::Start;
+        root.style.justify = MainAlign::SpaceBetween;
+        for id in 2..=4 {
+            root.children.push(fixed(id, Kind::Button, 10.0, 10.0));
+        }
+        root.children[1].style.align_self = Some(CrossAlign::End);
+        root.children[2].style.height = None;
+        root.children[2].style.align_self = Some(CrossAlign::Stretch);
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 100.0,
+                height: 60.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        assert_eq!(layout.get(NodeId(2)).unwrap().bounds.x, 0.0);
+        assert_eq!(layout.get(NodeId(3)).unwrap().bounds.x, 45.0);
+        assert_eq!(layout.get(NodeId(4)).unwrap().bounds.x, 90.0);
+        assert_eq!(layout.get(NodeId(2)).unwrap().bounds.y, 0.0);
+        assert_eq!(layout.get(NodeId(3)).unwrap().bounds.y, 50.0);
+        assert_eq!(layout.get(NodeId(4)).unwrap().bounds.height, 60.0);
+
+        root.style.width = Some(25.0);
+        root.style.wrap = true;
+        root.style.justify = MainAlign::Start;
+        root.style.align_content = CrossAlign::End;
+        root.children[2].style.height = Some(10.0);
+        root.children[2].style.align_self = None;
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 25.0,
+                height: 60.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        assert_eq!(layout.get(NodeId(2)).unwrap().bounds.y, 40.0);
+        assert_eq!(layout.get(NodeId(4)).unwrap().bounds.y, 50.0);
+    }
+
+    #[test]
+    fn shrink_remeasures_text_and_respects_minimums() {
+        let mut root = Node::new(NodeId(1), Kind::Row);
+        root.children.push(fixed(2, Kind::Button, 60.0, 20.0));
+        root.children.push(Node::new(NodeId(3), Kind::Text));
+        let size = Size {
+            width: 100.0,
+            height: 50.0,
+        };
+
+        let layout = Layout::compute(&root, size, &mut WrappingText).unwrap();
+        assert_eq!(layout.get(NodeId(3)).unwrap().bounds.width, 80.0);
+
+        root.children[1].style.shrink = Some(1.0);
+        let layout = Layout::compute(&root, size, &mut WrappingText).unwrap();
+        assert_eq!(layout.get(NodeId(3)).unwrap().bounds.width, 40.0);
+        assert_eq!(layout.get(NodeId(3)).unwrap().bounds.height, 20.0);
+
+        root.children[1].style.min_width = Some(50.0);
+        let layout = Layout::compute(&root, size, &mut WrappingText).unwrap();
+        assert_eq!(layout.get(NodeId(3)).unwrap().bounds.width, 50.0);
+    }
+
+    #[test]
+    fn max_size_limits_growth_and_oversized_alignment_keeps_hit_clipping() {
+        let mut root = Node::new(NodeId(1), Kind::Row);
+        let mut growing = fixed(2, Kind::Button, 10.0, 20.0);
+        growing.style.grow = 1.0;
+        growing.style.max_width = Some(70.0);
+        root.children.push(growing);
+        root.children.push(fixed(3, Kind::Button, 20.0, 20.0));
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 200.0,
+                height: 40.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        assert_eq!(layout.get(NodeId(2)).unwrap().bounds.width, 70.0);
+
+        root.children.truncate(1);
+        root.children[0].style.width = Some(10.0);
+        root.children[0].style.min_width = Some(150.0);
+        root.children[0].style.max_width = None;
+        root.style.justify = MainAlign::Center;
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 100.0,
+                height: 40.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        let child = layout.get(NodeId(2)).unwrap();
+        assert_eq!(child.bounds.x, -25.0);
+        assert_eq!(child.bounds.width, 150.0);
+        assert_eq!(child.clip.width, 100.0);
+        assert_eq!(layout.hit_test(Point { x: 0.0, y: 20.0 }), Some(NodeId(2)));
+        assert_eq!(layout.hit_test(Point { x: -1.0, y: 20.0 }), None);
+        assert_eq!(layout.hit_test(Point { x: 101.0, y: 20.0 }), None);
+    }
+
+    #[test]
+    fn stack_alignment_keeps_children_absolute_and_scroll_justification_is_safe() {
+        let mut stack = Node::new(NodeId(1), Kind::Stack);
+        stack.style.align = CrossAlign::End;
+        stack.style.justify = MainAlign::End;
+        let mut overlay = fixed(2, Kind::Button, 80.0, 40.0);
+        overlay.style.max_width = Some(20.0);
+        overlay.style.max_height = Some(10.0);
+        stack.children.push(overlay);
+        let layout = Layout::compute(
+            &stack,
+            Size {
+                width: 100.0,
+                height: 60.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        assert_eq!(
+            layout.get(NodeId(2)).unwrap().bounds,
+            Rect {
+                x: 80.0,
+                y: 50.0,
+                width: 20.0,
+                height: 10.0,
+            }
+        );
+
+        stack.style.align = CrossAlign::Center;
+        stack.style.justify = MainAlign::End;
+        stack.children[0] = fixed(2, Kind::Button, 150.0, 80.0);
+        let layout = Layout::compute(
+            &stack,
+            Size {
+                width: 100.0,
+                height: 60.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        let overlay = layout.get(NodeId(2)).unwrap();
+        assert_eq!(overlay.bounds.width, 150.0);
+        assert_eq!(overlay.bounds.height, 80.0);
+        assert_eq!(overlay.bounds.x, -50.0);
+        assert_eq!(overlay.bounds.y, -10.0);
+        assert_eq!(overlay.clip.width, 100.0);
+        assert_eq!(overlay.clip.height, 60.0);
+        assert_eq!(layout.hit_test(Point { x: 0.0, y: 0.0 }), Some(NodeId(2)));
+        assert_eq!(layout.hit_test(Point { x: -1.0, y: 0.0 }), None);
+
+        let mut scroll = fixed(3, Kind::Scroll, 100.0, 40.0);
+        scroll.children.push(fixed(4, Kind::Button, 100.0, 80.0));
+        let point = Point { x: 10.0, y: 10.0 };
+        for justify in [
+            MainAlign::Center,
+            MainAlign::SpaceAround,
+            MainAlign::SpaceEvenly,
+        ] {
+            scroll.style.justify = justify;
+            let mut state = ScrollState::default();
+            let layout = scrolled(
+                &scroll,
+                Size {
+                    width: 100.0,
+                    height: 40.0,
+                },
+                &mut state,
+            );
+            assert_eq!(layout.get(NodeId(4)).unwrap().bounds.y, 0.0);
+            assert!(layout.scroll_y(point, 100.0, &mut state));
+            assert_eq!(state.offset(NodeId(3)), 40.0);
+        }
     }
 
     #[test]

@@ -134,6 +134,28 @@ pub enum TextOverflow {
     Ellipsis,
 }
 
+/// placement on the cross axis of a flex container.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CrossAlign {
+    Start,
+    #[default]
+    Center,
+    End,
+    Stretch,
+}
+
+/// distribution on the main axis of a flex container.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MainAlign {
+    #[default]
+    Start,
+    Center,
+    End,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+}
+
 impl Kind {
     pub fn is_container(self) -> bool {
         matches!(
@@ -159,11 +181,21 @@ impl Kind {
 pub struct Style {
     pub width: Option<f32>,
     pub height: Option<f32>,
+    pub min_width: Option<f32>,
+    pub max_width: Option<f32>,
+    pub min_height: Option<f32>,
+    pub max_height: Option<f32>,
     pub padding: f32,
     pub padding_x: Option<f32>,
     pub padding_y: Option<f32>,
     pub gap: f32,
     pub grow: f32,
+    pub shrink: Option<f32>,
+    pub align: CrossAlign,
+    pub align_self: Option<CrossAlign>,
+    pub align_content: CrossAlign,
+    pub justify: MainAlign,
+    pub wrap: bool,
     pub radius: f32,
     pub border_width: f32,
     pub border_color: Color,
@@ -187,11 +219,21 @@ impl Default for Style {
         Self {
             width: None,
             height: None,
+            min_width: None,
+            max_width: None,
+            min_height: None,
+            max_height: None,
             padding: 0.0,
             padding_x: None,
             padding_y: None,
             gap: 0.0,
             grow: 0.0,
+            shrink: None,
+            align: CrossAlign::Center,
+            align_self: None,
+            align_content: CrossAlign::Start,
+            justify: MainAlign::Start,
+            wrap: false,
             radius: 0.0,
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
@@ -449,6 +491,20 @@ impl Node {
             )));
         }
         let style = &self.style;
+        if (self.kind == Kind::Popup || (depth == 0 && self.kind == Kind::Panel))
+            && [
+                style.min_width,
+                style.max_width,
+                style.min_height,
+                style.max_height,
+            ]
+            .into_iter()
+            .any(|value| value.is_some())
+        {
+            return Err(TreeError(
+                "min and max dimensions are not available on panel or popup surfaces".into(),
+            ));
+        }
         if [&self.image.source, &self.image.icon, &self.image.app_id]
             .iter()
             .filter(|v| v.is_some())
@@ -464,6 +520,21 @@ impl Node {
         {
             return Err(TreeError(
                 "centerbox needs exactly three non-popup children: start, center, end".into(),
+            ));
+        }
+        if self.kind == Kind::CenterBox && style.justify != MainAlign::Start {
+            return Err(TreeError(
+                "centerbox owns main-axis placement; justify is not available".into(),
+            ));
+        }
+        if style.wrap
+            && !matches!(
+                self.kind,
+                Kind::Panel | Kind::Popup | Kind::Row | Kind::Column | Kind::Button
+            )
+        {
+            return Err(TreeError(
+                "wrap is available only on panel, popup, row, column, and button containers".into(),
             ));
         }
         if self.max_lines == Some(0) {
@@ -486,11 +557,16 @@ impl Node {
         for value in [
             style.width,
             style.height,
+            style.min_width,
+            style.max_width,
+            style.min_height,
+            style.max_height,
             Some(style.padding),
             style.padding_x,
             style.padding_y,
             Some(style.gap),
             Some(style.grow),
+            style.shrink,
             Some(style.radius),
             Some(style.border_width),
             Some(style.focus_ring_width),
@@ -504,6 +580,24 @@ impl Node {
                     "style dimensions must be finite and between 0 and 100,000".into(),
                 ));
             }
+        }
+        if style
+            .min_width
+            .zip(style.max_width)
+            .is_some_and(|(min, max)| min > max)
+        {
+            return Err(TreeError(
+                "min_width cannot be greater than max_width".into(),
+            ));
+        }
+        if style
+            .min_height
+            .zip(style.max_height)
+            .is_some_and(|(min, max)| min > max)
+        {
+            return Err(TreeError(
+                "min_height cannot be greater than max_height".into(),
+            ));
         }
         if [style.opacity, style.disabled_opacity]
             .into_iter()
@@ -630,6 +724,9 @@ mod tests {
         node.style.width = Some(f32::NAN);
         assert!(node.validate().is_err());
         node.style.width = None;
+        node.style.shrink = Some(f32::INFINITY);
+        assert!(node.validate().is_err());
+        node.style.shrink = None;
         node.style.opacity = f32::INFINITY;
         assert!(node.validate().is_err());
 
@@ -640,6 +737,59 @@ mod tests {
         node.style.disabled_opacity = 1.0;
         node.style.focus_ring_width = f32::NAN;
         assert!(node.validate().is_err());
+    }
+
+    #[test]
+    fn validates_flex_controls_and_surface_size_boundaries() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut row = Node::new(NodeId(2), Kind::Row);
+        row.style.wrap = true;
+        row.style.min_width = Some(20.0);
+        row.style.max_width = Some(80.0);
+        row.style.align_self = Some(CrossAlign::End);
+        root.children.push(row);
+        assert!(root.validate().is_ok());
+
+        root.children[0].style.min_width = Some(81.0);
+        assert!(
+            root.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("min_width")
+        );
+        root.children[0].style.min_width = Some(20.0);
+        root.children[0].kind = Kind::Scroll;
+        assert!(root.validate().unwrap_err().to_string().contains("wrap"));
+
+        root.children.clear();
+        root.style.max_width = Some(800.0);
+        assert!(
+            root.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("surfaces")
+        );
+
+        let mut popup = Node::new(NodeId(3), Kind::Popup);
+        popup.style.min_height = Some(40.0);
+        assert!(
+            popup
+                .validate_surface()
+                .unwrap_err()
+                .to_string()
+                .contains("surfaces")
+        );
+
+        root.style.max_width = None;
+        let mut button = Node::new(NodeId(4), Kind::Button);
+        button.children.push(popup);
+        root.children.push(button);
+        assert!(
+            root.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("surfaces")
+        );
     }
 
     #[test]
