@@ -1169,7 +1169,7 @@ impl App {
             .panel
             .anchors
             .and_then(|anchors| anchors.exclusive_edge())
-            .or(Some(root.panel.edge).filter(|_| root.panel.anchors.is_none()));
+            .or(root.panel.anchors.is_none().then_some(root.panel.edge));
         Some((
             index,
             anchor,
@@ -1506,7 +1506,7 @@ impl App {
                     .panel
                     .anchors
                     .and_then(|anchors| anchors.exclusive_edge())
-                    .or(Some(root.panel.edge).filter(|_| root.panel.anchors.is_none()));
+                    .or(root.panel.anchors.is_none().then_some(root.panel.edge));
                 root.find(id)
                     .and_then(|node| popup::resolve_for_surface(node, anchor, edge, parent.size))
             })
