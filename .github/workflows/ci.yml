@@ -13,6 +13,27 @@ permissions:
   contents: read
 
 jobs:
+  luau-types:
+    name: luau definitions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: install luau-lsp
+        run: |
+          archive="$RUNNER_TEMP/luau-lsp.zip"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "$archive" \
+            https://github.com/JohnnyMorganz/luau-lsp/releases/download/1.70.1/luau-lsp-linux-x86_64.zip
+          echo "1a2ea1ae4f98f8946cefd970a4b54853e11ab4775e6932faa7f60cf920346567  $archive" | sha256sum --check
+          unzip -q "$archive" -d "$RUNNER_TEMP/luau-lsp"
+          echo "$RUNNER_TEMP/luau-lsp" >> "$GITHUB_PATH"
+      - name: check luau definitions
+        run: python3 tools/check_luau_types.py --analyzer luau-lsp
+
   test:
     name: rust ${{ matrix.toolchain }}
     runs-on: ubuntu-latest

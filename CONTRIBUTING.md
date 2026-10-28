@@ -1,7 +1,8 @@
 # contributing
 
 keep each pull request focused on one change. explain what it does and how you
-checked it. if it changes the luau api, update the configuration guide too.
+checked it. if it changes the luau api, update the configuration guide and
+`crates/thing/types/thing.d.luau` too.
 
 ## issues
 
@@ -39,6 +40,13 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 python3 -m unittest discover -s tools -p 'test_*.py'
+```
+
+when the luau api changes, update the definition fixtures as well. run them with
+luau-lsp 1.70.1:
+
+```sh
+python3 tools/check_luau_types.py --analyzer /path/to/luau-lsp
 ```
 
 text tests need an installed font, and socket tests need permission to bind local
