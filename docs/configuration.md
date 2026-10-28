@@ -118,9 +118,9 @@ widget kind; unkeyed children match by position and kind.
 | --- | --- |
 | `text` | `text`: utf-8 string |
 | `image` | one of `source`, `icon`, `app_id`; optional `icon_theme` |
-| `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll` |
-| `slider` | `min`, `max`, `value`, `step`, `on_change`: function receiving a number |
-| `popup` | `visible`, `on_close`: function with no arguments |
+| `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll`, `on_hover` |
+| `slider` | `min`, `max`, `value`, `step`, `on_change`, `on_hover` |
+| `popup` | `visible`, `open_on_hover`, `open_on_click`, `open_delay`, `close_delay`, `on_hover`, `on_close` |
 | containers | `children`: array of widgets, or a function returning one |
 
 `centerbox` takes exactly three non-popup children: start, center, and end. give
@@ -160,6 +160,11 @@ positive values move right/down. high-resolution wheels retain fractional steps.
 for continuous devices without wheel-step data, 15 compositor-reported pixels
 count as one step. a scroll gesture does not open a grabbed popup. buttons remain
 keyboard-activatable through the primary `on_click` handler.
+
+`on_hover(inside)` receives `true` when the pointer enters a button, slider, or
+popup and `false` when it leaves. moving between a control and its descendants
+does not produce a false leave. the callback runs on edges, not on every pointer
+motion.
 
 ## images and desktop icons
 
@@ -394,6 +399,36 @@ return ui.panel {
 
 the host anchors the popup to its nearest button ancestor and asks the compositor
 to constrain its position to the output.
+
+for a popup that opens on hover, let the host manage the delay and the crossing
+between the button and popup surfaces:
+
+```luau
+ui.button {
+    children = {
+        ui.text { text = 'audio' },
+        ui.popup {
+            open_on_hover = true,
+            open_on_click = true,
+            open_delay = 300,
+            close_delay = 250,
+            style = { width = 240, height = 160 },
+            children = { ui.text { text = 'mixer' } },
+        },
+    },
+}
+```
+
+`open_on_hover` opens an ungrabbed popup while the pointer is over its button or
+the popup itself. keyboard focus on the button also opens it. `open_delay` and
+`close_delay` are whole milliseconds from 0 to 60,000 and default to 300 and
+250. `open_on_click` additionally toggles it as a grabbed popup on a primary click
+or return/space. it does not replace or repeat the button's `on_click` handler.
+
+an automatic popup's `visible` property is an availability gate. setting it to
+false cancels a pending open and closes the popup. one button can own one
+automatic popup. `on_close` runs when the popup is dismissed, but not when an
+open hover popup is recreated in grabbed mode.
 
 the host supports one grabbed popup at a time. an input event is required to open
 it. outside clicks and escape dismiss it and call `on_close`. tab/shift+tab move
