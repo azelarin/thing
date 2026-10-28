@@ -45,6 +45,16 @@ text tests need an installed font, and socket tests need permission to bind loca
 unix sockets. for rendering or input changes, also try the affected behavior in
 a wayland session.
 
+the renderer fixtures are opt-in because they open a nested compositor and use
+the gpu. after building the backend you want to check, run:
+
+```sh
+python3 tools/check_rendering.py --binary ./target/debug/thing --renderer vulkan image-fit stencil
+```
+
+the tool requires a wayland session, `dbus-run-session`, niri, and grim. it does
+not install or build anything.
+
 keep `Cargo.lock` when building. before updating dependencies, check that the
 runtime tests pass: `mlua` 0.12.2 currently needs the locked `luau0-src` version.
 

@@ -1,0 +1,2 @@
+hotkey-overlay { skip-at-startup; }
+layout { background-color "#242424"; }
