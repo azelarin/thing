@@ -461,6 +461,11 @@ impl Runtime {
             let (key, value) = pair?;
             match key.as_str() {
                 "_id" | "_kind" | "children" => {}
+                "edge" | "margins" | "exclusive_zone" | "input_region" if depth > 0 => {
+                    return Err(Error::runtime(format!(
+                        "{key} is only supported on the root panel"
+                    )));
+                }
                 "key" => node.key = Some(properties::string(value, "key")?),
                 "on_click" | "on_middle_click" | "on_secondary_click" | "on_scroll"
                 | "on_change" | "on_hover" | "on_close" => {

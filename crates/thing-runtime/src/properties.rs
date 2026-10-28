@@ -1,5 +1,5 @@
-use mlua::{Error, Result, Value};
-use thing_core::{Kind, Node};
+use mlua::{Error, Result, Table, Value};
+use thing_core::{Kind, Node, PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins};
 
 pub(crate) fn string(value: Value, name: &str) -> Result<String> {
     match value {
@@ -37,6 +37,91 @@ fn milliseconds(value: Value, name: &str) -> Result<u32> {
     Ok(value as u32)
 }
 
+fn integer(value: Value, name: &str) -> Result<i32> {
+    let number = number(value, name)?;
+    if number.fract() != 0.0 || number < i32::MIN as f64 || number > i32::MAX as f64 {
+        return Err(Error::runtime(format!("{name} must be an integer")));
+    }
+    Ok(number as i32)
+}
+
+fn panel_edge(value: Value) -> Result<PanelEdge> {
+    match string(value, "edge")?.as_str() {
+        "top" => Ok(PanelEdge::Top),
+        "bottom" => Ok(PanelEdge::Bottom),
+        "left" => Ok(PanelEdge::Left),
+        "right" => Ok(PanelEdge::Right),
+        _ => Err(Error::runtime(
+            "edge must be 'top', 'bottom', 'left', or 'right'",
+        )),
+    }
+}
+
+fn panel_margins(value: Value) -> Result<PanelMargins> {
+    let Value::Table(table) = value else {
+        return Err(Error::runtime("margins must be a table"));
+    };
+    let mut margins = PanelMargins::default();
+    for pair in table.pairs::<String, Value>() {
+        let (name, value) = pair?;
+        let target = match name.as_str() {
+            "top" => &mut margins.top,
+            "right" => &mut margins.right,
+            "bottom" => &mut margins.bottom,
+            "left" => &mut margins.left,
+            _ => return Err(Error::runtime(format!("unknown margin {name:?}"))),
+        };
+        *target = integer(value, &format!("margins.{name}"))?;
+    }
+    Ok(margins)
+}
+
+fn exclusive_zone(value: Value) -> Result<Option<i32>> {
+    if value.is_nil() {
+        Ok(None)
+    } else {
+        Ok(Some(integer(value, "exclusive_zone")?))
+    }
+}
+
+fn panel_input_region(value: Value) -> Result<PanelInputRegion> {
+    match value {
+        Value::Nil => Ok(PanelInputRegion::Full),
+        Value::Boolean(false) => Ok(PanelInputRegion::Empty),
+        Value::Table(table) => panel_input_rect(table).map(PanelInputRegion::Rectangle),
+        _ => Err(Error::runtime(
+            "input_region must be false or a rectangle table",
+        )),
+    }
+}
+
+fn panel_input_rect(table: Table) -> Result<PanelInputRect> {
+    let mut rect = PanelInputRect::default();
+    for pair in table.pairs::<String, Value>() {
+        let (name, value) = pair?;
+        match name.as_str() {
+            "x" => rect.x = integer(value, "input_region.x")?,
+            "y" => rect.y = integer(value, "input_region.y")?,
+            "width" => rect.width = Some(positive_dimension(value, "input_region.width")?),
+            "height" => rect.height = Some(positive_dimension(value, "input_region.height")?),
+            _ => {
+                return Err(Error::runtime(format!(
+                    "unknown input_region property {name:?}"
+                )));
+            }
+        }
+    }
+    Ok(rect)
+}
+
+fn positive_dimension(value: Value, name: &str) -> Result<u32> {
+    let value = integer(value, name)?;
+    u32::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| Error::runtime(format!("{name} must be a positive integer")))
+}
+
 pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
     match name {
         "text" if node.kind == Kind::Text => node.text = string(value, name)?,
@@ -61,6 +146,14 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         }
         "close_delay" if node.kind == Kind::Popup => {
             node.popup.close_delay_ms = milliseconds(value, name)?
+        }
+        "edge" if node.kind == Kind::Panel => node.panel.edge = panel_edge(value)?,
+        "margins" if node.kind == Kind::Panel => node.panel.margins = panel_margins(value)?,
+        "exclusive_zone" if node.kind == Kind::Panel => {
+            node.panel.exclusive_zone = exclusive_zone(value)?
+        }
+        "input_region" if node.kind == Kind::Panel => {
+            node.panel.input_region = panel_input_region(value)?
         }
         "style.width" => {
             node.style.width = if value.is_nil() {

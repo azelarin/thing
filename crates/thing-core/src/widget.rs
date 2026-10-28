@@ -22,6 +22,101 @@ pub enum Kind {
     Slider,
 }
 
+/// the output edge that owns a panel surface.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PanelEdge {
+    #[default]
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// distances between a panel surface and the corresponding output edges.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PanelMargins {
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+    pub left: i32,
+}
+
+/// one rectangular input area in surface-local logical pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PanelInputRect {
+    pub x: i32,
+    pub y: i32,
+    /// `None` extends from x to the configured surface's right edge.
+    pub width: Option<u32>,
+    /// `None` extends from y to the configured surface's bottom edge.
+    pub height: Option<u32>,
+}
+
+/// which part of a panel surface accepts pointer and touch input.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PanelInputRegion {
+    #[default]
+    Full,
+    Empty,
+    Rectangle(PanelInputRect),
+}
+
+/// surface properties that are meaningful only on the root panel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PanelProperties {
+    pub edge: PanelEdge,
+    pub margins: PanelMargins,
+    /// None reserves the configured thickness plus the opposite-edge margin.
+    /// Layer shell also adds the margin on the panel's own edge.
+    /// Some(-1) uses layer-shell's ignore-exclusive-zones behavior.
+    pub exclusive_zone: Option<i32>,
+    pub input_region: PanelInputRegion,
+}
+
+impl PanelProperties {
+    fn validate(self) -> Result<(), TreeError> {
+        const LIMIT: i32 = 100_000;
+        if [
+            self.margins.top,
+            self.margins.right,
+            self.margins.bottom,
+            self.margins.left,
+        ]
+        .iter()
+        .any(|value| !(-LIMIT..=LIMIT).contains(value))
+        {
+            return Err(TreeError(
+                "panel margins must be between -100,000 and 100,000".into(),
+            ));
+        }
+        if self
+            .exclusive_zone
+            .is_some_and(|value| !(-1..=LIMIT).contains(&value))
+        {
+            return Err(TreeError(
+                "panel exclusive_zone must be -1 or between 0 and 100,000".into(),
+            ));
+        }
+        if let PanelInputRegion::Rectangle(rect) = self.input_region {
+            if !(-LIMIT..=LIMIT).contains(&rect.x) || !(-LIMIT..=LIMIT).contains(&rect.y) {
+                return Err(TreeError(
+                    "panel input_region coordinates must be between -100,000 and 100,000".into(),
+                ));
+            }
+            if [rect.width, rect.height]
+                .into_iter()
+                .flatten()
+                .any(|value| value == 0 || value > LIMIT as u32)
+            {
+                return Err(TreeError(
+                    "panel input_region dimensions must be between 1 and 100,000".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Kind {
     pub fn is_container(self) -> bool {
         matches!(
@@ -185,6 +280,7 @@ pub struct Node {
     pub image: Image,
     pub popup: PopupOptions,
     pub slider: Slider,
+    pub panel: PanelProperties,
     pub enabled: bool,
     pub visible: bool,
     pub key: Option<String>,
@@ -201,6 +297,7 @@ impl Node {
             image: Image::default(),
             popup: PopupOptions::default(),
             slider: Slider::default(),
+            panel: PanelProperties::default(),
             enabled: true,
             visible: true,
             key: None,
@@ -238,6 +335,17 @@ impl Node {
                 self.id
             )));
         }
+        if depth > 0 && self.panel != PanelProperties::default() {
+            return Err(TreeError(
+                "panel surface properties are only valid on the root panel".into(),
+            ));
+        }
+        if self.kind != Kind::Panel && self.panel != PanelProperties::default() {
+            return Err(TreeError(
+                "panel surface properties are only valid on a panel".into(),
+            ));
+        }
+        self.panel.validate()?;
         if !self.kind.is_container() && !self.children.is_empty() {
             return Err(TreeError(format!(
                 "{:?} cannot contain children",
@@ -422,6 +530,35 @@ mod tests {
         nested.popup.open_on_hover = true;
         popup.children.push(nested);
         assert!(popup.validate_surface().is_err());
+    }
+
+    #[test]
+    fn validates_root_panel_surface_properties() {
+        let mut root = Node::new(NodeId(0), Kind::Panel);
+        root.panel.input_region = PanelInputRegion::Rectangle(PanelInputRect {
+            height: Some(36),
+            ..PanelInputRect::default()
+        });
+        assert!(root.validate().is_ok());
+
+        root.panel.exclusive_zone = Some(-2);
+        assert!(
+            root.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("exclusive_zone")
+        );
+
+        let mut nested = Node::new(NodeId(1), Kind::Panel);
+        nested.panel.edge = PanelEdge::Left;
+        root.panel = PanelProperties::default();
+        root.children = vec![nested];
+        assert!(
+            root.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("only valid on the root panel")
+        );
     }
 
     #[test]

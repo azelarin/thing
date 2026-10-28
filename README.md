@@ -49,7 +49,8 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] panels, popups, layout, text, and images
 - [x] clock, output audio controls, and niri workspaces and windows
 - [x] per-output configuration
-- [ ] panel sizing, input regions, and popup positioning
+- [x] panel sizing and input regions
+- [ ] popup positioning controls
 - [x] hover popups
 - [x] scrolling containers
 - [ ] text input and consistent key repeat

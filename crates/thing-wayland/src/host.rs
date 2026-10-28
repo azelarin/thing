@@ -11,7 +11,7 @@ use calloop::{
 };
 use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
     delegate_registry, delegate_seat, delegate_xdg_popup, delegate_xdg_shell,
     output::{OutputHandler, OutputInfo, OutputState},
@@ -25,7 +25,7 @@ use smithay_client_toolkit::{
     shell::{
         WaylandSurface,
         wlr_layer::{
-            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
+            KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
             LayerSurfaceConfigure,
         },
         xdg::{
@@ -35,7 +35,7 @@ use smithay_client_toolkit::{
         },
     },
 };
-use thing_core::{Kind, Node, NodeId, Point, Rect, Scale};
+use thing_core::{Kind, Node, NodeId, PanelInputRegion, Point, Rect, Scale};
 use thing_runtime::{Action, Event, OutputContext, Scalar, ServiceSnapshot};
 use thing_ui::{Interaction, Layout, PaintFrame, ScrollState, Size};
 use wayland_client::{
@@ -60,6 +60,7 @@ use crate::{
     configuration::Configurations,
     hover::{Command as HoverCommand, HoverKey, HoverState, HoverTarget},
     niri::Niri,
+    panel::{self, Geometry, ResolvedInputRegion},
     render::{FrameResult, Render, Window},
     watch::Watch,
 };
@@ -262,7 +263,7 @@ struct Surface {
     output: wl_output::WlOutput,
     root: NodeId,
     size: (u32, u32),
-    requested_height: u32,
+    panel: Option<PanelState>,
     scale: Scale,
     viewport: Option<WpViewport>,
     fractional: Option<WpFractionalScaleV1>,
@@ -277,6 +278,24 @@ struct Surface {
     dirty: bool,
     waiting: bool,
     retry_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PanelState {
+    geometry: Geometry,
+    // resolved geometry cannot distinguish auto from an equal explicit zone.
+    exclusive_zone: Option<i32>,
+    input_region: PanelInputRegion,
+}
+
+impl PanelState {
+    fn from_root(root: &Node) -> Self {
+        Self {
+            geometry: panel::geometry(root, None),
+            exclusive_zone: root.panel.exclusive_zone,
+            input_region: root.panel.input_region,
+        }
+    }
 }
 
 impl Drop for Surface {
@@ -419,13 +438,15 @@ impl App {
             surface.press_serial = None;
             surface.pressed_button = None;
             surface.dirty = true;
-            if let Role::Panel(layer) = &surface.role {
-                let height = panel_height(root);
-                surface.requested_height = height;
-                layer.set_size(0, height);
-                layer.set_exclusive_zone(height as i32);
-                layer.wl_surface().commit();
-            }
+        }
+        let outputs: Vec<_> = self
+            .surfaces
+            .iter()
+            .filter(|surface| matches!(surface.role, Role::Panel(_)))
+            .map(|surface| surface.output.clone())
+            .collect();
+        for output in outputs {
+            self.sync_panel(&output, true)?;
         }
         self.update_watch();
         eprintln!("thing: reloaded {}", self.configurations.entry().display());
@@ -464,28 +485,27 @@ impl App {
             .configurations
             .root(&output)
             .ok_or("output configuration is unavailable")?;
-        let height = panel_height(root);
-        let scale = self
+        let panel = PanelState::from_root(root);
+        let context = self
             .configurations
             .output(&output)
-            .map(|context| context.scale)
-            .unwrap_or_default();
+            .ok_or("output context is unavailable")?;
+        let scale = context.scale;
+        let size = panel_size(panel.geometry, (context.width, context.height));
         let wl = self.compositor.create_surface(qh);
         let layer =
             self.layer_shell
                 .create_layer_surface(qh, wl, Layer::Top, Some("thing"), Some(&output));
-        layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_size(0, height);
-        layer.set_exclusive_zone(height as i32);
+        apply_panel_geometry(&layer, panel.geometry);
         layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
-        let surface = self.make_surface(
-            Role::Panel(layer),
-            output,
-            root.id,
-            (800, height),
-            scale,
-            qh,
-        );
+        apply_input_region(
+            &self.compositor,
+            layer.wl_surface(),
+            panel.input_region,
+            size,
+        )?;
+        let mut surface = self.make_surface(Role::Panel(layer), output, root.id, size, scale, qh);
+        surface.panel = Some(panel);
         surface.role.surface().commit();
         self.surfaces.push(surface);
         Ok(())
@@ -517,7 +537,7 @@ impl App {
             output,
             root,
             size,
-            requested_height: size.1,
+            panel: None,
             scale,
             viewport,
             fractional,
@@ -559,43 +579,89 @@ impl App {
         }
     }
 
-    fn sync_panel_height(&mut self, output: &wl_output::WlOutput) {
-        let Some(height) = self.configurations.root(output).map(panel_height) else {
-            return;
+    fn sync_panel(&mut self, output: &wl_output::WlOutput, force: bool) -> Result<(), String> {
+        let Some(root) = self.configurations.root(output) else {
+            return Ok(());
         };
-        let Some(surface) = self
-            .surfaces
-            .iter_mut()
-            .find(|surface| &surface.output == output && matches!(surface.role, Role::Panel(_)))
-        else {
-            return;
+        let next = PanelState::from_root(root);
+        let Some(index) = self.surfaces.iter().position(|surface| {
+            &surface.output == output && matches!(surface.role, Role::Panel(_))
+        }) else {
+            return Ok(());
         };
-        if surface.requested_height == height {
-            return;
+        let surface = &mut self.surfaces[index];
+        let previous = surface.panel;
+        if !force && previous == Some(next) {
+            return Ok(());
         }
         let Role::Panel(layer) = &surface.role else {
-            return;
+            return Ok(());
         };
-        surface.requested_height = height;
-        surface.layout = None;
+        let configured_size = previous
+            .filter(|previous| {
+                previous.geometry.anchors == next.geometry.anchors
+                    && previous.geometry.requested_size == next.geometry.requested_size
+            })
+            .map(|_| surface.size);
+        let geometry = panel::geometry(root, configured_size);
+        let size_changed = previous.is_none_or(|previous| {
+            previous.geometry.anchors != next.geometry.anchors
+                || previous.geometry.requested_size != next.geometry.requested_size
+        });
+        apply_panel_geometry(layer, geometry);
+        apply_input_region(
+            &self.compositor,
+            layer.wl_surface(),
+            next.input_region,
+            surface.size,
+        )?;
+        surface.panel = Some(next);
+        if size_changed {
+            surface.layout = None;
+        }
         surface.dirty = true;
-        layer.set_size(0, height);
-        layer.set_exclusive_zone(height as i32);
         layer.wl_surface().commit();
+        Ok(())
+    }
+
+    fn sync_configured_panel(&mut self, index: usize) -> Result<(), String> {
+        let surface = &self.surfaces[index];
+        let Role::Panel(layer) = &surface.role else {
+            return Ok(());
+        };
+        let Some(root) = self.configurations.root(&surface.output) else {
+            return Ok(());
+        };
+        let geometry = panel::geometry(root, Some(surface.size));
+        apply_panel_geometry(layer, geometry);
+        apply_input_region(
+            &self.compositor,
+            layer.wl_surface(),
+            root.panel.input_region,
+            surface.size,
+        )?;
+        Ok(())
     }
 
     fn set_output_scale(&mut self, output: &wl_output::WlOutput, scale: Scale) {
         let Some(mut context) = self.configurations.output(output).cloned() else {
             return;
         };
-        if context.scale == scale {
-            return;
+        if context.scale != scale {
+            context.scale = scale;
+            match self.configurations.set_output(output, context) {
+                Ok(true) => self.invalidate_output(output),
+                Ok(false) => {}
+                Err(error) => eprintln!("thing: cannot update output scale: {error}"),
+            }
         }
-        context.scale = scale;
-        match self.configurations.set_output(output, context) {
-            Ok(true) => self.invalidate_output(output),
-            Ok(false) => {}
-            Err(error) => eprintln!("thing: cannot update output scale: {error}"),
+        if let Some(index) = self
+            .surfaces
+            .iter()
+            .position(|surface| &surface.output == output && matches!(surface.role, Role::Panel(_)))
+            && let Err(error) = self.sync_configured_panel(index)
+        {
+            self.error = Some(error);
         }
     }
 
@@ -726,7 +792,9 @@ impl App {
         }) {
             self.remove_popup(index, true, false);
         }
-        self.sync_panel_height(output);
+        if let Err(error) = self.sync_panel(output, false) {
+            self.error = Some(error);
+        }
         for surface in self
             .surfaces
             .iter_mut()
@@ -1335,8 +1403,77 @@ impl App {
     }
 }
 
-fn panel_height(root: &Node) -> u32 {
-    root.style.height.unwrap_or(36.0).round().clamp(1.0, 4096.0) as u32
+fn panel_size(geometry: Geometry, output: (u32, u32)) -> (u32, u32) {
+    let requested = geometry.requested_size;
+    (
+        if requested.0 == 0 {
+            fill_dimension(output.0, geometry.margins.left, geometry.margins.right)
+        } else {
+            requested.0
+        },
+        if requested.1 == 0 {
+            fill_dimension(output.1, geometry.margins.top, geometry.margins.bottom)
+        } else {
+            requested.1
+        },
+    )
+}
+
+fn fill_dimension(output: u32, start_margin: i32, end_margin: i32) -> u32 {
+    (i64::from(output) - i64::from(start_margin) - i64::from(end_margin))
+        .clamp(1, i64::from(u32::MAX)) as u32
+}
+
+fn configured_panel_size(
+    configured: (u32, u32),
+    geometry: Geometry,
+    output: (u32, u32),
+) -> (u32, u32) {
+    let fallback = panel_size(geometry, output);
+    (
+        if configured.0 == 0 {
+            fallback.0
+        } else {
+            configured.0
+        },
+        if configured.1 == 0 {
+            fallback.1
+        } else {
+            configured.1
+        },
+    )
+}
+
+fn apply_panel_geometry(layer: &LayerSurface, geometry: Geometry) {
+    layer.set_anchor(geometry.anchors);
+    layer.set_size(geometry.requested_size.0, geometry.requested_size.1);
+    layer.set_margin(
+        geometry.margins.top,
+        geometry.margins.right,
+        geometry.margins.bottom,
+        geometry.margins.left,
+    );
+    layer.set_exclusive_zone(geometry.exclusive_zone);
+}
+
+fn apply_input_region(
+    compositor: &CompositorState,
+    surface: &wl_surface::WlSurface,
+    input: PanelInputRegion,
+    size: (u32, u32),
+) -> Result<(), String> {
+    match panel::input_region(input, size) {
+        ResolvedInputRegion::Full => surface.set_input_region(None),
+        ResolvedInputRegion::Region(rect) => {
+            let region = Region::new(compositor)
+                .map_err(|error| format!("cannot create panel input region: {error}"))?;
+            if let Some(rect) = rect {
+                region.add(rect.x, rect.y, rect.width, rect.height);
+            }
+            surface.set_input_region(Some(region.wl_region()));
+        }
+    }
+    Ok(())
 }
 
 fn earliest_deadline(
@@ -1391,10 +1528,11 @@ mod output_tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        earliest_deadline, fallback_logical_size, find_automatic_popup, find_manual_popup,
-        interactive_path, valid_dimensions,
+        PanelState, configured_panel_size, earliest_deadline, fallback_logical_size,
+        find_automatic_popup, find_manual_popup, interactive_path, panel_size, valid_dimensions,
     };
-    use thing_core::{Kind, Node, NodeId};
+    use crate::panel;
+    use thing_core::{Kind, Node, NodeId, PanelEdge, PanelMargins};
 
     #[test]
     fn renderer_retry_can_wake_before_hover_and_configuration_deadlines() {
@@ -1425,6 +1563,72 @@ mod output_tests {
             fallback_logical_size((3840, 2160), 2, true),
             Some((1080, 1920))
         );
+    }
+
+    #[test]
+    fn panel_fill_axis_uses_the_output_size_and_margins() {
+        let mut top = Node::new(NodeId(1), Kind::Panel);
+        top.style.height = Some(52.0);
+        top.panel.margins = PanelMargins {
+            right: 6,
+            left: 4,
+            ..PanelMargins::default()
+        };
+        assert_eq!(
+            panel_size(panel::geometry(&top, None), (1920, 1080)),
+            (1910, 52)
+        );
+
+        top.style.width = Some(480.0);
+        assert_eq!(
+            panel_size(panel::geometry(&top, None), (1920, 1080)),
+            (480, 52)
+        );
+    }
+
+    #[test]
+    fn zero_configure_dimensions_follow_the_current_panel_request() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        root.panel.edge = PanelEdge::Left;
+        root.panel.margins = PanelMargins {
+            top: 5,
+            bottom: 7,
+            ..PanelMargins::default()
+        };
+        root.style.width = Some(48.0);
+        let side = panel::geometry(&root, None);
+        assert_eq!(
+            configured_panel_size((48, 0), side, (1920, 1080)),
+            (48, 1068)
+        );
+
+        root.panel.edge = PanelEdge::Top;
+        root.style.width = None;
+        root.style.height = Some(80.0);
+        let resized_top = panel::geometry(&root, None);
+        assert_eq!(
+            configured_panel_size((0, 0), resized_top, (1920, 1080)),
+            (1920, 80)
+        );
+    }
+
+    #[test]
+    fn explicit_exclusivity_differs_from_an_equal_automatic_value() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        root.style.height = Some(52.0);
+        let automatic = PanelState::from_root(&root);
+        assert_eq!(panel::geometry(&root, Some((1920, 50))).exclusive_zone, 50);
+
+        root.panel.exclusive_zone = Some(52);
+        let explicit = PanelState::from_root(&root);
+        assert_eq!(automatic.geometry, explicit.geometry);
+        assert_ne!(automatic, explicit);
+        assert_eq!(panel::geometry(&root, Some((1920, 50))).exclusive_zone, 52);
+
+        root.panel.exclusive_zone = None;
+        let automatic_again = PanelState::from_root(&root);
+        assert_ne!(explicit, automatic_again);
+        assert_eq!(panel::geometry(&root, Some((1920, 50))).exclusive_zone, 50);
     }
 
     #[test]
@@ -1725,15 +1929,41 @@ impl LayerShellHandler for App {
         _: u32,
     ) {
         if let Some(index) = self.index(layer.wl_surface()) {
-            let surface = &mut self.surfaces[index];
-            if config.new_size.0 != 0 {
-                surface.size.0 = config.new_size.0;
+            let resolved_size = {
+                let surface = &self.surfaces[index];
+                surface.panel.and_then(|panel| {
+                    self.configurations.output(&surface.output).map(|output| {
+                        configured_panel_size(
+                            config.new_size,
+                            panel.geometry,
+                            (output.width, output.height),
+                        )
+                    })
+                })
+            };
+            {
+                let surface = &mut self.surfaces[index];
+                surface.size = match resolved_size {
+                    Some(size) => size,
+                    None => (
+                        if config.new_size.0 == 0 {
+                            surface.size.0
+                        } else {
+                            config.new_size.0
+                        },
+                        if config.new_size.1 == 0 {
+                            surface.size.1
+                        } else {
+                            config.new_size.1
+                        },
+                    ),
+                };
+                surface.configured = true;
+                surface.dirty = true;
             }
-            if config.new_size.1 != 0 {
-                surface.size.1 = config.new_size.1;
+            if let Err(error) = self.sync_configured_panel(index) {
+                self.error = Some(error);
             }
-            surface.configured = true;
-            surface.dirty = true;
         }
     }
 }
