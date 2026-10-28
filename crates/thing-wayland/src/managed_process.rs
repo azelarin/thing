@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    fs,
     io::{self, Read, Write},
     os::{
         fd::{AsRawFd, OwnedFd},
@@ -14,6 +15,7 @@ use std::{
     ptr,
     sync::{
         Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
     thread::{self, JoinHandle},
@@ -38,10 +40,35 @@ const MAX_READ_BYTES_PER_TURN: usize = 64 * 1024;
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(5);
+const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 const DEFAULT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 const DEFAULT_DROP_WAIT: Duration = Duration::from_secs(1);
 const XDG_ACTIVATION_TOKEN: &str = "XDG_ACTIVATION_TOKEN";
 const DESKTOP_STARTUP_ID: &str = "DESKTOP_STARTUP_ID";
+
+static MANAGER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct ManagerLease;
+
+impl ManagerLease {
+    fn acquire() -> io::Result<Self> {
+        MANAGER_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "a managed process worker is already active",
+                )
+            })
+    }
+}
+
+impl Drop for ManagerLease {
+    fn drop(&mut self) {
+        MANAGER_ACTIVE.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ShutdownSignal {
@@ -174,6 +201,58 @@ struct Shared {
     next_run_incarnation: u64,
     reserved_bytes: usize,
     shutdown: bool,
+    #[cfg(test)]
+    before_dequeue: Option<Arc<SpawnGate>>,
+    #[cfg(test)]
+    before_spawn: Option<Arc<SpawnGate>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SpawnGate {
+    state: Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl SpawnGate {
+    fn arrive(&self) {
+        let mut state = lock(&self.state);
+        state.0 = true;
+        self.changed.notify_all();
+        while !state.1 {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn wait_until_reached(&self) {
+        let mut state = lock(&self.state);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !state.0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for managed process gate"
+            );
+            let (next, timeout) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            assert!(
+                state.0 || !timeout.timed_out(),
+                "timed out waiting for managed process gate"
+            );
+        }
+    }
+
+    fn release(&self) {
+        lock(&self.state).1 = true;
+        self.changed.notify_all();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -210,6 +289,7 @@ impl ChildSetup {
 #[derive(Clone, Copy)]
 struct Limits {
     stop_grace: Duration,
+    shutdown_grace: Duration,
     drain_grace: Duration,
     drop_wait: Duration,
 }
@@ -218,6 +298,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             stop_grace: DEFAULT_STOP_GRACE,
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             drain_grace: DEFAULT_DRAIN_GRACE,
             drop_wait: DEFAULT_DROP_WAIT,
         }
@@ -235,10 +316,25 @@ pub(crate) struct Manager {
 
 impl Manager {
     pub(crate) fn start(ping: Ping) -> io::Result<Self> {
-        Self::start_with_limits(ping, Limits::default())
+        if !crate::launch::sigchld_is_reapable()? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "managed processes require the default SIGCHLD disposition",
+            ));
+        }
+        Self::start_inner(ping, Limits::default(), Some(ManagerLease::acquire()?))
     }
 
     fn start_with_limits(ping: Ping, limits: Limits) -> io::Result<Self> {
+        Self::start_inner(ping, limits, None)
+    }
+
+    #[cfg(test)]
+    fn start_with_singleton(ping: Ping, limits: Limits) -> io::Result<Self> {
+        Self::start_inner(ping, limits, Some(ManagerLease::acquire()?))
+    }
+
+    fn start_inner(ping: Ping, limits: Limits, lease: Option<ManagerLease>) -> io::Result<Self> {
         let setup = ChildSetup::capture()?;
         let (wake, reader) = UnixStream::pair()?;
         wake.set_nonblocking(true)?;
@@ -250,6 +346,7 @@ impl Manager {
         let worker = thread::Builder::new()
             .name("thing-managed-processes".into())
             .spawn(move || {
+                let _lease = lease;
                 run_worker(state, reader, worker_ping, setup, limits);
                 let _ = done_tx.send(());
             })?;
@@ -289,7 +386,7 @@ impl Manager {
             publish_locked(&mut shared)
         };
         self.ping.ping();
-        wake(&self.wake)?;
+        let _ = wake(&self.wake);
         Ok(snapshot)
     }
 
@@ -348,7 +445,7 @@ impl Manager {
             publish_locked(&mut shared)
         };
         self.ping.ping();
-        wake(&self.wake)?;
+        let _ = wake(&self.wake);
         Ok(snapshot)
     }
 
@@ -433,8 +530,14 @@ impl Manager {
             cwd,
         });
         shared.latest = Some(snapshot_locked(&shared));
+        #[cfg(test)]
+        let before_spawn = shared.before_spawn.clone();
         drop(shared);
         self.ping.ping();
+        #[cfg(test)]
+        if let Some(gate) = before_spawn {
+            gate.wait_until_reached();
+        }
         if let Err(error) = wake(&self.wake) {
             retire_failed_start(&self.shared, token, &error.to_string(), &self.ping);
             return Err(error);
@@ -471,7 +574,7 @@ impl Manager {
         };
         if changed {
             self.ping.ping();
-            wake(&self.wake)?;
+            let _ = wake(&self.wake);
         }
         Ok(())
     }
@@ -520,6 +623,8 @@ struct Run {
     stderr: Option<std::fs::File>,
     stdout_tail: Utf8Tail,
     stderr_tail: Utf8Tail,
+    exit_observed: bool,
+    identity_lost: bool,
     wait_status: Option<ExitStatus>,
     drain_deadline: Option<Instant>,
     stop_deadline: Option<Instant>,
@@ -651,46 +756,73 @@ fn maintain(
     setup: ChildSetup,
     limits: Limits,
 ) {
-    apply_starts(shared, runs, ping, setup, limits.stop_grace);
-    apply_stops(shared, runs, ping, limits.stop_grace);
+    apply_starts(shared, runs, ping, setup, limits);
+    apply_stops(shared, runs, ping, limits);
     let now = Instant::now();
     let tokens = runs.keys().copied().collect::<Vec<_>>();
     for token in tokens {
         let Some(run) = runs.get_mut(&token) else {
             continue;
         };
-        if run.wait_status.is_none() {
-            match run.child.try_wait() {
-                Ok(Some(status)) => {
-                    run.wait_status = Some(status);
-                    run.drain_deadline = Some(now + limits.drain_grace);
-                    if group_exists(run.pid) && run.stop_deadline.is_none() {
-                        signal_group(run.pid, shutdown_for(shared, run.token).raw());
-                        run.stop_deadline = Some(now + limits.stop_grace);
-                        mark_stopping(shared, run, ping);
+        if run.wait_status.is_none() && !run.identity_lost {
+            if !run.exit_observed {
+                match exit_observed(run.pid) {
+                    Ok(true) => {
+                        run.exit_observed = true;
+                        run.drain_deadline = Some(now + limits.drain_grace);
+                        if run.stop_deadline.is_none() {
+                            signal_owned(run, shutdown_for(shared, run.token).raw());
+                            run.stop_deadline = Some(now + stop_grace(shared, limits));
+                            mark_stopping(shared, run, ping);
+                        }
                     }
-                }
-                Ok(None) => {}
-                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
-                    set_run_error(shared, run, "managed process was reaped unexpectedly", ping);
-                    run.wait_status = Some(synthetic_failure_status());
-                    run.drain_deadline = Some(now + limits.drain_grace);
-                }
-                Err(error) => {
-                    set_run_error(
+                    Ok(false) => {}
+                    Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                        lose_child_identity(shared, run, ping, limits.drain_grace);
+                    }
+                    Err(error) => set_run_error(
                         shared,
                         run,
                         &format!("cannot inspect managed process: {error}"),
                         ping,
-                    );
+                    ),
+                }
+            }
+            if run.exit_observed {
+                match initial_group_has_other_members(run.pid) {
+                    Ok(true) => {}
+                    Ok(false) => match run.child.try_wait() {
+                        Ok(Some(status)) => run.wait_status = Some(status),
+                        Ok(None) => set_run_error(
+                            shared,
+                            run,
+                            "managed process exit observation changed unexpectedly",
+                            ping,
+                        ),
+                        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                            lose_child_identity(shared, run, ping, limits.drain_grace);
+                        }
+                        Err(error) => set_run_error(
+                            shared,
+                            run,
+                            &format!("cannot reap managed process: {error}"),
+                            ping,
+                        ),
+                    },
+                    Err(error) => set_run_error(
+                        shared,
+                        run,
+                        &format!("cannot inspect managed process group: {error}"),
+                        ping,
+                    ),
                 }
             }
         }
         if run
             .stop_deadline
-            .is_some_and(|deadline| deadline <= now && !run.kill_sent)
+            .is_some_and(|deadline| deadline <= now && !run.kill_sent && !run.identity_lost)
         {
-            signal_group(run.pid, libc::SIGKILL);
+            signal_owned(run, libc::SIGKILL);
             run.kill_sent = true;
         }
         if run
@@ -712,9 +844,7 @@ fn maintain(
     }
     let finished = runs
         .iter()
-        .filter_map(|(token, run)| {
-            (run.wait_status.is_some() && run.drained() && !group_exists(run.pid)).then_some(*token)
-        })
+        .filter_map(|(token, run)| (run.wait_status.is_some() && run.drained()).then_some(*token))
         .collect::<Vec<_>>();
     for token in finished {
         if let Some(mut run) = runs.remove(&token) {
@@ -728,8 +858,10 @@ fn apply_starts(
     runs: &mut BTreeMap<RunToken, Run>,
     ping: &Ping,
     setup: ChildSetup,
-    stop_grace: Duration,
+    limits: Limits,
 ) {
+    #[cfg(test)]
+    pause_before_dequeue(shared);
     let starts = {
         let mut shared = lock(shared);
         shared.starts.drain(..).collect::<Vec<_>>()
@@ -739,11 +871,13 @@ fn apply_starts(
             cancel_start(shared, start.token, ping);
             continue;
         }
+        #[cfg(test)]
+        pause_before_spawn(shared);
         match spawn(start, setup) {
             Ok((mut run, setup_error)) => {
                 if cancelled(shared, run.token) {
-                    signal_group(run.pid, shutdown_for(shared, run.token).raw());
-                    run.stop_deadline = Some(Instant::now() + stop_grace);
+                    signal_owned(&run, shutdown_for(shared, run.token).raw());
+                    run.stop_deadline = Some(Instant::now() + stop_grace(shared, limits));
                     mark_stopping(shared, &run, ping);
                 } else {
                     mark_running(shared, &run, ping);
@@ -758,22 +892,62 @@ fn apply_starts(
     }
 }
 
+#[cfg(test)]
+fn pause_before_dequeue(shared: &Mutex<Shared>) {
+    let gate = lock(shared).before_dequeue.clone();
+    if let Some(gate) = gate {
+        gate.arrive();
+    }
+}
+
 fn apply_stops(
     shared: &Mutex<Shared>,
     runs: &mut BTreeMap<RunToken, Run>,
     ping: &Ping,
-    grace: Duration,
+    limits: Limits,
 ) {
-    let stops = lock(shared).stops.clone();
+    let (stops, grace) = {
+        let shared = lock(shared);
+        (
+            shared.stops.clone(),
+            if shared.shutdown {
+                limits.shutdown_grace
+            } else {
+                limits.stop_grace
+            },
+        )
+    };
     for (token, signal) in stops {
         let Some(run) = runs.get_mut(&token) else {
             continue;
         };
-        if run.stop_deadline.is_none() {
-            signal_group(run.pid, signal.raw());
-            run.stop_deadline = Some(Instant::now() + grace);
-            mark_stopping(shared, run, ping);
+        if run.identity_lost {
+            continue;
         }
+        let deadline = Instant::now() + grace;
+        if run.stop_deadline.is_none() {
+            signal_owned(run, signal.raw());
+            run.stop_deadline = Some(deadline);
+            mark_stopping(shared, run, ping);
+        } else if run.stop_deadline.is_some_and(|current| deadline < current) {
+            run.stop_deadline = Some(deadline);
+        }
+    }
+}
+
+fn stop_grace(shared: &Mutex<Shared>, limits: Limits) -> Duration {
+    if lock(shared).shutdown {
+        limits.shutdown_grace
+    } else {
+        limits.stop_grace
+    }
+}
+
+#[cfg(test)]
+fn pause_before_spawn(shared: &Mutex<Shared>) {
+    let gate = lock(shared).before_spawn.clone();
+    if let Some(gate) = gate {
+        gate.arrive();
     }
 }
 
@@ -816,6 +990,8 @@ fn spawn(start: Start, setup: ChildSetup) -> Result<(Run, Option<String>), (RunT
             stderr,
             stdout_tail: Utf8Tail::new(MAX_STREAM_BYTES),
             stderr_tail: Utf8Tail::new(MAX_STREAM_BYTES),
+            exit_observed: false,
+            identity_lost: false,
             wait_status: None,
             drain_deadline: None,
             stop_deadline: None,
@@ -1039,7 +1215,28 @@ fn set_run_error(shared: &Mutex<Shared>, run: &Run, error: &str, ping: &Ping) {
         return;
     };
     if state.token == Some(run.token) {
-        state.error = Arc::from(bounded(error, MAX_ERROR_BYTES));
+        let error: Arc<str> = Arc::from(bounded(error, MAX_ERROR_BYTES));
+        if state.error == error {
+            return;
+        }
+        state.error = error;
+        shared.latest = Some(snapshot_locked(&shared));
+        drop(shared);
+        ping.ping();
+    }
+}
+
+fn lose_child_identity(shared: &Mutex<Shared>, run: &mut Run, ping: &Ping, drain_grace: Duration) {
+    run.identity_lost = true;
+    run.drain_deadline = Some(Instant::now() + drain_grace);
+    let mut shared = lock(shared);
+    let Some(state) = shared.states.get_mut(&run.key) else {
+        return;
+    };
+    if state.token == Some(run.token) {
+        state.status = Status::Failed;
+        state.error = Arc::from("managed process child identity was lost before reap");
+        state.terminal_failure = true;
         shared.latest = Some(snapshot_locked(&shared));
         drop(shared);
         ping.ping();
@@ -1136,8 +1333,10 @@ fn mark_worker_failure(
         }
     }
     for run in runs.values_mut() {
-        signal_group(run.pid, libc::SIGKILL);
-        run.kill_sent = true;
+        if !run.identity_lost {
+            signal_owned(run, libc::SIGKILL);
+            run.kill_sent = true;
+        }
         if run.stdout.is_some() {
             run.close_stream(Stream::Stdout);
         }
@@ -1329,13 +1528,77 @@ fn signal_group(pid: u32, signal: i32) {
     }
 }
 
-fn group_exists(pid: u32) -> bool {
+fn signal_process(pid: u32, signal: i32) {
     let Ok(pid) = i32::try_from(pid) else {
-        return false;
+        return;
     };
-    // SAFETY: signal zero checks the process group without delivering a signal.
-    let result = unsafe { libc::kill(-pid, 0) };
-    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    // SAFETY: the unreaped Child keeps this positive process identity stable.
+    let result = unsafe { libc::kill(pid, signal) };
+    if result == -1 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+        // Signal failures are reflected by the later wait/stop deadline.
+    }
+}
+
+fn signal_owned(run: &Run, signal: i32) {
+    signal_process(run.pid, signal);
+    signal_group(run.pid, signal);
+}
+
+fn exit_observed(pid: u32) -> io::Result<bool> {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: waitid initializes siginfo on success and WNOWAIT leaves the
+    // leader unreaped so its PID and initial process-group number stay pinned.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: waitid initialized the value after returning success.
+    Ok(unsafe { info.assume_init().si_pid() } != 0)
+}
+
+fn initial_group_has_other_members(pgid: u32) -> io::Result<bool> {
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == pgid {
+            continue;
+        }
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if process_group_from_stat(&stat)? == pgid {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn process_group_from_stat(stat: &str) -> io::Result<u32> {
+    let fields = stat
+        .rfind(") ")
+        .and_then(|end| stat.get(end + 2..))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid /proc stat"))?;
+    fields
+        .split_ascii_whitespace()
+        .nth(2)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing /proc process group"))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid /proc process group"))
 }
 
 fn nonblocking(fd: OwnedFd) -> io::Result<std::fs::File> {
@@ -1357,7 +1620,9 @@ fn poll_timeout(runs: &BTreeMap<RunToken, Run>, now: Instant) -> i32 {
         .values()
         .flat_map(|run| {
             [
-                (!run.kill_sent).then_some(run.stop_deadline).flatten(),
+                (!run.kill_sent && !run.identity_lost)
+                    .then_some(run.stop_deadline)
+                    .flatten(),
                 (!run.drained()).then_some(run.drain_deadline).flatten(),
                 run.dirty.then_some(run.next_publish),
             ]
@@ -1417,11 +1682,6 @@ fn drain_wake(stream: &UnixStream) {
             Err(_) => return,
         }
     }
-}
-
-fn synthetic_failure_status() -> ExitStatus {
-    // SAFETY: wait status 1 << 8 represents a normal exit code of 1 on Unix.
-    ExitStatus::from_raw(1 << 8)
 }
 
 struct Utf8Tail {
@@ -1533,15 +1793,16 @@ mod tests {
 
     fn manager() -> Manager {
         let (ping, _source) = calloop::ping::make_ping().unwrap();
-        Manager::start_with_limits(
-            ping,
-            Limits {
-                stop_grace: Duration::from_millis(100),
-                drain_grace: Duration::from_millis(50),
-                drop_wait: Duration::from_secs(1),
-            },
-        )
-        .unwrap()
+        Manager::start_with_limits(ping, test_limits()).unwrap()
+    }
+
+    fn test_limits() -> Limits {
+        Limits {
+            stop_grace: Duration::from_millis(100),
+            shutdown_grace: Duration::from_millis(100),
+            drain_grace: Duration::from_millis(50),
+            drop_wait: Duration::from_secs(1),
+        }
     }
 
     fn helper(mode: &str) -> Vec<String> {
@@ -1550,6 +1811,8 @@ mod tests {
             "ignore-term" => "managed_process::tests::fake_child_ignore_term",
             "flood" => "managed_process::tests::fake_child_flood",
             "group" => "managed_process::tests::fake_child_group",
+            "escape-group" => "managed_process::tests::fake_child_escape_group",
+            "report-ignore-term" => "managed_process::tests::fake_child_report_ignore_term",
             _ => panic!("unknown fake child mode"),
         };
         vec![
@@ -1576,6 +1839,37 @@ mod tests {
         }
     }
 
+    fn fixture(test: &str) -> Command {
+        let mut command = Command::new(env::current_exe().unwrap());
+        command.args([
+            "--ignored",
+            "--exact",
+            test,
+            "--nocapture",
+            "--quiet",
+            "--test-threads=1",
+        ]);
+        command
+    }
+
+    fn marker_pid(output: &str, marker: &str) -> u32 {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix(marker))
+            .unwrap_or_else(|| panic!("missing {marker:?} in {output:?}"))
+            .parse()
+            .unwrap()
+    }
+
+    fn process_exists(pid: u32) -> bool {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal zero only checks whether the positive pid exists.
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
     #[test]
     fn utf8_tail_preserves_split_sequences_and_replaces_only_invalid_input() {
         let mut tail = Utf8Tail::new(64);
@@ -1599,9 +1893,17 @@ mod tests {
     }
 
     #[test]
+    fn proc_stat_parser_handles_spaces_and_parentheses_in_the_name() {
+        assert_eq!(
+            process_group_from_stat("42 (a tricky) name) S 7 19 3").unwrap(),
+            19
+        );
+        assert!(process_group_from_stat("42 broken").is_err());
+    }
+
+    #[test]
     fn default_manager_publishes_and_reconciles_one_shared_scope() {
-        let (ping, _source) = calloop::ping::make_ping().unwrap();
-        let manager = Manager::start(ping).unwrap();
+        let manager = manager();
         manager.replace_scope(vec![definition("one")]).unwrap();
         assert_eq!(manager.take_snapshot().unwrap().states.len(), 1);
         let snapshot = manager
@@ -1660,18 +1962,55 @@ mod tests {
     }
 
     #[test]
-    fn wake_failure_retires_a_start_without_losing_child_ownership() {
+    fn wake_failure_retires_a_queued_start() {
         let mut manager = manager();
         manager.replace_scope(vec![definition("query")]).unwrap();
+        let gate = Arc::new(SpawnGate::default());
+        lock(&manager.shared).before_dequeue = Some(gate.clone());
         let (broken_wake, peer) = UnixStream::pair().unwrap();
         drop(peer);
         manager.wake = broken_wake;
+        gate.wait_until_reached();
         let error = manager
             .start_process("query", helper("ignore-term"), None)
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        {
+            let shared = lock(&manager.shared);
+            assert_eq!(shared.starts.len(), 1);
+            assert_eq!(shared.occupied.len(), 1);
+        }
+        gate.release();
         let state = wait_for(&manager, |state| state.status == Status::Failed);
         assert!(!state.error.is_empty());
+        assert_eq!(state.exit_signal, None);
+        assert!(lock(&manager.shared).occupied.is_empty());
+    }
+
+    #[test]
+    fn wake_failure_after_dequeue_still_reaps_the_spawned_child() {
+        let mut manager = manager();
+        manager.replace_scope(vec![definition("query")]).unwrap();
+        let gate = Arc::new(SpawnGate::default());
+        lock(&manager.shared).before_spawn = Some(gate.clone());
+        let (broken_wake, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        manager.wake = broken_wake;
+
+        let error = manager
+            .start_process("query", helper("ignore-term"), None)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        {
+            let shared = lock(&manager.shared);
+            assert!(shared.starts.is_empty());
+            assert_eq!(shared.occupied.len(), 1);
+        }
+        gate.release();
+
+        let state = wait_for(&manager, |state| state.status == Status::Failed);
+        assert!(!state.error.is_empty());
+        assert!(state.exit_signal.is_some());
         assert!(lock(&manager.shared).occupied.is_empty());
     }
 
@@ -1683,6 +2022,19 @@ mod tests {
             .start_process("stubborn", helper("ignore-term"), None)
             .unwrap();
         wait_for(&manager, |state| state.stdout.contains("ready"));
+        manager.stop_process("stubborn").unwrap();
+        let state = wait_for(&manager, |state| state.status == Status::Exited);
+        assert_eq!(state.exit_signal, Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn direct_child_is_reaped_after_leaving_its_initial_group() {
+        let manager = manager();
+        manager.replace_scope(vec![definition("stubborn")]).unwrap();
+        manager
+            .start_process("stubborn", helper("escape-group"), None)
+            .unwrap();
+        wait_for(&manager, |state| state.stdout.contains("escaped_group="));
         manager.stop_process("stubborn").unwrap();
         let state = wait_for(&manager, |state| state.status == Status::Exited);
         assert_eq!(state.exit_signal, Some(libc::SIGKILL));
@@ -1805,6 +2157,96 @@ mod tests {
     }
 
     #[test]
+    fn detached_worker_keeps_the_process_wide_lease_until_it_finishes() {
+        let limits = Limits {
+            stop_grace: Duration::from_secs(5),
+            shutdown_grace: Duration::from_millis(200),
+            drain_grace: Duration::from_millis(50),
+            drop_wait: Duration::from_millis(10),
+        };
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let manager = Manager::start_with_singleton(ping, limits).unwrap();
+        manager.replace_scope(vec![definition("child")]).unwrap();
+        manager
+            .start_process("child", helper("ignore-term"), None)
+            .unwrap();
+        wait_for(&manager, |state| state.stdout.contains("ready"));
+        drop(manager);
+
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let error = match Manager::start_with_singleton(ping, limits) {
+            Ok(manager) => {
+                drop(manager);
+                panic!("a replacement manager started before the old worker retired")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let replacement = loop {
+            let (ping, _source) = calloop::ping::make_ping().unwrap();
+            match Manager::start_with_singleton(ping, limits) {
+                Ok(manager) => break manager,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("unexpected manager start error: {error}"),
+            }
+        };
+        drop(replacement);
+    }
+
+    #[test]
+    fn prepare_restores_reapable_sigchld_for_managed_children() {
+        let mut command =
+            fixture("managed_process::tests::fake_manager_with_inherited_sigchld_ignore");
+        // SAFETY: the closure changes only its own signal disposition with an
+        // async-signal-safe syscall before exec.
+        unsafe {
+            command.pre_exec(|| {
+                let mut action = std::mem::zeroed::<libc::sigaction>();
+                action.sa_sigaction = libc::SIG_IGN;
+                action.sa_flags = libc::SA_NOCLDWAIT;
+                if libc::sigemptyset(&mut action.sa_mask) == -1
+                    || libc::sigaction(libc::SIGCHLD, &action, ptr::null_mut()) == -1
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("reaped_exit=0"));
+    }
+
+    #[test]
+    fn production_shutdown_reaps_a_term_ignoring_child_before_parent_exit() {
+        let output = fixture("managed_process::tests::fake_manager_shutdown_parent")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = String::from_utf8(output.stdout).unwrap();
+        let pid = marker_pid(&output, "retired_pid=");
+        assert!(
+            !process_exists(pid),
+            "managed child {pid} survived its parent"
+        );
+    }
+
+    #[test]
     #[ignore = "managed process fixture"]
     fn fake_child_output() {
         println!("hello from child");
@@ -1817,6 +2259,37 @@ mod tests {
         // SAFETY: SIG_IGN is a process-global, async-signal-safe disposition.
         unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
         println!("ready");
+        std::io::stdout().flush().unwrap();
+        loop {
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    #[ignore = "managed process fixture"]
+    fn fake_child_escape_group() {
+        // SAFETY: the parent remains in a process group in this session.
+        let parent_group = unsafe { libc::getpgid(libc::getppid()) };
+        assert!(parent_group > 0);
+        // SAFETY: both this process and the target group are in the inherited
+        // session; moving only this process does not affect the test parent.
+        assert_eq!(unsafe { libc::setpgid(0, parent_group) }, 0);
+        // SAFETY: SIG_IGN is a process-global, async-signal-safe disposition.
+        unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+        println!("escaped_group={parent_group}");
+        std::io::stdout().flush().unwrap();
+        loop {
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    #[ignore = "managed process fixture"]
+    fn fake_child_report_ignore_term() {
+        // SAFETY: SIG_IGN is a process-global, async-signal-safe disposition.
+        unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+        // SAFETY: getpid has no preconditions.
+        println!("controlled_pid={}", unsafe { libc::getpid() });
         std::io::stdout().flush().unwrap();
         loop {
             thread::sleep(Duration::from_secs(1));
@@ -1846,5 +2319,42 @@ mod tests {
         let descendant = descendant.spawn().unwrap();
         println!("descendant={}", descendant.id());
         std::io::stdout().flush().unwrap();
+    }
+
+    #[test]
+    #[ignore = "managed process fixture"]
+    fn fake_manager_with_inherited_sigchld_ignore() {
+        assert!(!crate::launch::sigchld_is_reapable().unwrap());
+        let (_launcher, _signals) = crate::launch::prepare().unwrap();
+        assert!(crate::launch::sigchld_is_reapable().unwrap());
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let manager = Manager::start(ping).unwrap();
+        manager.replace_scope(vec![definition("query")]).unwrap();
+        manager
+            .start_process("query", helper("output"), None)
+            .unwrap();
+        let state = wait_for(&manager, |state| state.status == Status::Exited);
+        assert_eq!(state.exit_code, Some(0));
+        println!("reaped_exit={}", state.exit_code.unwrap());
+    }
+
+    #[test]
+    #[ignore = "managed process fixture"]
+    fn fake_manager_shutdown_parent() {
+        let (_launcher, _signals) = crate::launch::prepare().unwrap();
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let manager = Manager::start(ping).unwrap();
+        manager.replace_scope(vec![definition("child")]).unwrap();
+        manager
+            .start_process("child", helper("report-ignore-term"), None)
+            .unwrap();
+        let state = wait_for(&manager, |state| state.stdout.contains("controlled_pid="));
+        let pid = marker_pid(&state.stdout, "controlled_pid=");
+        drop(manager);
+        assert!(
+            !process_exists(pid),
+            "managed child {pid} survived manager drop"
+        );
+        println!("retired_pid={pid}");
     }
 }

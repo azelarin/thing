@@ -210,6 +210,7 @@ impl Launcher {
 }
 
 pub(crate) fn prepare() -> calloop::Result<(Launcher, Signals)> {
+    reset_sigchld_disposition()?;
     let child_mask = ChildSignalMask::capture()?;
     match Signals::new(&[Signal::SIGCHLD]) {
         Ok(signals) => Ok((Launcher::new(child_mask), signals)),
@@ -220,6 +221,36 @@ pub(crate) fn prepare() -> calloop::Result<(Launcher, Signals)> {
             Err(error)
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn sigchld_is_reapable() -> io::Result<bool> {
+    let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    // SAFETY: a null replacement asks sigaction to copy the current
+    // disposition into the initialized output storage.
+    if unsafe { libc::sigaction(libc::SIGCHLD, ptr::null(), action.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: sigaction initialized action after returning success.
+    let action = unsafe { action.assume_init() };
+    Ok(action.sa_sigaction == libc::SIG_DFL && action.sa_flags & libc::SA_NOCLDWAIT == 0)
+}
+
+fn reset_sigchld_disposition() -> io::Result<()> {
+    // SAFETY: an all-zero sigaction is a valid starting value on Unix. The
+    // handler, mask, and flags are initialized before the syscall reads them.
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    action.sa_sigaction = libc::SIG_DFL;
+    action.sa_flags = 0;
+    // SAFETY: sigemptyset initializes the embedded signal mask.
+    if unsafe { libc::sigemptyset(&mut action.sa_mask) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: action is fully initialized and SIGCHLD is a valid signal.
+    if unsafe { libc::sigaction(libc::SIGCHLD, &action, ptr::null_mut()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn command(
