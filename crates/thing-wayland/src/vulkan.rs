@@ -298,10 +298,10 @@ fn choose_surface(capabilities: &SurfaceCapabilities) -> Result<SurfaceChoice, S
         .contains(&CompositeAlphaMode::PreMultiplied)
         .then_some(CompositeAlphaMode::PreMultiplied)
         .ok_or("vulkan surface does not support premultiplied alpha")?;
-    let present_mode = if capabilities.present_modes.contains(&PresentMode::Mailbox) {
-        PresentMode::Mailbox
-    } else if capabilities.present_modes.contains(&PresentMode::Fifo) {
+    let present_mode = if capabilities.present_modes.contains(&PresentMode::Fifo) {
         PresentMode::Fifo
+    } else if capabilities.present_modes.contains(&PresentMode::Mailbox) {
+        PresentMode::Mailbox
     } else {
         return Err("vulkan surface does not support mailbox or fifo presentation".into());
     };
@@ -342,12 +342,12 @@ mod tests {
     }
 
     #[test]
-    fn surface_selection_prefers_linear_format_mailbox_and_premultiplied_alpha() {
+    fn surface_selection_prefers_linear_format_fifo_and_premultiplied_alpha() {
         assert_eq!(
             choose_surface(&capabilities()).unwrap(),
             SurfaceChoice {
                 format: TextureFormat::Rgba8Unorm,
-                present_mode: PresentMode::Mailbox,
+                present_mode: PresentMode::Fifo,
                 alpha_mode: CompositeAlphaMode::PreMultiplied,
             }
         );
@@ -361,6 +361,17 @@ mod tests {
         let choice = choose_surface(&capabilities).unwrap();
         assert_eq!(choice.format, TextureFormat::Bgra8Unorm);
         assert_eq!(choice.present_mode, PresentMode::Fifo);
+    }
+
+    #[test]
+    fn surface_selection_falls_back_to_mailbox() {
+        let mut capabilities = capabilities();
+        capabilities.present_modes = vec![PresentMode::Mailbox];
+
+        assert_eq!(
+            choose_surface(&capabilities).unwrap().present_mode,
+            PresentMode::Mailbox
+        );
     }
 
     #[test]
