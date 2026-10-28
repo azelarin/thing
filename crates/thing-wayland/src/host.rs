@@ -93,7 +93,7 @@ use crate::{
     Renderer, RunOptions, SystemTray,
     audio::Audio,
     clipboard::{Clipboard, OfferData as ClipboardOfferData, SourceData as ClipboardSourceData},
-    configuration::{Configurations, DispatchOutcome},
+    configuration::{Configurations, DispatchOutcome, RemovedConfiguration},
     hover::{Command as HoverCommand, HoverKey, HoverStates, HoverTarget},
     input_method::{
         ChangeCause as InputMethodChangeCause, CursorRectangle as InputMethodCursorRectangle,
@@ -5016,7 +5016,7 @@ impl OutputHandler for App {
             .retain(|pending| pending.output != output);
         let managed_processes = &mut self.managed_processes;
         let loop_handle = self.loop_handle.clone();
-        match self
+        if let Some(removed) = self
             .configurations
             .remove_with_processes(&output, |definitions| {
                 configure_managed_processes(
@@ -5025,16 +5025,16 @@ impl OutputHandler for App {
                     definitions,
                     ManagedProcessScopeChange::Reconcile,
                 )
-            }) {
-            Ok(Some(consumer)) => {
-                if let Err(error) =
-                    release_system_tray_consumer(self.system_tray.as_ref(), &consumer)
-                {
-                    eprintln!("thing: {error}");
-                }
+            })
+        {
+            let RemovedConfiguration {
+                consumer,
+                process_reconciliation,
+            } = removed;
+            if let Err(error) = release_system_tray_consumer(self.system_tray.as_ref(), &consumer) {
+                eprintln!("thing: {error}");
             }
-            Ok(None) => {}
-            Err(error) => {
+            if let Err(error) = process_reconciliation {
                 self.error = Some(format!("cannot remove output configuration: {error}"));
             }
         }

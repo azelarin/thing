@@ -28,6 +28,11 @@ pub(crate) struct Configurations<K> {
     next_consumer: u64,
 }
 
+pub(crate) struct RemovedConfiguration {
+    pub(crate) consumer: String,
+    pub(crate) process_reconciliation: Result<(), String>,
+}
+
 #[derive(Debug)]
 pub(crate) struct DispatchOutcome {
     pub(crate) changed: bool,
@@ -118,35 +123,38 @@ impl<K: Clone + Eq> Configurations<K> {
 
     #[cfg(test)]
     pub(crate) fn remove(&mut self, key: &K) -> Option<String> {
-        self.remove_with_processes(key, |_| Ok(()))
-            .expect("loaded managed process definitions must remain valid")
+        let removed = self.remove_with_processes(key, |_| Ok(()))?;
+        removed
+            .process_reconciliation
+            .expect("loaded managed process definitions must remain valid");
+        Some(removed.consumer)
     }
 
     pub(crate) fn remove_with_processes(
         &mut self,
         key: &K,
         reconcile: impl FnOnce(&[ManagedProcessDefinition]) -> Result<(), String>,
-    ) -> Result<Option<String>, String> {
+    ) -> Option<RemovedConfiguration> {
         let index = self
             .instances
             .iter()
-            .position(|instance| &instance.key == key);
-        let Some(index) = index else {
-            return Ok(None);
-        };
-        let definitions =
-            collect_managed_process_definitions(self.instances.iter().enumerate().filter_map(
-                |(candidate, instance)| (candidate != index).then_some(&instance.runtime),
-            ))?;
+            .position(|instance| &instance.key == key)?;
+        let consumer = self.instances.remove(index).consumer;
+        let definitions = collect_managed_process_definitions(
+            self.instances.iter().map(|instance| &instance.runtime),
+        )
+        .expect("loaded managed process definitions must remain compatible");
         let snapshot =
             reconciled_managed_processes(self.services.managed_processes(), &definitions);
         let mut services = self.services.clone();
         services
             .set_managed_processes(snapshot)
-            .map_err(|error| error.to_string())?;
-        reconcile(&definitions)?;
+            .expect("loaded managed process state must remain valid");
         self.services = services;
-        Ok(Some(self.instances.remove(index).consumer))
+        Some(RemovedConfiguration {
+            consumer,
+            process_reconciliation: reconcile(&definitions),
+        })
     }
 
     pub(crate) fn keys(&self) -> impl Iterator<Item = &K> {
@@ -1921,15 +1929,13 @@ mod tests {
         assert_eq!(text(&configurations, 2), "second:idle:");
 
         let mut remaining_definitions = Vec::new();
-        assert!(
-            configurations
-                .remove_with_processes(&2, |definitions| {
-                    remaining_definitions = definitions.to_vec();
-                    Ok(())
-                })
-                .unwrap()
-                .is_some()
-        );
+        let removed = configurations
+            .remove_with_processes(&2, |definitions| {
+                remaining_definitions = definitions.to_vec();
+                Ok(())
+            })
+            .unwrap();
+        assert!(removed.process_reconciliation.is_ok());
         assert_eq!(
             remaining_definitions
                 .iter()
@@ -1938,6 +1944,82 @@ mod tests {
             ["shared"]
         );
         assert_eq!(text(&configurations, 1), "shared:running:ready");
+    }
+
+    #[test]
+    fn failed_process_reconciliation_cannot_retain_a_removed_output() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            local key = if services.output.name:get() == 'DP-1' then 'shared' else 'retired'
+            local process = services.process(key)
+            return ui.panel { children = { ui.text { text = function()
+                return key .. ':' .. process.status:get() .. ':' .. process.stdout:get()
+            end } } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations
+            .add_checked_with_processes(1, output("DP-1", 1920), |_| Ok(()), |_| Ok(()))
+            .unwrap();
+        configurations
+            .add_checked_with_processes(2, output("DP-2", 2560), |_| Ok(()), |_| Ok(()))
+            .unwrap();
+        configurations
+            .set_managed_processes(ManagedProcessSnapshot {
+                states: vec![
+                    managed_process_state(
+                        "retired",
+                        thing_runtime::ManagedProcessStatus::Running,
+                        "old",
+                    ),
+                    managed_process_state(
+                        "shared",
+                        thing_runtime::ManagedProcessStatus::Running,
+                        "ready",
+                    ),
+                ],
+            })
+            .unwrap();
+        assert_eq!(configurations.refresh(), vec![1, 2]);
+        let retired_consumer = configurations.consumer(&2).unwrap().to_owned();
+        let mut remaining_definitions = Vec::new();
+
+        let removed = configurations
+            .remove_with_processes(&2, |definitions| {
+                remaining_definitions = definitions.to_vec();
+                Err("managed process worker is shutting down".into())
+            })
+            .unwrap();
+
+        assert_eq!(removed.consumer, retired_consumer);
+        assert_eq!(
+            removed.process_reconciliation,
+            Err("managed process worker is shutting down".into())
+        );
+        assert!(!configurations.contains(&2));
+        assert_eq!(configurations.consumer(&2), None);
+        assert_eq!(text(&configurations, 1), "shared:running:ready");
+        assert_eq!(
+            remaining_definitions
+                .iter()
+                .map(|definition| definition.key.as_str())
+                .collect::<Vec<_>>(),
+            ["shared"]
+        );
+        assert_eq!(
+            configurations
+                .services
+                .managed_processes()
+                .states
+                .iter()
+                .map(|state| state.key.as_str())
+                .collect::<Vec<_>>(),
+            ["shared"]
+        );
     }
 
     #[test]
