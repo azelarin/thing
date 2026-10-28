@@ -147,13 +147,14 @@ fn session(
     events.send(&serde_json::json!("EventStream"))?;
     let mut commands: Option<Connection> = None;
     let mut model = Model::default();
-    let mut subscribed = false;
+    let mut acknowledged = false;
+    let mut ready = false;
     let mut error = String::new();
     loop {
         if lock(shared).stop {
             return Ok(());
         }
-        if subscribed && commands.as_ref().is_none_or(|c| c.deadline.is_none()) {
+        if ready && commands.as_ref().is_none_or(|c| c.deadline.is_none()) {
             let next = lock(shared).commands.pop_front();
             if let Some(action) = next {
                 let connection = match commands.as_mut() {
@@ -192,14 +193,17 @@ fn session(
         }
         let mut changed = false;
         for line in events.ready(descriptors[1].revents)? {
-            if !subscribed {
+            if !acknowledged {
                 model::reply(&line)?;
-                events.deadline = None;
-                subscribed = true;
-                lock(shared).online = true;
-                changed = true;
+                acknowledged = true;
             } else {
                 changed |= model.apply(&line)?;
+                if !ready && model.is_initialized() {
+                    events.deadline = None;
+                    ready = true;
+                    lock(shared).online = true;
+                    changed = true;
+                }
             }
         }
         if let Some(connection) = &mut commands {
@@ -214,9 +218,9 @@ fn session(
                 changed = true;
             }
         }
-        if changed {
+        if changed && ready {
             publish(Snapshot {
-                available: subscribed,
+                available: true,
                 error: error.clone(),
                 state: model.snapshot(),
             });
