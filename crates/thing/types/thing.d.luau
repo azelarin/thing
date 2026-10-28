@@ -40,6 +40,13 @@ export type ThingPathStrokeJoin = "miter" | "round" | "bevel"
 export type ThingPopupAnchor = "auto" | ThingEdge
 export type ThingPopupAlignment = "start" | "center" | "end"
 export type ThingEasing = "linear" | "in_cubic" | "out_cubic" | "in_out_cubic"
+export type ThingManagedProcessStatus =
+    "idle" | "starting" | "running" | "stopping" | "exited" | "failed"
+
+export type ThingManagedProcessOptions = {
+    key: string,
+    shutdown_signal: ("terminate" | "interrupt")?,
+}
 
 export type ThingTransitionOptions = {
     duration: number,
@@ -639,6 +646,20 @@ declare extern type ThingOutputService with
     read scale: ThingSignal<number>
 end
 
+declare extern type ThingManagedProcess with
+    read status: ThingSignal<ThingManagedProcessStatus>
+    read running: ThingSignal<boolean>
+    read stdout: ThingSignal<string>
+    read stderr: ThingSignal<string>
+    read stdout_truncated: ThingSignal<boolean>
+    read stderr_truncated: ThingSignal<boolean>
+    read exit_code: ThingSignal<number?>
+    read exit_signal: ThingSignal<number?>
+    read error: ThingSignal<string>
+    read start: (arguments: { string }, working_directory: string?) -> ()
+    read stop: () -> ()
+end
+
 declare extern type ThingServices with
     read audio: ThingAudioService
     read clipboard: ThingClipboardService
@@ -649,6 +670,10 @@ declare extern type ThingServices with
     read output: ThingOutputService
     read power: ThingPowerService
     read system_tray: ThingSystemTrayService
+    read process: (
+        ((key: string) -> ThingManagedProcess)
+        & ((options: ThingManagedProcessOptions) -> ThingManagedProcess)
+    )
     read launch: (arguments: { string }, working_directory: string?) -> ()
 end
 

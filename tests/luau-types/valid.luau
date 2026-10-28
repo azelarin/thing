@@ -96,6 +96,31 @@ local tray_menu_button = ui.button {
     children = { ui.text { text = "menu" } },
 }
 
+local query_process = services.process("query")
+local recorder_process = services.process {
+    key = "recorder",
+    shutdown_signal = "interrupt",
+}
+local process_button = ui.button {
+    on_click = function()
+        if query_process.running:get() then
+            query_process.stop()
+        else
+            query_process.start({ "query-command", "--compact" }, "/tmp")
+        end
+        recorder_process.stop()
+    end,
+    children = {
+        ui.text {
+            text = function()
+                local status: ThingManagedProcessStatus = query_process.status:get()
+                local code: number? = query_process.exit_code:get()
+                return `{status}:{code or "none"}:{query_process.stdout:get()}`
+            end,
+        },
+    },
+}
+
 return ui.panel {
     on_key = function(event)
         if event.key == "Escape" or (event.ctrl and event.text == "c") then
@@ -109,5 +134,5 @@ return ui.panel {
             { x = 420, width = 80 },
         },
     },
-    children = { input, clipboard_button, tray, tray_menu_button },
+    children = { input, clipboard_button, tray, tray_menu_button, process_button },
 }

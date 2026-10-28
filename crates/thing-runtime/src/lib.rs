@@ -12,10 +12,12 @@ mod state;
 mod transition;
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
 pub use services::{
-    Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, ClipboardSnapshot, MediaAction,
-    MediaPlayer, MediaSnapshot, Notification, NotificationButton, NotificationSnapshot,
-    NotificationUrgency, PowerDevice, PowerSnapshot, ServiceSnapshot, SystemTrayAction,
-    SystemTrayItem, SystemTrayMenu, SystemTrayMenuAction, SystemTrayMenuItem, SystemTraySnapshot,
+    Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, ClipboardSnapshot,
+    ManagedProcessAction, ManagedProcessDefinition, ManagedProcessShutdownSignal,
+    ManagedProcessSnapshot, ManagedProcessState, ManagedProcessStatus, MediaAction, MediaPlayer,
+    MediaSnapshot, Notification, NotificationButton, NotificationSnapshot, NotificationUrgency,
+    PowerDevice, PowerSnapshot, ServiceSnapshot, SystemTrayAction, SystemTrayItem, SystemTrayMenu,
+    SystemTrayMenuAction, SystemTrayMenuItem, SystemTraySnapshot,
 };
 
 use mlua::{Error, Function, Lua, Result, Table, Value, VmState};
@@ -309,6 +311,9 @@ impl Runtime {
         services.set_power_devices(snapshot.power_display, snapshot.power_devices)?;
         services.set_notification_records(snapshot.notifications)?;
         services.set_system_tray_items(snapshot.system_tray_items)?;
+        services.set_managed_processes(ManagedProcessSnapshot {
+            states: snapshot.managed_processes,
+        })?;
         services.set_niri(snapshot.niri)?;
         if let Some(output) = &output {
             services.set_output(output)?;
@@ -317,6 +322,7 @@ impl Runtime {
         lua.sandbox(true)?;
         let modules = modules::Modules::default();
         let exported = modules.load(&lua, path)?;
+        services.freeze_managed_process_declarations();
         let mut runtime = Self {
             lua,
             surfaces: Vec::new(),
@@ -406,6 +412,16 @@ impl Runtime {
     /// replaces status notifier watcher and item state. call [`Self::refresh`] afterward.
     pub fn set_system_tray(&mut self, system_tray: SystemTraySnapshot) -> Result<()> {
         self.services.set_system_tray(system_tray)
+    }
+
+    /// replaces managed process state in one update. call [`Self::refresh`] afterward.
+    pub fn set_managed_processes(&mut self, processes: ManagedProcessSnapshot) -> Result<()> {
+        self.services.set_managed_processes(processes)
+    }
+
+    /// the managed process keys declared while this configuration loaded.
+    pub fn managed_process_definitions(&self) -> Vec<ManagedProcessDefinition> {
+        self.services.managed_process_definitions()
     }
 
     /// replaces clipboard state in one update. call [`Self::refresh`] afterward.
@@ -1129,12 +1145,9 @@ impl Runtime {
 
     /// load a replacement without changing the current runtime.
     pub fn load_replacement(&self, path: impl AsRef<Path>) -> Result<Self> {
-        Self::load_with_services(
-            path.as_ref(),
-            self.limits,
-            self.services.snapshot(),
-            self.output.clone(),
-        )
+        let mut services = self.services.snapshot();
+        services.set_managed_processes(ManagedProcessSnapshot::default())?;
+        Self::load_with_services(path.as_ref(), self.limits, services, self.output.clone())
     }
 
     /// reload the configuration, preserving it if loading or validation fails.
@@ -2038,6 +2051,104 @@ mod ui_action_tests {
                 .to_string()
                 .contains("static boolean")
         );
+    }
+}
+
+#[cfg(test)]
+mod managed_process_tests {
+    use std::{fs, sync::Arc};
+
+    use super::*;
+
+    fn process(status: ManagedProcessStatus, stdout: &str) -> ManagedProcessState {
+        ManagedProcessState {
+            key: "query".into(),
+            status,
+            stdout: Arc::from(stdout),
+            stderr: Arc::from(""),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            exit_code: None,
+            exit_signal: None,
+            error: Arc::from(""),
+        }
+    }
+
+    #[test]
+    fn process_declarations_freeze_after_load_and_replacements_start_idle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("panel.luau");
+        fs::write(
+            &path,
+            r#"
+            local query = services.process('query')
+            return ui.panel { children = {
+                ui.text { text = function()
+                    return query.status:get() .. ':' .. query.stdout:get()
+                end },
+                ui.button { on_click = function()
+                    services.process('late')
+                end },
+            } }
+            "#,
+        )
+        .unwrap();
+        let mut services = ServiceSnapshot::default();
+        services
+            .set_managed_processes(ManagedProcessSnapshot {
+                states: vec![process(ManagedProcessStatus::Running, "ready")],
+            })
+            .unwrap();
+        let mut runtime = Runtime::load_for_output(
+            &path,
+            OutputContext {
+                name: Some("test".into()),
+                width: 100,
+                height: 40,
+                scale: Scale::default(),
+            },
+            &services,
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime.managed_process_definitions(),
+            vec![ManagedProcessDefinition {
+                key: "query".into(),
+                shutdown_signal: ManagedProcessShutdownSignal::Terminate,
+            }]
+        );
+        assert_eq!(runtime.root().unwrap().children[0].text, "running:ready");
+        let button = runtime.root().unwrap().children[1].id;
+        assert!(runtime.dispatch(button, Event::Click).is_err());
+
+        let replacement = runtime.load_replacement(&path).unwrap();
+        assert_eq!(replacement.root().unwrap().children[0].text, "idle:");
+    }
+
+    #[test]
+    fn process_snapshot_updates_reactive_properties_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("panel.luau");
+        fs::write(
+            &path,
+            r#"
+            local query = services.process('query')
+            return ui.panel { children = { ui.text { text = function()
+                return query.status:get() .. ':' .. query.stdout:get()
+            end } } }
+            "#,
+        )
+        .unwrap();
+        let mut runtime = Runtime::load(&path).unwrap();
+        runtime
+            .set_managed_processes(ManagedProcessSnapshot {
+                states: vec![process(ManagedProcessStatus::Exited, "complete")],
+            })
+            .unwrap();
+
+        assert!(runtime.refresh().unwrap());
+        assert_eq!(runtime.root().unwrap().children[0].text, "exited:complete");
     }
 }
 

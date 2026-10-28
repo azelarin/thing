@@ -176,8 +176,8 @@ impl Launcher {
         activation_token: Option<&str>,
     ) -> io::Result<u32> {
         if self.children.len() >= self.limit {
-            // SIGCHLD may have been inherited as ignored, in which case the
-            // kernel reaps children without making signalfd readable.
+            // An exited child may still be waiting for the next SIGCHLD
+            // dispatch, so reap once before rejecting at capacity.
             let _ = self.reap();
         }
         if self.children.len() >= self.limit {
@@ -220,6 +220,47 @@ pub(crate) fn prepare() -> calloop::Result<(Launcher, Signals)> {
             Err(error)
         }
     }
+}
+
+pub(crate) fn prepare_managed_sigchld() -> io::Result<()> {
+    reset_sigchld_disposition()?;
+    if sigchld_is_reapable()? {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "managed processes require the default SIGCHLD disposition",
+        ))
+    }
+}
+
+pub(crate) fn sigchld_is_reapable() -> io::Result<bool> {
+    let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    // SAFETY: a null replacement asks sigaction to copy the current
+    // disposition into the initialized output storage.
+    if unsafe { libc::sigaction(libc::SIGCHLD, ptr::null(), action.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: sigaction initialized action after returning success.
+    let action = unsafe { action.assume_init() };
+    Ok(action.sa_sigaction == libc::SIG_DFL && action.sa_flags & libc::SA_NOCLDWAIT == 0)
+}
+
+fn reset_sigchld_disposition() -> io::Result<()> {
+    // SAFETY: an all-zero sigaction is a valid starting value on Unix. The
+    // handler, mask, and flags are initialized before the syscall reads them.
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    action.sa_sigaction = libc::SIG_DFL;
+    action.sa_flags = 0;
+    // SAFETY: sigemptyset initializes the embedded signal mask.
+    if unsafe { libc::sigemptyset(&mut action.sa_mask) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: action is fully initialized and SIGCHLD is a valid signal.
+    if unsafe { libc::sigaction(libc::SIGCHLD, &action, ptr::null_mut()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn command(

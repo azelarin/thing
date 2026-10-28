@@ -10,6 +10,7 @@ mod host;
 mod hover;
 mod input_method;
 mod launch;
+mod managed_process;
 mod media;
 mod niri;
 mod notifications;

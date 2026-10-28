@@ -43,8 +43,9 @@ use thing_core::{
     SurfaceLayer,
 };
 use thing_runtime::{
-    Action, Event, KeyInput, OutputContext, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree,
-    SystemTrayAction, SystemTrayMenuAction, UiAction, UiTarget,
+    Action, Event, KeyInput, ManagedProcessAction, ManagedProcessDefinition, OutputContext, Scalar,
+    ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTrayAction, SystemTrayMenuAction, UiAction,
+    UiTarget,
 };
 use thing_ui::{
     Interaction, Layout, PaintFrame, ScrollState, Size, TextInputCheckpoint, TextInputEditor,
@@ -92,13 +93,14 @@ use crate::{
     Renderer, RunOptions, SystemTray,
     audio::Audio,
     clipboard::{Clipboard, OfferData as ClipboardOfferData, SourceData as ClipboardSourceData},
-    configuration::{Configurations, DispatchOutcome},
+    configuration::{Configurations, DispatchOutcome, RemovedConfiguration},
     hover::{Command as HoverCommand, HoverKey, HoverStates, HoverTarget},
     input_method::{
         ChangeCause as InputMethodChangeCause, CursorRectangle as InputMethodCursorRectangle,
         Done as InputMethodDone, InputMethod, TextState as InputMethodTextState,
     },
     launch::{self, LaunchRequest, Launcher, PendingLaunches},
+    managed_process::{Definition as ManagedProcessDefinitionInternal, Manager as ProcessManager},
     media::Media,
     niri::Niri,
     notifications::Server as NotificationServer,
@@ -227,6 +229,7 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         clipboard,
         input_method,
         launcher,
+        managed_processes: None,
         pending_launches: PendingLaunches::new(),
         pending_ui_actions: Vec::new(),
         surfaces: Vec::new(),
@@ -266,10 +269,20 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         .filter_map(|output| app.output_context(&output).map(|context| (output, context)))
         .collect();
     let layer_shell_version = app.layer_shell_version;
-    app.configurations
-        .reload_for_checked(outputs.clone(), |_, runtime| {
-            validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
-        })?;
+    let managed_processes = &mut app.managed_processes;
+    let loop_handle = app.loop_handle.clone();
+    app.configurations.reload_for_checked_with_processes(
+        outputs.clone(),
+        |_, runtime| validate_surface_capabilities(runtime.surfaces(), layer_shell_version),
+        |definitions| {
+            configure_managed_processes(
+                managed_processes,
+                &loop_handle,
+                definitions,
+                ManagedProcessScopeChange::Replace,
+            )
+        },
+    )?;
     for (output, _) in outputs {
         app.sync_output_surfaces(&output, false, &qh)?;
     }
@@ -375,6 +388,54 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ManagedProcessScopeChange {
+    Replace,
+    Reconcile,
+}
+
+fn configure_managed_processes(
+    manager: &mut Option<ProcessManager>,
+    loop_handle: &LoopHandle<'static, App>,
+    definitions: &[ManagedProcessDefinition],
+    change: ManagedProcessScopeChange,
+) -> Result<(), String> {
+    if manager.is_none() && definitions.is_empty() {
+        return Ok(());
+    }
+    let definitions = definitions
+        .iter()
+        .map(ManagedProcessDefinitionInternal::from)
+        .collect();
+    if let Some(manager) = manager {
+        apply_managed_process_scope(manager, definitions, change)?;
+        return Ok(());
+    }
+
+    let (ping, source) = calloop::ping::make_ping().map_err(|error| error.to_string())?;
+    let candidate = ProcessManager::start(ping)
+        .map_err(|error| format!("cannot start managed process service: {error}"))?;
+    apply_managed_process_scope(&candidate, definitions, change)?;
+    loop_handle
+        .insert_source(source, |_, _, app| app.update_managed_processes())
+        .map_err(|error| format!("cannot monitor managed process service: {error}"))?;
+    *manager = Some(candidate);
+    Ok(())
+}
+
+fn apply_managed_process_scope(
+    manager: &ProcessManager,
+    definitions: Vec<ManagedProcessDefinitionInternal>,
+    change: ManagedProcessScopeChange,
+) -> Result<(), String> {
+    match change {
+        ManagedProcessScopeChange::Replace => manager.replace_scope(definitions),
+        ManagedProcessScopeChange::Reconcile => manager.reconcile_scope(definitions),
+    }
+    .map(|_| ())
+    .map_err(|error| format!("cannot configure managed processes: {error}"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -876,6 +937,7 @@ pub(crate) struct App {
     clipboard: Option<Clipboard>,
     input_method: InputMethod,
     launcher: Launcher,
+    managed_processes: Option<ProcessManager>,
     pending_launches: PendingLaunches<XdgActivationTokenV1>,
     pending_ui_actions: Vec<PendingUiAction>,
     watch: Rc<Watch>,
@@ -1007,6 +1069,22 @@ impl App {
         }
         self.refresh();
     }
+    fn update_managed_processes(&mut self) {
+        let Some(snapshot) = self
+            .managed_processes
+            .as_ref()
+            .and_then(ProcessManager::take_snapshot)
+        else {
+            return;
+        };
+        if let Err(error) = self
+            .configurations
+            .set_managed_processes(snapshot.runtime())
+        {
+            eprintln!("thing: {error}");
+        }
+        self.refresh();
+    }
     fn update_clipboard(&mut self) {
         let Some(snapshot) = self.clipboard.as_mut().and_then(Clipboard::take_snapshot) else {
             return;
@@ -1048,12 +1126,20 @@ impl App {
             .collect();
         let layer_shell_version = self.layer_shell_version;
         let retired_consumers = self.configurations.consumers();
-        if let Err(error) = self
-            .configurations
-            .reload_for_checked(outputs, |_, runtime| {
-                validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
-            })
-        {
+        let managed_processes = &mut self.managed_processes;
+        let loop_handle = self.loop_handle.clone();
+        if let Err(error) = self.configurations.reload_for_checked_with_processes(
+            outputs,
+            |_, runtime| validate_surface_capabilities(runtime.surfaces(), layer_shell_version),
+            |definitions| {
+                configure_managed_processes(
+                    managed_processes,
+                    &loop_handle,
+                    definitions,
+                    ManagedProcessScopeChange::Replace,
+                )
+            },
+        ) {
             eprintln!("thing: reload failed; keeping the previous surfaces: {error}");
             return Ok(());
         }
@@ -1116,10 +1202,21 @@ impl App {
                 return Ok(());
             };
             let layer_shell_version = self.layer_shell_version;
-            self.configurations
-                .add_checked(output.clone(), context, |runtime| {
-                    validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
-                })?;
+            let managed_processes = &mut self.managed_processes;
+            let loop_handle = self.loop_handle.clone();
+            self.configurations.add_checked_with_processes(
+                output.clone(),
+                context,
+                |runtime| validate_surface_capabilities(runtime.surfaces(), layer_shell_version),
+                |definitions| {
+                    configure_managed_processes(
+                        managed_processes,
+                        &loop_handle,
+                        definitions,
+                        ManagedProcessScopeChange::Reconcile,
+                    )
+                },
+            )?;
         }
         self.sync_output_surfaces(&output, false, qh)?;
         self.update_watch();
@@ -2019,6 +2116,9 @@ impl App {
                     &id,
                     consumer.as_deref(),
                 ),
+                Action::ManagedProcess { key, action } => {
+                    send_managed_process_action(self.managed_processes.as_ref(), &key, action)
+                }
                 Action::Launch { argv, cwd } => {
                     self.request_launch(LaunchRequest { argv, cwd }, origin.as_ref());
                     Ok(())
@@ -4345,6 +4445,19 @@ fn release_system_tray_consumer(
     Ok(())
 }
 
+fn send_managed_process_action(
+    manager: Option<&ProcessManager>,
+    key: &str,
+    action: ManagedProcessAction,
+) -> Result<(), String> {
+    let manager = manager.ok_or_else(|| "managed process service is unavailable".to_owned())?;
+    match action {
+        ManagedProcessAction::Start { argv, cwd } => manager.start_process(key, argv, cwd),
+        ManagedProcessAction::Stop => manager.stop_process(key),
+    }
+    .map_err(|error| format!("managed process {key:?}: {error}"))
+}
+
 fn earliest_deadline(
     reload: Option<Instant>,
     hover: Option<Instant>,
@@ -4406,17 +4519,18 @@ mod output_tests {
     };
 
     use super::{
-        PanelState, configured_panel_size, earliest_deadline, fallback_logical_size,
-        find_automatic_popup, find_manual_popup, interactive_path, panel_size,
-        release_system_tray_consumer, send_system_tray_action, send_system_tray_menu_action,
+        App, ManagedProcessScopeChange, PanelState, configure_managed_processes,
+        configured_panel_size, earliest_deadline, fallback_logical_size, find_automatic_popup,
+        find_manual_popup, interactive_path, panel_size, release_system_tray_consumer,
+        send_managed_process_action, send_system_tray_action, send_system_tray_menu_action,
         valid_dimensions, validate_surface_capabilities,
     };
     use crate::{configuration::Configurations, panel};
     use tempfile::tempdir;
     use thing_core::{KeyboardMode, Kind, Node, NodeId, PanelEdge, PanelMargins, Scale};
     use thing_runtime::{
-        Event, OutputContext, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTrayAction,
-        SystemTrayMenuAction,
+        Event, ManagedProcessAction, OutputContext, ServiceSnapshot, SurfaceKey, SurfaceTree,
+        SystemTrayAction, SystemTrayMenuAction,
     };
 
     #[test]
@@ -4435,6 +4549,26 @@ mod output_tests {
             Err("system tray capability is disabled".into())
         );
         assert_eq!(release_system_tray_consumer(None, "configuration1"), Ok(()));
+    }
+
+    #[test]
+    fn empty_process_scope_does_not_start_the_optional_worker() {
+        let event_loop = calloop::EventLoop::<App>::try_new().unwrap();
+        let mut manager = None;
+
+        configure_managed_processes(
+            &mut manager,
+            &event_loop.handle(),
+            &[],
+            ManagedProcessScopeChange::Replace,
+        )
+        .unwrap();
+
+        assert!(manager.is_none());
+        assert_eq!(
+            send_managed_process_action(None, "query", ManagedProcessAction::Stop),
+            Err("managed process service is unavailable".into())
+        );
     }
 
     #[test]
@@ -4880,10 +5014,29 @@ impl OutputHandler for App {
         self.closed_surfaces.retain(|owner| owner.output != output);
         self.pending_ui_actions
             .retain(|pending| pending.output != output);
-        if let Some(consumer) = self.configurations.remove(&output)
-            && let Err(error) = release_system_tray_consumer(self.system_tray.as_ref(), &consumer)
+        let managed_processes = &mut self.managed_processes;
+        let loop_handle = self.loop_handle.clone();
+        if let Some(removed) = self
+            .configurations
+            .remove_with_processes(&output, |definitions| {
+                configure_managed_processes(
+                    managed_processes,
+                    &loop_handle,
+                    definitions,
+                    ManagedProcessScopeChange::Reconcile,
+                )
+            })
         {
-            eprintln!("thing: {error}");
+            let RemovedConfiguration {
+                consumer,
+                process_reconciliation,
+            } = removed;
+            if let Err(error) = release_system_tray_consumer(self.system_tray.as_ref(), &consumer) {
+                eprintln!("thing: {error}");
+            }
+            if let Err(error) = process_reconciliation {
+                self.error = Some(format!("cannot remove output configuration: {error}"));
+            }
         }
         self.update_watch();
         if self

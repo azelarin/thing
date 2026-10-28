@@ -603,6 +603,77 @@ expose its exit status or terminate it during a reload or normal shutdown. a
 service manager can still apply its own process and cgroup lifetime policy.
 launch failures are reported in the terminal running thing.
 
+## managed processes
+
+use `services.process` when a configuration needs the output and lifetime of a
+child it starts itself. declare each handle while the configuration loads, then
+start or stop it from an event handler:
+
+```luau
+local updates = services.process('updates')
+local recorder = services.process {
+    key = 'recorder',
+    shutdown_signal = 'interrupt',
+}
+
+return ui.button {
+    on_click = function()
+        if updates.running:get() then
+            updates.stop()
+        else
+            updates.start({ 'checkupdates' })
+        end
+    end,
+    children = { ui.text { text = function() return updates.stdout:get() end } },
+}
+```
+
+a key names one process across all output runtimes. repeated declarations must
+use the same `shutdown_signal`; conflicting declarations reject the candidate
+configuration. `terminate` is the default, while `interrupt` is useful for a
+program that treats `SIGINT` as a request to finish its current work.
+
+the handle exposes read-only `status`, `running`, `stdout`, `stderr`,
+`stdout_truncated`, `stderr_truncated`, `exit_code`, `exit_signal`, and `error`
+signals. status is `idle`, `starting`, `running`, `stopping`, `exited`, or
+`failed`. `running` remains true while a stop is in progress. starting again
+clears output and exit state from the previous run.
+
+`start(arguments, working_directory?)` uses the same argument and working
+directory limits as `services.launch`. arguments go directly to the program;
+there is no implicit shell. stdin is `/dev/null`, stdout and stderr are captured,
+and desktop activation variables are removed. use `services.launch` for ordinary
+applications that should receive compositor activation and outlive the panel
+configuration.
+
+each output tail retains at most 64 kib, on utf-8 boundaries, and reports when
+older text was discarded. updates are coalesced to at most 20 per second, with
+exit and end-of-file changes delivered immediately. one process-wide supervisor
+limits the shell to 32 declared keys, 32 unreaped child incarnations, 128 queued
+starts, and 4 mib of retained or reserved capture buffers across current and
+retiring runs. current bounded strings are also projected into each output
+runtime that declares the key; the 4 mib figure is not a total heap limit. a key
+cannot start again until its previous incarnation has been reaped.
+
+a failed reload leaves the current processes and widgets alone. a successful
+reload retires the previous generation and gives the replacement configuration
+idle handles. adding or removing an output keeps a process for as long as any
+output declares its key. stopping first sends the configured signal and, after
+five seconds, escalates to `SIGKILL`. thing also retires managed children during
+shutdown, using a shorter grace period so ordinary killable children do not
+survive the host.
+
+ownership covers the direct child and processes that remain in its initial
+process group. a descendant that deliberately creates or joins another group or
+session is outside that boundary. the first implementation needs a real procfs
+mounted at `/proc`, rooted at `/`, with mount identity available through
+`statx` and unrestricted process visibility (`hidepid=0` or `hidepid=off`). this
+is checked only when a configuration declares a managed process. if the check
+fails, initial configuration reports a service error; a reload keeps the working
+configuration. configurations that do not use `services.process` never start
+the worker or perform this check. `thing check` validates declarations but does
+not start children.
+
 ## niri workspaces and windows
 
 `services.niri` provides niri workspace and window state. other widgets and services

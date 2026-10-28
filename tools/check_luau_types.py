@@ -88,6 +88,15 @@ CASES = (
             "Expected this to be 'boolean', but got 'string'",
         ),
     ),
+    Case(
+        "invalid-managed-process.luau",
+        (
+            "Other overloads are also not viable",
+            "Expected this to be 'string', but got 'number'",
+            "Function 'query.stop' expects 0 arguments",
+            "Property 'text' is not compatible.",
+        ),
+    ),
 )
 
 
