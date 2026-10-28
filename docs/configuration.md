@@ -464,6 +464,7 @@ read them inside property functions to subscribe to updates.
 | `services.audio.source_muted` | default input mute state |
 | `services.audio.source_device` | default input's server name |
 | `services.audio.sources` | immutable array of selectable `{ name, description }` input records |
+| `services.audio.all_sources` | complete immutable array of `{ name, description, monitor }` input records |
 | `services.audio.error` | connection failure message, or an empty string |
 
 use actions in event handlers to change audio:
@@ -524,9 +525,11 @@ showing an enabled volume control; streams without writable volume remain in the
 list. ids change when a stream disappears or the server reconnects. the audio
 backend ignores ids absent from its latest confirmed snapshot.
 
-`sources` leaves out the monitor devices that audio servers create for recording
-an output. if a monitor is already the default input, it remains in the list so
-the current selection is still visible.
+`sources` is a microphone-picker convenience. it leaves out the monitor devices
+that audio servers create for recording an output, unless a monitor is already
+the default input. `all_sources` is the unfiltered list; its `monitor` field lets
+a configuration expose desktop-audio monitors or apply a different filter.
+`set_default_source` accepts names from either list.
 
 actions are forbidden during load and property evaluation. a failed event or
 reactive update discards actions queued by that event. local state changes are

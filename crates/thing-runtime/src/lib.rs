@@ -10,7 +10,7 @@ mod reconcile;
 mod services;
 mod state;
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
-pub use services::{Action, AudioDevice, AudioSnapshot, AudioStream, ServiceSnapshot};
+pub use services::{Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, ServiceSnapshot};
 
 use mlua::{Error, Function, Lua, Result, Table, Value, VmState};
 pub use state::Scalar;
@@ -166,6 +166,7 @@ impl Runtime {
         }
         services.set_devices(snapshot.devices)?;
         services.set_sources(snapshot.sources)?;
+        services.set_all_sources(snapshot.all_sources)?;
         services.set_streams(snapshot.streams)?;
         services.set_niri(snapshot.niri)?;
         if let Some(output) = &output {
@@ -228,6 +229,11 @@ impl Runtime {
     /// replaces the audio input list and marks its subscribers for update.
     pub fn set_audio_sources(&mut self, sources: Vec<AudioDevice>) -> Result<()> {
         self.services.set_sources(sources)
+    }
+
+    /// replaces the complete audio input list and marks its subscribers for update.
+    pub fn set_all_audio_sources(&mut self, sources: Vec<AudioSource>) -> Result<()> {
+        self.services.set_all_sources(sources)
     }
 
     /// replaces output and input audio state in one update. call [`Self::refresh`] afterward.

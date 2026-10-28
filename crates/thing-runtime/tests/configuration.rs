@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf, time::Duration};
 use tempfile::TempDir;
 use thing_core::{Color, Kind, TextAlign, TextOverflow};
 use thing_runtime::{
-    Action, AudioDevice, AudioSnapshot, AudioStream, Event, Limits, Runtime, Scalar,
+    Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, Event, Limits, Runtime, Scalar,
 };
 
 fn fixture(source: &str) -> (TempDir, PathBuf) {
@@ -917,4 +917,88 @@ fn playback_streams_are_reactive_preserved_and_controllable() {
         .unwrap();
     assert!(runtime.refresh().unwrap());
     assert_eq!(runtime.root().children[0].text, "none");
+}
+
+#[test]
+fn complete_audio_sources_are_reactive_bounded_and_read_only() {
+    let (_directory, path) = fixture(
+        r#"
+        local audio = services.audio
+        return ui.panel { children = {
+            ui.text { text = function()
+                local sources = audio.all_sources:get()
+                local values = { tostring(#sources) }
+                for _, source in sources do
+                    table.insert(values, `{source.name}:{source.monitor}`)
+                end
+                return table.concat(values, ':')
+            end },
+            ui.button { on_click = function()
+                audio.all_sources:get()[1].monitor = true
+            end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(&path).unwrap();
+    runtime
+        .set_audio(AudioSnapshot {
+            all_sources: vec![
+                AudioSource {
+                    name: "microphone".into(),
+                    description: "Microphone".into(),
+                    monitor: false,
+                },
+                AudioSource {
+                    name: "speakers.monitor".into(),
+                    description: "Monitor of Speakers".into(),
+                    monitor: true,
+                },
+            ],
+            ..AudioSnapshot::default()
+        })
+        .unwrap();
+    assert!(runtime.refresh().unwrap());
+    assert_eq!(
+        runtime.root().children[0].text,
+        "2:microphone:false:speakers.monitor:true"
+    );
+    assert!(
+        runtime
+            .dispatch(runtime.root().children[1].id, Event::Click)
+            .is_err()
+    );
+
+    runtime.reload(&path).unwrap();
+    assert_eq!(
+        runtime.root().children[0].text,
+        "2:microphone:false:speakers.monitor:true"
+    );
+    assert!(
+        runtime
+            .set_all_audio_sources(vec![
+                AudioSource {
+                    name: "duplicate".into(),
+                    description: String::new(),
+                    monitor: false,
+                },
+                AudioSource {
+                    name: "duplicate".into(),
+                    description: String::new(),
+                    monitor: true,
+                },
+            ])
+            .is_err()
+    );
+    let too_many = (0..513)
+        .map(|index| AudioSource {
+            name: format!("source-{index}"),
+            description: String::new(),
+            monitor: false,
+        })
+        .collect();
+    assert!(runtime.set_all_audio_sources(too_many).is_err());
+    assert_eq!(
+        runtime.root().children[0].text,
+        "2:microphone:false:speakers.monitor:true"
+    );
 }
