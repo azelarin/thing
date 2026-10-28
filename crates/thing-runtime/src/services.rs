@@ -31,6 +31,10 @@ pub enum Action {
         action: MediaAction,
         player: Option<String>,
     },
+    SystemTray {
+        action: SystemTrayAction,
+        item: String,
+    },
     DismissNotification {
         key: u64,
     },
@@ -51,6 +55,14 @@ pub enum MediaAction {
     Next,
     Previous,
     Stop,
+}
+
+/// an action requested from one status notifier item lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemTrayAction {
+    Activate,
+    SecondaryActivate,
+    ContextMenu,
 }
 
 const MAX_LAUNCH_ARGUMENTS: usize = 256;
@@ -118,6 +130,28 @@ pub struct MediaPlayer {
     pub can_next: bool,
     pub can_previous: bool,
     pub can_stop: bool,
+}
+
+/// one status notifier item ownership lifetime and its current properties.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemTrayItem {
+    pub id: String,
+    pub protocol_item_id: String,
+    pub category: String,
+    pub title: String,
+    pub status: String,
+    pub icon_name: String,
+    pub attention_icon_name: String,
+    pub overlay_icon_name: String,
+    pub tooltip_icon_name: String,
+    pub tooltip_title: String,
+    pub tooltip_text: String,
+    pub item_is_menu: bool,
+    pub has_menu: bool,
+    pub has_icon_pixmap: bool,
+    pub has_attention_icon_pixmap: bool,
+    pub has_overlay_icon_pixmap: bool,
+    pub has_tooltip_icon_pixmap: bool,
 }
 
 /// one UPower device identified by its object path.
@@ -362,6 +396,39 @@ impl MediaSnapshot {
     }
 }
 
+/// one confirmed generation of status notifier watcher and item state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SystemTraySnapshot {
+    pub available: bool,
+    pub watcher_owned: bool,
+    pub error: String,
+    pub items: Vec<SystemTrayItem>,
+}
+
+impl SystemTraySnapshot {
+    fn values(&self) -> [(&'static str, Scalar); 3] {
+        [
+            ("system_tray.available", Scalar::Boolean(self.available)),
+            (
+                "system_tray.watcher_owned",
+                Scalar::Boolean(self.watcher_owned),
+            ),
+            ("system_tray.error", Scalar::String(self.error.clone())),
+        ]
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (name, value) in self.values() {
+            validate_service(name, &value)?;
+        }
+        validate_system_tray_items(&self.items)?;
+        if !self.available && (!self.items.is_empty() || self.watcher_owned) {
+            return Err(Error::runtime("inconsistent system tray snapshot"));
+        }
+        Ok(())
+    }
+}
+
 /// one confirmed generation of UPower state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PowerSnapshot {
@@ -412,6 +479,7 @@ pub struct ServiceSnapshot {
     pub(crate) power_display: Option<PowerDevice>,
     pub(crate) power_devices: Vec<PowerDevice>,
     pub(crate) notifications: Vec<Notification>,
+    pub(crate) system_tray_items: Vec<SystemTrayItem>,
     pub(crate) niri: NiriState,
 }
 
@@ -480,6 +548,15 @@ impl ServiceSnapshot {
         Ok(())
     }
 
+    pub fn set_system_tray(&mut self, system_tray: SystemTraySnapshot) -> Result<()> {
+        system_tray.validate()?;
+        for (name, value) in system_tray.values() {
+            self.values.insert(name.into(), value);
+        }
+        self.system_tray_items = system_tray.items;
+        Ok(())
+    }
+
     pub fn set_niri(&mut self, state: NiriState) -> Result<()> {
         state.validate()?;
         self.niri = state;
@@ -497,6 +574,12 @@ struct MediaPlayerList {
     tracker: Rc<RefCell<Tracker>>,
     revision: usize,
     players: Rc<RefCell<Vec<MediaPlayer>>>,
+}
+
+struct SystemTrayItemList {
+    tracker: Rc<RefCell<Tracker>>,
+    revision: usize,
+    items: Rc<RefCell<Vec<SystemTrayItem>>>,
 }
 
 struct NotificationList {
@@ -574,6 +657,45 @@ impl UserData for MediaPlayerList {
                 item.set("can_next", player.can_next)?;
                 item.set("can_previous", player.can_previous)?;
                 item.set("can_stop", player.can_stop)?;
+                item.set_readonly(true);
+                list.raw_set(index + 1, item)?;
+            }
+            list.set_readonly(true);
+            Ok(list)
+        });
+    }
+}
+
+impl UserData for SystemTrayItemList {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |lua, this, ()| {
+            this.tracker.borrow_mut().read(this.revision);
+            let list = lua.create_table()?;
+            for (index, tray_item) in this.items.borrow().iter().enumerate() {
+                let item = lua.create_table()?;
+                item.set("id", tray_item.id.as_str())?;
+                item.set("protocol_item_id", tray_item.protocol_item_id.as_str())?;
+                item.set("category", tray_item.category.as_str())?;
+                item.set("title", tray_item.title.as_str())?;
+                item.set("status", tray_item.status.as_str())?;
+                item.set("icon_name", tray_item.icon_name.as_str())?;
+                item.set(
+                    "attention_icon_name",
+                    tray_item.attention_icon_name.as_str(),
+                )?;
+                item.set("overlay_icon_name", tray_item.overlay_icon_name.as_str())?;
+                item.set("tooltip_icon_name", tray_item.tooltip_icon_name.as_str())?;
+                item.set("tooltip_title", tray_item.tooltip_title.as_str())?;
+                item.set("tooltip_text", tray_item.tooltip_text.as_str())?;
+                item.set("item_is_menu", tray_item.item_is_menu)?;
+                item.set("has_menu", tray_item.has_menu)?;
+                item.set("has_icon_pixmap", tray_item.has_icon_pixmap)?;
+                item.set(
+                    "has_attention_icon_pixmap",
+                    tray_item.has_attention_icon_pixmap,
+                )?;
+                item.set("has_overlay_icon_pixmap", tray_item.has_overlay_icon_pixmap)?;
+                item.set("has_tooltip_icon_pixmap", tray_item.has_tooltip_icon_pixmap)?;
                 item.set_readonly(true);
                 list.raw_set(index + 1, item)?;
             }
@@ -744,6 +866,8 @@ pub(crate) struct Services {
     power_devices_revision: usize,
     notifications: Rc<RefCell<Vec<Notification>>>,
     notifications_revision: usize,
+    system_tray_items: Rc<RefCell<Vec<SystemTrayItem>>>,
+    system_tray_items_revision: usize,
     niri: NiriData,
 }
 
@@ -757,6 +881,7 @@ impl Services {
         let power_display_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let power_devices_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let notifications_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
+        let system_tray_items_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let niri = lua.create_table()?;
         let niri_data = NiriData::install(&niri, tracker.clone())?;
         let mut result = Self {
@@ -780,6 +905,8 @@ impl Services {
             power_devices_revision,
             notifications: Rc::default(),
             notifications_revision,
+            system_tray_items: Rc::default(),
+            system_tray_items_revision,
             niri: niri_data,
         };
         let services = lua.create_table()?;
@@ -789,6 +916,7 @@ impl Services {
         let notifications = lua.create_table()?;
         let output = lua.create_table()?;
         let power = lua.create_table()?;
+        let system_tray = lua.create_table()?;
         audio.set(
             "devices",
             DeviceList {
@@ -853,6 +981,14 @@ impl Services {
                 notifications: result.notifications.clone(),
             },
         )?;
+        system_tray.set(
+            "items",
+            SystemTrayItemList {
+                tracker: result.tracker.clone(),
+                revision: system_tray_items_revision,
+                items: result.system_tray_items.clone(),
+            },
+        )?;
         for (name, value) in [
             ("audio.available", Scalar::Boolean(false)),
             ("audio.volume", Scalar::Number(0.0)),
@@ -883,6 +1019,9 @@ impl Services {
             ("power.error", Scalar::String(String::new())),
             ("notifications.owned", Scalar::Boolean(false)),
             ("notifications.error", Scalar::String(String::new())),
+            ("system_tray.available", Scalar::Boolean(false)),
+            ("system_tray.watcher_owned", Scalar::Boolean(false)),
+            ("system_tray.error", Scalar::String(String::new())),
             ("niri.available", Scalar::Boolean(false)),
             ("niri.error", Scalar::String(String::new())),
             ("output.available", Scalar::Boolean(false)),
@@ -909,6 +1048,7 @@ impl Services {
                 "niri" => niri.set(property, signal)?,
                 "output" => output.set(property, signal)?,
                 "power" => power.set(property, signal)?,
+                "system_tray" => system_tray.set(property, signal)?,
                 _ => return Err(Error::runtime("invalid service name")),
             }
         }
@@ -1024,6 +1164,22 @@ impl Services {
             )?;
         }
         media.set_readonly(true);
+        for (name, action) in [
+            ("activate", SystemTrayAction::Activate),
+            ("secondary_activate", SystemTrayAction::SecondaryActivate),
+            ("context_menu", SystemTrayAction::ContextMenu),
+        ] {
+            let actions = result.actions.clone();
+            let allowed = result.allowed.clone();
+            system_tray.set(
+                name,
+                lua.create_function(move |_, item: Value| {
+                    let item = system_tray_item_id(item)?;
+                    enqueue(&actions, &allowed, Action::SystemTray { action, item })
+                })?,
+            )?;
+        }
+        system_tray.set_readonly(true);
         power.set_readonly(true);
         let actions = result.actions.clone();
         let allowed = result.allowed.clone();
@@ -1086,6 +1242,7 @@ impl Services {
         services.set("niri", niri)?;
         services.set("output", output)?;
         services.set("power", power)?;
+        services.set("system_tray", system_tray)?;
         services.set_readonly(true);
         lua.globals().set("services", services)?;
         Ok(result)
@@ -1327,6 +1484,30 @@ impl Services {
         Ok(())
     }
 
+    pub fn set_system_tray(&self, system_tray: SystemTraySnapshot) -> Result<()> {
+        system_tray.validate()?;
+        let items_changed = *self.system_tray_items.borrow() != system_tray.items;
+        let mut items = self.system_tray_items.borrow_mut();
+        let mut tracker = self.tracker.borrow_mut();
+        let mut updates = system_tray
+            .values()
+            .into_iter()
+            .map(|(name, value)| (self.signals[name], value))
+            .collect::<Vec<_>>();
+        if items_changed {
+            let revision = tracker.read(self.system_tray_items_revision);
+            updates.push((
+                self.system_tray_items_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            ));
+        }
+        tracker.write_batch(updates)?;
+        if items_changed {
+            *items = system_tray.items;
+        }
+        Ok(())
+    }
+
     pub fn set_power_devices(
         &self,
         display: Option<PowerDevice>,
@@ -1378,6 +1559,20 @@ impl Services {
         Ok(())
     }
 
+    pub fn set_system_tray_items(&self, items: Vec<SystemTrayItem>) -> Result<()> {
+        validate_system_tray_items(&items)?;
+        if *self.system_tray_items.borrow() != items {
+            *self.system_tray_items.borrow_mut() = items;
+            let mut tracker = self.tracker.borrow_mut();
+            let revision = tracker.read(self.system_tray_items_revision);
+            tracker.write(
+                self.system_tray_items_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> ServiceSnapshot {
         let mut tracker = self.tracker.borrow_mut();
         let values = self
@@ -1396,6 +1591,7 @@ impl Services {
             power_display: self.power_display.borrow().clone(),
             power_devices: self.power_devices.borrow().clone(),
             notifications: self.notifications.borrow().clone(),
+            system_tray_items: self.system_tray_items.borrow().clone(),
             niri: self.niri.snapshot(),
         }
     }
@@ -1521,6 +1717,21 @@ fn media_player_id(value: Value) -> Result<Option<String>> {
     Ok(Some(value.to_owned()))
 }
 
+fn system_tray_item_id(value: Value) -> Result<String> {
+    let Value::String(value) = value else {
+        return Err(Error::runtime("system tray item id must be a string"));
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| Error::runtime("system tray item id must be valid utf-8"))?;
+    if value.is_empty() || value.len() > 128 || value.contains('\0') {
+        return Err(Error::runtime(
+            "system tray item id must be nonempty, contain no NUL, and not exceed 128 bytes",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
 fn notification_key(value: Value) -> Result<u64> {
     let Value::String(value) = value else {
         return Err(Error::runtime("notification key must be a string"));
@@ -1561,6 +1772,8 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "power.available"
             | "power.on_battery"
             | "notifications.owned"
+            | "system_tray.available"
+            | "system_tray.watcher_owned"
             | "niri.available",
             Scalar::Boolean(_),
         ) => true,
@@ -1581,6 +1794,7 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "media.error"
             | "power.error"
             | "notifications.error"
+            | "system_tray.error"
             | "niri.error",
             Scalar::String(value),
         ) => value.len() <= 4096 && !value.contains('\0'),
@@ -1691,6 +1905,32 @@ fn validate_media_players(players: &[MediaPlayer]) -> Result<()> {
     }
 }
 
+fn validate_system_tray_items(items: &[SystemTrayItem]) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    let invalid = items.len() > 128
+        || items.iter().any(|item| {
+            item.id.is_empty()
+                || item.id.len() > 128
+                || item.id.contains('\0')
+                || !ids.insert(item.id.as_str())
+                || invalid_system_tray_text(&item.protocol_item_id, 4096)
+                || invalid_system_tray_text(&item.category, 4096)
+                || invalid_system_tray_text(&item.title, 4096)
+                || invalid_system_tray_text(&item.status, 4096)
+                || invalid_system_tray_text(&item.icon_name, 4096)
+                || invalid_system_tray_text(&item.attention_icon_name, 4096)
+                || invalid_system_tray_text(&item.overlay_icon_name, 4096)
+                || invalid_system_tray_text(&item.tooltip_icon_name, 4096)
+                || invalid_system_tray_text(&item.tooltip_title, 4096)
+                || invalid_system_tray_text(&item.tooltip_text, 16 * 1024)
+        });
+    if invalid {
+        Err(Error::runtime("invalid system tray item list"))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_power_devices(devices: &[PowerDevice]) -> Result<()> {
     let mut ids = BTreeSet::new();
     let invalid = devices.len() > 128
@@ -1759,6 +1999,10 @@ fn valid_power_text(value: &str, max: usize) -> bool {
 }
 
 fn invalid_media_text(value: &str, max: usize) -> bool {
+    value.len() > max || value.contains('\0')
+}
+
+fn invalid_system_tray_text(value: &str, max: usize) -> bool {
     value.len() > max || value.contains('\0')
 }
 

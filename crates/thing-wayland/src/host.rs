@@ -1448,6 +1448,7 @@ impl App {
                     .media
                     .send(action, player.as_deref())
                     .map_err(str::to_owned),
+                Action::SystemTray { .. } => Err("system tray capability is disabled".into()),
                 Action::Launch { argv, cwd } => {
                     self.request_launch(LaunchRequest { argv, cwd }, origin.as_ref());
                     Ok(())

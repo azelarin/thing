@@ -14,7 +14,8 @@ pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
 pub use services::{
     Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, MediaAction, MediaPlayer,
     MediaSnapshot, Notification, NotificationButton, NotificationSnapshot, NotificationUrgency,
-    PowerDevice, PowerSnapshot, ServiceSnapshot,
+    PowerDevice, PowerSnapshot, ServiceSnapshot, SystemTrayAction, SystemTrayItem,
+    SystemTraySnapshot,
 };
 
 use mlua::{Error, Function, Lua, Result, Table, Value, VmState};
@@ -192,6 +193,7 @@ impl Runtime {
         services.set_media_players(snapshot.media_players)?;
         services.set_power_devices(snapshot.power_display, snapshot.power_devices)?;
         services.set_notification_records(snapshot.notifications)?;
+        services.set_system_tray_items(snapshot.system_tray_items)?;
         services.set_niri(snapshot.niri)?;
         if let Some(output) = &output {
             services.set_output(output)?;
@@ -281,6 +283,11 @@ impl Runtime {
     /// replaces notification-server state in one update. call [`Self::refresh`] afterward.
     pub fn set_notifications(&mut self, notifications: NotificationSnapshot) -> Result<()> {
         self.services.set_notifications(notifications)
+    }
+
+    /// replaces status notifier watcher and item state. call [`Self::refresh`] afterward.
+    pub fn set_system_tray(&mut self, system_tray: SystemTraySnapshot) -> Result<()> {
+        self.services.set_system_tray(system_tray)
     }
 
     /// replaces workspace and window lists. call [`Self::refresh`] to update widgets.
