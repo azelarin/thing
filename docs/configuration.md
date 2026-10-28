@@ -336,16 +336,35 @@ and `StartupWMClass`, case-insensitively, then the app id itself. missing icons
 fall back to `application-x-executable`. application discovery honors xdg data
 directories; icon resolution honors theme inheritance through freedesktop-icons.
 
-file paths currently resolve against the process working directory; absolute
-paths avoid ambiguity. png, jpeg, webp, and path-based svg artwork are supported.
+use `ui.asset` for artwork stored beside a configuration or reusable module:
+
+```luau
+ui.image {
+    source = ui.asset('./corner.svg'),
+    style = { width = 14, height = 14 },
+}
+```
+
+`ui.asset` accepts a `./` or `../` path and returns an absolute path resolved
+against the module where the helper came from. a helper saved in a local variable
+keeps that module location when a property function calls it later. the asset does
+not need to exist while the configuration loads; a missing or invalid image still
+reports an error and leaves an empty image box. source strings not passed through
+`ui.asset` keep their existing meaning, including resolving relative paths against
+the process working directory.
+
+png, jpeg, webp, and path-based svg artwork are supported.
 svg text, embedded images, external references, animation, and svgz are not
 supported. images fit inside their content box without changing aspect ratio;
 the default box is 32×32 logical pixels. svgs rasterize at the output scale.
 
 files are limited to 16 mib, raster input dimensions to 8192 per axis, and
 rendered images to 4096 per axis. the decoder allocation limit is 64 mib; the
-texture cache holds up to 128 entries and 64 mib of pixel data. failed loads report an error and leave an empty image
-box. reload clears the cache; changes to image files alone do not trigger reload.
+texture cache holds up to 128 entries and 64 mib of pixel data. asset paths are
+limited to 4096 bytes and each output configuration may reference 10,000 distinct
+asset files. thing watches files registered by `ui.asset`; creating or changing one
+reloads the configuration and clears the image cache. other source paths are not
+watched.
 
 ## state and property functions
 

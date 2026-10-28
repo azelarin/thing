@@ -49,6 +49,9 @@ impl Watch {
 
     pub fn set_files(&self, files: &[PathBuf]) -> io::Result<()> {
         let files: BTreeSet<_> = files.iter().cloned().collect();
+        if *self.files.borrow() == files {
+            return Ok(());
+        }
         self.reconcile(&files)?;
         *self.files.borrow_mut() = files;
         Ok(())
@@ -290,6 +293,38 @@ mod tests {
         assert!(!watch.changed().unwrap());
         std::fs::write(directory.path().join("unrelated.luau"), "return {}").unwrap();
         assert!(!watch.changed().unwrap());
+    }
+
+    #[test]
+    fn observes_asset_replacements_and_missing_asset_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let panel = directory.path().join("panel.luau");
+        let present = directory.path().join("present.svg");
+        let missing = directory.path().join("missing.svg");
+        std::fs::write(&present, "before").unwrap();
+        std::fs::write(
+            &panel,
+            r#"
+            return ui.panel { children = {
+                ui.image { source = ui.asset('./present.svg') },
+                ui.image { source = ui.asset('./missing.svg') },
+            } }
+            "#,
+        )
+        .unwrap();
+        let runtime = thing_runtime::Runtime::load(&panel).unwrap();
+        let watch = Watch::new().unwrap();
+        watch.set_files(&runtime.files()).unwrap();
+        assert!(!watch.changed().unwrap());
+
+        let replacement = directory.path().join("replacement.svg");
+        std::fs::write(&replacement, "after").unwrap();
+        std::fs::rename(replacement, &present).unwrap();
+        assert!(watch.changed().unwrap());
+        assert!(!watch.changed().unwrap());
+
+        std::fs::write(&missing, "created").unwrap();
+        assert!(watch.changed().unwrap());
     }
 
     #[test]

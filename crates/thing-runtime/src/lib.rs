@@ -231,7 +231,7 @@ impl Runtime {
         self.surfaces.iter().find(|surface| &surface.key == key)
     }
 
-    /// files loaded by the configuration, including its entry file.
+    /// dependency files referenced by the configuration, including its entry file.
     pub fn files(&self) -> Vec<PathBuf> {
         self.modules.files()
     }
