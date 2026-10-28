@@ -1,8 +1,8 @@
 use mlua::{Error, Result, Table, Value};
 use thing_core::{
-    CrossAlign, KeyboardMode, Kind, MainAlign, Node, PanelEdge, PanelInputRect, PanelInputRegion,
-    PanelMargins, PopupAlignment, PopupAnchor, PopupConstraints, PopupOffset, SurfaceAnchors,
-    SurfaceLayer, TextAlign, TextOverflow,
+    CrossAlign, ImageFit, KeyboardMode, Kind, MainAlign, Node, PanelEdge, PanelInputRect,
+    PanelInputRegion, PanelMargins, PopupAlignment, PopupAnchor, PopupConstraints, PopupOffset,
+    SurfaceAnchors, SurfaceLayer, TextAlign, TextOverflow,
 };
 
 pub(crate) fn string(value: Value, name: &str) -> Result<String> {
@@ -273,6 +273,17 @@ fn text_overflow(value: Value, name: &str) -> Result<TextOverflow> {
     }
 }
 
+fn image_fit(value: Value, name: &str) -> Result<ImageFit> {
+    match string(value, name)?.as_str() {
+        "contain" => Ok(ImageFit::Contain),
+        "cover" => Ok(ImageFit::Cover),
+        "fill" => Ok(ImageFit::Fill),
+        _ => Err(Error::runtime(format!(
+            "{name} must be 'contain', 'cover', or 'fill'"
+        ))),
+    }
+}
+
 fn cross_align(value: Value, name: &str) -> Result<CrossAlign> {
     match string(value, name)?.as_str() {
         "start" => Ok(CrossAlign::Start),
@@ -386,6 +397,7 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "icon" if node.kind == Kind::Image => node.image.icon = optional_string(value, name)?,
         "app_id" if node.kind == Kind::Image => node.image.app_id = optional_string(value, name)?,
         "icon_theme" if node.kind == Kind::Image => node.image.theme = string(value, name)?,
+        "fit" if node.kind == Kind::Image => node.image_fit = image_fit(value, name)?,
         "visible" => node.visible = boolean(value, name)?,
         "enabled" => node.enabled = boolean(value, name)?,
         "value" if node.kind == Kind::Slider => node.slider.value = number(value, name)?,

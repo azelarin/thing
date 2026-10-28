@@ -5,7 +5,7 @@ use femtovg::{
     renderer::{OpenGl, Renderer},
 };
 use parley::PositionedLayoutItem;
-use thing_core::{Kind, Node, NodeId, Rect};
+use thing_core::{ImageFit, Kind, Node, NodeId, Rect};
 
 use crate::{Layout, ScrollState, Size, TextSystem};
 
@@ -241,27 +241,88 @@ impl<R: Renderer> Painter<R> {
     }
 
     fn draw_image(&mut self, node: &Node, bounds: Rect, scale: f32) {
-        let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
-        let padding_y = node.style.padding_y.unwrap_or(node.style.padding);
-        let area = Rect {
-            x: bounds.x + padding_x,
-            y: bounds.y + padding_y,
-            width: (bounds.width - 2.0 * padding_x).max(0.0),
-            height: (bounds.height - 2.0 * padding_y).max(0.0),
-        };
-        let Some((id, width, height)) = self.images.get(&node.image, area, scale) else {
+        let area = image_area(node, bounds);
+        let Some((id, width, height)) = self.images.get(&node.image, node.image_fit, area, scale)
+        else {
             return;
         };
-        let factor = (area.width / width as f32).min(area.height / height as f32);
-        let width = width as f32 * factor;
-        let height = height as f32 * factor;
-        let x = area.x + (area.width - width) / 2.0;
-        let y = area.y + (area.height - height) / 2.0;
+        let geometry = image_geometry(area, width, height, node.image_fit);
         let mut path = Path::new();
-        path.rect(x, y, width, height);
-        self.canvas
-            .fill_path(&path, &Paint::image(id, x, y, width, height, 0.0, 1.0));
+        let radius = image_radius(node.style.radius, geometry.clip);
+        if radius > 0.0 {
+            path.rounded_rect(
+                geometry.clip.x,
+                geometry.clip.y,
+                geometry.clip.width,
+                geometry.clip.height,
+                radius,
+            );
+        } else {
+            path.rect(
+                geometry.clip.x,
+                geometry.clip.y,
+                geometry.clip.width,
+                geometry.clip.height,
+            );
+        }
+        self.canvas.fill_path(
+            &path,
+            &Paint::image(
+                id,
+                geometry.paint.x,
+                geometry.paint.y,
+                geometry.paint.width,
+                geometry.paint.height,
+                0.0,
+                1.0,
+            ),
+        );
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ImageGeometry {
+    paint: Rect,
+    clip: Rect,
+}
+
+fn image_area(node: &Node, bounds: Rect) -> Rect {
+    let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
+    let padding_y = node.style.padding_y.unwrap_or(node.style.padding);
+    Rect {
+        x: bounds.x + padding_x,
+        y: bounds.y + padding_y,
+        width: (bounds.width - 2.0 * padding_x).max(0.0),
+        height: (bounds.height - 2.0 * padding_y).max(0.0),
+    }
+}
+
+fn image_geometry(area: Rect, width: u32, height: u32, fit: ImageFit) -> ImageGeometry {
+    match fit {
+        ImageFit::Contain => {}
+        ImageFit::Cover | ImageFit::Fill => {
+            return ImageGeometry {
+                paint: area,
+                clip: area,
+            };
+        }
+    }
+    let width = width as f32;
+    let height = height as f32;
+    let factor = (area.width / width).min(area.height / height);
+    let width = width * factor;
+    let height = height * factor;
+    let paint = Rect {
+        x: area.x + (area.width - width) / 2.0,
+        y: area.y + (area.height - height) / 2.0,
+        width,
+        height,
+    };
+    ImageGeometry { paint, clip: paint }
+}
+
+fn image_radius(radius: f32, clip: Rect) -> f32 {
+    radius.min(clip.width / 2.0).min(clip.height / 2.0)
 }
 
 impl Painter<OpenGl> {
@@ -402,5 +463,96 @@ mod tests {
 
         assert!(submitted.get());
         assert_eq!(result.unwrap_err(), "paint failed");
+    }
+
+    #[test]
+    fn image_area_applies_axis_padding_without_rounding() {
+        let mut image = Node::new(NodeId(1), Kind::Image);
+        image.style.padding = 5.0;
+        image.style.padding_x = Some(10.0);
+        let bounds = Rect {
+            x: 2.5,
+            y: 4.0,
+            width: 100.0,
+            height: 50.0,
+        };
+
+        assert_eq!(
+            image_area(&image, bounds),
+            Rect {
+                x: 12.5,
+                y: 9.0,
+                width: 80.0,
+                height: 40.0,
+            }
+        );
+    }
+
+    #[test]
+    fn contain_centers_landscape_and_portrait_images() {
+        let area = Rect {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        let landscape = image_geometry(area, 200, 100, ImageFit::Contain);
+        assert_eq!(
+            landscape,
+            ImageGeometry {
+                paint: Rect {
+                    x: 10.0,
+                    y: 45.0,
+                    width: 100.0,
+                    height: 50.0,
+                },
+                clip: Rect {
+                    x: 10.0,
+                    y: 45.0,
+                    width: 100.0,
+                    height: 50.0,
+                },
+            }
+        );
+        let portrait = image_geometry(area, 100, 200, ImageFit::Contain);
+        assert_eq!(
+            portrait.paint,
+            Rect {
+                x: 35.0,
+                y: 20.0,
+                width: 50.0,
+                height: 100.0,
+            }
+        );
+    }
+
+    #[test]
+    fn cover_and_fill_use_the_fit_aware_texture_without_a_second_crop() {
+        let area = Rect {
+            x: 1.25,
+            y: 2.5,
+            width: 100.5,
+            height: 40.25,
+        };
+        for fit in [ImageFit::Cover, ImageFit::Fill] {
+            assert_eq!(
+                image_geometry(area, 1000, 100, fit),
+                ImageGeometry {
+                    paint: area,
+                    clip: area,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn image_radius_is_clamped_to_the_visible_path() {
+        let clip = Rect {
+            width: 100.0,
+            height: 20.0,
+            ..Rect::default()
+        };
+        assert_eq!(image_radius(6.0, clip), 6.0);
+        assert_eq!(image_radius(30.0, clip), 10.0);
     }
 }

@@ -10,7 +10,7 @@ use std::{
 };
 
 use femtovg::{Canvas, ImageFlags, ImageId, ImageSource, renderer::Renderer, rgb::FromSlice};
-use thing_core::{Image, Rect};
+use thing_core::{Image, ImageFit, Rect};
 
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_INPUT: u64 = 16 * 1024 * 1024;
@@ -18,6 +18,7 @@ const MAX_INPUT: u64 = 16 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Key {
     image: Image,
+    fit: ImageFit,
     width: u32,
     height: u32,
 }
@@ -165,17 +166,25 @@ impl Images {
         }
     }
 
-    pub fn get(&mut self, image: &Image, bounds: Rect, scale: f32) -> Option<(ImageId, u32, u32)> {
+    pub fn get(
+        &mut self,
+        image: &Image,
+        fit: ImageFit,
+        bounds: Rect,
+        scale: f32,
+    ) -> Option<(ImageId, u32, u32)> {
         if image.source.is_none() && image.icon.is_none() && image.app_id.is_none() {
             return None;
         }
         if bounds.width <= 0.0 || bounds.height <= 0.0 {
             return None;
         }
+        let (width, height) = request_dimensions(bounds, scale);
         let key = Key {
             image: image.clone(),
-            width: (bounds.width * scale).ceil().clamp(1.0, 4096.0) as u32,
-            height: (bounds.height * scale).ceil().clamp(1.0, 4096.0) as u32,
+            fit,
+            width,
+            height,
         };
         self.tick = self.tick.saturating_add(1);
         if let Some(entry) = self.cache.get_mut(&key) {
@@ -242,6 +251,13 @@ impl Images {
     }
 }
 
+fn request_dimensions(bounds: Rect, scale: f32) -> (u32, u32) {
+    (
+        (bounds.width * scale).ceil().clamp(1.0, 4096.0) as u32,
+        (bounds.height * scale).ceil().clamp(1.0, 4096.0) as u32,
+    )
+}
+
 impl Drop for Images {
     fn drop(&mut self) {
         let mut inbox = lock(&self.shared.inbox);
@@ -276,10 +292,17 @@ fn decode(key: &Key, icons: &mut icons::Icons) -> Result<Pixels, String> {
             .is_some_and(|e| e.eq_ignore_ascii_case("svg")),
         key.width,
         key.height,
+        key.fit,
     )
 }
 
-fn decode_bytes(bytes: &[u8], svg: bool, width: u32, height: u32) -> Result<Pixels, String> {
+fn decode_bytes(
+    bytes: &[u8],
+    svg: bool,
+    width: u32,
+    height: u32,
+    fit: ImageFit,
+) -> Result<Pixels, String> {
     if svg {
         let options = resvg::usvg::Options {
             image_href_resolver: resvg::usvg::ImageHrefResolver {
@@ -289,20 +312,36 @@ fn decode_bytes(bytes: &[u8], svg: bool, width: u32, height: u32) -> Result<Pixe
             ..Default::default()
         };
         let tree = resvg::usvg::Tree::from_data(bytes, &options).map_err(|e| e.to_string())?;
-        let factor = (width as f32 / tree.size().width()).min(height as f32 / tree.size().height());
-        let width = (tree.size().width() * factor)
-            .round()
-            .clamp(1.0, width as f32) as u32;
-        let height = (tree.size().height() * factor)
-            .round()
-            .clamp(1.0, height as f32) as u32;
+        let source_width = tree.size().width();
+        let source_height = tree.size().height();
+        let (width, height, transform) = match fit {
+            ImageFit::Contain => {
+                let factor = (width as f32 / source_width).min(height as f32 / source_height);
+                let width = (source_width * factor).round().clamp(1.0, width as f32) as u32;
+                let height = (source_height * factor).round().clamp(1.0, height as f32) as u32;
+                (
+                    width,
+                    height,
+                    resvg::tiny_skia::Transform::from_scale(factor, factor),
+                )
+            }
+            ImageFit::Cover => (
+                width,
+                height,
+                svg_cover_transform(source_width, source_height, width, height),
+            ),
+            ImageFit::Fill => (
+                width,
+                height,
+                resvg::tiny_skia::Transform::from_scale(
+                    width as f32 / source_width,
+                    height as f32 / source_height,
+                ),
+            ),
+        };
         let mut pixmap =
             resvg::tiny_skia::Pixmap::new(width, height).ok_or("invalid SVG dimensions")?;
-        resvg::render(
-            &tree,
-            resvg::tiny_skia::Transform::from_scale(factor, factor),
-            &mut pixmap.as_mut(),
-        );
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
         Ok(Pixels {
             width,
             height,
@@ -319,13 +358,73 @@ fn decode_bytes(bytes: &[u8], svg: bool, width: u32, height: u32) -> Result<Pixe
         limits.max_alloc = Some(CACHE_BYTES as u64);
         reader.limits(limits);
         let decoded = reader.decode().map_err(|e| e.to_string())?;
-        let image = decoded.thumbnail(width, height).into_rgba8();
+        let image = match fit {
+            ImageFit::Contain => decoded.thumbnail(width, height).into_rgba8(),
+            ImageFit::Cover => {
+                let (x, y, crop_width, crop_height) =
+                    cover_crop(decoded.width(), decoded.height(), width, height);
+                decoded
+                    .crop_imm(x, y, crop_width, crop_height)
+                    .resize_exact(width, height, image::imageops::FilterType::Triangle)
+                    .into_rgba8()
+            }
+            ImageFit::Fill => decoded
+                .resize_exact(width, height, image::imageops::FilterType::Triangle)
+                .into_rgba8(),
+        };
         Ok(Pixels {
             width: image.width(),
             height: image.height(),
             rgba: image.into_raw(),
             premultiplied: false,
         })
+    }
+}
+
+fn svg_cover_transform(
+    source_width: f32,
+    source_height: f32,
+    target_width: u32,
+    target_height: u32,
+) -> resvg::tiny_skia::Transform {
+    let factor = (target_width as f32 / source_width).max(target_height as f32 / source_height);
+    let x = (target_width as f32 - source_width * factor) / 2.0;
+    let y = (target_height as f32 - source_height * factor) / 2.0;
+    resvg::tiny_skia::Transform::from_row(factor, 0.0, 0.0, factor, x, y)
+}
+
+fn cover_crop(
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> (u32, u32, u32, u32) {
+    debug_assert!(source_width > 0 && source_height > 0);
+    debug_assert!(target_width > 0 && target_height > 0);
+    let source_ratio = u64::from(source_width) * u64::from(target_height);
+    let target_ratio = u64::from(target_width) * u64::from(source_height);
+    if source_ratio > target_ratio {
+        let numerator = u64::from(source_height) * u64::from(target_width);
+        let crop_width = ((numerator + u64::from(target_height) / 2) / u64::from(target_height))
+            .clamp(1, u64::from(source_width)) as u32;
+        (
+            (source_width - crop_width) / 2,
+            0,
+            crop_width,
+            source_height,
+        )
+    } else if source_ratio < target_ratio {
+        let numerator = u64::from(source_width) * u64::from(target_height);
+        let crop_height = ((numerator + u64::from(target_width) / 2) / u64::from(target_width))
+            .clamp(1, u64::from(source_height)) as u32;
+        (
+            0,
+            (source_height - crop_height) / 2,
+            source_width,
+            crop_height,
+        )
+    } else {
+        (0, 0, source_width, source_height)
     }
 }
 
@@ -346,6 +445,7 @@ mod tests {
             .unwrap();
         let key = Key {
             image: Image::default(),
+            fit: ImageFit::Contain,
             width: 2,
             height: 2,
         };
@@ -383,7 +483,7 @@ mod tests {
 
     #[test]
     fn svg_uses_requested_size_preserves_aspect_ratio_and_premultiplies_alpha() {
-        let pixels = decode_bytes(br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><path fill="#ff0000" fill-opacity=".5" d="M0 0h20v10H0z"/></svg>"##, true, 40, 40).unwrap();
+        let pixels = decode_bytes(br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><path fill="#ff0000" fill-opacity=".5" d="M0 0h20v10H0z"/></svg>"##, true, 40, 40, ImageFit::Contain).unwrap();
         assert_eq!((pixels.width, pixels.height), (40, 20));
         assert!(pixels.premultiplied);
         assert_eq!(&pixels.rgba[..4], &[128, 0, 0, 128]);
@@ -396,11 +496,85 @@ mod tests {
         source
             .write_to(&mut encoded, image::ImageFormat::Png)
             .unwrap();
-        let pixels = decode_bytes(encoded.get_ref(), false, 10, 10).unwrap();
+        let pixels = decode_bytes(encoded.get_ref(), false, 10, 10, ImageFit::Contain).unwrap();
         assert_eq!((pixels.width, pixels.height), (10, 5));
         assert!(!pixels.premultiplied);
         assert_eq!(&pixels.rgba[..4], &[255, 0, 0, 128]);
-        assert!(decode_bytes(b"broken", false, 10, 10).is_err());
-        assert!(decode_bytes(b"<svg>", true, 10, 10).is_err());
+        assert!(decode_bytes(b"broken", false, 10, 10, ImageFit::Contain).is_err());
+        assert!(decode_bytes(b"<svg>", true, 10, 10, ImageFit::Contain).is_err());
+    }
+
+    #[test]
+    fn cover_crops_before_resampling_raster_images() {
+        let source = image::RgbaImage::from_fn(1000, 100, |x, _| {
+            if x < 450 {
+                image::Rgba([255, 0, 0, 255])
+            } else if x < 550 {
+                image::Rgba([0, 255, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        });
+        let mut encoded = Cursor::new(Vec::new());
+        source
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+
+        let contain = decode_bytes(encoded.get_ref(), false, 100, 100, ImageFit::Contain).unwrap();
+        let cover = decode_bytes(encoded.get_ref(), false, 100, 100, ImageFit::Cover).unwrap();
+        let fill = decode_bytes(encoded.get_ref(), false, 100, 100, ImageFit::Fill).unwrap();
+
+        assert_eq!((contain.width, contain.height), (100, 10));
+        assert_eq!((cover.width, cover.height), (100, 100));
+        assert_eq!(&cover.rgba[..4], &[0, 255, 0, 255]);
+        assert_eq!((fill.width, fill.height), (100, 100));
+        assert_eq!(&fill.rgba[..4], &[255, 0, 0, 255]);
+        assert_eq!(cover_crop(1000, 100, 100, 100), (450, 0, 100, 100));
+        assert_eq!(cover_crop(8192, 1, 4096, 4096), (4095, 0, 1, 1));
+        let (x, y, width, height) = cover_crop(101, 50, 64, 37);
+        assert_eq!((y, height), (0, 50));
+        assert!((2 * x + width).abs_diff(101) <= 1);
+        let (x, y, width, height) = cover_crop(50, 101, 37, 64);
+        assert_eq!((x, width), (0, 50));
+        assert!((2 * y + height).abs_diff(101) <= 1);
+    }
+
+    #[test]
+    fn cover_and_fill_render_svg_at_the_requested_bounds() {
+        let source = br##"<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="100"><path fill="#f00" d="M0 0h450v100H0z"/><path fill="#0f0" d="M450 0h100v100H450z"/><path fill="#00f" d="M550 0h450v100H550z"/></svg>"##;
+        let contain = decode_bytes(source, true, 100, 100, ImageFit::Contain).unwrap();
+        let cover = decode_bytes(source, true, 100, 100, ImageFit::Cover).unwrap();
+        let fill = decode_bytes(source, true, 100, 100, ImageFit::Fill).unwrap();
+
+        assert_eq!((contain.width, contain.height), (100, 10));
+        assert_eq!((cover.width, cover.height), (100, 100));
+        assert_eq!(&cover.rgba[..4], &[0, 255, 0, 255]);
+        assert_eq!((fill.width, fill.height), (100, 100));
+        assert_eq!(&fill.rgba[..4], &[255, 0, 0, 255]);
+
+        let transform = svg_cover_transform(101.0, 50.0, 64, 37);
+        assert!((transform.tx + 101.0 * transform.sx / 2.0 - 32.0).abs() < 0.0001);
+        assert!((transform.ty + 50.0 * transform.sy / 2.0 - 18.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn image_requests_round_fractional_output_sizes_up_within_cache_bounds() {
+        let bounds = Rect {
+            width: 100.1,
+            height: 40.1,
+            ..Rect::default()
+        };
+        assert_eq!(request_dimensions(bounds, 1.25), (126, 51));
+        assert_eq!(
+            request_dimensions(
+                Rect {
+                    width: 10_000.0,
+                    height: 0.1,
+                    ..Rect::default()
+                },
+                2.0,
+            ),
+            (4096, 1)
+        );
     }
 }

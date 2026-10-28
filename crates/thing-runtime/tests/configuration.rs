@@ -1,6 +1,8 @@
 use std::{collections::BTreeSet, fs, path::PathBuf, time::Duration};
 use tempfile::TempDir;
-use thing_core::{Color, CrossAlign, KeyboardMode, Kind, MainAlign, TextAlign, TextOverflow};
+use thing_core::{
+    Color, CrossAlign, ImageFit, KeyboardMode, Kind, MainAlign, TextAlign, TextOverflow,
+};
 use thing_runtime::{
     Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, Event, Limits, Runtime, Scalar,
 };
@@ -160,6 +162,69 @@ fn interaction_styles_update_reactively() {
     assert_eq!(button.style.disabled_opacity, 0.25);
     assert_eq!(button.style.focus_ring_color, Color([238, 238, 238, 255]));
     assert_eq!(button.style.focus_ring_width, 1.0);
+}
+
+#[test]
+fn image_fit_defaults_and_updates_reactively() {
+    let (_directory, path) = fixture(
+        r#"
+        local fit = ui.state('contain')
+        return ui.panel { children = {
+            ui.image { source = 'cover.png', fit = function() return fit:get() end },
+            ui.image { source = 'fill.png', fit = 'fill' },
+            ui.image { source = 'default.png' },
+            ui.button { on_click = function() fit:set('cover') end },
+            ui.button { on_click = function() fit:set('crop') end },
+            ui.button { on_click = function() fit:set('contain') end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    assert_eq!(
+        runtime.root().unwrap().children[0].image_fit,
+        ImageFit::Contain
+    );
+    assert_eq!(
+        runtime.root().unwrap().children[1].image_fit,
+        ImageFit::Fill
+    );
+    assert_eq!(
+        runtime.root().unwrap().children[2].image_fit,
+        ImageFit::Contain
+    );
+
+    let button = runtime.root().unwrap().children[3].id;
+    assert!(runtime.dispatch(button, Event::Click).unwrap());
+    assert_eq!(
+        runtime.root().unwrap().children[0].image_fit,
+        ImageFit::Cover
+    );
+
+    let invalid = runtime.root().unwrap().children[4].id;
+    assert!(runtime.dispatch(invalid, Event::Click).is_err());
+    assert_eq!(
+        runtime.root().unwrap().children[0].image_fit,
+        ImageFit::Cover
+    );
+
+    let recover = runtime.root().unwrap().children[5].id;
+    assert!(runtime.dispatch(recover, Event::Click).unwrap());
+    assert_eq!(
+        runtime.root().unwrap().children[0].image_fit,
+        ImageFit::Contain
+    );
+}
+
+#[test]
+fn rejects_invalid_or_non_image_fit() {
+    for source in [
+        "return ui.panel { children = { ui.image { fit = 'crop' } } }",
+        "return ui.panel { children = { ui.image { fit = 1 } } }",
+        "return ui.panel { children = { ui.row { fit = 'cover' } } }",
+    ] {
+        let (_directory, path) = fixture(source);
+        assert!(Runtime::load(path).is_err(), "accepted {source}");
+    }
 }
 
 #[test]
