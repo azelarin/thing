@@ -14,7 +14,8 @@ export type ThingReadonlyArray<T> = { T }
 export type ThingReactive<T> = T | (() -> T)
 
 declare extern type ThingWidget with end
-declare extern type ThingTransition with end
+declare extern type ThingNumberTransition with end
+declare extern type ThingColorTransition with end
 
 export type ThingEdge = "top" | "right" | "bottom" | "left"
 export type ThingLayer = "background" | "bottom" | "top" | "overlay"
@@ -88,8 +89,9 @@ export type ThingPopupConstraints = {
     slide_y: boolean?,
 }
 
-type ThingAnimatedNumber = number | (() -> number) | ThingTransition
-type ThingAnimatedOptionalNumber = number | (() -> number?) | ThingTransition
+type ThingAnimatedNumber = number | (() -> number) | ThingNumberTransition
+type ThingAnimatedOptionalNumber = number | (() -> number?) | ThingNumberTransition
+type ThingAnimatedColor = string | (() -> string) | ThingColorTransition
 
 export type ThingStyle = {
     width: ThingAnimatedOptionalNumber?,
@@ -113,17 +115,17 @@ export type ThingStyle = {
     wrap: ThingReactive<boolean>?,
     radius: ThingAnimatedNumber?,
     border_width: ThingAnimatedNumber?,
-    border_color: ThingReactive<string>?,
-    hover_overlay: ThingReactive<string>?,
-    pressed_overlay: ThingReactive<string>?,
+    border_color: ThingAnimatedColor?,
+    hover_overlay: ThingAnimatedColor?,
+    pressed_overlay: ThingAnimatedColor?,
     disabled_opacity: ThingReactive<number>?,
-    focus_ring_color: ThingReactive<string>?,
+    focus_ring_color: ThingAnimatedColor?,
     focus_ring_width: ThingReactive<number>?,
     font_size: ThingReactive<number>?,
     font_weight: ThingReactive<number>?,
     font_family: ThingReactive<string>?,
-    background: ThingReactive<string>?,
-    foreground: ThingReactive<string>?,
+    background: ThingAnimatedColor?,
+    foreground: ThingAnimatedColor?,
     opacity: ThingAnimatedNumber?,
 }
 
@@ -149,19 +151,19 @@ export type ThingTextStyle = {
     wrap: ThingReactive<boolean>?,
     radius: ThingAnimatedNumber?,
     border_width: ThingAnimatedNumber?,
-    border_color: ThingReactive<string>?,
-    hover_overlay: ThingReactive<string>?,
-    pressed_overlay: ThingReactive<string>?,
+    border_color: ThingAnimatedColor?,
+    hover_overlay: ThingAnimatedColor?,
+    pressed_overlay: ThingAnimatedColor?,
     disabled_opacity: ThingReactive<number>?,
-    focus_ring_color: ThingReactive<string>?,
+    focus_ring_color: ThingAnimatedColor?,
     focus_ring_width: ThingReactive<number>?,
     font_size: ThingReactive<number>?,
     font_weight: ThingReactive<number>?,
     font_family: ThingReactive<string>?,
     text_align: ThingReactive<ThingTextAlign>?,
     tabular_digits: ThingReactive<boolean>?,
-    background: ThingReactive<string>?,
-    foreground: ThingReactive<string>?,
+    background: ThingAnimatedColor?,
+    foreground: ThingAnimatedColor?,
     opacity: ThingAnimatedNumber?,
 }
 
@@ -545,7 +547,10 @@ declare ui: {
     slider: (properties: ThingSliderProperties) -> ThingWidget,
     range: (properties: ThingRangeProperties) -> ThingWidget,
     state: <T>(initial: T & ThingStateValue) -> ThingState<T>,
-    transition: (value: () -> number, options: ThingTransitionOptions) -> ThingTransition,
+    transition: (
+        ((value: () -> number, options: ThingTransitionOptions) -> ThingNumberTransition)
+        & ((value: () -> string, options: ThingTransitionOptions) -> ThingColorTransition)
+    ),
     asset: (relative_path: string) -> string,
 }
 
