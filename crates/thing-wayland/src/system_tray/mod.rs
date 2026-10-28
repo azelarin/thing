@@ -31,9 +31,13 @@ use zbus::{
 
 use model::{Endpoint, Lifetime, Model, QueriedItem, Target};
 
-const WATCHER_NAME: &str = "org.kde.StatusNotifierWatcher";
 const WATCHER_PATH: &str = "/StatusNotifierWatcher";
-const WATCHER_INTERFACE: &str = "org.kde.StatusNotifierWatcher";
+const KDE_WATCHER_NAME: &str = "org.kde.StatusNotifierWatcher";
+const KDE_WATCHER_INTERFACE: &str = "org.kde.StatusNotifierWatcher";
+const KDE_HOST_PREFIX: &str = "org.kde.StatusNotifierHost";
+const FREEDESKTOP_WATCHER_NAME: &str = "org.freedesktop.StatusNotifierWatcher";
+const FREEDESKTOP_WATCHER_INTERFACE: &str = "org.freedesktop.StatusNotifierWatcher";
+const FREEDESKTOP_HOST_PREFIX: &str = "org.freedesktop.StatusNotifierHost";
 const KDE_ITEM_INTERFACE: &str = "org.kde.StatusNotifierItem";
 const FREEDESKTOP_ITEM_INTERFACE: &str = "org.freedesktop.StatusNotifierItem";
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
@@ -42,17 +46,46 @@ const MAX_ITEMS: usize = 128;
 const MAX_HOSTS: usize = 64;
 const MAX_COMMANDS: usize = 128;
 const MAX_QUERIES: usize = 4;
+const MAX_ENDPOINT_BYTES: usize = 4096;
+const MAX_SIGNAL_BYTES: usize = 8 * 1024;
 const MAX_PROPERTY_BYTES: usize = 512 * 1024;
 const MAX_PIXMAPS: usize = 32;
 const MAX_PIXMAP_BYTES: usize = 256 * 1024;
 const METHOD_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct WatcherProtocol {
+    name: &'static str,
+    interface: &'static str,
+    host_prefix: &'static str,
+}
+
+const KDE_PROTOCOL: WatcherProtocol = WatcherProtocol {
+    name: KDE_WATCHER_NAME,
+    interface: KDE_WATCHER_INTERFACE,
+    host_prefix: KDE_HOST_PREFIX,
+};
+const FREEDESKTOP_PROTOCOL: WatcherProtocol = WatcherProtocol {
+    name: FREEDESKTOP_WATCHER_NAME,
+    interface: FREEDESKTOP_WATCHER_INTERFACE,
+    host_prefix: FREEDESKTOP_HOST_PREFIX,
+};
+// kde is preferred when both practical protocol variants are present. the
+// order also makes two-name acquisition and fallback deterministic.
+const WATCHER_PROTOCOLS: [WatcherProtocol; 2] = [KDE_PROTOCOL, FREEDESKTOP_PROTOCOL];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WatcherTarget {
+    protocol: WatcherProtocol,
+    owner: String,
+}
 
 /// how the transport participates in the status notifier protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemTrayMode {
     /// register a visualization host only when another watcher exists.
     Host,
-    /// own the watcher only when its name is free, otherwise act as a host.
+    /// own both recognized watcher names only when both are free, otherwise act as a host.
     OwnWatcher,
 }
 
@@ -123,18 +156,12 @@ impl SystemTray {
                     }
                     let result = async_io::block_on(session(
                         address.as_deref(),
-                        ownership_allowed,
+                        &mut ownership_allowed,
                         &state,
                         &reader,
                         &mut next_item_id,
                         |snapshot| publish(&state, &ping, &mut previous, snapshot),
                     ));
-                    let declined_ownership = result
-                        .as_ref()
-                        .is_ok_and(|outcome| outcome.declined_ownership);
-                    if declined_ownership {
-                        ownership_allowed = false;
-                    }
                     {
                         let mut shared = lock(&state);
                         shared.online = false;
@@ -145,9 +172,12 @@ impl SystemTray {
                             break;
                         }
                     }
-                    let error = result
-                        .err()
-                        .unwrap_or_else(|| "system tray connection ended".into());
+                    let error = sanitize(
+                        result
+                            .err()
+                            .unwrap_or_else(|| "system tray connection ended".into()),
+                        4096,
+                    );
                     if error != last_error {
                         eprintln!("thing: system tray unavailable: {error}; retrying in 1 second");
                         last_error = error.clone();
@@ -157,7 +187,7 @@ impl SystemTray {
                         &ping,
                         &mut previous,
                         SystemTraySnapshot {
-                            error: sanitize(error, 4096),
+                            error,
                             ..SystemTraySnapshot::default()
                         },
                     );
@@ -220,22 +250,21 @@ fn publish(
     }
 }
 
-struct SessionOutcome {
-    declined_ownership: bool,
-}
-
 async fn session(
     address: Option<&str>,
-    ownership_allowed: bool,
+    ownership_allowed: &mut bool,
     shared: &Mutex<Shared>,
     wake_stream: &UnixStream,
     next_item_id: &mut u64,
     mut publish: impl FnMut(SystemTraySnapshot),
-) -> Result<SessionOutcome, String> {
+) -> Result<(), String> {
     let reader = wake_stream.try_clone().map_err(|error| error.to_string())?;
     let wake_source = Async::new(reader).map_err(|error| error.to_string())?;
     let watcher_registry = Arc::new(Mutex::new(WatcherRegistry::default()));
-    let watcher_object = WatcherObject {
+    let kde_watcher = KdeWatcherObject {
+        registry: watcher_registry.clone(),
+    };
+    let freedesktop_watcher = FreedesktopWatcherObject {
         registry: watcher_registry.clone(),
     };
     let builder = match address {
@@ -244,7 +273,9 @@ async fn session(
     }
     .map_err(|error| error.to_string())?
     .method_timeout(METHOD_TIMEOUT)
-    .serve_at(WATCHER_PATH, watcher_object)
+    .serve_at(WATCHER_PATH, kde_watcher)
+    .map_err(|error| error.to_string())?
+    .serve_at(WATCHER_PATH, freedesktop_watcher)
     .map_err(|error| error.to_string())?;
     let connection = future::race(
         async {
@@ -272,17 +303,13 @@ async fn session(
     .await?;
     let Some(connection) = connection else {
         return if stopping(shared) {
-            Ok(SessionOutcome {
-                declined_ownership: false,
-            })
+            Ok(())
         } else {
             Err("system tray connection interrupted".into())
         };
     };
     if stopping(shared) {
-        return Ok(SessionOutcome {
-            declined_ownership: false,
-        });
+        return Ok(());
     }
 
     let mut names = name_stream(&connection).await?;
@@ -295,53 +322,44 @@ async fn session(
         .unique_name()
         .ok_or_else(|| "session bus did not assign a unique name".to_owned())?
         .to_string();
-    let host_name = host_name(&unique_name);
-    let host_reply = connection
-        .request_name_with_flags(host_name.as_str(), RequestNameFlags::DoNotQueue.into())
-        .await
-        .map_err(|error| error.to_string())?;
-    if !matches!(
-        host_reply,
-        RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner
-    ) {
-        return Err("cannot acquire a unique status notifier host name".into());
-    }
-
+    let mut watcher_owners = query_watcher_owners(&dbus).await?;
     let mut watcher_owned = false;
-    let mut declined_ownership = false;
-    if ownership_allowed {
-        let reply = connection
-            .request_name_with_flags(WATCHER_NAME, RequestNameFlags::DoNotQueue.into())
-            .await;
-        match reply {
-            Ok(RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner) => {
+    if *ownership_allowed && !watcher_owners.is_empty() {
+        *ownership_allowed = false;
+    }
+    if *ownership_allowed {
+        match acquire_watcher_names(&connection).await? {
+            WatcherAcquisition::Owned => {
                 watcher_owned = true;
+                watcher_owners = WATCHER_PROTOCOLS
+                    .into_iter()
+                    .map(|protocol| (protocol, unique_name.clone()))
+                    .collect();
             }
-            Err(zbus::Error::NameTaken) | Ok(RequestNameReply::Exists) => {
-                declined_ownership = true;
+            WatcherAcquisition::Declined => {
+                *ownership_allowed = false;
+                watcher_owners = query_watcher_owners(&dbus).await?;
             }
-            Ok(RequestNameReply::InQueue) => {
-                return Err("status notifier watcher ownership was unexpectedly queued".into());
-            }
-            Err(error) => return Err(error.to_string()),
         }
     }
 
+    let host_names = request_host_names(&connection, &unique_name).await?;
+    let mut owned_host_names = WATCHER_PROTOCOLS.into_iter().collect::<BTreeSet<_>>();
+    let mut active_host = None;
     if watcher_owned {
-        lock(&watcher_registry).hosts.insert(
-            host_name.clone(),
-            RegisteredOwner {
-                owner: unique_name.clone(),
-            },
-        );
+        let mut registry = lock(&watcher_registry);
+        for host_name in host_names.values() {
+            registry.hosts.insert(
+                host_name.clone(),
+                RegisteredOwner {
+                    owner: unique_name.clone(),
+                },
+            );
+        }
     }
 
     let mut model = Model::default();
-    let mut current_watcher = if watcher_owned {
-        Some(unique_name.clone())
-    } else {
-        get_name_owner(&dbus, WATCHER_NAME).await?
-    };
+    let mut current_watcher = select_watcher(&watcher_owners);
     let mut attached_watcher = None;
     let mut queued = BTreeMap::new();
     let mut running = BTreeSet::new();
@@ -349,19 +367,47 @@ async fn session(
 
     loop {
         if stopping(shared) {
-            return Ok(SessionOutcome { declined_ownership });
+            return Ok(());
         }
         if current_watcher != attached_watcher {
+            if !watcher_owned {
+                let next_host = current_watcher.as_ref().map(|watcher| watcher.protocol);
+                if active_host != next_host {
+                    if let Some(protocol) = active_host {
+                        connection
+                            .release_name(host_names[&protocol].as_str())
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        owned_host_names.remove(&protocol);
+                    }
+                    if let Some(protocol) = next_host
+                        && !owned_host_names.contains(&protocol)
+                    {
+                        if !request_name_without_queue(&connection, &host_names[&protocol]).await? {
+                            return Err("cannot reacquire a status notifier host name".into());
+                        }
+                        owned_host_names.insert(protocol);
+                    }
+                    active_host = next_host;
+                }
+            }
             model.clear();
             queued.clear();
             running.clear();
             queries = FuturesUnordered::new();
             attached_watcher = current_watcher.clone();
-            if let Some(owner) = current_watcher.as_deref() {
+            if let Some(watcher) = current_watcher.as_ref() {
                 if !watcher_owned {
-                    register_host(&connection, owner, &host_name).await?;
+                    register_host(
+                        &connection,
+                        &watcher.owner,
+                        watcher.protocol.interface,
+                        &host_names[&watcher.protocol],
+                    )
+                    .await?;
                 }
-                let registrations = watcher_items(&connection, owner).await?;
+                let registrations =
+                    watcher_items(&connection, &watcher.owner, watcher.protocol.interface).await?;
                 for registration in registrations.into_iter().take(MAX_ITEMS) {
                     if let Some((endpoint, owner)) =
                         resolve_registration(&dbus, &registration, None).await?
@@ -419,13 +465,15 @@ async fn session(
                 let Some((name, old_owner, new_owner)) = name_event(&message) else {
                     continue;
                 };
-                if name == WATCHER_NAME {
-                    if current_watcher.as_deref() == Some(old_owner.as_str()) {
-                        current_watcher = None;
+                if let Some(protocol) = watcher_protocol(&name) {
+                    if watcher_owners.get(&protocol).map(String::as_str) == Some(old_owner.as_str())
+                    {
+                        watcher_owners.remove(&protocol);
                     }
                     if !new_owner.is_empty() {
-                        current_watcher = Some(new_owner);
+                        watcher_owners.insert(protocol, new_owner.clone());
                     }
+                    current_watcher = select_watcher(&watcher_owners);
                 }
                 if !old_owner.is_empty() {
                     let model_changed = model.remove_name(&name, &old_owner);
@@ -435,28 +483,10 @@ async fn session(
                         (Vec::new(), false)
                     };
                     for endpoint in removed {
-                        connection
-                            .emit_signal(
-                                None::<&str>,
-                                WATCHER_PATH,
-                                WATCHER_INTERFACE,
-                                "StatusNotifierItemUnregistered",
-                                &(endpoint.key(),),
-                            )
-                            .await
-                            .map_err(|error| error.to_string())?;
+                        emit_item_unregistered(&connection, &endpoint.key()).await?;
                     }
                     if host_removed {
-                        connection
-                            .emit_signal(
-                                None::<&str>,
-                                WATCHER_PATH,
-                                WATCHER_INTERFACE,
-                                "StatusNotifierHostUnregistered",
-                                &(),
-                            )
-                            .await
-                            .map_err(|error| error.to_string())?;
+                        emit_host_unregistered(&connection).await?;
                     }
                     if model_changed {
                         publish(update_shared(
@@ -472,7 +502,14 @@ async fn session(
             Input::Name(Some(Err(error))) => return Err(error.to_string()),
             Input::Name(None) => return Err("system tray name subscription ended".into()),
             Input::Watcher(Some(Ok(message))) => {
-                if message.header().sender().map(ToString::to_string) != current_watcher {
+                let Some(watcher) = current_watcher.as_ref() else {
+                    continue;
+                };
+                if message.header().sender().map(ToString::to_string) != Some(watcher.owner.clone())
+                    || message.header().interface().map(ToString::to_string)
+                        != Some(watcher.protocol.interface.into())
+                    || message.body().len() > MAX_SIGNAL_BYTES
+                {
                     continue;
                 }
                 let Some(member) = message.header().member().map(ToString::to_string) else {
@@ -535,7 +572,7 @@ async fn session(
                     && !send_action_interruptible(&connection, command, shared, &wake_source)
                         .await?
                 {
-                    return Ok(SessionOutcome { declined_ownership });
+                    return Ok(());
                 }
             }
         }
@@ -601,6 +638,9 @@ fn queue_item_refreshes(
     model: &Model,
     queued: &mut BTreeMap<String, QueryRequest>,
 ) {
+    if message.body().len() > MAX_PROPERTY_BYTES {
+        return;
+    }
     let Some(owner) = message.header().sender().map(ToString::to_string) else {
         return;
     };
@@ -828,17 +868,25 @@ async fn name_stream(connection: &Connection) -> Result<MessageStream, String> {
         .map_err(|error| error.to_string())
 }
 
-async fn watcher_stream(connection: &Connection) -> Result<MessageStream, String> {
-    let rule = MatchRule::builder()
-        .msg_type(Type::Signal)
-        .path(WATCHER_PATH)
-        .map_err(|error| error.to_string())?
-        .interface(WATCHER_INTERFACE)
-        .map_err(|error| error.to_string())?
-        .build();
-    MessageStream::for_match_rule(rule, connection, Some(256))
-        .await
-        .map_err(|error| error.to_string())
+async fn watcher_stream(
+    connection: &Connection,
+) -> Result<stream::SelectAll<MessageStream>, String> {
+    let mut streams = Vec::new();
+    for protocol in WATCHER_PROTOCOLS {
+        let rule = MatchRule::builder()
+            .msg_type(Type::Signal)
+            .path(WATCHER_PATH)
+            .map_err(|error| error.to_string())?
+            .interface(protocol.interface)
+            .map_err(|error| error.to_string())?
+            .build();
+        streams.push(
+            MessageStream::for_match_rule(rule, connection, Some(256))
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(stream::select_all(streams))
 }
 
 async fn item_stream(connection: &Connection) -> Result<stream::SelectAll<MessageStream>, String> {
@@ -873,13 +921,16 @@ async fn item_stream(connection: &Connection) -> Result<stream::SelectAll<Messag
 }
 
 fn name_event(message: &Message) -> Option<(String, String, String)> {
+    if message.body().len() > MAX_SIGNAL_BYTES {
+        return None;
+    }
     message
         .body()
         .deserialize::<(String, String, String)>()
         .ok()
 }
 
-fn host_name(unique_name: &str) -> String {
+fn host_name(protocol: WatcherProtocol, unique_name: &str) -> String {
     let suffix = unique_name
         .chars()
         .map(|character| {
@@ -890,7 +941,88 @@ fn host_name(unique_name: &str) -> String {
             }
         })
         .collect::<String>();
-    format!("org.kde.StatusNotifierHost-{}-{suffix}", std::process::id())
+    format!("{}-{}-{suffix}", protocol.host_prefix, std::process::id())
+}
+
+fn watcher_protocol(name: &str) -> Option<WatcherProtocol> {
+    WATCHER_PROTOCOLS
+        .into_iter()
+        .find(|protocol| protocol.name == name)
+}
+
+fn select_watcher(owners: &BTreeMap<WatcherProtocol, String>) -> Option<WatcherTarget> {
+    WATCHER_PROTOCOLS.into_iter().find_map(|protocol| {
+        owners.get(&protocol).map(|owner| WatcherTarget {
+            protocol,
+            owner: owner.clone(),
+        })
+    })
+}
+
+async fn query_watcher_owners(
+    dbus: &DBusProxy<'_>,
+) -> Result<BTreeMap<WatcherProtocol, String>, String> {
+    let mut owners = BTreeMap::new();
+    for protocol in WATCHER_PROTOCOLS {
+        if let Some(owner) = get_name_owner(dbus, protocol.name).await? {
+            owners.insert(protocol, owner);
+        }
+    }
+    Ok(owners)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatcherAcquisition {
+    Owned,
+    Declined,
+}
+
+async fn acquire_watcher_names(connection: &Connection) -> Result<WatcherAcquisition, String> {
+    let mut acquired = Vec::new();
+    for protocol in WATCHER_PROTOCOLS {
+        match request_name_without_queue(connection, protocol.name).await? {
+            true => acquired.push(protocol.name),
+            false => {
+                for name in acquired.into_iter().rev() {
+                    connection
+                        .release_name(name)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                return Ok(WatcherAcquisition::Declined);
+            }
+        }
+    }
+    Ok(WatcherAcquisition::Owned)
+}
+
+async fn request_host_names(
+    connection: &Connection,
+    unique_name: &str,
+) -> Result<BTreeMap<WatcherProtocol, String>, String> {
+    let mut names = BTreeMap::new();
+    for protocol in WATCHER_PROTOCOLS {
+        let name = host_name(protocol, unique_name);
+        if !request_name_without_queue(connection, &name).await? {
+            return Err("cannot acquire a unique status notifier host name".into());
+        }
+        names.insert(protocol, name);
+    }
+    Ok(names)
+}
+
+async fn request_name_without_queue(connection: &Connection, name: &str) -> Result<bool, String> {
+    match connection
+        .request_name_with_flags(name, RequestNameFlags::DoNotQueue.into())
+        .await
+    {
+        Ok(RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner) => Ok(true),
+        Err(zbus::Error::NameTaken) | Ok(RequestNameReply::Exists) => Ok(false),
+        Ok(RequestNameReply::InQueue) => {
+            Err("status notifier name ownership was unexpectedly queued".into())
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 async fn get_name_owner(dbus: &DBusProxy<'_>, name: &str) -> Result<Option<String>, String> {
@@ -909,12 +1041,17 @@ async fn resolve_registration(
     registration: &str,
     sender: Option<&str>,
 ) -> Result<Option<(Endpoint, String)>, String> {
-    let endpoint = parse_endpoint(registration, sender)?;
+    let Ok(endpoint) = parse_endpoint(registration, sender) else {
+        return Ok(None);
+    };
     let owner = get_name_owner(dbus, &endpoint.service).await?;
     Ok(owner.map(|owner| (endpoint, owner)))
 }
 
 fn parse_endpoint(registration: &str, sender: Option<&str>) -> Result<Endpoint, String> {
+    if registration.len() > MAX_ENDPOINT_BYTES {
+        return Err("status notifier item endpoint exceeds 4096 bytes".into());
+    }
     let (service, path) = if registration.starts_with('/') {
         (
             sender.ok_or_else(|| "item path registration has no sender".to_owned())?,
@@ -925,6 +1062,13 @@ fn parse_endpoint(registration: &str, sender: Option<&str>) -> Result<Endpoint, 
     } else {
         (registration, DEFAULT_ITEM_PATH)
     };
+    if service
+        .len()
+        .checked_add(path.len())
+        .is_none_or(|length| length > MAX_ENDPOINT_BYTES)
+    {
+        return Err("status notifier item endpoint exceeds 4096 bytes".into());
+    }
     BusName::try_from(service).map_err(|error| error.to_string())?;
     OwnedObjectPath::try_from(path).map_err(|error| error.to_string())?;
     Ok(Endpoint {
@@ -936,13 +1080,14 @@ fn parse_endpoint(registration: &str, sender: Option<&str>) -> Result<Endpoint, 
 async fn register_host(
     connection: &Connection,
     watcher_owner: &str,
+    watcher_interface: &str,
     host_name: &str,
 ) -> Result<(), String> {
     connection
         .call_method(
             Some(watcher_owner),
             WATCHER_PATH,
-            Some(WATCHER_INTERFACE),
+            Some(watcher_interface),
             "RegisterStatusNotifierHost",
             &(host_name,),
         )
@@ -951,8 +1096,12 @@ async fn register_host(
         .map_err(|error| error.to_string())
 }
 
-async fn watcher_items(connection: &Connection, owner: &str) -> Result<Vec<String>, String> {
-    let values = get_all(connection, owner, WATCHER_PATH, WATCHER_INTERFACE).await?;
+async fn watcher_items(
+    connection: &Connection,
+    owner: &str,
+    watcher_interface: &str,
+) -> Result<Vec<String>, String> {
+    let values = get_all(connection, owner, WATCHER_PATH, watcher_interface).await?;
     let items = values
         .into_iter()
         .find_map(|(name, value)| {
@@ -975,129 +1124,262 @@ struct WatcherRegistry {
     hosts: BTreeMap<String, RegisteredOwner>,
 }
 
-struct WatcherObject {
-    registry: Arc<Mutex<WatcherRegistry>>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegistryChange {
+    Unchanged,
+    Inserted,
+    Replaced,
 }
 
-#[zbus::interface(name = "org.kde.StatusNotifierWatcher")]
-impl WatcherObject {
-    async fn register_status_notifier_item(
-        &self,
-        service_or_path: String,
-        #[zbus(header)] header: Header<'_>,
-        #[zbus(connection)] connection: &Connection,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) -> zbus::fdo::Result<()> {
-        let sender = header
-            .sender()
-            .ok_or_else(|| zbus::fdo::Error::InvalidArgs("missing method sender".into()))?
-            .to_string();
-        let endpoint = parse_endpoint(&service_or_path, Some(&sender))
-            .map_err(zbus::fdo::Error::InvalidArgs)?;
-        let dbus = DBusProxy::new(connection).await?;
-        let owner = get_name_owner(&dbus, &endpoint.service)
-            .await
-            .map_err(zbus::fdo::Error::Failed)?
-            .ok_or_else(|| zbus::fdo::Error::InvalidArgs("item service has no owner".into()))?;
-        let (unregistered, registered) = {
-            let mut registry = lock(&self.registry);
-            if registry
-                .items
-                .get(&endpoint)
-                .is_some_and(|registered| registered.owner == owner)
-            {
-                return Ok(());
-            }
-            if !registry.items.contains_key(&endpoint) && registry.items.len() >= MAX_ITEMS {
-                return Err(zbus::fdo::Error::LimitsExceeded(
-                    "too many status notifier items".into(),
-                ));
-            }
-            let unregistered = registry.items.insert(
-                endpoint.clone(),
-                RegisteredOwner {
-                    owner: owner.clone(),
-                },
-            );
-            (unregistered.is_some(), endpoint.key())
-        };
-        if unregistered {
-            Self::status_notifier_item_unregistered(&emitter, &registered).await?;
-        }
-        Self::status_notifier_item_registered(&emitter, &registered)
-            .await
-            .map_err(zbus::fdo::Error::ZBus)
-    }
-
-    async fn register_status_notifier_host(
-        &self,
-        service: String,
-        #[zbus(connection)] connection: &Connection,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) -> zbus::fdo::Result<()> {
-        BusName::try_from(service.as_str())
-            .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?;
-        let dbus = DBusProxy::new(connection).await?;
-        let owner = get_name_owner(&dbus, &service)
-            .await
-            .map_err(zbus::fdo::Error::Failed)?
-            .ok_or_else(|| zbus::fdo::Error::InvalidArgs("host service has no owner".into()))?;
-        let inserted = {
-            let mut registry = lock(&self.registry);
-            if registry.hosts.contains_key(&service) {
-                false
-            } else {
-                if registry.hosts.len() >= MAX_HOSTS {
-                    return Err(zbus::fdo::Error::LimitsExceeded(
-                        "too many status notifier hosts".into(),
-                    ));
-                }
-                registry.hosts.insert(service, RegisteredOwner { owner });
-                true
-            }
-        };
-        if inserted {
-            Self::status_notifier_host_registered(&emitter).await?;
-        }
-        Ok(())
-    }
-
-    #[zbus(property)]
-    fn registered_status_notifier_items(&self) -> Vec<String> {
-        lock(&self.registry)
+impl WatcherRegistry {
+    fn register_item(
+        &mut self,
+        endpoint: Endpoint,
+        owner: String,
+    ) -> Result<RegistryChange, zbus::fdo::Error> {
+        if self
             .items
-            .keys()
-            .map(Endpoint::key)
-            .collect()
+            .get(&endpoint)
+            .is_some_and(|registered| registered.owner == owner)
+        {
+            return Ok(RegistryChange::Unchanged);
+        }
+        if !self.items.contains_key(&endpoint) && self.items.len() >= MAX_ITEMS {
+            return Err(zbus::fdo::Error::LimitsExceeded(
+                "too many status notifier items".into(),
+            ));
+        }
+        let replaced = self
+            .items
+            .insert(endpoint, RegisteredOwner { owner })
+            .is_some();
+        Ok(if replaced {
+            RegistryChange::Replaced
+        } else {
+            RegistryChange::Inserted
+        })
     }
 
-    #[zbus(property)]
-    fn is_status_notifier_host_registered(&self) -> bool {
-        !lock(&self.registry).hosts.is_empty()
+    fn register_host(
+        &mut self,
+        service: String,
+        owner: String,
+    ) -> Result<RegistryChange, zbus::fdo::Error> {
+        if self
+            .hosts
+            .get(&service)
+            .is_some_and(|registered| registered.owner == owner)
+        {
+            return Ok(RegistryChange::Unchanged);
+        }
+        if !self.hosts.contains_key(&service) && self.hosts.len() >= MAX_HOSTS {
+            return Err(zbus::fdo::Error::LimitsExceeded(
+                "too many status notifier hosts".into(),
+            ));
+        }
+        let replaced = self
+            .hosts
+            .insert(service, RegisteredOwner { owner })
+            .is_some();
+        Ok(if replaced {
+            RegistryChange::Replaced
+        } else {
+            RegistryChange::Inserted
+        })
     }
+}
 
-    #[zbus(property)]
-    fn protocol_version(&self) -> i32 {
-        0
+async fn register_watcher_item(
+    registry: &Mutex<WatcherRegistry>,
+    service_or_path: String,
+    header: Header<'_>,
+    connection: &Connection,
+) -> zbus::fdo::Result<()> {
+    let sender = header
+        .sender()
+        .ok_or_else(|| zbus::fdo::Error::InvalidArgs("missing method sender".into()))?
+        .to_string();
+    let endpoint =
+        parse_endpoint(&service_or_path, Some(&sender)).map_err(zbus::fdo::Error::InvalidArgs)?;
+    let dbus = DBusProxy::new(connection).await?;
+    let owner = get_name_owner(&dbus, &endpoint.service)
+        .await
+        .map_err(zbus::fdo::Error::Failed)?
+        .ok_or_else(|| zbus::fdo::Error::InvalidArgs("item service has no owner".into()))?;
+    let key = endpoint.key();
+    let change = lock(registry).register_item(endpoint, owner)?;
+    if change == RegistryChange::Replaced {
+        emit_item_unregistered(connection, &key)
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
     }
+    if change != RegistryChange::Unchanged {
+        emit_item_registered(connection, &key)
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+    }
+    Ok(())
+}
 
-    #[zbus(signal)]
-    async fn status_notifier_item_registered(
-        emitter: &SignalEmitter<'_>,
-        service: &str,
-    ) -> zbus::Result<()>;
+async fn register_watcher_host(
+    registry: &Mutex<WatcherRegistry>,
+    service: String,
+    connection: &Connection,
+) -> zbus::fdo::Result<()> {
+    if service.len() > MAX_ENDPOINT_BYTES {
+        return Err(zbus::fdo::Error::InvalidArgs(
+            "status notifier host name exceeds 4096 bytes".into(),
+        ));
+    }
+    BusName::try_from(service.as_str())
+        .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?;
+    let dbus = DBusProxy::new(connection).await?;
+    let owner = get_name_owner(&dbus, &service)
+        .await
+        .map_err(zbus::fdo::Error::Failed)?
+        .ok_or_else(|| zbus::fdo::Error::InvalidArgs("host service has no owner".into()))?;
+    let change = lock(registry).register_host(service, owner)?;
+    if change == RegistryChange::Replaced {
+        emit_host_unregistered(connection)
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+    }
+    if change != RegistryChange::Unchanged {
+        emit_host_registered(connection)
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+    }
+    Ok(())
+}
 
-    #[zbus(signal)]
-    async fn status_notifier_item_unregistered(
-        emitter: &SignalEmitter<'_>,
-        service: &str,
-    ) -> zbus::Result<()>;
+macro_rules! watcher_object {
+    ($type:ident, $interface:literal) => {
+        pub(super) struct $type {
+            pub(super) registry: Arc<Mutex<WatcherRegistry>>,
+        }
 
-    #[zbus(signal)]
-    async fn status_notifier_host_registered(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+        // these declarations keep signals in introspection; emission is mirrored
+        // through the generated associated functions below.
+        #[zbus::interface(name = $interface)]
+        impl $type {
+            async fn register_status_notifier_item(
+                &self,
+                service_or_path: String,
+                #[zbus(header)] header: Header<'_>,
+                #[zbus(connection)] connection: &Connection,
+            ) -> zbus::fdo::Result<()> {
+                register_watcher_item(&self.registry, service_or_path, header, connection).await
+            }
 
-    #[zbus(signal)]
-    async fn status_notifier_host_unregistered(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+            async fn register_status_notifier_host(
+                &self,
+                service: String,
+                #[zbus(connection)] connection: &Connection,
+            ) -> zbus::fdo::Result<()> {
+                register_watcher_host(&self.registry, service, connection).await
+            }
+
+            #[zbus(property)]
+            fn registered_status_notifier_items(&self) -> Vec<String> {
+                lock(&self.registry)
+                    .items
+                    .keys()
+                    .map(Endpoint::key)
+                    .collect()
+            }
+
+            #[zbus(property)]
+            fn is_status_notifier_host_registered(&self) -> bool {
+                !lock(&self.registry).hosts.is_empty()
+            }
+
+            #[zbus(property)]
+            fn protocol_version(&self) -> i32 {
+                0
+            }
+
+            #[zbus(signal)]
+            pub(super) async fn status_notifier_item_registered(
+                emitter: &SignalEmitter<'_>,
+                service: &str,
+            ) -> zbus::Result<()>;
+
+            #[zbus(signal)]
+            pub(super) async fn status_notifier_item_unregistered(
+                emitter: &SignalEmitter<'_>,
+                service: &str,
+            ) -> zbus::Result<()>;
+
+            #[zbus(signal)]
+            pub(super) async fn status_notifier_host_registered(
+                emitter: &SignalEmitter<'_>,
+            ) -> zbus::Result<()>;
+
+            #[zbus(signal)]
+            pub(super) async fn status_notifier_host_unregistered(
+                emitter: &SignalEmitter<'_>,
+            ) -> zbus::Result<()>;
+        }
+    };
+}
+
+// zbus generates signal traits for introspection in addition to the associated
+// emitters used below, so the trait methods themselves have no Rust caller.
+#[allow(dead_code)]
+mod watcher_interfaces {
+    use super::*;
+
+    watcher_object!(KdeWatcherObject, "org.kde.StatusNotifierWatcher");
+    watcher_object!(
+        FreedesktopWatcherObject,
+        "org.freedesktop.StatusNotifierWatcher"
+    );
+}
+
+use watcher_interfaces::{FreedesktopWatcherObject, KdeWatcherObject};
+
+async fn emit_item_registered(connection: &Connection, service: &str) -> Result<(), String> {
+    let emitter =
+        SignalEmitter::new(connection, WATCHER_PATH).map_err(|error| error.to_string())?;
+    KdeWatcherObject::status_notifier_item_registered(&emitter, service)
+        .await
+        .map_err(|error| error.to_string())?;
+    FreedesktopWatcherObject::status_notifier_item_registered(&emitter, service)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn emit_item_unregistered(connection: &Connection, service: &str) -> Result<(), String> {
+    let emitter =
+        SignalEmitter::new(connection, WATCHER_PATH).map_err(|error| error.to_string())?;
+    KdeWatcherObject::status_notifier_item_unregistered(&emitter, service)
+        .await
+        .map_err(|error| error.to_string())?;
+    FreedesktopWatcherObject::status_notifier_item_unregistered(&emitter, service)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn emit_host_registered(connection: &Connection) -> Result<(), String> {
+    let emitter =
+        SignalEmitter::new(connection, WATCHER_PATH).map_err(|error| error.to_string())?;
+    KdeWatcherObject::status_notifier_host_registered(&emitter)
+        .await
+        .map_err(|error| error.to_string())?;
+    FreedesktopWatcherObject::status_notifier_host_registered(&emitter)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn emit_host_unregistered(connection: &Connection) -> Result<(), String> {
+    let emitter =
+        SignalEmitter::new(connection, WATCHER_PATH).map_err(|error| error.to_string())?;
+    KdeWatcherObject::status_notifier_host_unregistered(&emitter)
+        .await
+        .map_err(|error| error.to_string())?;
+    FreedesktopWatcherObject::status_notifier_host_unregistered(&emitter)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn remove_registered_name(
@@ -1177,7 +1459,7 @@ mod tests {
     use std::{
         io::{BufRead, BufReader},
         process::{Child, Command as ProcessCommand, Stdio},
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         time::Instant,
     };
 
@@ -1187,6 +1469,7 @@ mod tests {
 
     const ITEM_NAME: &str = "org.example.ThingTrayItem";
     const FREEDESKTOP_ITEM_NAME: &str = "org.example.ThingFreedesktopTrayItem";
+    const STALLED_ITEM_NAME: &str = "org.example.ThingStalledTrayItem";
     const ITEM_PATH: &str = "/StatusNotifierItem";
 
     #[test]
@@ -1215,6 +1498,8 @@ mod tests {
         assert!(parse_endpoint("/custom/item", None).is_err());
         assert!(parse_endpoint("not a bus name", None).is_err());
         assert!(parse_endpoint("org.example.Item/not a path", None).is_err());
+        let oversized_path = format!("/{}", "a".repeat(MAX_ENDPOINT_BYTES));
+        assert!(parse_endpoint(&oversized_path, Some(":1.42")).is_err());
     }
 
     #[test]
@@ -1224,6 +1509,35 @@ mod tests {
         assert!(!valid_pixmaps(&[(2, 2, vec![0; 15])]));
         assert!(!valid_pixmaps(&[(257, 257, vec![0; 257 * 257 * 4])]));
         assert!(!valid_pixmaps(&vec![(1, 1, vec![0; 4]); MAX_PIXMAPS + 1]));
+    }
+
+    #[test]
+    fn retained_error_text_is_bounded_on_a_utf8_boundary() {
+        let error = sanitize(format!("{}\0", "é".repeat(4096)), 4096);
+        assert_eq!(error.len(), 4096);
+        assert!(!error.contains('\0'));
+    }
+
+    #[test]
+    fn host_owner_replacement_survives_late_cleanup_for_the_previous_owner() {
+        let registry = Mutex::new(WatcherRegistry::default());
+        assert_eq!(
+            lock(&registry)
+                .register_host("org.example.Host".into(), ":1.10".into())
+                .unwrap(),
+            RegistryChange::Inserted
+        );
+        assert_eq!(
+            lock(&registry)
+                .register_host("org.example.Host".into(), ":1.11".into())
+                .unwrap(),
+            RegistryChange::Replaced
+        );
+
+        let (items, host_removed) = remove_registered_name(&registry, "org.example.Host", ":1.10");
+        assert!(items.is_empty());
+        assert!(!host_removed);
+        assert_eq!(lock(&registry).hosts["org.example.Host"].owner, ":1.11");
     }
 
     #[test]
@@ -1243,7 +1557,7 @@ mod tests {
         let state = Arc::new(Mutex::new(FakeItemState::default()));
         let calls = Arc::new(FakeCalls::default());
         let item_connection = fake_item(&address, state.clone(), calls.clone());
-        register_item(&item_connection, ITEM_NAME);
+        register_item(&item_connection, KDE_PROTOCOL, ITEM_NAME);
 
         let snapshot = wait_for(&tray, |snapshot| snapshot.items.len() == 1);
         let first_id = snapshot.items[0].id.clone();
@@ -1318,7 +1632,7 @@ mod tests {
             item_connection.request_name_with_flags(ITEM_NAME, RequestNameFlags::DoNotQueue.into()),
         )
         .unwrap();
-        register_item(&item_connection, ITEM_NAME);
+        register_item(&item_connection, KDE_PROTOCOL, ITEM_NAME);
         let replacement = wait_for(&tray, |snapshot| snapshot.items.len() == 1);
         assert_ne!(replacement.items[0].id, first_id);
 
@@ -1340,7 +1654,11 @@ mod tests {
 
         let calls = Arc::new(FakeCalls::default());
         let item_connection = freedesktop_item(&address, calls.clone());
-        register_item(&item_connection, FREEDESKTOP_ITEM_NAME);
+        register_item(
+            &item_connection,
+            FREEDESKTOP_PROTOCOL,
+            FREEDESKTOP_ITEM_NAME,
+        );
         let snapshot = wait_for(&tray, |snapshot| snapshot.items.len() == 1);
         let item = &snapshot.items[0];
         assert_eq!(item.protocol_item_id, "freedesktop-item");
@@ -1361,19 +1679,7 @@ mod tests {
         let address = format!("unix:path={}", socket.display());
         let mut bus = Bus::start(&address);
         let registry = Arc::new(Mutex::new(WatcherRegistry::default()));
-        let external = async_io::block_on(async {
-            zbus::connection::Builder::address(address.as_str())?
-                .name(WATCHER_NAME)?
-                .serve_at(
-                    WATCHER_PATH,
-                    WatcherObject {
-                        registry: registry.clone(),
-                    },
-                )?
-                .build()
-                .await
-        })
-        .unwrap();
+        let external = external_watcher(&address, KDE_PROTOCOL, registry.clone());
         let external_owner = external.unique_name().unwrap().to_string();
         let (ping, _source) = calloop::ping::make_ping().unwrap();
         let tray =
@@ -1390,7 +1696,7 @@ mod tests {
         .unwrap();
         let dbus = async_io::block_on(DBusProxy::new(&observer)).unwrap();
         assert_eq!(
-            async_io::block_on(get_name_owner(&dbus, WATCHER_NAME)).unwrap(),
+            async_io::block_on(get_name_owner(&dbus, KDE_WATCHER_NAME)).unwrap(),
             Some(external_owner)
         );
 
@@ -1398,34 +1704,225 @@ mod tests {
         wait_for(&tray, |snapshot| !snapshot.available);
         thread::sleep(Duration::from_millis(150));
         assert_eq!(
-            async_io::block_on(get_name_owner(&dbus, WATCHER_NAME)).unwrap(),
+            async_io::block_on(get_name_owner(&dbus, KDE_WATCHER_NAME)).unwrap(),
             None
         );
 
-        let replacement = async_io::block_on(async {
-            zbus::connection::Builder::address(address.as_str())?
-                .name(WATCHER_NAME)?
-                .serve_at(
-                    WATCHER_PATH,
-                    WatcherObject {
-                        registry: Arc::new(Mutex::new(WatcherRegistry::default())),
-                    },
-                )?
-                .build()
-                .await
-        })
-        .unwrap();
+        let replacement = external_watcher(
+            &address,
+            KDE_PROTOCOL,
+            Arc::new(Mutex::new(WatcherRegistry::default())),
+        );
         let replacement_owner = replacement.unique_name().unwrap().to_string();
         let snapshot = wait_for(&tray, |snapshot| snapshot.available);
         assert!(!snapshot.watcher_owned);
         assert_eq!(
-            async_io::block_on(get_name_owner(&dbus, WATCHER_NAME)).unwrap(),
+            async_io::block_on(get_name_owner(&dbus, KDE_WATCHER_NAME)).unwrap(),
             Some(replacement_owner)
         );
 
         drop(tray);
         drop(observer);
         drop(replacement);
+        bus.stop();
+    }
+
+    #[test]
+    fn own_watcher_mode_follows_a_freedesktop_watcher_without_splitting_names() {
+        let directory = TempDir::new().unwrap();
+        let socket = directory.path().join("bus");
+        let address = format!("unix:path={}", socket.display());
+        let mut bus = Bus::start(&address);
+        let registry = Arc::new(Mutex::new(WatcherRegistry::default()));
+        let watcher = external_watcher(&address, FREEDESKTOP_PROTOCOL, registry.clone());
+        let expected_owner = watcher.unique_name().unwrap().to_string();
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let tray =
+            SystemTray::start_at(SystemTrayMode::OwnWatcher, Some(address.clone()), ping).unwrap();
+
+        let snapshot = wait_for(&tray, |snapshot| snapshot.available);
+        assert!(!snapshot.watcher_owned);
+        wait_until(|| {
+            lock(&registry)
+                .hosts
+                .keys()
+                .any(|name| name.starts_with(FREEDESKTOP_HOST_PREFIX))
+        });
+        let freedesktop_host_name = lock(&registry).hosts.keys().next().unwrap().clone();
+        let observer = async_io::block_on(
+            zbus::connection::Builder::address(address.as_str())
+                .unwrap()
+                .build(),
+        )
+        .unwrap();
+        let dbus = async_io::block_on(DBusProxy::new(&observer)).unwrap();
+        assert_eq!(
+            async_io::block_on(get_name_owner(&dbus, FREEDESKTOP_WATCHER_NAME)).unwrap(),
+            Some(expected_owner)
+        );
+        assert_eq!(
+            async_io::block_on(get_name_owner(&dbus, KDE_WATCHER_NAME)).unwrap(),
+            None
+        );
+
+        let kde_registry = Arc::new(Mutex::new(WatcherRegistry::default()));
+        let kde_watcher = external_watcher(&address, KDE_PROTOCOL, kde_registry.clone());
+        wait_until(|| !lock(&kde_registry).hosts.is_empty());
+        wait_until(|| {
+            async_io::block_on(get_name_owner(&dbus, &freedesktop_host_name))
+                .unwrap()
+                .is_none()
+        });
+
+        drop(tray);
+        drop(observer);
+        drop(kde_watcher);
+        drop(watcher);
+        bus.stop();
+    }
+
+    #[test]
+    fn host_uses_one_watcher_and_retires_targets_when_falling_back_to_the_other() {
+        let directory = TempDir::new().unwrap();
+        let socket = directory.path().join("bus");
+        let address = format!("unix:path={}", socket.display());
+        let mut bus = Bus::start(&address);
+        let kde_registry = Arc::new(Mutex::new(WatcherRegistry::default()));
+        let freedesktop_registry = Arc::new(Mutex::new(WatcherRegistry::default()));
+        let kde = external_watcher(&address, KDE_PROTOCOL, kde_registry.clone());
+        let freedesktop =
+            external_watcher(&address, FREEDESKTOP_PROTOCOL, freedesktop_registry.clone());
+        let calls = Arc::new(FakeCalls::default());
+        let item_connection = fake_item(
+            &address,
+            Arc::new(Mutex::new(FakeItemState::default())),
+            calls.clone(),
+        );
+        register_item(&item_connection, KDE_PROTOCOL, ITEM_NAME);
+        register_item(&item_connection, FREEDESKTOP_PROTOCOL, ITEM_NAME);
+
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let tray = SystemTray::start_at(SystemTrayMode::Host, Some(address.clone()), ping).unwrap();
+        let first = wait_for(&tray, |snapshot| snapshot.items.len() == 1);
+        let first_id = first.items[0].id.clone();
+        wait_until(|| !lock(&kde_registry).hosts.is_empty());
+        assert!(lock(&freedesktop_registry).hosts.is_empty());
+        tray.send(SystemTrayAction::Activate, &first_id).unwrap();
+        wait_until(|| calls.activate.load(Ordering::Acquire) == 1);
+
+        drop(kde);
+        let second = wait_for(&tray, |snapshot| {
+            snapshot.items.len() == 1 && snapshot.items[0].id != first_id
+        });
+        let second_id = second.items[0].id.clone();
+        wait_until(|| !lock(&freedesktop_registry).hosts.is_empty());
+        assert_eq!(
+            tray.send(SystemTrayAction::Activate, &first_id),
+            Err("system tray item is no longer available")
+        );
+        tray.send(SystemTrayAction::Activate, &second_id).unwrap();
+        wait_until(|| calls.activate.load(Ordering::Acquire) == 2);
+
+        drop(tray);
+        drop(item_connection);
+        drop(freedesktop);
+        bus.stop();
+    }
+
+    #[test]
+    fn second_watcher_name_race_releases_partial_ownership() {
+        let directory = TempDir::new().unwrap();
+        let socket = directory.path().join("bus");
+        let address = format!("unix:path={}", socket.display());
+        let mut bus = Bus::start(&address);
+        let external = external_watcher(
+            &address,
+            FREEDESKTOP_PROTOCOL,
+            Arc::new(Mutex::new(WatcherRegistry::default())),
+        );
+        let expected_owner = external.unique_name().unwrap().to_string();
+        let contender = async_io::block_on(
+            zbus::connection::Builder::address(address.as_str())
+                .unwrap()
+                .build(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            async_io::block_on(acquire_watcher_names(&contender)).unwrap(),
+            WatcherAcquisition::Declined
+        );
+        let dbus = async_io::block_on(DBusProxy::new(&contender)).unwrap();
+        assert_eq!(
+            async_io::block_on(get_name_owner(&dbus, KDE_WATCHER_NAME)).unwrap(),
+            None
+        );
+        assert_eq!(
+            async_io::block_on(get_name_owner(&dbus, FREEDESKTOP_WATCHER_NAME)).unwrap(),
+            Some(expected_owner)
+        );
+
+        drop(contender);
+        drop(external);
+        bus.stop();
+    }
+
+    #[test]
+    fn malformed_external_registrations_are_isolated_and_bounded() {
+        let directory = TempDir::new().unwrap();
+        let socket = directory.path().join("bus");
+        let address = format!("unix:path={}", socket.display());
+        let mut bus = Bus::start(&address);
+        let state = Arc::new(Mutex::new(FakeItemState::default()));
+        let item_connection = fake_item(&address, state.clone(), Arc::new(FakeCalls::default()));
+        let watcher = listed_watcher(&address, vec!["not a bus name".into(), ITEM_NAME.into()]);
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let tray = SystemTray::start_at(SystemTrayMode::Host, Some(address.clone()), ping).unwrap();
+        let first = wait_for(&tray, |snapshot| snapshot.items.len() == 1);
+        assert_eq!(first.items[0].protocol_item_id, "thing-item");
+
+        emit_watcher_registration(&watcher, KDE_PROTOCOL, "still not a bus name");
+        emit_watcher_registration(
+            &watcher,
+            KDE_PROTOCOL,
+            &format!("org.example.{}", "a".repeat(MAX_SIGNAL_BYTES)),
+        );
+        state.lock().unwrap().title = "still connected".into();
+        emit_item_signal(&item_connection, "NewTitle", &());
+        let updated = wait_for(&tray, |snapshot| {
+            snapshot
+                .items
+                .first()
+                .is_some_and(|item| item.title == "still connected")
+        });
+        assert!(updated.available);
+
+        drop(tray);
+        drop(watcher);
+        drop(item_connection);
+        bus.stop();
+    }
+
+    #[test]
+    fn dropping_the_worker_interrupts_a_stalled_item_query() {
+        let directory = TempDir::new().unwrap();
+        let socket = directory.path().join("bus");
+        let address = format!("unix:path={}", socket.display());
+        let mut bus = Bus::start(&address);
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let tray =
+            SystemTray::start_at(SystemTrayMode::OwnWatcher, Some(address.clone()), ping).unwrap();
+        wait_for(&tray, |snapshot| snapshot.available);
+        let started = Arc::new(AtomicBool::new(false));
+        let item_connection = stalled_item(&address, started.clone());
+        register_item(&item_connection, KDE_PROTOCOL, STALLED_ITEM_NAME);
+        wait_until(|| started.load(Ordering::Acquire));
+
+        let before = Instant::now();
+        drop(tray);
+        assert!(before.elapsed() < Duration::from_millis(500));
+
+        drop(item_connection);
         bus.stop();
     }
 
@@ -1441,19 +1938,7 @@ mod tests {
         assert!(!lock(&tray.shared).online);
 
         let registry = Arc::new(Mutex::new(WatcherRegistry::default()));
-        let watcher = async_io::block_on(async {
-            zbus::connection::Builder::address(address.as_str())?
-                .name(WATCHER_NAME)?
-                .serve_at(
-                    WATCHER_PATH,
-                    WatcherObject {
-                        registry: registry.clone(),
-                    },
-                )?
-                .build()
-                .await
-        })
-        .unwrap();
+        let watcher = external_watcher(&address, KDE_PROTOCOL, registry.clone());
         let snapshot = wait_for(&tray, |snapshot| snapshot.available);
         assert!(!snapshot.watcher_owned);
         wait_until(|| !lock(&registry).hosts.is_empty());
@@ -1529,6 +2014,43 @@ mod tests {
 
     struct FakeFreedesktopItem {
         calls: Arc<FakeCalls>,
+    }
+
+    struct StalledItem {
+        started: Arc<AtomicBool>,
+    }
+
+    #[zbus::interface(name = "org.kde.StatusNotifierItem")]
+    impl StalledItem {
+        #[zbus(property)]
+        async fn title(&self) -> String {
+            self.started.store(true, Ordering::Release);
+            future::pending().await
+        }
+    }
+
+    struct ListedWatcher {
+        registrations: Vec<String>,
+    }
+
+    #[zbus::interface(name = "org.kde.StatusNotifierWatcher")]
+    impl ListedWatcher {
+        fn register_status_notifier_host(&self, _service: String) {}
+
+        #[zbus(property)]
+        fn registered_status_notifier_items(&self) -> Vec<String> {
+            self.registrations.clone()
+        }
+
+        #[zbus(property)]
+        fn is_status_notifier_host_registered(&self) -> bool {
+            true
+        }
+
+        #[zbus(property)]
+        fn protocol_version(&self) -> i32 {
+            0
+        }
     }
 
     #[zbus::interface(name = "org.freedesktop.StatusNotifierItem")]
@@ -1652,6 +2174,34 @@ mod tests {
         }
     }
 
+    fn external_watcher(
+        address: &str,
+        protocol: WatcherProtocol,
+        registry: Arc<Mutex<WatcherRegistry>>,
+    ) -> Connection {
+        async_io::block_on(async {
+            let builder = zbus::connection::Builder::address(address)?.name(protocol.name)?;
+            let builder = if protocol == KDE_PROTOCOL {
+                builder.serve_at(WATCHER_PATH, KdeWatcherObject { registry })?
+            } else {
+                builder.serve_at(WATCHER_PATH, FreedesktopWatcherObject { registry })?
+            };
+            builder.build().await
+        })
+        .unwrap()
+    }
+
+    fn listed_watcher(address: &str, registrations: Vec<String>) -> Connection {
+        async_io::block_on(async {
+            zbus::connection::Builder::address(address)?
+                .name(KDE_WATCHER_NAME)?
+                .serve_at(WATCHER_PATH, ListedWatcher { registrations })?
+                .build()
+                .await
+        })
+        .unwrap()
+    }
+
     fn fake_item(
         address: &str,
         state: Arc<Mutex<FakeItemState>>,
@@ -1678,11 +2228,22 @@ mod tests {
         .unwrap()
     }
 
-    fn register_item(connection: &Connection, service: &str) {
+    fn stalled_item(address: &str, started: Arc<AtomicBool>) -> Connection {
+        async_io::block_on(async {
+            zbus::connection::Builder::address(address)?
+                .name(STALLED_ITEM_NAME)?
+                .serve_at(ITEM_PATH, StalledItem { started })?
+                .build()
+                .await
+        })
+        .unwrap()
+    }
+
+    fn register_item(connection: &Connection, protocol: WatcherProtocol, service: &str) {
         async_io::block_on(connection.call_method(
-            Some(WATCHER_NAME),
+            Some(protocol.name),
             WATCHER_PATH,
-            Some(WATCHER_INTERFACE),
+            Some(protocol.interface),
             "RegisterStatusNotifierItem",
             &(service,),
         ))
@@ -1699,6 +2260,21 @@ mod tests {
             KDE_ITEM_INTERFACE,
             member,
             body,
+        ))
+        .unwrap();
+    }
+
+    fn emit_watcher_registration(
+        connection: &Connection,
+        protocol: WatcherProtocol,
+        registration: &str,
+    ) {
+        async_io::block_on(connection.emit_signal(
+            None::<&str>,
+            WATCHER_PATH,
+            protocol.interface,
+            "StatusNotifierItemRegistered",
+            &(registration,),
         ))
         .unwrap();
     }
