@@ -1109,6 +1109,59 @@ rendered yet. `has_menu` does not mean thing can render a DBusMenu layout; the
 context-menu action is only forwarded to the item. legacy XEmbed tray items are
 not supported.
 
+## clipboard
+
+clipboard access is opt-in because it lets a configuration read text copied in
+other applications, even when a thing surface is not focused. enable it only for
+a configuration you trust:
+
+```sh
+thing run --clipboard ./panel.luau
+```
+
+`services.clipboard.text:get()` contains the current regular clipboard text, or
+`nil` when the selection is empty or does not offer text. `loading:get()` is true
+while thing is reading a new selection. `available:get()` says whether the
+compositor has provided a usable clipboard device, and `error:get()` contains a
+protocol or read error when something goes wrong. outgoing write failures are
+reported in the terminal running thing.
+
+these are reactive values. this button follows the current text and replaces it
+when clicked:
+
+```luau
+local clipboard = services.clipboard
+
+ui.button {
+    enabled = function() return clipboard.available:get() end,
+    on_click = function() clipboard.set_text('copied from thing') end,
+    children = {
+        ui.text {
+            text = function()
+                if clipboard.loading:get() then return 'reading…' end
+                return clipboard.text:get() or 'clipboard has no text'
+            end,
+        },
+    },
+}
+```
+
+`set_text(text)` and `clear()` are event-handler actions. after `set_text`, thing
+keeps the supplied bytes available to other applications until the selection is
+replaced, the compositor cancels it, or thing exits. text must be valid utf-8,
+contain no NUL byte, and be no larger than 1 mib. reads and writes time out after
+two seconds, and retained source text is bounded to 4 mib.
+
+the service prefers `ext-data-control-v1` and falls back to
+`wlr-data-control-v1`. if the compositor supports neither protocol,
+`available:get()` remains false and `error:get()` explains why. there is no
+focus-dependent `wl_data_device` fallback for this desktop-wide service.
+
+thing does not keep clipboard history and does not expose the primary selection,
+images, or arbitrary mime types. without `--clipboard`, the service is
+unavailable with no error and performs no clipboard work. `thing check` never
+connects to wayland.
+
 ## popups and input
 
 place a popup under its trigger button and bind `visible` to local state. change

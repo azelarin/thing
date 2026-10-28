@@ -64,7 +64,8 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] per-application audio controls
 - [x] media metadata and playback controls
 - [x] desktop notifications
-- [ ] tray and clipboard services
+- [x] clipboard text service
+- [x] system tray
 - [ ] session locking and idle inhibition
 - [ ] accessibility and complete keyboard navigation
 
