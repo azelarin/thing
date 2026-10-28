@@ -50,6 +50,25 @@ local clipboard_button = ui.button {
     },
 }
 
+local pointer_area = ui.pointer_area {
+    on_pointer = function(event)
+        local local_position = event.x + event.y
+        local surface_position = event.surface_x + event.surface_y
+        local modified = event.shift or event.ctrl or event.alt or event.logo
+        if event.phase == "cancel" or event.button == "secondary" then
+            return modified and local_position ~= surface_position
+        end
+        return nil
+    end,
+    children = { ui.text { text = "drag region" } },
+}
+
+local pointer_button = ui.button {
+    on_pointer = function(event)
+        return event.phase == "press"
+    end,
+}
+
 local tray = ui.row {
     children = function()
         local children = {}
@@ -134,5 +153,13 @@ return ui.panel {
             { x = 420, width = 80 },
         },
     },
-    children = { input, clipboard_button, tray, tray_menu_button, process_button },
+    children = {
+        input,
+        clipboard_button,
+        pointer_area,
+        pointer_button,
+        tray,
+        tray_menu_button,
+        process_button,
+    },
 }

@@ -21,6 +21,7 @@ pub enum Kind {
     Image,
     Path,
     Button,
+    PointerArea,
     Slider,
     Range,
 }
@@ -451,6 +452,7 @@ impl Kind {
                 | Self::Stack
                 | Self::Scroll
                 | Self::Button
+                | Self::PointerArea
                 | Self::Range
         )
     }
@@ -734,6 +736,7 @@ pub struct Node {
     pub enabled: bool,
     pub visible: bool,
     pub autofocus: bool,
+    pub pointer_events: bool,
     pub key: Option<String>,
     pub children: Vec<Node>,
 }
@@ -765,6 +768,7 @@ impl Node {
             enabled: true,
             visible: true,
             autofocus: false,
+            pointer_events: false,
             key: None,
             children: Vec::new(),
         }
@@ -858,6 +862,14 @@ impl Node {
                 "autofocus is available only on interactive widgets".into(),
             ));
         }
+        if self.pointer_events && !matches!(self.kind, Kind::Button | Kind::PointerArea) {
+            return Err(TreeError(
+                "pointer events are available only on button and pointer_area widgets".into(),
+            ));
+        }
+        if self.kind == Kind::PointerArea && !self.pointer_events {
+            return Err(TreeError("pointer_area requires an event handler".into()));
+        }
         let style = &self.style;
         if (self.kind == Kind::Popup || (depth == 0 && self.kind == Kind::Panel))
             && [
@@ -910,11 +922,17 @@ impl Node {
         if style.wrap
             && !matches!(
                 self.kind,
-                Kind::Panel | Kind::Popup | Kind::Row | Kind::Column | Kind::Button
+                Kind::Panel
+                    | Kind::Popup
+                    | Kind::Row
+                    | Kind::Column
+                    | Kind::Button
+                    | Kind::PointerArea
             )
         {
             return Err(TreeError(
-                "wrap is available only on panel, popup, row, column, and button containers".into(),
+                "wrap is available only on panel, popup, row, column, button, and pointer_area containers"
+                    .into(),
             ));
         }
         if self.max_lines == Some(0) {
@@ -1359,6 +1377,21 @@ mod tests {
         text.autofocus = true;
         assert_eq!(
             text.validate().unwrap_err().to_string(),
+            "autofocus is available only on interactive widgets"
+        );
+    }
+
+    #[test]
+    fn pointer_areas_are_containers_without_keyboard_focus() {
+        let mut area = Node::new(NodeId(1), Kind::PointerArea);
+        area.pointer_events = true;
+        area.children.push(Node::new(NodeId(2), Kind::Text));
+        assert!(area.validate().is_ok());
+        assert!(!area.kind.is_interactive());
+
+        area.autofocus = true;
+        assert_eq!(
+            area.validate().unwrap_err().to_string(),
             "autofocus is available only on interactive widgets"
         );
     }

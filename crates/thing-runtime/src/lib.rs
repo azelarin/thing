@@ -125,6 +125,46 @@ pub struct KeyDispatch {
     pub changed: bool,
 }
 
+/// one phase of a captured custom pointer sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerPhase {
+    Press,
+    Move,
+    Release,
+    Cancel,
+}
+
+/// a compositor pointer button exposed to a custom pointer handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerButton {
+    Primary,
+    Middle,
+    Secondary,
+}
+
+/// logical coordinates and modifiers for a custom pointer callback.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointerEvent {
+    pub phase: PointerPhase,
+    pub button: PointerButton,
+    pub x: f64,
+    pub y: f64,
+    pub surface_x: f64,
+    pub surface_y: f64,
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub logo: bool,
+}
+
+/// the observable result of dispatching one custom pointer callback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PointerDispatchOutcome {
+    pub changed: bool,
+    pub handled: bool,
+    pub active: bool,
+}
+
 const MAX_UI_ACTIONS_PER_HANDLER: usize = 1024;
 
 /// one widget identity captured by a local ui action.
@@ -242,6 +282,13 @@ struct Binding {
 
 type Handlers = BTreeMap<(NodeId, &'static str), Function>;
 
+struct ActivePointer {
+    target: UiTarget,
+    handler: Function,
+    last_event: PointerEvent,
+    handled: bool,
+}
+
 struct Children {
     nodes: Vec<Node>,
     bindings: BTreeMap<usize, Binding>,
@@ -261,6 +308,7 @@ pub struct Runtime {
     deferred: BTreeSet<usize>,
     handlers: Handlers,
     active_presses: BTreeMap<NodeId, Option<Function>>,
+    active_pointer: Option<ActivePointer>,
     ended_hovers: BTreeSet<NodeId>,
     deadline: Rc<Cell<Instant>>,
     limits: Limits,
@@ -351,6 +399,7 @@ impl Runtime {
             deferred: BTreeSet::new(),
             handlers: BTreeMap::new(),
             active_presses: BTreeMap::new(),
+            active_pointer: None,
             ended_hovers: BTreeSet::new(),
             deadline,
             limits,
@@ -580,6 +629,221 @@ impl Runtime {
         self.is_available(id) && self.handlers.contains_key(&(id, "on_scroll"))
     }
 
+    /// capture an available button or pointer area that has a custom handler.
+    pub fn pointer_target(&self, id: NodeId) -> Option<UiTarget> {
+        let target = self.ui_target(id)?;
+        self.pointer_target_is_current(&target).then_some(target)
+    }
+
+    /// whether the captured source and every keyed ancestor still identify a pointer target.
+    pub fn pointer_target_is_current(&self, target: &UiTarget) -> bool {
+        self.ui_target_is_current(target)
+            && self.find(target.node).is_some_and(|node| {
+                node.pointer_events && matches!(node.kind, Kind::Button | Kind::PointerArea)
+            })
+            && self.handlers.contains_key(&(target.node, "on_pointer"))
+    }
+
+    pub fn active_pointer_target(&self) -> Option<&UiTarget> {
+        self.active_pointer
+            .as_ref()
+            .map(|sequence| &sequence.target)
+    }
+
+    pub fn active_pointer_is_current(&self) -> bool {
+        self.active_pointer
+            .as_ref()
+            .is_some_and(|sequence| self.pointer_target_is_current(&sequence.target))
+    }
+
+    /// cancel a sequence whose live widget identity or availability changed.
+    pub fn reconcile_pointer_checked(
+        &mut self,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<PointerDispatchOutcome> {
+        let Some(sequence) = &self.active_pointer else {
+            return Ok(PointerDispatchOutcome::default());
+        };
+        if self.pointer_target_is_current(&sequence.target) {
+            return Ok(PointerDispatchOutcome {
+                changed: false,
+                handled: sequence.handled,
+                active: true,
+            });
+        }
+        self.cancel_pointer_checked(validate)
+    }
+
+    /// start an implicitly captured custom pointer sequence.
+    pub fn begin_pointer_checked(
+        &mut self,
+        target: &UiTarget,
+        event: PointerEvent,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<PointerDispatchOutcome> {
+        validate_pointer_event(event)?;
+        if event.phase != PointerPhase::Press {
+            return Err(Error::runtime("a pointer sequence must begin with press"));
+        }
+        if let Some(sequence) = &self.active_pointer {
+            return Ok(PointerDispatchOutcome {
+                changed: false,
+                handled: sequence.handled,
+                active: true,
+            });
+        }
+        if !self.pointer_target_is_current(target) {
+            return Ok(PointerDispatchOutcome::default());
+        }
+        let handler = self.handlers[&(target.node, "on_pointer")].clone();
+        let checkpoint = self.action_checkpoint();
+        self.active_pointer = Some(ActivePointer {
+            target: target.clone(),
+            handler: handler.clone(),
+            last_event: event,
+            handled: false,
+        });
+        let (changed, handled) = match self.call_pointer_checked(&handler, event, &validate) {
+            Ok(result) => result,
+            Err(error) => {
+                self.active_pointer = None;
+                return Err(error);
+            }
+        };
+        if let Some(sequence) = &mut self.active_pointer {
+            sequence.handled = handled;
+        }
+        let mut outcome = PointerDispatchOutcome {
+            changed,
+            handled,
+            active: true,
+        };
+        if !self.active_pointer_is_current() {
+            match self.reconcile_pointer_checked(&validate) {
+                Ok(cancelled) => {
+                    outcome.changed |= cancelled.changed;
+                    outcome.handled |= cancelled.handled;
+                    outcome.active = false;
+                }
+                Err(error) => {
+                    self.truncate_actions(checkpoint);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// deliver motion or release to the retained handler for a captured sequence.
+    pub fn dispatch_pointer_checked(
+        &mut self,
+        event: PointerEvent,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<PointerDispatchOutcome> {
+        validate_pointer_event(event)?;
+        if !matches!(event.phase, PointerPhase::Move | PointerPhase::Release) {
+            return Err(Error::runtime(
+                "a captured pointer sequence accepts move or release",
+            ));
+        }
+        let Some(mut sequence) = self.active_pointer.take() else {
+            return Ok(PointerDispatchOutcome::default());
+        };
+        if event.button != sequence.last_event.button {
+            self.active_pointer = Some(sequence);
+            return Err(Error::runtime(
+                "pointer event button does not match the captured sequence",
+            ));
+        }
+        if !self.pointer_target_is_current(&sequence.target) {
+            self.active_pointer = Some(sequence);
+            return self.reconcile_pointer_checked(&validate);
+        }
+
+        sequence.last_event = event;
+        let checkpoint = self.action_checkpoint();
+        let (changed, handled) = self.call_pointer_checked(&sequence.handler, event, &validate)?;
+        sequence.handled |= handled;
+        let mut outcome = PointerDispatchOutcome {
+            changed,
+            handled: sequence.handled,
+            active: event.phase == PointerPhase::Move,
+        };
+        if event.phase == PointerPhase::Release {
+            return Ok(outcome);
+        }
+
+        self.active_pointer = Some(sequence);
+        if !self.active_pointer_is_current() {
+            match self.reconcile_pointer_checked(&validate) {
+                Ok(cancelled) => {
+                    outcome.changed |= cancelled.changed;
+                    outcome.handled |= cancelled.handled;
+                    outcome.active = false;
+                }
+                Err(error) => {
+                    self.truncate_actions(checkpoint);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// end a captured sequence with one synthetic cancellation callback.
+    pub fn cancel_pointer_checked(
+        &mut self,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<PointerDispatchOutcome> {
+        let Some(sequence) = self.active_pointer.take() else {
+            return Ok(PointerDispatchOutcome::default());
+        };
+        let event = PointerEvent {
+            phase: PointerPhase::Cancel,
+            ..sequence.last_event
+        };
+        let (changed, handled) = self.call_pointer_checked(&sequence.handler, event, &validate)?;
+        Ok(PointerDispatchOutcome {
+            changed,
+            handled: sequence.handled || handled,
+            active: false,
+        })
+    }
+
+    fn call_pointer_checked(
+        &mut self,
+        handler: &Function,
+        event: PointerEvent,
+        validate: &impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<(bool, bool)> {
+        let argument = self.lua.create_table()?;
+        argument.set("phase", pointer_phase_name(event.phase))?;
+        argument.set("button", pointer_button_name(event.button))?;
+        argument.set("x", event.x)?;
+        argument.set("y", event.y)?;
+        argument.set("surface_x", event.surface_x)?;
+        argument.set("surface_y", event.surface_y)?;
+        argument.set("shift", event.shift)?;
+        argument.set("ctrl", event.ctrl)?;
+        argument.set("alt", event.alt)?;
+        argument.set("logo", event.logo)?;
+        argument.set_readonly(true);
+
+        let checkpoint = self.action_checkpoint();
+        self.begin_call();
+        self.allow_actions(true);
+        let result = handler.call::<Option<bool>>(argument);
+        self.allow_actions(false);
+        let result = result.and_then(|handled| {
+            self.refresh_at_checked(Instant::now(), validate)
+                .map(|changed| (changed, handled.unwrap_or(false)))
+        });
+        if result.is_err() {
+            self.truncate_actions(checkpoint);
+        }
+        result
+    }
+
     /// run an input handler. disabled or hidden widgets ignore input.
     pub fn dispatch(&mut self, id: NodeId, event: Event) -> Result<bool> {
         self.dispatch_checked(id, event, |_| Ok(()))
@@ -739,8 +1003,15 @@ impl Runtime {
             self.truncate_actions(checkpoint);
         }
         let changed = result?;
-        match self.cancel_unavailable_presses_checked(now, validate) {
-            Ok(cleaned) => Ok(changed || cleaned),
+        let changed = match self.cancel_unavailable_presses_checked(now, validate) {
+            Ok(cleaned) => changed || cleaned,
+            Err(error) => {
+                self.truncate_actions(checkpoint);
+                return Err(error);
+            }
+        };
+        match self.reconcile_pointer_checked(validate) {
+            Ok(pointer) => Ok(changed || pointer.changed),
             Err(error) => {
                 self.truncate_actions(checkpoint);
                 Err(error)
@@ -1294,6 +1565,9 @@ impl Runtime {
                 return Err(Error::runtime("text_input requires on_change"));
             }
         }
+        if kind == Kind::PointerArea && table.raw_get::<Value>("on_pointer")?.is_nil() {
+            return Err(Error::runtime("pointer_area requires on_pointer"));
+        }
         if depth == 0
             && !table.raw_get::<Value>("edge")?.is_nil()
             && !table.raw_get::<Value>("anchors")?.is_nil()
@@ -1330,7 +1604,8 @@ impl Runtime {
                     node.autofocus = value;
                 }
                 "on_click" | "on_middle_click" | "on_secondary_click" | "on_scroll"
-                | "on_change" | "on_pressed" | "on_submit" | "on_hover" | "on_close" | "on_key" => {
+                | "on_change" | "on_pressed" | "on_submit" | "on_hover" | "on_close" | "on_key"
+                | "on_pointer" => {
                     if (matches!(
                         key.as_str(),
                         "on_click" | "on_middle_click" | "on_secondary_click" | "on_scroll"
@@ -1342,6 +1617,8 @@ impl Runtime {
                         || (key == "on_hover" && kind != Kind::Popup && !kind.is_interactive())
                         || (key == "on_close" && kind != Kind::Popup)
                         || (key == "on_key" && !matches!(kind, Kind::Panel | Kind::Popup))
+                        || (key == "on_pointer"
+                            && !matches!(kind, Kind::Button | Kind::PointerArea))
                     {
                         return Err(Error::runtime(format!(
                             "{key} is not supported on {kind:?}"
@@ -1360,8 +1637,13 @@ impl Runtime {
                         "on_submit" => "on_submit",
                         "on_hover" => "on_hover",
                         "on_close" => "on_close",
-                        _ => "on_key",
+                        "on_key" => "on_key",
+                        "on_pointer" => "on_pointer",
+                        _ => unreachable!("event name was accepted above"),
                     };
+                    if key == "on_pointer" {
+                        node.pointer_events = true;
+                    }
                     self.handlers.insert((node.id, name), function);
                 }
                 "style" => {
@@ -1579,6 +1861,34 @@ fn valid_text_input_event(value: &str) -> bool {
             .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
 }
 
+fn validate_pointer_event(event: PointerEvent) -> Result<()> {
+    if [event.x, event.y, event.surface_x, event.surface_y]
+        .into_iter()
+        .all(f64::is_finite)
+    {
+        Ok(())
+    } else {
+        Err(Error::runtime("pointer coordinates must be finite"))
+    }
+}
+
+fn pointer_phase_name(phase: PointerPhase) -> &'static str {
+    match phase {
+        PointerPhase::Press => "press",
+        PointerPhase::Move => "move",
+        PointerPhase::Release => "release",
+        PointerPhase::Cancel => "cancel",
+    }
+}
+
+fn pointer_button_name(button: PointerButton) -> &'static str {
+    match button {
+        PointerButton::Primary => "primary",
+        PointerButton::Middle => "middle",
+        PointerButton::Secondary => "secondary",
+    }
+}
+
 fn is_available(node: &Node, id: NodeId) -> bool {
     node.visible
         && node.enabled
@@ -1599,6 +1909,7 @@ fn kind(name: &str) -> Result<Kind> {
         "image" => Ok(Kind::Image),
         "path" => Ok(Kind::Path),
         "button" => Ok(Kind::Button),
+        "pointer_area" => Ok(Kind::PointerArea),
         "slider" => Ok(Kind::Slider),
         "range" => Ok(Kind::Range),
         _ => Err(Error::runtime(format!("unknown widget {name:?}"))),
@@ -1622,6 +1933,7 @@ fn install_ui(lua: &Lua, tracker: Rc<RefCell<Tracker>>) -> Result<Rc<RefCell<UiC
         "image",
         "path",
         "button",
+        "pointer_area",
         "slider",
         "range",
     ] {

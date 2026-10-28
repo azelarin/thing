@@ -26,6 +26,7 @@ pub struct Placement {
     pub bounds: Rect,
     pub clip: Rect,
     pub interactive: bool,
+    pub pointer_events: bool,
     pub enabled: bool,
     pub opacity: f32,
     pub(crate) disabled_opacity: f32,
@@ -270,6 +271,19 @@ impl Layout {
             .rev()
             .find(|p| p.interactive && p.bounds.contains(point) && p.clip.contains(point))
             .map(|p| p.id)
+    }
+
+    /// find the deepest semantic control or custom pointer target under a point.
+    pub fn pointer_event_target(&self, point: Point) -> Option<NodeId> {
+        self.placements
+            .iter()
+            .rev()
+            .find(|placement| {
+                (placement.interactive || placement.pointer_events)
+                    && placement.bounds.contains(point)
+                    && placement.clip.contains(point)
+            })
+            .map(|placement| placement.id)
     }
 
     pub fn focus_order(&self) -> impl Iterator<Item = NodeId> + '_ {
@@ -521,6 +535,7 @@ impl Layout {
             bounds,
             clip,
             interactive: enabled && node.kind.is_interactive(),
+            pointer_events: enabled && node.pointer_events,
             enabled,
             opacity,
             disabled_opacity,
@@ -1000,6 +1015,52 @@ mod tests {
             Some(NodeId(2))
         );
         assert_eq!(layout.focus_order().collect::<Vec<_>>(), vec![NodeId(2)]);
+    }
+
+    #[test]
+    fn pointer_areas_route_to_the_deepest_target_without_joining_focus_order() {
+        let mut root = fixed(1, Kind::PointerArea, 100.0, 40.0);
+        root.pointer_events = true;
+        root.children.push(fixed(2, Kind::Button, 20.0, 20.0));
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 100.0,
+                height: 40.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+
+        assert_eq!(
+            layout.pointer_event_target(Point { x: 10.0, y: 10.0 }),
+            Some(NodeId(2))
+        );
+        assert_eq!(
+            layout.pointer_event_target(Point { x: 50.0, y: 10.0 }),
+            Some(NodeId(1))
+        );
+        assert_eq!(layout.hit_test(Point { x: 50.0, y: 10.0 }), None);
+        assert_eq!(layout.focus_order().collect::<Vec<_>>(), vec![NodeId(2)]);
+
+        let mut button = fixed(3, Kind::Button, 100.0, 40.0);
+        let mut nested = fixed(4, Kind::PointerArea, 20.0, 20.0);
+        nested.pointer_events = true;
+        button.children.push(nested);
+        let layout = Layout::compute(
+            &button,
+            Size {
+                width: 100.0,
+                height: 40.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        assert_eq!(
+            layout.pointer_event_target(Point { x: 10.0, y: 10.0 }),
+            Some(NodeId(4))
+        );
+        assert_eq!(layout.hit_test(Point { x: 10.0, y: 10.0 }), Some(NodeId(3)));
     }
 
     #[test]

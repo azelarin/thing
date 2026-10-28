@@ -48,6 +48,22 @@ export type ThingManagedProcessOptions = {
     shutdown_signal: ("terminate" | "interrupt")?,
 }
 
+export type ThingPointerPhase = "press" | "move" | "release" | "cancel"
+export type ThingPointerButton = "primary" | "middle" | "secondary"
+
+declare extern type ThingPointerEvent with
+    read phase: ThingPointerPhase
+    read button: ThingPointerButton
+    read x: number
+    read y: number
+    read surface_x: number
+    read surface_y: number
+    read shift: boolean
+    read ctrl: boolean
+    read alt: boolean
+    read logo: boolean
+end
+
 export type ThingTransitionOptions = {
     duration: number,
     easing: ThingEasing?,
@@ -324,6 +340,16 @@ export type ThingButtonProperties = {
     on_secondary_click: (() -> ())?,
     on_scroll: ((x: number, y: number) -> ())?,
     on_hover: ((inside: boolean) -> ())?,
+    on_pointer: ((event: ThingPointerEvent) -> boolean?)?,
+}
+
+export type ThingPointerAreaProperties = {
+    key: string?,
+    visible: ThingReactive<boolean>?,
+    enabled: ThingReactive<boolean>?,
+    style: ThingStyle?,
+    children: ThingChildren?,
+    on_pointer: (event: ThingPointerEvent) -> boolean?,
 }
 
 export type ThingSliderProperties = {
@@ -690,6 +716,7 @@ declare ui: {
     image: (properties: ThingImageProperties) -> ThingWidget,
     path: (properties: ThingPathProperties) -> ThingWidget,
     button: (properties: ThingButtonProperties) -> ThingWidget,
+    pointer_area: (properties: ThingPointerAreaProperties) -> ThingWidget,
     slider: (properties: ThingSliderProperties) -> ThingWidget,
     range: (properties: ThingRangeProperties) -> ThingWidget,
     focus: (widget: ThingWidget) -> (),
