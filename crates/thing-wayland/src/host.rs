@@ -30,7 +30,7 @@ use smithay_client_toolkit::{
         },
         xdg::{
             XdgShell,
-            popup::{Popup, PopupConfigure, PopupHandler},
+            popup::{Popup as XdgPopup, PopupConfigure, PopupHandler},
             window::{Window as XdgWindow, WindowConfigure, WindowHandler},
         },
     },
@@ -39,7 +39,7 @@ use thing_core::{Kind, Node, NodeId, PanelInputRegion, Point, Rect, Scale};
 use thing_runtime::{Action, Event, OutputContext, Scalar, ServiceSnapshot};
 use thing_ui::{Interaction, Layout, PaintFrame, ScrollState, Size};
 use wayland_client::{
-    Connection, Dispatch, QueueHandle, delegate_noop,
+    Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
 };
@@ -68,6 +68,7 @@ use crate::{
     launch::{self, LaunchRequest, Launcher, PendingLaunches},
     niri::Niri,
     panel::{self, Geometry, ResolvedInputRegion},
+    popup::{self, Position as PopupPosition},
     render::{FrameResult, Render, Window},
     watch::Watch,
 };
@@ -263,22 +264,29 @@ struct InputOrigin {
     surface: wl_surface::WlSurface,
 }
 
+struct PopupRole {
+    shell: XdgPopup,
+    mode: PopupMode,
+    anchor: Option<NodeId>,
+    reposition: popup::RepositionState,
+}
+
 enum Role {
     Panel(LayerSurface),
-    Popup(Popup, PopupMode),
+    Popup(PopupRole),
 }
 impl Role {
     fn surface(&self) -> &wl_surface::WlSurface {
         match self {
             Self::Panel(layer) => layer.wl_surface(),
-            Self::Popup(popup, _) => popup.wl_surface(),
+            Self::Popup(role) => role.shell.wl_surface(),
         }
     }
 
     fn popup_mode(&self) -> Option<&PopupMode> {
         match self {
             Self::Panel(_) => None,
-            Self::Popup(_, mode) => Some(mode),
+            Self::Popup(role) => Some(&role.mode),
         }
     }
 }
@@ -795,8 +803,120 @@ impl App {
                 }
             }
         }
+        let mut outputs: Vec<(wl_output::WlOutput, bool)> = Vec::new();
+        for surface in presented
+            .iter()
+            .filter_map(|index| self.surfaces.get(*index))
+        {
+            let panel = matches!(surface.role, Role::Panel(_));
+            if let Some((_, presented)) = outputs
+                .iter_mut()
+                .find(|(output, _)| output == &surface.output)
+            {
+                *presented |= panel;
+            } else {
+                outputs.push((surface.output.clone(), panel));
+            }
+        }
+        for (output, parent_presented) in outputs {
+            self.sync_popup_placement(&output, parent_presented, qh);
+        }
         self.reconcile_presented_pointers(&presented);
         Ok(())
+    }
+
+    fn sync_popup_placement(
+        &mut self,
+        output: &wl_output::WlOutput,
+        parent_presented: bool,
+        qh: &QueueHandle<Self>,
+    ) {
+        if !parent_presented
+            && self.surfaces.iter().any(|surface| {
+                &surface.output == output && matches!(surface.role, Role::Panel(_)) && surface.dirty
+            })
+        {
+            return;
+        }
+        let Some((index, anchor, position)) = self.desired_popup_position(output) else {
+            return;
+        };
+        let Role::Popup(role) = &self.surfaces[index].role else {
+            return;
+        };
+        if role.reposition.current() == position {
+            if role.anchor != anchor
+                && let Role::Popup(role) = &mut self.surfaces[index].role
+            {
+                role.anchor = anchor;
+            }
+            return;
+        }
+        let supported = role.shell.xdg_popup().version() >= 3;
+        let token = if let Role::Popup(role) = &mut self.surfaces[index].role {
+            role.reposition.request(position, supported)
+        } else {
+            None
+        };
+        let Some(token) = token else {
+            return;
+        };
+
+        let positioner = self.xdg_shell.xdg_wm_base().create_positioner(qh, ());
+        popup::configure(&positioner, position, true);
+        let Role::Popup(role) = &mut self.surfaces[index].role else {
+            positioner.destroy();
+            return;
+        };
+        role.shell.reposition(&positioner, token);
+        role.anchor = anchor;
+        positioner.destroy();
+    }
+
+    fn desired_popup_position(
+        &self,
+        output: &wl_output::WlOutput,
+    ) -> Option<(usize, Option<NodeId>, PopupPosition)> {
+        let index = self.surfaces.iter().position(|surface| {
+            &surface.output == output && matches!(surface.role, Role::Popup(_))
+        })?;
+        let popup_surface = &self.surfaces[index];
+        // reposition applies only after the popup's first buffer has been mapped.
+        popup_surface.layout.as_ref()?;
+        let Role::Popup(role) = &popup_surface.role else {
+            return None;
+        };
+        let parent = self
+            .surfaces
+            .iter()
+            .find(|surface| &surface.output == output && matches!(surface.role, Role::Panel(_)))?;
+        let root = self.configurations.root(output)?;
+        let anchor = match &role.mode {
+            PopupMode::Manual => {
+                let (popup, anchor) = find_manual_popup(root, None)?;
+                (popup == popup_surface.root).then_some(anchor)?
+            }
+            PopupMode::Automatic(key) | PopupMode::Hover(key) => Some(key.anchor),
+        };
+        let trigger = match anchor {
+            Some(anchor) => parent
+                .layout
+                .as_ref()?
+                .get(anchor)
+                .map(|placement| placement.bounds)?,
+            None => Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: parent.size.1 as f32,
+            },
+        };
+        let node = root.find(popup_surface.root)?;
+        Some((
+            index,
+            anchor,
+            popup::resolve(node, trigger, root.panel.edge, parent.size),
+        ))
     }
 
     fn dispatch(
@@ -1074,20 +1194,6 @@ impl App {
         };
         let output = parent.output.clone();
         let parent_scale = parent.scale;
-        let Some(node) = self
-            .configurations
-            .root(&output)
-            .and_then(|root| root.find(id))
-        else {
-            return false;
-        };
-        let width = node.style.width.unwrap_or(320.0).round().clamp(1.0, 4096.0) as i32;
-        let height = node
-            .style
-            .height
-            .unwrap_or(200.0)
-            .round()
-            .clamp(1.0, 4096.0) as i32;
         let anchor = match anchor_id {
             Some(id) => {
                 let Some(anchor) = parent
@@ -1107,6 +1213,12 @@ impl App {
                 height: parent.size.1 as f32,
             },
         };
+        let Some(position) = self.configurations.root(&output).and_then(|root| {
+            root.find(id)
+                .map(|node| popup::resolve(node, anchor, root.panel.edge, parent.size))
+        }) else {
+            return false;
+        };
         let layer = layer.clone();
         let seat = match serial {
             Some(_) => {
@@ -1118,34 +1230,26 @@ impl App {
             None => None,
         };
         let positioner = self.xdg_shell.xdg_wm_base().create_positioner(qh, ());
-        positioner.set_size(width, height);
-        positioner.set_anchor_rect(
-            anchor.x.round() as i32,
-            anchor.y.round() as i32,
-            anchor.width.max(1.0).round() as i32,
-            anchor.height.max(1.0).round() as i32,
-        );
-        positioner.set_anchor(xdg_positioner::Anchor::BottomRight);
-        positioner.set_gravity(xdg_positioner::Gravity::BottomLeft);
-        positioner.set_constraint_adjustment(
-            xdg_positioner::ConstraintAdjustment::SlideX
-                | xdg_positioner::ConstraintAdjustment::FlipX
-                | xdg_positioner::ConstraintAdjustment::FlipY,
-        );
+        popup::configure(&positioner, position, true);
         let wl = self.compositor.create_surface(qh);
-        let popup = Popup::from_surface(None, &positioner, qh, wl, &self.xdg_shell);
+        let popup = XdgPopup::from_surface(None, &positioner, qh, wl, &self.xdg_shell);
         positioner.destroy();
         match popup {
-            Ok(popup) => {
-                layer.get_popup(popup.xdg_popup());
+            Ok(shell) => {
+                layer.get_popup(shell.xdg_popup());
                 if let Some((seat, serial)) = seat.as_ref().zip(serial) {
-                    popup.xdg_popup().grab(seat, serial);
+                    shell.xdg_popup().grab(seat, serial);
                 }
                 let surface = self.make_surface(
-                    Role::Popup(popup, mode),
+                    Role::Popup(PopupRole {
+                        shell,
+                        mode,
+                        anchor: anchor_id,
+                        reposition: popup::RepositionState::new(position),
+                    }),
                     output,
                     id,
-                    (width as u32, height as u32),
+                    (position.size.0 as u32, position.size.1 as u32),
                     parent_scale,
                     qh,
                 );
@@ -2114,17 +2218,23 @@ impl PopupHandler for App {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        popup: &Popup,
+        popup: &XdgPopup,
         config: PopupConfigure,
     ) {
         if let Some(index) = self.index(popup.wl_surface()) {
             let surface = &mut self.surfaces[index];
-            surface.size = (config.width.max(1) as u32, config.height.max(1) as u32);
+            let size = (config.width.max(1) as u32, config.height.max(1) as u32);
+            let initial = !surface.configured;
+            if surface.size != size {
+                surface.size = size;
+                surface.layout = None;
+                surface.dirty = true;
+            }
             surface.configured = true;
-            surface.dirty = true;
+            surface.dirty |= initial;
         }
     }
-    fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &Popup) {
+    fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &XdgPopup) {
         if let Some(index) = self.index(popup.wl_surface()) {
             self.remove_popup(index, true, true);
             self.reconcile_hover_intent();

@@ -9,6 +9,7 @@ mod hover;
 mod launch;
 mod niri;
 mod panel;
+mod popup;
 mod render;
 #[cfg(feature = "vulkan")]
 mod vulkan;
