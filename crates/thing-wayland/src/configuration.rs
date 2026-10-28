@@ -8,8 +8,9 @@ use thing_core::{Node, NodeId};
 use thing_runtime::{
     Action, AudioSnapshot, ClipboardSnapshot, Event, KeyInput, ManagedProcessDefinition,
     ManagedProcessSnapshot, ManagedProcessState, MediaSnapshot, NiriState, NotificationSnapshot,
-    OutputContext, PowerSnapshot, Runtime, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree,
-    SystemTraySnapshot, UiAction, UiTarget,
+    OutputContext, PointerDispatchOutcome as RuntimePointerOutcome, PointerEvent, PowerSnapshot,
+    Runtime, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTraySnapshot, UiAction,
+    UiTarget,
 };
 use thing_ui::Layout;
 
@@ -44,6 +45,39 @@ pub(crate) struct DispatchOutcome {
 pub(crate) struct KeyHandlerOutcome {
     pub(crate) handled: bool,
     pub(crate) dispatch: DispatchOutcome,
+}
+
+#[derive(Debug)]
+pub(crate) struct PointerHandlerOutcome {
+    pub(crate) handled: bool,
+    pub(crate) active: bool,
+    pub(crate) dispatch: DispatchOutcome,
+}
+
+impl PointerHandlerOutcome {
+    fn inactive() -> Self {
+        Self {
+            handled: false,
+            active: false,
+            dispatch: DispatchOutcome {
+                changed: false,
+                actions: Vec::new(),
+                ui_actions: Vec::new(),
+            },
+        }
+    }
+
+    fn collect(runtime: &mut Runtime, outcome: RuntimePointerOutcome) -> Self {
+        Self {
+            handled: outcome.handled,
+            active: outcome.active,
+            dispatch: DispatchOutcome {
+                changed: outcome.changed,
+                actions: runtime.take_actions(),
+                ui_actions: runtime.take_ui_actions(),
+            },
+        }
+    }
 }
 
 impl<K: Clone + Eq> Configurations<K> {
@@ -196,6 +230,15 @@ impl<K: Clone + Eq> Configurations<K> {
             .is_some_and(|runtime| runtime.ui_target_identity_is_current(target))
     }
 
+    pub(crate) fn pointer_target_is_current(&self, key: &K, target: &UiTarget) -> bool {
+        self.runtime(key)
+            .is_some_and(|runtime| runtime.pointer_target_is_current(target))
+    }
+
+    pub(crate) fn active_pointer_matches(&self, key: &K, target: &UiTarget) -> bool {
+        self.runtime(key).and_then(Runtime::active_pointer_target) == Some(target)
+    }
+
     pub(crate) fn presented_target_is_current(
         &self,
         key: &K,
@@ -217,6 +260,18 @@ impl<K: Clone + Eq> Configurations<K> {
     ) -> bool {
         self.consumer(key) == Some(consumer)
             && self.ui_target_identity_is_current(key, target)
+            && self.rendered_surface_root(key, target.node()) == Some(surface_root)
+    }
+
+    pub(crate) fn presented_pointer_target_is_current(
+        &self,
+        key: &K,
+        consumer: &str,
+        surface_root: NodeId,
+        target: &UiTarget,
+    ) -> bool {
+        self.consumer(key) == Some(consumer)
+            && self.pointer_target_is_current(key, target)
             && self.rendered_surface_root(key, target.node()) == Some(surface_root)
     }
 
@@ -559,6 +614,65 @@ impl<K: Clone + Eq> Configurations<K> {
         }))
     }
 
+    pub(crate) fn begin_pointer_checked(
+        &mut self,
+        key: &K,
+        target: &UiTarget,
+        event: PointerEvent,
+        validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
+    ) -> Result<PointerHandlerOutcome, String> {
+        let Some(runtime) = self.runtime_mut(key) else {
+            return Ok(PointerHandlerOutcome::inactive());
+        };
+        let outcome = runtime
+            .begin_pointer_checked(target, event, validate)
+            .map_err(|error| error.to_string())?;
+        Ok(PointerHandlerOutcome::collect(runtime, outcome))
+    }
+
+    pub(crate) fn dispatch_pointer_checked(
+        &mut self,
+        key: &K,
+        event: PointerEvent,
+        validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
+    ) -> Result<PointerHandlerOutcome, String> {
+        let Some(runtime) = self.runtime_mut(key) else {
+            return Ok(PointerHandlerOutcome::inactive());
+        };
+        let outcome = runtime
+            .dispatch_pointer_checked(event, validate)
+            .map_err(|error| error.to_string())?;
+        Ok(PointerHandlerOutcome::collect(runtime, outcome))
+    }
+
+    pub(crate) fn reconcile_pointer_checked(
+        &mut self,
+        key: &K,
+        validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
+    ) -> Result<PointerHandlerOutcome, String> {
+        let Some(runtime) = self.runtime_mut(key) else {
+            return Ok(PointerHandlerOutcome::inactive());
+        };
+        let outcome = runtime
+            .reconcile_pointer_checked(validate)
+            .map_err(|error| error.to_string())?;
+        Ok(PointerHandlerOutcome::collect(runtime, outcome))
+    }
+
+    pub(crate) fn cancel_pointer_checked(
+        &mut self,
+        key: &K,
+        validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
+    ) -> Result<PointerHandlerOutcome, String> {
+        let Some(runtime) = self.runtime_mut(key) else {
+            return Ok(PointerHandlerOutcome::inactive());
+        };
+        let outcome = runtime
+            .cancel_pointer_checked(validate)
+            .map_err(|error| error.to_string())?;
+        Ok(PointerHandlerOutcome::collect(runtime, outcome))
+    }
+
     #[cfg(test)]
     fn reload(&mut self) -> Result<(), String> {
         let outputs = self
@@ -722,8 +836,8 @@ mod tests {
     use thing_core::{KeyboardMode, Kind, Point, Scale};
     use thing_runtime::{
         AudioDevice, AudioSource, AudioStream, MediaPlayer, Notification, NotificationButton,
-        NotificationUrgency, PowerDevice, SystemTrayItem, SystemTrayMenu, SystemTrayMenuItem,
-        SystemTraySnapshot,
+        NotificationUrgency, PointerButton, PointerPhase, PowerDevice, SystemTrayItem,
+        SystemTrayMenu, SystemTrayMenuItem, SystemTraySnapshot,
     };
     use thing_ui::{Layout, Measurer, Size};
 
@@ -1309,6 +1423,80 @@ mod tests {
             .dispatch(&1, current_target.node(), Event::Scroll { x: 0.0, y: 1.0 })
             .unwrap();
         assert_eq!(text(&configurations, 1), "new");
+    }
+
+    #[test]
+    fn presented_pointer_areas_cancel_after_output_refresh_hides_the_target() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            local phase = ui.state('none')
+            return ui.panel { children = {
+                ui.pointer_area {
+                    key = 'drag-region',
+                    visible = function() return services.output.width:get() < 2000 end,
+                    style = { width = 100, height = 40 },
+                    on_pointer = function(event)
+                        phase:set(event.phase)
+                        return true
+                    end,
+                },
+                ui.text { text = function() return phase:get() end },
+            } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        let root = configurations.root(&1).unwrap();
+        let area = root.children[0].id;
+        let layout = Layout::compute(
+            root,
+            Size {
+                width: 300.0,
+                height: 80.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        assert_eq!(
+            layout.pointer_event_target(Point { x: 50.0, y: 20.0 }),
+            Some(area),
+        );
+        let (_, targets) = configurations.presented_targets(&1, root, &layout).unwrap();
+        let target = targets
+            .get(&area)
+            .expect("a presented pointer area needs an identity snapshot")
+            .clone();
+        let press = PointerEvent {
+            phase: PointerPhase::Press,
+            button: PointerButton::Primary,
+            x: 50.0,
+            y: 20.0,
+            surface_x: 50.0,
+            surface_y: 20.0,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            logo: false,
+        };
+        let pressed = configurations
+            .begin_pointer_checked(&1, &target, press, |_| Ok(()))
+            .unwrap();
+        assert!(pressed.active);
+        assert!(pressed.handled);
+        assert_eq!(text(&configurations, 1), "press");
+
+        assert!(configurations.set_output(&1, output("DP-1", 2560)).unwrap());
+        let cancelled = configurations
+            .reconcile_pointer_checked(&1, |_| Ok(()))
+            .unwrap();
+        assert!(!cancelled.active);
+        assert!(cancelled.handled);
+        assert!(cancelled.dispatch.changed);
+        assert_eq!(text(&configurations, 1), "cancel");
     }
 
     #[test]

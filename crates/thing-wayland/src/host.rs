@@ -43,9 +43,10 @@ use thing_core::{
     SurfaceLayer,
 };
 use thing_runtime::{
-    Action, Event, KeyInput, ManagedProcessAction, ManagedProcessDefinition, OutputContext, Scalar,
-    ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTrayAction, SystemTrayMenuAction, UiAction,
-    UiTarget,
+    Action, Event, KeyInput, ManagedProcessAction, ManagedProcessDefinition, OutputContext,
+    PointerButton as RuntimePointerButton, PointerEvent as RuntimePointerEvent, PointerPhase,
+    Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTrayAction, SystemTrayMenuAction,
+    UiAction, UiTarget,
 };
 use thing_ui::{
     Interaction, Layout, PaintFrame, ScrollState, Size, TextInputCheckpoint, TextInputEditor,
@@ -93,7 +94,7 @@ use crate::{
     Renderer, RunOptions, SystemTray,
     audio::Audio,
     clipboard::{Clipboard, OfferData as ClipboardOfferData, SourceData as ClipboardSourceData},
-    configuration::{Configurations, DispatchOutcome, RemovedConfiguration},
+    configuration::{Configurations, DispatchOutcome, PointerHandlerOutcome, RemovedConfiguration},
     hover::{Command as HoverCommand, HoverKey, HoverStates, HoverTarget},
     input_method::{
         ChangeCause as InputMethodChangeCause, CursorRectangle as InputMethodCursorRectangle,
@@ -245,6 +246,7 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         fractional: globals.bind(&qh, 1..=1, ()).ok(),
         viewporter: globals.bind(&qh, 1..=1, ()).ok(),
         pointer: None,
+        pointer_capture: None,
         keyboard: None,
         seat: None,
         keyboard_surface: None,
@@ -875,6 +877,14 @@ struct ActiveTextInput {
     editor: TextInputEditor,
 }
 
+#[derive(Clone)]
+struct CustomPointerCapture {
+    surface: wl_surface::WlSurface,
+    output: wl_output::WlOutput,
+    target: ScopedUiTarget,
+    button: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GenerationReset {
     Reset,
@@ -956,6 +966,7 @@ pub(crate) struct App {
     fractional: Option<WpFractionalScaleManagerV1>,
     viewporter: Option<WpViewporter>,
     pointer: Option<wl_pointer::WlPointer>,
+    pointer_capture: Option<CustomPointerCapture>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     seat: Option<wl_seat::WlSeat>,
     keyboard_surface: Option<wl_surface::WlSurface>,
@@ -1096,12 +1107,16 @@ impl App {
     }
     fn refresh(&mut self) {
         let layer_shell_version = self.layer_shell_version;
+        let configured_outputs: Vec<_> = self.configurations.keys().cloned().collect();
         let outputs = self.configurations.refresh_checked(|_, surfaces| {
             validate_surface_capabilities(surfaces, layer_shell_version)
         });
         self.update_watch();
         for output in outputs {
             self.invalidate_output(&output);
+        }
+        for output in configured_outputs {
+            self.reconcile_custom_pointer(&output);
         }
         self.reconcile_published_configuration();
     }
@@ -1142,6 +1157,10 @@ impl App {
         ) {
             eprintln!("thing: reload failed; keeping the previous surfaces: {error}");
             return Ok(());
+        }
+        // the replacement runtimes never inherit an in-flight pointer sequence.
+        if let Some(capture) = self.pointer_capture.take() {
+            self.clear_pressed_for_capture(&capture);
         }
         for consumer in retired_consumers {
             if let Err(error) = release_system_tray_consumer(self.system_tray.as_ref(), &consumer) {
@@ -1533,6 +1552,8 @@ impl App {
                 Ok(changed) => {
                     if changed {
                         self.invalidate_output(output);
+                    } else {
+                        self.reconcile_custom_pointer(output);
                     }
                     self.reconcile_published_configuration();
                 }
@@ -1572,6 +1593,20 @@ impl App {
             return;
         };
         let wl = self.surfaces[index].role.surface().clone();
+        let captured = self
+            .pointer_capture
+            .as_ref()
+            .is_some_and(|capture| capture.surface == wl);
+        if captured {
+            if notify_hover {
+                self.cancel_custom_pointer();
+            } else {
+                self.pointer_capture = None;
+            }
+        }
+        let Some(index) = self.index(&wl) else {
+            return;
+        };
         let surface_root = self.surfaces[index].root;
         let hovered = std::mem::take(&mut self.surfaces[index].hover_path);
         let pressed = notify_hover
@@ -2166,6 +2201,7 @@ impl App {
         if outcome.changed {
             self.invalidate_output(&output);
         }
+        self.reconcile_custom_pointer(&output);
         self.reconcile_published_configuration();
         true
     }
@@ -2448,6 +2484,7 @@ impl App {
     }
 
     fn invalidate_output(&mut self, output: &wl_output::WlOutput) {
+        self.reconcile_custom_pointer(output);
         self.reconcile_range_presses(output);
         self.reconcile_presented_pointer_state(output);
         while let Some(index) = self.surfaces.iter().position(|surface| {
@@ -2628,6 +2665,18 @@ impl App {
         )
     }
 
+    fn surface_pointer_target_is_current(&self, surface: usize, target: &ScopedUiTarget) -> bool {
+        let Some(surface) = self.surfaces.get(surface) else {
+            return false;
+        };
+        self.configurations.presented_pointer_target_is_current(
+            &surface.output,
+            &target.consumer,
+            surface.root,
+            &target.target,
+        )
+    }
+
     fn scoped_target_identity_is_current_at(
         &self,
         output: &wl_output::WlOutput,
@@ -2671,6 +2720,199 @@ impl App {
         let target = self.surfaces.get(surface)?.layouts.presented_target(id)?;
         self.surface_target_is_current(surface, &target)
             .then_some(target)
+    }
+
+    fn current_presented_pointer_target(
+        &self,
+        surface: usize,
+        id: NodeId,
+    ) -> Option<ScopedUiTarget> {
+        let target = self.surfaces.get(surface)?.layouts.presented_target(id)?;
+        self.surface_pointer_target_is_current(surface, &target)
+            .then_some(target)
+    }
+
+    fn custom_pointer_event(
+        &self,
+        surface: usize,
+        target: &ScopedUiTarget,
+        phase: PointerPhase,
+        button: u32,
+        position: (f64, f64),
+    ) -> Option<RuntimePointerEvent> {
+        if !self.surface_pointer_target_is_current(surface, target) {
+            return None;
+        }
+        let bounds = self.surfaces[surface]
+            .layouts
+            .presented()?
+            .get(target.target.node())?
+            .bounds;
+        runtime_pointer_event(bounds, phase, button, position, &self.modifiers)
+    }
+
+    fn finish_pointer_dispatch(
+        &mut self,
+        output: wl_output::WlOutput,
+        consumer: Option<String>,
+        result: Result<PointerHandlerOutcome, String>,
+        origin: Option<InputOrigin>,
+    ) -> Option<(bool, bool)> {
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(capture) = self.pointer_capture.take() {
+                    self.clear_pressed_for_capture(&capture);
+                }
+                self.finish_dispatch(output, consumer, Err(error), origin);
+                return None;
+            }
+        };
+        if !outcome.active
+            && let Some(capture) = self.pointer_capture.take()
+        {
+            self.clear_pressed_for_capture(&capture);
+        }
+        let result = (outcome.handled, outcome.active);
+        self.finish_dispatch(output, consumer, Ok(outcome.dispatch), origin)
+            .then_some(result)
+    }
+
+    fn begin_custom_pointer(
+        &mut self,
+        surface: usize,
+        target: ScopedUiTarget,
+        event: RuntimePointerEvent,
+        origin: Option<InputOrigin>,
+    ) -> Option<(bool, bool)> {
+        if self.pointer_capture.is_some() {
+            return None;
+        }
+        let output = self.surfaces.get(surface)?.output.clone();
+        let wl = self.surfaces[surface].role.surface().clone();
+        let consumer = self.configurations.consumer(&output).map(str::to_owned);
+        self.pointer_capture = Some(CustomPointerCapture {
+            surface: wl,
+            output: output.clone(),
+            target: target.clone(),
+            button: runtime_pointer_code(event.button),
+        });
+        let layer_shell_version = self.layer_shell_version;
+        let result =
+            self.configurations
+                .begin_pointer_checked(&output, &target.target, event, |surfaces| {
+                    validate_surface_capabilities(surfaces, layer_shell_version)
+                });
+        self.finish_pointer_dispatch(output, consumer, result, origin)
+    }
+
+    fn dispatch_custom_pointer(
+        &mut self,
+        event: RuntimePointerEvent,
+        origin: Option<InputOrigin>,
+    ) -> Option<(bool, bool)> {
+        let capture = self.pointer_capture.clone()?;
+        if event.button != runtime_pointer_button(capture.button)? {
+            return None;
+        }
+        if self.configurations.consumer(&capture.output) != Some(capture.target.consumer.as_str())
+            || !self
+                .configurations
+                .active_pointer_matches(&capture.output, &capture.target.target)
+        {
+            self.pointer_capture = None;
+            self.clear_pressed_for_capture(&capture);
+            return None;
+        }
+        if event.phase == PointerPhase::Release {
+            self.pointer_capture = None;
+        }
+        let consumer = Some(capture.target.consumer.clone());
+        let layer_shell_version = self.layer_shell_version;
+        let result =
+            self.configurations
+                .dispatch_pointer_checked(&capture.output, event, |surfaces| {
+                    validate_surface_capabilities(surfaces, layer_shell_version)
+                });
+        self.finish_pointer_dispatch(capture.output, consumer, result, origin)
+    }
+
+    fn cancel_custom_pointer(&mut self) {
+        let Some(capture) = self.pointer_capture.take() else {
+            return;
+        };
+        self.clear_pressed_for_capture(&capture);
+        if self.configurations.consumer(&capture.output) != Some(capture.target.consumer.as_str())
+            || !self
+                .configurations
+                .active_pointer_matches(&capture.output, &capture.target.target)
+        {
+            return;
+        }
+        let consumer = Some(capture.target.consumer.clone());
+        let layer_shell_version = self.layer_shell_version;
+        let result = self
+            .configurations
+            .cancel_pointer_checked(&capture.output, |surfaces| {
+                validate_surface_capabilities(surfaces, layer_shell_version)
+            });
+        self.finish_pointer_dispatch(capture.output, consumer, result, None);
+    }
+
+    fn reconcile_custom_pointer(&mut self, output: &wl_output::WlOutput) {
+        let Some(capture) = self
+            .pointer_capture
+            .as_ref()
+            .filter(|capture| &capture.output == output)
+            .cloned()
+        else {
+            return;
+        };
+        if self.configurations.consumer(output) != Some(capture.target.consumer.as_str())
+            || !self
+                .configurations
+                .active_pointer_matches(output, &capture.target.target)
+        {
+            self.pointer_capture = None;
+            self.clear_pressed_for_capture(&capture);
+            return;
+        }
+        let current = self
+            .index(&capture.surface)
+            .is_some_and(|index| self.surface_pointer_target_is_current(index, &capture.target));
+        if current {
+            return;
+        }
+        self.pointer_capture = None;
+        self.clear_pressed_for_capture(&capture);
+        let consumer = Some(capture.target.consumer.clone());
+        let layer_shell_version = self.layer_shell_version;
+        let result = self
+            .configurations
+            .reconcile_pointer_checked(output, |surfaces| {
+                validate_surface_capabilities(surfaces, layer_shell_version)
+            });
+        self.finish_pointer_dispatch(output.clone(), consumer, result, None);
+    }
+
+    fn clear_pressed_for_capture(&mut self, capture: &CustomPointerCapture) {
+        let Some(index) = self.index(&capture.surface) else {
+            return;
+        };
+        let matches = self.surfaces[index].pressed_button == Some(capture.button)
+            && self.surfaces[index]
+                .pressed_target
+                .as_ref()
+                .is_none_or(|target| target == &capture.target);
+        if !matches {
+            return;
+        }
+        let surface = &mut self.surfaces[index];
+        surface.input.pressed = None;
+        surface.pressed_target = None;
+        surface.pressed_button = None;
+        surface.press_serial = None;
+        surface.dirty = true;
     }
 
     fn same_surface_target(
@@ -3113,9 +3355,23 @@ impl App {
     }
 
     fn remove_popup(&mut self, index: usize, notify_runtime: bool, suppress_hover: bool) {
+        let wl = self.surfaces[index].role.surface().clone();
+        let captured = self
+            .pointer_capture
+            .as_ref()
+            .is_some_and(|capture| capture.surface == wl);
+        if captured {
+            if notify_runtime {
+                self.cancel_custom_pointer();
+            } else {
+                self.pointer_capture = None;
+            }
+        }
+        let Some(index) = self.index(&wl) else {
+            return;
+        };
         let id = self.surfaces[index].root;
         let output = self.surfaces[index].output.clone();
-        let wl = self.surfaces[index].role.surface().clone();
         let surface_root = self.surfaces[index].root;
         let close_target = self.surfaces[index].layouts.presented_target(surface_root);
         let mode = self.surfaces[index].role.popup_mode().cloned();
@@ -3665,6 +3921,7 @@ impl App {
     }
 
     fn clear_pointer_state(&mut self, preserve_keyboard_hover: bool) {
+        self.cancel_custom_pointer();
         let mut leaving = Vec::new();
         let mut pressed = Vec::new();
         for surface in &mut self.surfaces {
@@ -4983,6 +5240,8 @@ impl OutputHandler for App {
             Ok(changed) => {
                 if changed {
                     self.invalidate_output(&output);
+                } else {
+                    self.reconcile_custom_pointer(&output);
                 }
                 self.reconcile_published_configuration();
             }
@@ -5259,6 +5518,17 @@ impl PointerHandler for App {
         events: &[PointerEvent],
     ) {
         for event in events {
+            if self.pointer_capture.as_ref().is_some_and(|capture| {
+                capture.surface != event.surface
+                    && matches!(
+                        event.kind,
+                        PointerEventKind::Enter { .. }
+                            | PointerEventKind::Motion { .. }
+                            | PointerEventKind::Release { .. }
+                    )
+            }) {
+                self.cancel_custom_pointer();
+            }
             let Some(index) = self.index(&event.surface) else {
                 continue;
             };
@@ -5270,16 +5540,45 @@ impl PointerHandler for App {
                 .layouts
                 .presented()
                 .and_then(|layout| layout.hit_test(point));
-            let hit = hit_id.and_then(|id| self.current_presented_target(index, id));
+            let semantic_hit = hit_id.and_then(|id| self.current_presented_target(index, id));
+            let pointer_hit_id = self.surfaces[index]
+                .layouts
+                .presented()
+                .and_then(|layout| layout.pointer_event_target(point));
+            let custom_hit =
+                pointer_hit_id.and_then(|id| self.current_presented_pointer_target(index, id));
+            let semantic_id = semantic_hit.as_ref().map(|target| target.target.node());
+            let custom_id = custom_hit.as_ref().map(|target| target.target.node());
+            let hit = semantic_pointer_target(semantic_id, custom_id).and(semantic_hit);
             match event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
-                    let surface = &mut self.surfaces[index];
-                    surface.pointer_position = Some(point);
-                    if surface.pressed_button == Some(0x110)
-                        && let Some(target) = surface.pressed_target.clone()
+                    self.surfaces[index].pointer_position = Some(point);
+                    let event_surface = event.surface.clone();
+                    if let Some(capture) = self
+                        .pointer_capture
+                        .as_ref()
+                        .filter(|capture| capture.surface == event.surface)
+                        .cloned()
                     {
-                        let output = surface.output.clone();
-                        let event_surface = surface.role.surface().clone();
+                        if let Some(input) = self.custom_pointer_event(
+                            index,
+                            &capture.target,
+                            PointerPhase::Move,
+                            capture.button,
+                            event.position,
+                        ) {
+                            self.dispatch_custom_pointer(input, None);
+                        } else {
+                            self.reconcile_custom_pointer(&capture.output);
+                        }
+                    }
+                    let Some(index) = self.index(&event_surface) else {
+                        continue;
+                    };
+                    if self.surfaces[index].pressed_button == Some(0x110)
+                        && let Some(target) = self.surfaces[index].pressed_target.clone()
+                    {
+                        let output = self.surfaces[index].output.clone();
                         let id = target.target.node();
                         self.range_input(index, &target, point.x);
                         self.reconcile_range_presses(&output);
@@ -5301,9 +5600,12 @@ impl PointerHandler for App {
                 }
                 PointerEventKind::Press { button, serial, .. }
                     if matches!(button, 0x110..=0x112)
-                        && self.surfaces[index].range_press.is_none() =>
+                        && self.surfaces[index].range_press.is_none()
+                        && self.surfaces[index].pressed_button.is_none()
+                        && self.pointer_capture.is_none() =>
                 {
                     self.clear_key_repeat();
+                    let event_surface = self.surfaces[index].role.surface().clone();
                     let surface = &mut self.surfaces[index];
                     surface.pointer_position = Some(point);
                     surface.input.pressed = hit.as_ref().map(|target| target.target.node());
@@ -5312,13 +5614,29 @@ impl PointerHandler for App {
                     surface.press_serial = Some(serial);
                     surface.dirty = true;
                     self.focus_from_pointer(index, hit.clone());
-                    if button == 0x110
-                        && let Some(target) = hit
+                    if let Some(target) = custom_hit
+                        && let Some(input) = self.custom_pointer_event(
+                            index,
+                            &target,
+                            PointerPhase::Press,
+                            button,
+                            event.position,
+                        )
                     {
+                        let origin = self.input_origin(event_surface.clone(), serial);
+                        self.begin_custom_pointer(index, target, input, origin);
+                    }
+                    let Some(index) = self.index(&event_surface) else {
+                        continue;
+                    };
+                    let pressed = (button == 0x110)
+                        .then_some(hit)
+                        .flatten()
+                        .filter(|target| self.surface_target_is_current(index, target));
+                    if let Some(target) = pressed {
                         let id = target.target.node();
                         let output = self.surfaces[index].output.clone();
                         let key = self.surfaces[index].key.clone();
-                        let event_surface = self.surfaces[index].role.surface().clone();
                         let kind = self
                             .configurations
                             .surface_root(&output, &key)
@@ -5350,7 +5668,27 @@ impl PointerHandler for App {
                     button,
                     serial: release_serial,
                     ..
-                } if self.surfaces[index].pressed_button == Some(button) => {
+                } if self.surfaces[index].pressed_button == Some(button)
+                    || self.pointer_capture.as_ref().is_some_and(|capture| {
+                        capture.surface == event.surface && capture.button == button
+                    }) =>
+                {
+                    let custom = self
+                        .pointer_capture
+                        .as_ref()
+                        .filter(|capture| {
+                            capture.surface == event.surface && capture.button == button
+                        })
+                        .cloned();
+                    let custom_event = custom.as_ref().and_then(|capture| {
+                        self.custom_pointer_event(
+                            index,
+                            &capture.target,
+                            PointerPhase::Release,
+                            button,
+                            event.position,
+                        )
+                    });
                     self.surfaces[index].pressed_button = None;
                     self.surfaces[index].pointer_position = Some(point);
                     self.surfaces[index].input.pressed = None;
@@ -5373,6 +5711,23 @@ impl PointerHandler for App {
                         }
                         continue;
                     }
+                    let handled = if let Some(custom) = custom {
+                        let Some(input) = custom_event else {
+                            self.reconcile_custom_pointer(&custom.output);
+                            continue;
+                        };
+                        let origin = self.input_origin(event_surface.clone(), release_serial);
+                        self.dispatch_custom_pointer(input, origin)
+                            .is_none_or(|(handled, _)| handled)
+                    } else {
+                        false
+                    };
+                    if handled {
+                        continue;
+                    }
+                    let Some(index) = self.index(&event_surface) else {
+                        continue;
+                    };
                     if let Some(target) = pressed.filter(|pressed| {
                         hit.as_ref().is_some_and(|hit| {
                             self.same_surface_target(index, pressed, hit)
@@ -5461,6 +5816,48 @@ fn scroll_steps(axis: AxisScroll) -> f64 {
     }
 }
 
+fn runtime_pointer_button(button: u32) -> Option<RuntimePointerButton> {
+    match button {
+        0x110 => Some(RuntimePointerButton::Primary),
+        0x111 => Some(RuntimePointerButton::Secondary),
+        0x112 => Some(RuntimePointerButton::Middle),
+        _ => None,
+    }
+}
+
+fn runtime_pointer_event(
+    bounds: Rect,
+    phase: PointerPhase,
+    button: u32,
+    position: (f64, f64),
+    modifiers: &Modifiers,
+) -> Option<RuntimePointerEvent> {
+    Some(RuntimePointerEvent {
+        phase,
+        button: runtime_pointer_button(button)?,
+        x: position.0 - f64::from(bounds.x),
+        y: position.1 - f64::from(bounds.y),
+        surface_x: position.0,
+        surface_y: position.1,
+        shift: modifiers.shift,
+        ctrl: modifiers.ctrl,
+        alt: modifiers.alt,
+        logo: modifiers.logo,
+    })
+}
+
+fn semantic_pointer_target(semantic: Option<NodeId>, custom: Option<NodeId>) -> Option<NodeId> {
+    semantic.filter(|semantic| custom.is_none_or(|custom| custom == *semantic))
+}
+
+fn runtime_pointer_code(button: RuntimePointerButton) -> u32 {
+    match button {
+        RuntimePointerButton::Primary => 0x110,
+        RuntimePointerButton::Secondary => 0x111,
+        RuntimePointerButton::Middle => 0x112,
+    }
+}
+
 fn scroll_distance(steps: f64) -> Option<f32> {
     const PIXELS_PER_STEP: f64 = 40.0;
     let distance = (steps * PIXELS_PER_STEP) as f32;
@@ -5476,16 +5873,17 @@ mod input_tests {
     use thing_ui::{Layout, Measurer, Size, TextInputEditor};
 
     use super::{
-        ActiveTextInput, GenerationReset, MissingSurfacePolicy, RepeatSession, RepeatTimerAction,
-        SliderKeyAction, SurfaceActionRoute, SurfaceLayouts, TextKeyAction, WidgetKeyAction,
-        active_text_input_is_current, allocate_text_input_generation,
-        cancel_active_text_input_composition, claim_autofocus, direct_input_serial,
-        focused_widget_is_interactive, input_method_cursor_rectangle,
+        ActiveTextInput, GenerationReset, MissingSurfacePolicy, PointerPhase, RepeatSession,
+        RepeatTimerAction, RuntimePointerButton, SliderKeyAction, SurfaceActionRoute,
+        SurfaceLayouts, TextKeyAction, WidgetKeyAction, active_text_input_is_current,
+        allocate_text_input_generation, cancel_active_text_input_composition, claim_autofocus,
+        direct_input_serial, focused_widget_is_interactive, input_method_cursor_rectangle,
         input_method_surface_has_keyboard_focus, keyboard_focus_transition_affects,
         keyboard_leave_matches, paint_interaction, prepare_text_input_submit,
         reconcile_controlled_text_edit, repeat_action_is_current,
         reset_active_text_input_generation, retain_non_focus_actions, reveal_text_input_focus,
-        root_key_input, scroll_distance, surface_action_route, text_key_action, widget_key_action,
+        root_key_input, runtime_pointer_event, scroll_distance, semantic_pointer_target,
+        surface_action_route, text_key_action, widget_key_action,
     };
 
     struct FixedMeasurer;
@@ -5506,6 +5904,59 @@ mod input_tests {
         assert_eq!(next, 0);
         assert_eq!(allocate_text_input_generation(&mut next), None);
         assert_eq!(next, 0);
+    }
+
+    #[test]
+    fn custom_pointer_coordinates_are_local_to_current_presented_bounds() {
+        let modifiers = Modifiers {
+            shift: true,
+            logo: true,
+            ..Modifiers::default()
+        };
+        let event = runtime_pointer_event(
+            Rect {
+                x: 40.0,
+                y: 25.0,
+                width: 100.0,
+                height: 50.0,
+            },
+            PointerPhase::Move,
+            0x110,
+            (170.5, 10.0),
+            &modifiers,
+        )
+        .unwrap();
+        assert_eq!(event.phase, PointerPhase::Move);
+        assert_eq!(event.button, RuntimePointerButton::Primary);
+        assert_eq!((event.x, event.y), (130.5, -15.0));
+        assert_eq!((event.surface_x, event.surface_y), (170.5, 10.0));
+        assert!(event.shift);
+        assert!(event.logo);
+        assert!(!event.ctrl);
+        assert!(!event.alt);
+        assert!(
+            runtime_pointer_event(
+                Rect::default(),
+                PointerPhase::Press,
+                0x113,
+                (0.0, 0.0),
+                &Modifiers::default(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn custom_pointer_children_block_parent_button_defaults() {
+        let button = NodeId(1);
+        let area = NodeId(2);
+        assert_eq!(semantic_pointer_target(Some(button), Some(area)), None);
+        assert_eq!(
+            semantic_pointer_target(Some(button), Some(button)),
+            Some(button),
+        );
+        assert_eq!(semantic_pointer_target(Some(button), None), Some(button));
+        assert_eq!(semantic_pointer_target(None, Some(area)), None);
     }
 
     #[test]

@@ -5,8 +5,8 @@ use thing_core::{
     PathStrokeCap, PathStrokeJoin, TextAlign, TextOverflow, VectorSegment,
 };
 use thing_runtime::{
-    Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, Event, KeyInput, Limits, Runtime,
-    Scalar, UiAction,
+    Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, Event, KeyInput, Limits,
+    PointerButton, PointerEvent, PointerPhase, Runtime, Scalar, UiAction,
 };
 
 fn fixture(source: &str) -> (TempDir, PathBuf) {
@@ -25,6 +25,21 @@ fn key_input(key: &str, text: Option<&str>, repeated: bool) -> KeyInput {
         alt: true,
         logo: false,
         repeated,
+    }
+}
+
+fn pointer_event(phase: PointerPhase, x: f64, y: f64) -> PointerEvent {
+    PointerEvent {
+        phase,
+        button: PointerButton::Secondary,
+        x,
+        y,
+        surface_x: x + 10.0,
+        surface_y: y + 20.0,
+        shift: true,
+        ctrl: false,
+        alt: true,
+        logo: false,
     }
 }
 
@@ -438,6 +453,304 @@ fn rejects_invalid_or_non_image_fit() {
         let (_directory, path) = fixture(source);
         assert!(Runtime::load(path).is_err(), "accepted {source}");
     }
+}
+
+#[test]
+fn pointer_areas_receive_coordinates_and_retain_sticky_handling() {
+    let (_directory, path) = fixture(
+        r#"
+        local events = ui.state('')
+        local area = ui.pointer_area {
+            on_pointer = function(event)
+                assert(event.button == 'secondary')
+                assert(event.surface_x == event.x + 10)
+                assert(event.surface_y == event.y + 20)
+                assert(event.shift and event.alt and not event.ctrl and not event.logo)
+                events:set(events:get() .. event.phase)
+                return if event.phase == 'press' then true else nil
+            end,
+            children = { ui.text { text = 'drag' } },
+        }
+        return ui.panel { children = {
+            area,
+            ui.text { text = function() return events:get() end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let area = runtime.root().unwrap().children[0].id;
+    assert_eq!(runtime.root().unwrap().children[0].kind, Kind::PointerArea);
+    assert!(runtime.focus_target(area).is_none());
+    let target = runtime.pointer_target(area).unwrap();
+
+    let pressed = runtime
+        .begin_pointer_checked(
+            &target,
+            pointer_event(PointerPhase::Press, 2.0, 3.0),
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert!(pressed.changed && pressed.handled && pressed.active);
+    let mut invalid = pointer_event(PointerPhase::Move, f64::NAN, 0.0);
+    assert!(
+        runtime
+            .dispatch_pointer_checked(invalid, |_| Ok(()))
+            .is_err()
+    );
+    assert!(runtime.active_pointer_is_current());
+    invalid.x = 0.0;
+    invalid.button = PointerButton::Primary;
+    assert!(
+        runtime
+            .dispatch_pointer_checked(invalid, |_| Ok(()))
+            .is_err()
+    );
+    assert!(runtime.active_pointer_is_current());
+    let moved = runtime
+        .dispatch_pointer_checked(pointer_event(PointerPhase::Move, 7.0, -4.0), |_| Ok(()))
+        .unwrap();
+    assert!(moved.changed && moved.handled && moved.active);
+    let released = runtime
+        .dispatch_pointer_checked(pointer_event(PointerPhase::Release, 9.0, 6.0), |_| Ok(()))
+        .unwrap();
+    assert!(released.changed && released.handled && !released.active);
+    assert!(runtime.active_pointer_target().is_none());
+    assert_eq!(runtime.root().unwrap().children[1].text, "pressmoverelease");
+}
+
+#[test]
+fn pointer_self_removal_cancels_once_with_the_retained_handler() {
+    let (_directory, path) = fixture(
+        r#"
+        local shown = ui.state(true)
+        local events = ui.state('')
+        return ui.panel { children = {
+            ui.pointer_area {
+                visible = function() return shown:get() end,
+                on_pointer = function(event)
+                    events:set(events:get() .. event.phase .. ';')
+                    if event.phase == 'press' then shown:set(false) end
+                end,
+            },
+            ui.text { text = function() return events:get() end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let area = runtime.root().unwrap().children[0].id;
+    let target = runtime.pointer_target(area).unwrap();
+    let outcome = runtime
+        .begin_pointer_checked(
+            &target,
+            pointer_event(PointerPhase::Press, 1.0, 1.0),
+            |_| Ok(()),
+        )
+        .unwrap();
+
+    assert!(outcome.changed && !outcome.active);
+    assert!(!runtime.root().unwrap().children[0].visible);
+    assert_eq!(runtime.root().unwrap().children[1].text, "press;cancel;");
+    assert_eq!(
+        runtime.reconcile_pointer_checked(|_| Ok(())).unwrap(),
+        Default::default()
+    );
+}
+
+#[test]
+fn root_key_refresh_cancels_an_unavailable_pointer_target() {
+    let (_directory, path) = fixture(
+        r#"
+        local shown = ui.state(true)
+        local events = ui.state('')
+        return ui.panel {
+            on_key = function()
+                shown:set(false)
+                return true
+            end,
+            children = {
+                ui.pointer_area {
+                    visible = function() return shown:get() end,
+                    on_pointer = function(event)
+                        events:set(events:get() .. event.phase .. ';')
+                    end,
+                },
+                ui.text { text = function() return events:get() end },
+            },
+        }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let root = runtime.root().unwrap().id;
+    let area = runtime.root().unwrap().children[0].id;
+    let target = runtime.pointer_target(area).unwrap();
+    runtime
+        .begin_pointer_checked(
+            &target,
+            pointer_event(PointerPhase::Press, 1.0, 1.0),
+            |_| Ok(()),
+        )
+        .unwrap();
+
+    let outcome = runtime
+        .dispatch_key(root, key_input("Escape", None, false))
+        .unwrap()
+        .unwrap();
+
+    assert!(outcome.handled && outcome.changed);
+    assert!(runtime.active_pointer_target().is_none());
+    assert!(!runtime.root().unwrap().children[0].visible);
+    assert_eq!(runtime.root().unwrap().children[1].text, "press;cancel;");
+}
+
+#[test]
+fn pointer_areas_require_handlers_and_reject_focus_semantics() {
+    for source in [
+        "return ui.panel { children = { ui.pointer_area {} } }",
+        "return ui.panel { children = { ui.pointer_area { on_pointer = true } } }",
+        "return ui.panel { children = { ui.pointer_area { autofocus = true, on_pointer = function() end } } }",
+        "return ui.panel { children = { ui.row { on_pointer = function() end } } }",
+    ] {
+        let (_directory, path) = fixture(source);
+        assert!(Runtime::load(path).is_err(), "accepted {source}");
+    }
+
+    let (_directory, path) = fixture(
+        "return ui.panel { children = { ui.button { on_pointer = function() return false end } } }",
+    );
+    let runtime = Runtime::load(path).unwrap();
+    let button = runtime.root().unwrap().children[0].id;
+    assert!(runtime.pointer_target(button).is_some());
+    assert!(runtime.focus_target(button).is_some());
+}
+
+fn pointer_replacement_fixture(key: &str) -> (TempDir, Runtime) {
+    let source = format!(
+        r#"
+        local replace = ui.state(false)
+        local events = ui.state('')
+        local generation = 0
+        local list = ui.column {{ children = function()
+            local changed = replace:get()
+            generation += 1
+            local own = generation
+            return {{ ui.pointer_area {{ {key}
+                on_pointer = function(event)
+                    events:set(events:get() .. tostring(own) .. event.phase .. ';')
+                end,
+            }} }}
+        end }}
+        return ui.panel {{ children = {{
+            list,
+            ui.button {{ on_click = function() replace:set(true) end }},
+            ui.text {{ text = function() return events:get() end }},
+        }} }}
+        "#,
+    );
+    let (directory, path) = fixture(&source);
+    (directory, Runtime::load(path).unwrap())
+}
+
+#[test]
+fn pointer_capture_rejects_unkeyed_replacement_but_preserves_keyed_lineage() {
+    let (_directory, mut runtime) = pointer_replacement_fixture("");
+    let area = runtime.root().unwrap().children[0].children[0].id;
+    let target = runtime.pointer_target(area).unwrap();
+    runtime
+        .begin_pointer_checked(
+            &target,
+            pointer_event(PointerPhase::Press, 1.0, 1.0),
+            |_| Ok(()),
+        )
+        .unwrap();
+    let replace = runtime.root().unwrap().children[1].id;
+    runtime.dispatch(replace, Event::Click).unwrap();
+    assert!(runtime.active_pointer_target().is_none());
+    assert_eq!(runtime.root().unwrap().children[2].text, "1press;1cancel;");
+
+    let (_directory, mut runtime) = pointer_replacement_fixture("key = 'area',");
+    let area = runtime.root().unwrap().children[0].children[0].id;
+    let target = runtime.pointer_target(area).unwrap();
+    runtime
+        .begin_pointer_checked(
+            &target,
+            pointer_event(PointerPhase::Press, 1.0, 1.0),
+            |_| Ok(()),
+        )
+        .unwrap();
+    let replace = runtime.root().unwrap().children[1].id;
+    runtime.dispatch(replace, Event::Click).unwrap();
+    assert!(runtime.active_pointer_is_current());
+    runtime
+        .dispatch_pointer_checked(pointer_event(PointerPhase::Move, 2.0, 2.0), |_| Ok(()))
+        .unwrap();
+    assert_eq!(runtime.root().unwrap().children[2].text, "1press;1move;");
+}
+
+#[test]
+fn pointer_callback_errors_end_capture_without_recursive_cancellation() {
+    let (_directory, path) = fixture(
+        r#"
+        local events = ui.state('')
+        return ui.panel { children = {
+            ui.pointer_area { on_pointer = function(event)
+                events:set(events:get() .. event.phase .. ';')
+                if event.phase == 'move' then
+                    services.audio.set_muted(true)
+                    error('move failed')
+                end
+                if event.phase == 'cancel' then error('unexpected cancel') end
+            end },
+            ui.text { text = function() return events:get() end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let area = runtime.root().unwrap().children[0].id;
+    let target = runtime.pointer_target(area).unwrap();
+    runtime
+        .begin_pointer_checked(
+            &target,
+            pointer_event(PointerPhase::Press, 1.0, 1.0),
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert!(
+        runtime
+            .dispatch_pointer_checked(pointer_event(PointerPhase::Move, 2.0, 2.0), |_| Ok(()))
+            .is_err()
+    );
+    assert!(runtime.active_pointer_target().is_none());
+    assert!(runtime.take_actions().is_empty());
+    assert!(!runtime.cancel_pointer_checked(|_| Ok(())).unwrap().active);
+    assert!(runtime.refresh().unwrap());
+    assert_eq!(runtime.root().unwrap().children[1].text, "press;move;");
+}
+
+#[test]
+fn successful_reload_drops_pointer_capture_without_old_callbacks() {
+    let (_directory, path) = fixture(
+        r#"
+        return ui.panel { children = { ui.pointer_area {
+            on_pointer = function(event)
+                if event.phase == 'cancel' then services.audio.set_muted(true) end
+            end,
+        } } }
+        "#,
+    );
+    let mut runtime = Runtime::load(&path).unwrap();
+    let area = runtime.root().unwrap().children[0].id;
+    let target = runtime.pointer_target(area).unwrap();
+    runtime
+        .begin_pointer_checked(
+            &target,
+            pointer_event(PointerPhase::Press, 1.0, 1.0),
+            |_| Ok(()),
+        )
+        .unwrap();
+    fs::write(&path, "return ui.panel {}").unwrap();
+    runtime.reload(path).unwrap();
+    assert!(runtime.active_pointer_target().is_none());
+    assert!(runtime.take_actions().is_empty());
 }
 
 #[test]

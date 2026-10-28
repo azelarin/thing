@@ -97,6 +97,13 @@ CASES = (
             "Property 'text' is not compatible.",
         ),
     ),
+    Case(
+        "invalid-pointer-area.luau",
+        (
+            "missing field 'on_pointer'",
+            "Expected this to be 'boolean?', but got 'number'",
+        ),
+    ),
 )
 
 

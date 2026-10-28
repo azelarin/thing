@@ -236,8 +236,9 @@ a reactive `margins` property returns the complete margins table.
 ## widgets and children
 
 the current model has `panel`, `popup`, `row`, `centerbox`, `column`, `stack`,
-`scroll`, `text`, `text_input`, `image`, `path`, `button`, `slider`, and `range`
-constructors. pass properties in a table and children in a dense array:
+`scroll`, `text`, `text_input`, `image`, `path`, `button`, `pointer_area`,
+`slider`, and `range` constructors. pass properties in a table and children in a
+dense array:
 
 ```luau
 return ui.panel {
@@ -268,7 +269,8 @@ widget kind; unkeyed children match by position and kind.
 | `text_input` | controlled `value` and `on_change`; optional `placeholder` and `on_submit` |
 | `image` | one of `source`, `icon`, `app_id`; optional `icon_theme` and `fit` |
 | `path` | `data`, `view_box`; optional fit, fill, and stroke controls |
-| `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll`, `on_hover` |
+| `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll`, `on_hover`, `on_pointer` |
+| `pointer_area` | `children` and required `on_pointer` |
 | `slider` | `min`, `max`, `value`, `step`, `on_change`, `on_hover` |
 | `range` | `children`, `min`, `max`, `value`, `step`, `inset`, `on_change`, `on_hover`, `on_pressed` |
 | `popup` | `visible`, `open_on_hover`, `open_on_click`, `open_delay`, `close_delay`, `anchor`, `alignment`, `offset`, `constraints`, `on_key`, `on_hover`, `on_close` |
@@ -434,6 +436,44 @@ keyboard-activatable through the primary `on_click` handler.
 range, or popup and `false` when it leaves. moving between a control and its
 descendants does not produce a false leave. the callback runs on edges, not on
 every pointer motion.
+
+use `pointer_area` for a drag region or gesture that has no built-in button
+meaning. it is a horizontal container, does not enter keyboard focus order, and
+does not draw button interaction feedback. use a button when the same action
+also needs keyboard activation.
+
+```luau
+local last_x = ui.state(0)
+
+ui.pointer_area {
+    on_pointer = function(event)
+        if event.phase ~= 'cancel' then last_x:set(event.x) end
+        return true
+    end,
+    children = {
+        ui.text { text = function() return string.format('%.1f', last_x:get()) end },
+    },
+}
+```
+
+`on_pointer(event)` receives `press`, `move`, `release`, and `cancel` phases.
+`event.x` and `event.y` are logical coordinates within the presented widget;
+`surface_x` and `surface_y` are logical surface coordinates. `button` is
+`primary`, `middle`, or `secondary`, and the `shift`, `ctrl`, `alt`, and `logo`
+fields report the current modifiers. a press captures subsequent motion and
+release even outside the widget. if layout moves during the drag, local
+coordinates follow the geometry currently shown on screen. a synthetic
+cancellation keeps the last delivered coordinates because its target may no
+longer have geometry.
+
+the deepest control or pointer area owns pointer input; custom events do not
+bubble to ancestors and capture cannot move to another widget. hiding,
+disabling, or removing the target, losing pointer input, or closing its surface
+sends one `cancel` while the runtime remains loaded. a successful configuration
+reload drops the old runtime without calling its handlers. returning `true`
+from any phase suppresses a button's ordinary click for the rest of that
+sequence; `false` or `nil` leaves it available. the release callback runs before
+that ordinary click.
 
 ## images and desktop icons
 
@@ -740,19 +780,20 @@ whole branch without compounding it at every descendant.
 not inherit implicitly.
 individual style values can be functions, just like widget properties.
 
-rows, panels, popups, buttons, and stacks have a horizontal main axis and a
-vertical cross axis. columns and scrolls swap those axes. `justify` places or
-distributes children on the main axis and accepts `start`, `center`, `end`,
-`space_between`, `space_around`, or `space_evenly`. `align` places children on
-the cross axis and accepts `start`, `center`, `end`, or `stretch`; `align_self`
-overrides it for one child.
+rows, panels, popups, buttons, pointer areas, and stacks have a horizontal main
+axis and a vertical cross axis. columns and scrolls swap those axes. `justify`
+places or distributes children on the main axis and accepts `start`, `center`,
+`end`, `space_between`, `space_around`, or `space_evenly`. `align` places
+children on the cross axis and accepts `start`, `center`, `end`, or `stretch`;
+`align_self` overrides it for one child.
 
 set `wrap = true` on a row or column to move children onto another line when the
-main axis fills. it is also available on panels, popups, and buttons. `gap`
-separates both children and wrapped lines. `align_content` places the complete
-set of lines on the cross axis using `start`, `center`, `end`, or `stretch`,
-without changing how `align` places children within each line. wrapping moves
-widgets; text still wraps according to the width available to its own widget.
+main axis fills. it is also available on panels, popups, buttons, and pointer
+areas. `gap` separates both children and wrapped lines. `align_content` places
+the complete set of lines on the cross axis using `start`, `center`, `end`, or
+`stretch`, without changing how `align` places children within each line.
+wrapping moves widgets; text still wraps according to the width available to
+its own widget.
 
 `grow` shares spare main-axis space, while `shrink` chooses how an item gives up
 space when its row or column is too small. larger values take a larger share. an
