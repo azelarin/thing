@@ -366,6 +366,9 @@ put layout and paint values in `style`. dimensions use logical pixels.
 | `padding`, `gap`, `grow`, `radius` | `0` |
 | `border_width`, `border_color` | `0`, transparent; border paints inside the box |
 | `padding_x`, `padding_y` | unspecified; override `padding` on that axis |
+| `hover_overlay`, `pressed_overlay` | `#ffffff14`, `#ffffff28`; interactive control feedback |
+| `disabled_opacity` | `0.45`; fades a disabled widget and its descendants once |
+| `focus_ring_color`, `focus_ring_width` | `#89b4fa`, `2`; keyboard focus indicator |
 | `font_size` | `14` |
 | `font_weight` | `400`; a number from `1` to `1000`, with `700` for bold |
 | `font_family` | `sans-serif`, resolved through fontconfig |
@@ -376,10 +379,26 @@ put layout and paint values in `style`. dimensions use logical pixels.
 | `opacity` | `1` |
 
 colors use `#RRGGBB` or `#RRGGBBAA`. numeric style values must be finite and between
-0 and 100,000; opacity is between 0 and 1. parent opacity multiplies child opacity.
+0 and 100,000; opacity and disabled opacity are between 0 and 1. parent opacity
+multiplies child opacity. a disabled ancestor applies its disabled opacity to the
+whole branch without compounding it at every descendant.
 `start` and `end` text alignment follow the text direction. other style values do
 not inherit implicitly.
 individual style values can be functions, just like widget properties.
+
+set an overlay color to transparent or the focus ring width to `0` to remove that
+part of the built-in interaction appearance. for example, this keeps only a thin
+monochrome keyboard indicator:
+
+```luau
+style = {
+    hover_overlay = '#00000000',
+    pressed_overlay = '#00000000',
+    disabled_opacity = 0.25,
+    focus_ring_color = '#ffffff',
+    focus_ring_width = 1,
+}
+```
 
 a theme is an ordinary table returned from a module. for example, save this as
 `theme.luau` next to your panel:

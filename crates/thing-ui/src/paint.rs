@@ -110,7 +110,7 @@ impl<R: Renderer> Painter<R> {
             let clip = placement.clip;
             self.canvas.scissor(clip.x, clip.y, clip.width, clip.height);
             self.canvas
-                .set_global_alpha(placement.opacity * if placement.enabled { 1.0 } else { 0.45 });
+                .set_global_alpha(placement.opacity * placement.disabled_opacity);
             let mut path = Path::new();
             path.rounded_rect(
                 bounds.x,
@@ -135,20 +135,12 @@ impl<R: Renderer> Painter<R> {
                 paint.set_line_width(width);
                 self.canvas.stroke_path(&border, &paint);
             }
-            if node.kind.is_interactive()
-                && (input.hovered == Some(node.id) || input.pressed == Some(node.id))
-            {
-                let alpha = if input.pressed == Some(node.id) {
-                    40
-                } else {
-                    20
-                };
-                self.canvas
-                    .fill_path(&path, &Paint::color(Color::rgba(255, 255, 255, alpha)));
+            if let Some(overlay) = interaction_overlay(node, input) {
+                self.canvas.fill_path(&path, &Paint::color(color(overlay)));
             }
-            if input.focus_visible && input.focused == Some(node.id) {
-                let mut focus = Paint::color(Color::rgb(137, 180, 250));
-                focus.set_line_width(2.0);
+            if let Some((focus_color, focus_width)) = focus_ring(node, input) {
+                let mut focus = Paint::color(color(focus_color));
+                focus.set_line_width(focus_width);
                 self.canvas.stroke_path(&path, &focus);
             }
             match node.kind {
@@ -300,11 +292,34 @@ fn color(value: thing_core::Color) -> Color {
     Color::rgba(r, g, b, a)
 }
 
+fn interaction_overlay(node: &Node, input: Interaction) -> Option<thing_core::Color> {
+    if !node.kind.is_interactive() {
+        return None;
+    }
+    let overlay = if input.pressed == Some(node.id) {
+        node.style.pressed_overlay
+    } else if input.hovered == Some(node.id) {
+        node.style.hover_overlay
+    } else {
+        return None;
+    };
+    (overlay.0[3] > 0).then_some(overlay)
+}
+
+fn focus_ring(node: &Node, input: Interaction) -> Option<(thing_core::Color, f32)> {
+    (input.focus_visible
+        && input.focused == Some(node.id)
+        && node.style.focus_ring_width > 0.0
+        && node.style.focus_ring_color.0[3] > 0)
+        .then_some((node.style.focus_ring_color, node.style.focus_ring_width))
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
 
     use femtovg::renderer::Void;
+    use thing_core::Color as ThingColor;
 
     use super::*;
 
@@ -325,6 +340,55 @@ mod tests {
         interaction.focus_from_keyboard(NodeId(3));
         assert_eq!(interaction.focused, Some(NodeId(3)));
         assert!(interaction.focus_visible);
+    }
+
+    #[test]
+    fn pressed_overlay_takes_precedence_and_transparency_disables_it() {
+        let mut button = Node::new(NodeId(1), Kind::Button);
+        button.style.hover_overlay = ThingColor([1, 2, 3, 4]);
+        button.style.pressed_overlay = ThingColor([5, 6, 7, 8]);
+        let input = Interaction {
+            hovered: Some(button.id),
+            pressed: Some(button.id),
+            ..Interaction::default()
+        };
+        assert_eq!(
+            interaction_overlay(&button, input),
+            Some(button.style.pressed_overlay)
+        );
+
+        button.style.pressed_overlay = ThingColor::TRANSPARENT;
+        assert_eq!(interaction_overlay(&button, input), None);
+        let hover = Interaction {
+            hovered: Some(button.id),
+            ..Interaction::default()
+        };
+        assert_eq!(
+            interaction_overlay(&button, hover),
+            Some(button.style.hover_overlay)
+        );
+        assert_eq!(
+            interaction_overlay(&Node::new(NodeId(2), Kind::Text), hover),
+            None
+        );
+    }
+
+    #[test]
+    fn focus_ring_uses_keyboard_visibility_and_accepts_zero_width() {
+        let mut button = Node::new(NodeId(1), Kind::Button);
+        button.style.focus_ring_color = ThingColor([12, 12, 12, 255]);
+        button.style.focus_ring_width = 1.0;
+        let mut input = Interaction::default();
+        input.focus_from_pointer(Some(button.id));
+        assert_eq!(focus_ring(&button, input), None);
+
+        input.reveal_keyboard_focus();
+        assert_eq!(
+            focus_ring(&button, input),
+            Some((button.style.focus_ring_color, 1.0))
+        );
+        button.style.focus_ring_width = 0.0;
+        assert_eq!(focus_ring(&button, input), None);
     }
 
     #[test]

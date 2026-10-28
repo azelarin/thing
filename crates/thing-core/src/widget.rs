@@ -167,6 +167,11 @@ pub struct Style {
     pub radius: f32,
     pub border_width: f32,
     pub border_color: Color,
+    pub hover_overlay: Color,
+    pub pressed_overlay: Color,
+    pub disabled_opacity: f32,
+    pub focus_ring_color: Color,
+    pub focus_ring_width: f32,
     pub font_size: f32,
     pub font_weight: f32,
     pub font_family: String,
@@ -190,6 +195,11 @@ impl Default for Style {
             radius: 0.0,
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
+            hover_overlay: Color([255, 255, 255, 20]),
+            pressed_overlay: Color([255, 255, 255, 40]),
+            disabled_opacity: 0.45,
+            focus_ring_color: Color([137, 180, 250, 255]),
+            focus_ring_width: 2.0,
             font_size: 14.0,
             font_weight: 400.0,
             font_family: "sans-serif".into(),
@@ -483,6 +493,7 @@ impl Node {
             Some(style.grow),
             Some(style.radius),
             Some(style.border_width),
+            Some(style.focus_ring_width),
             Some(style.font_size),
         ]
         .into_iter()
@@ -494,8 +505,13 @@ impl Node {
                 ));
             }
         }
-        if !style.opacity.is_finite() || !(0.0..=1.0).contains(&style.opacity) {
-            return Err(TreeError("opacity must be between 0 and 1".into()));
+        if [style.opacity, style.disabled_opacity]
+            .into_iter()
+            .any(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err(TreeError(
+                "opacity and disabled_opacity must be between 0 and 1".into(),
+            ));
         }
         if !style.font_weight.is_finite() || !(1.0..=1000.0).contains(&style.font_weight) {
             return Err(TreeError("font weight must be between 1 and 1000".into()));
@@ -615,6 +631,14 @@ mod tests {
         assert!(node.validate().is_err());
         node.style.width = None;
         node.style.opacity = f32::INFINITY;
+        assert!(node.validate().is_err());
+
+        node.style.opacity = 1.0;
+        node.style.disabled_opacity = -0.1;
+        assert!(node.validate().is_err());
+
+        node.style.disabled_opacity = 1.0;
+        node.style.focus_ring_width = f32::NAN;
         assert!(node.validate().is_err());
     }
 

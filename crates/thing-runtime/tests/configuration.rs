@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf, time::Duration};
 use tempfile::TempDir;
-use thing_core::{Kind, TextAlign, TextOverflow};
+use thing_core::{Color, Kind, TextAlign, TextOverflow};
 use thing_runtime::{
     Action, AudioDevice, AudioSnapshot, AudioStream, Event, Limits, Runtime, Scalar,
 };
@@ -55,6 +55,49 @@ fn updates_only_dependencies_that_were_read() {
     assert!(runtime.dispatch(button, Event::Click).unwrap());
     assert_eq!(runtime.root().children[0].text, "1");
     assert!(!runtime.refresh().unwrap());
+}
+
+#[test]
+fn interaction_styles_update_reactively() {
+    let (_directory, path) = fixture(
+        r#"
+        local alternate = ui.state(false)
+        return ui.panel { children = {
+            ui.button {
+                style = {
+                    hover_overlay = function()
+                        return if alternate:get() then '#11111122' else '#00000000'
+                    end,
+                    pressed_overlay = function()
+                        return if alternate:get() then '#22222244' else '#00000000'
+                    end,
+                    disabled_opacity = function() return if alternate:get() then 0.25 else 1 end,
+                    focus_ring_color = function()
+                        return if alternate:get() then '#eeeeee' else '#00000000'
+                    end,
+                    focus_ring_width = function() return if alternate:get() then 1 else 0 end,
+                },
+                on_click = function() alternate:set(true) end,
+            },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let button = &runtime.root().children[0];
+    assert_eq!(button.style.hover_overlay, Color::TRANSPARENT);
+    assert_eq!(button.style.pressed_overlay, Color::TRANSPARENT);
+    assert_eq!(button.style.disabled_opacity, 1.0);
+    assert_eq!(button.style.focus_ring_color, Color::TRANSPARENT);
+    assert_eq!(button.style.focus_ring_width, 0.0);
+
+    let id = button.id;
+    assert!(runtime.dispatch(id, Event::Click).unwrap());
+    let button = &runtime.root().children[0];
+    assert_eq!(button.style.hover_overlay, Color([17, 17, 17, 34]));
+    assert_eq!(button.style.pressed_overlay, Color([34, 34, 34, 68]));
+    assert_eq!(button.style.disabled_opacity, 0.25);
+    assert_eq!(button.style.focus_ring_color, Color([238, 238, 238, 255]));
+    assert_eq!(button.style.focus_ring_width, 1.0);
 }
 
 #[test]
