@@ -59,6 +59,7 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] clock, power state, output audio controls, and niri workspaces and windows
 - [x] per-output configuration
 - [x] application launching
+- [x] managed child processes with output and exit state
 - [x] panel sizing and input regions
 - [x] popup positioning controls
 - [x] hover popups

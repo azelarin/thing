@@ -6,9 +6,10 @@ use std::{
 
 use thing_core::{Node, NodeId};
 use thing_runtime::{
-    Action, AudioSnapshot, ClipboardSnapshot, Event, KeyInput, MediaSnapshot, NiriState,
-    NotificationSnapshot, OutputContext, PowerSnapshot, Runtime, Scalar, ServiceSnapshot,
-    SurfaceKey, SurfaceTree, SystemTraySnapshot, UiAction, UiTarget,
+    Action, AudioSnapshot, ClipboardSnapshot, Event, KeyInput, ManagedProcessDefinition,
+    ManagedProcessSnapshot, ManagedProcessState, MediaSnapshot, NiriState, NotificationSnapshot,
+    OutputContext, PowerSnapshot, Runtime, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree,
+    SystemTraySnapshot, UiAction, UiTarget,
 };
 use thing_ui::Layout;
 
@@ -63,19 +64,49 @@ impl<K: Clone + Eq> Configurations<K> {
         self.add_checked(key, output, |_| Ok(()))
     }
 
+    #[cfg(test)]
     pub(crate) fn add_checked(
         &mut self,
         key: K,
         output: OutputContext,
         validate: impl FnOnce(&Runtime) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.add_checked_with_processes(key, output, validate, |_| Ok(()))
+    }
+
+    pub(crate) fn add_checked_with_processes(
+        &mut self,
+        key: K,
+        output: OutputContext,
+        validate: impl FnOnce(&Runtime) -> Result<(), String>,
+        reconcile: impl FnOnce(&[ManagedProcessDefinition]) -> Result<(), String>,
+    ) -> Result<(), String> {
         if self.contains(&key) {
             return Ok(());
         }
-        let runtime = Runtime::load_for_output(&self.entry, output.clone(), &self.services)
+        let mut runtime = Runtime::load_for_output(&self.entry, output.clone(), &self.services)
             .map_err(|error| error.to_string())?;
         validate(&runtime)?;
-        let consumer = allocate_consumer(&mut self.next_consumer)?;
+        let definitions = collect_managed_process_definitions(
+            self.instances
+                .iter()
+                .map(|instance| &instance.runtime)
+                .chain(std::iter::once(&runtime)),
+        )?;
+        let snapshot =
+            reconciled_managed_processes(self.services.managed_processes(), &definitions);
+        runtime
+            .set_managed_processes(snapshot.clone())
+            .map_err(|error| error.to_string())?;
+        let mut services = self.services.clone();
+        services
+            .set_managed_processes(snapshot)
+            .map_err(|error| error.to_string())?;
+        let mut next_consumer = self.next_consumer;
+        let consumer = allocate_consumer(&mut next_consumer)?;
+        reconcile(&definitions)?;
+        self.services = services;
+        self.next_consumer = next_consumer;
         self.instances.push(Instance {
             key,
             consumer,
@@ -85,12 +116,37 @@ impl<K: Clone + Eq> Configurations<K> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn remove(&mut self, key: &K) -> Option<String> {
+        self.remove_with_processes(key, |_| Ok(()))
+            .expect("loaded managed process definitions must remain valid")
+    }
+
+    pub(crate) fn remove_with_processes(
+        &mut self,
+        key: &K,
+        reconcile: impl FnOnce(&[ManagedProcessDefinition]) -> Result<(), String>,
+    ) -> Result<Option<String>, String> {
         let index = self
             .instances
             .iter()
-            .position(|instance| &instance.key == key)?;
-        Some(self.instances.remove(index).consumer)
+            .position(|instance| &instance.key == key);
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        let definitions =
+            collect_managed_process_definitions(self.instances.iter().enumerate().filter_map(
+                |(candidate, instance)| (candidate != index).then_some(&instance.runtime),
+            ))?;
+        let snapshot =
+            reconciled_managed_processes(self.services.managed_processes(), &definitions);
+        let mut services = self.services.clone();
+        services
+            .set_managed_processes(snapshot)
+            .map_err(|error| error.to_string())?;
+        reconcile(&definitions)?;
+        self.services = services;
+        Ok(Some(self.instances.remove(index).consumer))
     }
 
     pub(crate) fn keys(&self) -> impl Iterator<Item = &K> {
@@ -361,6 +417,24 @@ impl<K: Clone + Eq> Configurations<K> {
         Ok(())
     }
 
+    pub(crate) fn set_managed_processes(
+        &mut self,
+        processes: ManagedProcessSnapshot,
+    ) -> Result<(), String> {
+        let mut services = self.services.clone();
+        services
+            .set_managed_processes(processes.clone())
+            .map_err(|error| error.to_string())?;
+        for instance in &mut self.instances {
+            instance
+                .runtime
+                .set_managed_processes(processes.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        self.services = services;
+        Ok(())
+    }
+
     pub(crate) fn set_clipboard(&mut self, clipboard: ClipboardSnapshot) -> Result<(), String> {
         let mut services = self.services.clone();
         services
@@ -492,13 +566,27 @@ impl<K: Clone + Eq> Configurations<K> {
         self.reload_for_checked(outputs, |_, _| Ok(()))
     }
 
+    #[cfg(test)]
     pub(crate) fn reload_for_checked(
         &mut self,
         outputs: Vec<(K, OutputContext)>,
         validate: impl Fn(&K, &Runtime) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.reload_for_checked_with_processes(outputs, validate, |_| Ok(()))
+    }
+
+    pub(crate) fn reload_for_checked_with_processes(
+        &mut self,
+        outputs: Vec<(K, OutputContext)>,
+        validate: impl Fn(&K, &Runtime) -> Result<(), String>,
+        replace: impl FnOnce(&[ManagedProcessDefinition]) -> Result<(), String>,
+    ) -> Result<(), String> {
         let mut candidates = Vec::with_capacity(outputs.len());
         let mut next_consumer = self.next_consumer;
+        let mut services = self.services.clone();
+        services
+            .set_managed_processes(ManagedProcessSnapshot::default())
+            .map_err(|error| error.to_string())?;
         for (key, output) in outputs {
             if candidates
                 .iter()
@@ -506,7 +594,7 @@ impl<K: Clone + Eq> Configurations<K> {
             {
                 return Err("duplicate output while reloading configuration".into());
             }
-            let runtime = Runtime::load_for_output(&self.entry, output.clone(), &self.services)
+            let runtime = Runtime::load_for_output(&self.entry, output.clone(), &services)
                 .map_err(|error| error.to_string())?;
             validate(&key, &runtime)?;
             let consumer = allocate_consumer(&mut next_consumer)?;
@@ -517,6 +605,26 @@ impl<K: Clone + Eq> Configurations<K> {
                 runtime,
             });
         }
+        let definitions = collect_managed_process_definitions(
+            candidates.iter().map(|instance| &instance.runtime),
+        )?;
+        let snapshot = ManagedProcessSnapshot {
+            states: definitions
+                .iter()
+                .map(|definition| ManagedProcessState::idle(definition.key.clone()))
+                .collect(),
+        };
+        services
+            .set_managed_processes(snapshot.clone())
+            .map_err(|error| error.to_string())?;
+        for candidate in &mut candidates {
+            candidate
+                .runtime
+                .set_managed_processes(snapshot.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        replace(&definitions)?;
+        self.services = services;
         self.next_consumer = next_consumer;
         self.instances = candidates;
         Ok(())
@@ -554,6 +662,48 @@ fn allocate_consumer(next: &mut u64) -> Result<String, String> {
         .checked_add(1)
         .ok_or_else(|| "configuration generation space exhausted".to_owned())?;
     Ok(format!("configuration{value}"))
+}
+
+fn collect_managed_process_definitions<'a>(
+    runtimes: impl IntoIterator<Item = &'a Runtime>,
+) -> Result<Vec<ManagedProcessDefinition>, String> {
+    let mut definitions = BTreeMap::<String, ManagedProcessDefinition>::new();
+    for definition in runtimes
+        .into_iter()
+        .flat_map(Runtime::managed_process_definitions)
+    {
+        if let Some(existing) = definitions.get(&definition.key)
+            && existing != &definition
+        {
+            return Err(format!(
+                "managed process {:?} has conflicting declarations across outputs",
+                definition.key
+            ));
+        }
+        definitions.insert(definition.key.clone(), definition);
+    }
+    Ok(definitions.into_values().collect())
+}
+
+fn reconciled_managed_processes(
+    current: ManagedProcessSnapshot,
+    definitions: &[ManagedProcessDefinition],
+) -> ManagedProcessSnapshot {
+    let mut current = current
+        .states
+        .into_iter()
+        .map(|state| (state.key.clone(), state))
+        .collect::<BTreeMap<_, _>>();
+    ManagedProcessSnapshot {
+        states: definitions
+            .iter()
+            .map(|definition| {
+                current
+                    .remove(&definition.key)
+                    .unwrap_or_else(|| ManagedProcessState::idle(definition.key.clone()))
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -624,6 +774,24 @@ mod tests {
             has_attention_icon_pixmap: false,
             has_overlay_icon_pixmap: false,
             has_tooltip_icon_pixmap: false,
+        }
+    }
+
+    fn managed_process_state(
+        key: &str,
+        status: thing_runtime::ManagedProcessStatus,
+        stdout: &str,
+    ) -> ManagedProcessState {
+        ManagedProcessState {
+            key: key.into(),
+            status,
+            stdout: Arc::from(stdout),
+            stderr: Arc::from(""),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            exit_code: None,
+            exit_signal: None,
+            error: Arc::from(""),
         }
     }
 
@@ -1682,6 +1850,162 @@ mod tests {
         for key in [1, 2] {
             assert_eq!(text(&configurations, key), "true:false:copied:");
         }
+    }
+
+    #[test]
+    fn managed_process_state_is_shared_and_output_lifetimes_reconcile() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            local key = if services.output.name:get() == 'DP-1' then 'shared' else 'second'
+            local process = services.process(key)
+            return ui.panel { children = { ui.text { text = function()
+                return key .. ':' .. process.status:get() .. ':' .. process.stdout:get()
+            end } } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        let mut first_definitions = Vec::new();
+        configurations
+            .add_checked_with_processes(
+                1,
+                output("DP-1", 1920),
+                |_| Ok(()),
+                |definitions| {
+                    first_definitions = definitions.to_vec();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            first_definitions
+                .iter()
+                .map(|definition| definition.key.as_str())
+                .collect::<Vec<_>>(),
+            ["shared"]
+        );
+        configurations
+            .set_managed_processes(ManagedProcessSnapshot {
+                states: vec![managed_process_state(
+                    "shared",
+                    thing_runtime::ManagedProcessStatus::Running,
+                    "ready",
+                )],
+            })
+            .unwrap();
+        assert_eq!(configurations.refresh(), vec![1]);
+
+        let mut added_definitions = Vec::new();
+        configurations
+            .add_checked_with_processes(
+                2,
+                output("DP-2", 2560),
+                |_| Ok(()),
+                |definitions| {
+                    added_definitions = definitions.to_vec();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            added_definitions
+                .iter()
+                .map(|definition| definition.key.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "shared"]
+        );
+        assert_eq!(text(&configurations, 1), "shared:running:ready");
+        assert_eq!(text(&configurations, 2), "second:idle:");
+
+        let mut remaining_definitions = Vec::new();
+        assert!(
+            configurations
+                .remove_with_processes(&2, |definitions| {
+                    remaining_definitions = definitions.to_vec();
+                    Ok(())
+                })
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            remaining_definitions
+                .iter()
+                .map(|definition| definition.key.as_str())
+                .collect::<Vec<_>>(),
+            ["shared"]
+        );
+        assert_eq!(text(&configurations, 1), "shared:running:ready");
+    }
+
+    #[test]
+    fn failed_process_scope_preflight_preserves_the_loaded_generation() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            "local process = services.process('old'); return ui.panel { children = { ui.text { text = 'old:' .. process.status:get() } } }",
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry.clone(), ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        let old_consumer = configurations.consumer(&1).unwrap().to_owned();
+        fs::write(
+            &entry,
+            "local process = services.process('new'); return ui.panel { children = { ui.text { text = 'new:' .. process.status:get() } } }",
+        )
+        .unwrap();
+        let mut observed = Vec::new();
+
+        let error = configurations
+            .reload_for_checked_with_processes(
+                vec![(1, output("DP-1", 1920))],
+                |_, _| Ok(()),
+                |definitions| {
+                    observed = definitions.to_vec();
+                    Err("managed process service requires unrestricted procfs".into())
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.contains("unrestricted procfs"));
+        assert_eq!(observed[0].key, "new");
+        assert_eq!(configurations.consumer(&1), Some(old_consumer.as_str()));
+        assert_eq!(text(&configurations, 1), "old:idle");
+    }
+
+    #[test]
+    fn conflicting_output_process_declarations_fail_before_scope_change() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            local signal = if services.output.name:get() == 'DP-1' then 'terminate' else 'interrupt'
+            services.process { key = 'shared', shutdown_signal = signal }
+            return ui.panel {}
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        let mut scope_changed = false;
+
+        let error = configurations
+            .reload_for_checked_with_processes(
+                vec![(1, output("DP-1", 1920)), (2, output("DP-2", 2560))],
+                |_, _| Ok(()),
+                |_| {
+                    scope_changed = true;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.contains("conflicting declarations across outputs"));
+        assert!(!scope_changed);
+        assert!(configurations.keys().next().is_none());
     }
 
     #[test]

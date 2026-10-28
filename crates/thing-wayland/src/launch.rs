@@ -223,7 +223,6 @@ pub(crate) fn prepare() -> calloop::Result<(Launcher, Signals)> {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn sigchld_is_reapable() -> io::Result<bool> {
     let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
     // SAFETY: a null replacement asks sigaction to copy the current

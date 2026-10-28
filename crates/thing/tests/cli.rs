@@ -179,3 +179,31 @@ fn system_tray_is_explicit_and_run_only() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("expected host or own-watcher"));
 }
+
+#[test]
+fn check_validates_managed_processes_without_starting_the_host_service() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("panel.luau");
+    fs::write(
+        &path,
+        r#"
+        local query = services.process('query')
+        return ui.panel { children = {
+            ui.text { text = function() return query.status:get() end },
+            ui.button { on_click = function() query.start({ 'never-run-by-check' }) end },
+        } }
+        "#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/missing/session-bus")
+        .arg("check")
+        .arg(&path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+}

@@ -775,6 +775,13 @@ impl ServiceSnapshot {
         Ok(())
     }
 
+    /// returns the current process-wide managed process state.
+    pub fn managed_processes(&self) -> ManagedProcessSnapshot {
+        ManagedProcessSnapshot {
+            states: self.managed_processes.clone(),
+        }
+    }
+
     pub fn set_niri(&mut self, state: NiriState) -> Result<()> {
         state.validate()?;
         self.niri = state;

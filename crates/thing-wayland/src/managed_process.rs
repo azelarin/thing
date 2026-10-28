@@ -23,6 +23,10 @@ use std::{
 };
 
 use calloop::ping::Ping;
+use thing_runtime::{
+    ManagedProcessDefinition, ManagedProcessShutdownSignal, ManagedProcessSnapshot,
+    ManagedProcessState, ManagedProcessStatus,
+};
 
 const MAX_KEYS: usize = 32;
 const MAX_UNREAPED: usize = 32;
@@ -96,6 +100,18 @@ pub(crate) struct Definition {
     pub shutdown_signal: ShutdownSignal,
 }
 
+impl From<&ManagedProcessDefinition> for Definition {
+    fn from(definition: &ManagedProcessDefinition) -> Self {
+        Self {
+            key: definition.key.clone(),
+            shutdown_signal: match definition.shutdown_signal {
+                ManagedProcessShutdownSignal::Terminate => ShutdownSignal::Terminate,
+                ManagedProcessShutdownSignal::Interrupt => ShutdownSignal::Interrupt,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Status {
     Idle,
@@ -165,6 +181,35 @@ impl State {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Snapshot {
     pub states: Arc<[State]>,
+}
+
+impl Snapshot {
+    pub(crate) fn runtime(&self) -> ManagedProcessSnapshot {
+        ManagedProcessSnapshot {
+            states: self
+                .states
+                .iter()
+                .map(|state| ManagedProcessState {
+                    key: state.key.clone(),
+                    status: match state.status {
+                        Status::Idle => ManagedProcessStatus::Idle,
+                        Status::Starting => ManagedProcessStatus::Starting,
+                        Status::Running => ManagedProcessStatus::Running,
+                        Status::Stopping => ManagedProcessStatus::Stopping,
+                        Status::Exited => ManagedProcessStatus::Exited,
+                        Status::Failed => ManagedProcessStatus::Failed,
+                    },
+                    stdout: state.stdout.clone(),
+                    stderr: state.stderr.clone(),
+                    stdout_truncated: state.stdout_truncated,
+                    stderr_truncated: state.stderr_truncated,
+                    exit_code: state.exit_code,
+                    exit_signal: state.exit_signal,
+                    error: state.error.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -330,6 +375,7 @@ impl Manager {
         Self::start_inner(ping, Limits::default(), Some(ManagerLease::acquire()?))
     }
 
+    #[cfg(test)]
     fn start_with_limits(ping: Ping, limits: Limits) -> io::Result<Self> {
         Self::start_inner(ping, limits, None)
     }
