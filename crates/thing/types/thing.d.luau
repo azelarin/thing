@@ -340,6 +340,7 @@ export type ThingSecretInputProperties = {
     enabled: ThingReactive<boolean>?,
     style: ThingTextInputStyle?,
     placeholder: ThingReactive<string>?,
+    on_hover: ((inside: boolean) -> ())?,
 }
 
 export type ThingImageProperties = {
