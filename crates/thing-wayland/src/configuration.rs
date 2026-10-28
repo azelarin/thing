@@ -82,6 +82,16 @@ impl<K: Clone + Eq> Configurations<K> {
             .is_some_and(|runtime| runtime.has_scroll_handler(id))
     }
 
+    pub(crate) fn has_active_press(&self, key: &K, id: NodeId) -> bool {
+        self.runtime(key)
+            .is_some_and(|runtime| runtime.has_active_press(id))
+    }
+
+    pub(crate) fn active_press_is_available(&self, key: &K, id: NodeId) -> bool {
+        self.runtime(key)
+            .is_some_and(|runtime| runtime.active_press_is_available(id))
+    }
+
     pub(crate) fn layout_is_animating(&self, key: &K, layout: &Layout) -> bool {
         self.runtime(key).is_some_and(|runtime| {
             runtime.is_any_animating(layout.placements().iter().map(|placement| placement.id))

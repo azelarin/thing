@@ -97,6 +97,7 @@ pub enum Event {
         y: f64,
     },
     Change(f64),
+    Pressed(bool),
     Hover(bool),
     Close,
 }
@@ -128,6 +129,7 @@ pub struct Runtime {
     sources: BTreeMap<NodeId, u64>,
     deferred: BTreeSet<usize>,
     handlers: Handlers,
+    active_presses: BTreeMap<NodeId, Option<Function>>,
     ended_hovers: BTreeSet<NodeId>,
     deadline: Rc<Cell<Instant>>,
     limits: Limits,
@@ -212,6 +214,7 @@ impl Runtime {
             sources: BTreeMap::new(),
             deferred: BTreeSet::new(),
             handlers: BTreeMap::new(),
+            active_presses: BTreeMap::new(),
             ended_hovers: BTreeSet::new(),
             deadline,
             limits,
@@ -339,6 +342,14 @@ impl Runtime {
         now: Option<Instant>,
         validate: &impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<bool> {
+        if let Event::Pressed(pressed) = event {
+            let now = now.unwrap_or_else(Instant::now);
+            return if pressed {
+                self.begin_press_checked(id, now, validate)
+            } else {
+                self.end_press_checked(id, now, validate)
+            };
+        }
         if matches!(event, Event::Hover(false)) && self.ended_hovers.remove(&id) {
             return Ok(false);
         }
@@ -358,6 +369,7 @@ impl Runtime {
             Event::Hover(_) => "on_hover",
             Event::Change(value) if value.is_finite() => "on_change",
             Event::Change(_) => return Err(Error::runtime("input value must be finite")),
+            Event::Pressed(_) => unreachable!("press events are handled above"),
         };
         let Some(handler) = self.handlers.get(&(id, name)).cloned() else {
             return Ok(false);
@@ -372,6 +384,7 @@ impl Runtime {
             Event::Scroll { x, y } => handler.call::<()>((x, y)),
             Event::Change(value) => handler.call::<()>(value),
             Event::Hover(inside) => handler.call::<()>(inside),
+            Event::Pressed(_) => unreachable!("press events are handled above"),
         };
         self.services.allow_actions(false);
         let now = now.unwrap_or_else(Instant::now);
@@ -396,7 +409,117 @@ impl Runtime {
         if result.is_err() {
             self.services.truncate_actions(checkpoint);
         }
+        let changed = result?;
+        match self.cancel_unavailable_presses_checked(now, validate) {
+            Ok(cleaned) => Ok(changed || cleaned),
+            Err(error) => {
+                self.services.truncate_actions(checkpoint);
+                Err(error)
+            }
+        }
+    }
+
+    fn begin_press_checked(
+        &mut self,
+        id: NodeId,
+        now: Instant,
+        validate: &impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<bool> {
+        if self.active_presses.contains_key(&id) {
+            return Ok(false);
+        }
+        if !self.is_available(id) || self.find(id).is_none_or(|node| node.kind != Kind::Range) {
+            return Ok(false);
+        }
+        let handler = self.handlers.get(&(id, "on_pressed")).cloned();
+        let checkpoint = self.services.action_count();
+        let result = if let Some(handler) = &handler {
+            self.begin_call();
+            self.services.allow_actions(true);
+            let result = handler.call::<()>(true);
+            self.services.allow_actions(false);
+            result.and_then(|()| self.refresh_at_checked(now, validate))
+        } else {
+            Ok(false)
+        };
+        let changed = match result {
+            Ok(changed) => changed,
+            Err(error) => {
+                if let Some(handler) = handler {
+                    self.begin_call();
+                    self.services.allow_actions(true);
+                    let cleanup = handler.call::<()>(false);
+                    self.services.allow_actions(false);
+                    let cleanup = cleanup.and_then(|()| self.refresh_at_checked(now, validate));
+                    self.services.truncate_actions(checkpoint);
+                    return match cleanup {
+                        Ok(_) => Err(error),
+                        Err(cleanup) => Err(Error::runtime(format!(
+                            "{error}; press cleanup also failed: {cleanup}"
+                        ))),
+                    };
+                }
+                self.services.truncate_actions(checkpoint);
+                return Err(error);
+            }
+        };
+        self.active_presses.insert(id, handler);
+        match self.cancel_unavailable_presses_checked(now, validate) {
+            Ok(cleaned) => Ok(changed || cleaned),
+            Err(error) => {
+                self.services.truncate_actions(checkpoint);
+                Err(error)
+            }
+        }
+    }
+
+    fn end_press_checked(
+        &mut self,
+        id: NodeId,
+        now: Instant,
+        validate: &impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<bool> {
+        let Some(handler) = self.active_presses.remove(&id) else {
+            return Ok(false);
+        };
+        let Some(handler) = handler else {
+            return Ok(false);
+        };
+        let checkpoint = self.services.action_count();
+        self.begin_call();
+        self.services.allow_actions(true);
+        let result = handler.call::<()>(false);
+        self.services.allow_actions(false);
+        let result = result.and_then(|()| self.refresh_at_checked(now, validate));
+        if result.is_err() {
+            self.services.truncate_actions(checkpoint);
+        }
         result
+    }
+
+    fn cancel_unavailable_presses_checked(
+        &mut self,
+        now: Instant,
+        validate: &impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<bool> {
+        let mut changed = false;
+        while let Some(id) = self
+            .active_presses
+            .keys()
+            .copied()
+            .find(|id| !self.is_available(*id))
+        {
+            changed |= self.end_press_checked(id, now, validate)?;
+        }
+        Ok(changed)
+    }
+
+    pub fn has_active_press(&self, id: NodeId) -> bool {
+        self.active_presses.contains_key(&id)
+    }
+
+    pub fn active_press_is_available(&self, id: NodeId) -> bool {
+        self.has_active_press(id) && self.is_available(id)
     }
 
     /// reevaluate only dirty properties and publish them together after validation.
@@ -801,12 +924,13 @@ impl Runtime {
                 }
                 "key" => node.key = Some(properties::string(value, "key")?),
                 "on_click" | "on_middle_click" | "on_secondary_click" | "on_scroll"
-                | "on_change" | "on_hover" | "on_close" => {
+                | "on_change" | "on_pressed" | "on_hover" | "on_close" => {
                     if (matches!(
                         key.as_str(),
                         "on_click" | "on_middle_click" | "on_secondary_click" | "on_scroll"
                     ) && kind != Kind::Button)
-                        || (key == "on_change" && kind != Kind::Slider)
+                        || (key == "on_change" && !matches!(kind, Kind::Slider | Kind::Range))
+                        || (key == "on_pressed" && kind != Kind::Range)
                         || (key == "on_hover" && kind != Kind::Popup && !kind.is_interactive())
                         || (key == "on_close" && kind != Kind::Popup)
                     {
@@ -823,6 +947,7 @@ impl Runtime {
                         "on_secondary_click" => "on_secondary_click",
                         "on_scroll" => "on_scroll",
                         "on_change" => "on_change",
+                        "on_pressed" => "on_pressed",
                         "on_hover" => "on_hover",
                         _ => "on_close",
                     };
@@ -1053,6 +1178,7 @@ fn kind(name: &str) -> Result<Kind> {
         "image" => Ok(Kind::Image),
         "button" => Ok(Kind::Button),
         "slider" => Ok(Kind::Slider),
+        "range" => Ok(Kind::Range),
         _ => Err(Error::runtime(format!("unknown widget {name:?}"))),
     }
 }
@@ -1072,6 +1198,7 @@ fn install_ui(lua: &Lua, tracker: Rc<RefCell<Tracker>>) -> Result<()> {
         "image",
         "button",
         "slider",
+        "range",
     ] {
         let next_id = next_id.clone();
         ui.set(

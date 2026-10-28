@@ -20,6 +20,7 @@ pub enum Kind {
     Image,
     Button,
     Slider,
+    Range,
 }
 
 /// the output edge that owns a panel surface.
@@ -281,11 +282,19 @@ impl Kind {
                 | Self::Stack
                 | Self::Scroll
                 | Self::Button
+                | Self::Range
         )
     }
 
     pub fn is_interactive(self) -> bool {
-        matches!(self, Self::Button | Self::Slider)
+        matches!(self, Self::Button | Self::Slider | Self::Range)
+    }
+
+    fn is_range_visual(self) -> bool {
+        matches!(
+            self,
+            Self::Row | Self::CenterBox | Self::Column | Self::Stack | Self::Text | Self::Image
+        )
     }
 }
 
@@ -371,7 +380,7 @@ impl Default for Style {
     }
 }
 
-/// a finite slider range with optional quantization.
+/// a finite input range with optional quantization.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Slider {
     pub min: f64,
@@ -488,7 +497,7 @@ impl Slider {
             || self.step < 0.0
         {
             return Err(TreeError(
-                "slider needs a finite increasing range and a nonnegative step".into(),
+                "range input needs a finite increasing range and a nonnegative step".into(),
             ));
         }
         Ok(())
@@ -534,11 +543,19 @@ pub struct Node {
     pub image_fit: ImageFit,
     pub popup: PopupOptions,
     pub slider: Slider,
+    pub range_inset: f32,
     pub panel: PanelProperties,
     pub enabled: bool,
     pub visible: bool,
     pub key: Option<String>,
     pub children: Vec<Node>,
+}
+
+#[derive(Clone, Copy)]
+struct ValidationScope {
+    allow_external_anchor: bool,
+    allow_automatic_popup_anchor: bool,
+    inside_range: bool,
 }
 
 impl Node {
@@ -554,6 +571,7 @@ impl Node {
             image_fit: ImageFit::Contain,
             popup: PopupOptions::default(),
             slider: Slider::default(),
+            range_inset: 0.0,
             panel: PanelProperties::default(),
             enabled: true,
             visible: true,
@@ -569,8 +587,11 @@ impl Node {
             &mut HashSet::new(),
             None,
             &mut HashSet::new(),
-            false,
-            self.allows_automatic_popup_anchor(),
+            ValidationScope {
+                allow_external_anchor: false,
+                allow_automatic_popup_anchor: self.allows_automatic_popup_anchor(),
+                inside_range: false,
+            },
         )
     }
 
@@ -582,8 +603,11 @@ impl Node {
             &mut HashSet::new(),
             None,
             &mut HashSet::new(),
-            true,
-            self.allows_automatic_popup_anchor(),
+            ValidationScope {
+                allow_external_anchor: true,
+                allow_automatic_popup_anchor: self.allows_automatic_popup_anchor(),
+                inside_range: false,
+            },
         )
     }
 
@@ -601,8 +625,7 @@ impl Node {
         ids: &mut HashSet<NodeId>,
         anchor: Option<NodeId>,
         automatic_popups: &mut HashSet<NodeId>,
-        allow_external_anchor: bool,
-        allow_automatic_popup_anchor: bool,
+        scope: ValidationScope,
     ) -> Result<(), TreeError> {
         if depth > 64 || ids.len() >= 10_000 {
             return Err(TreeError(
@@ -613,6 +636,12 @@ impl Node {
             return Err(TreeError(format!(
                 "widget {:?} is used more than once; create a fresh widget for each position",
                 self.id
+            )));
+        }
+        if scope.inside_range && !self.kind.is_range_visual() {
+            return Err(TreeError(format!(
+                "range children must be visual widgets, found {:?}",
+                self.kind
             )));
         }
         if depth > 0 && self.panel != PanelProperties::default() {
@@ -778,8 +807,19 @@ impl Node {
         if !style.font_weight.is_finite() || !(1.0..=1000.0).contains(&style.font_weight) {
             return Err(TreeError("font weight must be between 1 and 1000".into()));
         }
-        if self.kind == Kind::Slider {
+        if matches!(self.kind, Kind::Slider | Kind::Range) {
             self.slider.validate()?;
+        }
+        if self.kind == Kind::Range {
+            if !self.range_inset.is_finite() || !(0.0..=100_000.0).contains(&self.range_inset) {
+                return Err(TreeError(
+                    "range inset must be finite and between 0 and 100,000".into(),
+                ));
+            }
+        } else if self.range_inset != 0.0 {
+            return Err(TreeError(
+                "range inset is available only on range widgets".into(),
+            ));
         }
         let anchor = if self.kind == Kind::Button {
             Some(self.id)
@@ -793,7 +833,7 @@ impl Node {
                         "a button can own only one automatic popup".into(),
                     ));
                 }
-                None if !(allow_external_anchor && depth == 0) => {
+                None if !(scope.allow_external_anchor && depth == 0) => {
                     return Err(TreeError(
                         "an automatic popup needs a button ancestor".into(),
                     ));
@@ -803,7 +843,7 @@ impl Node {
         }
         if self.kind == Kind::Popup
             && self.popup.anchor == PopupAnchor::Auto
-            && !allow_automatic_popup_anchor
+            && !scope.allow_automatic_popup_anchor
         {
             return Err(TreeError(
                 "popup anchor 'auto' needs an unambiguous panel anchor edge".into(),
@@ -822,8 +862,10 @@ impl Node {
                 ids,
                 anchor,
                 automatic_popups,
-                allow_external_anchor,
-                allow_automatic_popup_anchor,
+                ValidationScope {
+                    inside_range: scope.inside_range || self.kind == Kind::Range,
+                    ..scope
+                },
             )?;
         }
         Ok(())
@@ -1118,5 +1160,41 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn ranges_accept_only_visual_descendants() {
+        let mut range = Node::new(NodeId(1), Kind::Range);
+        range.range_inset = 4.0;
+        let mut row = Node::new(NodeId(2), Kind::Row);
+        row.children.push(Node::new(NodeId(3), Kind::Text));
+        row.children.push(Node::new(NodeId(4), Kind::Image));
+        range.children.push(row);
+        assert!(range.validate().is_ok());
+
+        for kind in [
+            Kind::Panel,
+            Kind::Popup,
+            Kind::Scroll,
+            Kind::Button,
+            Kind::Slider,
+            Kind::Range,
+        ] {
+            let mut candidate = range.clone();
+            candidate.children[0]
+                .children
+                .push(Node::new(NodeId(10), kind));
+            assert!(
+                candidate
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("visual widgets"),
+                "{kind:?} should not be accepted below a range"
+            );
+        }
+
+        range.range_inset = -1.0;
+        assert!(range.validate().unwrap_err().to_string().contains("inset"));
     }
 }

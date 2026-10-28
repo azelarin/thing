@@ -5,7 +5,7 @@ use femtovg::{
     renderer::{OpenGl, Renderer},
 };
 use parley::PositionedLayoutItem;
-use thing_core::{ImageFit, Kind, Node, NodeId, Rect};
+use thing_core::{HorizontalRange, ImageFit, Kind, Node, NodeId, Rect};
 
 use crate::{Layout, ScrollState, Size, TextSystem};
 
@@ -225,9 +225,10 @@ impl<R: Renderer> Painter<R> {
     }
 
     fn draw_slider(&mut self, node: &Node, bounds: Rect) {
-        let x = bounds.x + 8.0;
+        let span = HorizontalRange::unclamped_inset(bounds, 8.0);
+        let x = span.start();
         let y = bounds.y + bounds.height / 2.0;
-        let width = (bounds.width - 16.0).max(0.0);
+        let width = span.length();
         let value = node.slider.fraction() as f32;
         let mut track = Path::new();
         track.rounded_rect(x, y - 2.0, width, 4.0, 2.0);
@@ -235,7 +236,7 @@ impl<R: Renderer> Painter<R> {
             .fill_path(&track, &Paint::color(Color::rgba(255, 255, 255, 50)));
         let mut active = Path::new();
         active.rounded_rect(x, y - 2.0, width * value, 4.0, 2.0);
-        active.circle(x + width * value, y, 6.0);
+        active.circle(span.position(value), y, 6.0);
         self.canvas
             .fill_path(&active, &Paint::color(color(node.style.foreground)));
     }

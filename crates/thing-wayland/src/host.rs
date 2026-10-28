@@ -38,7 +38,8 @@ use smithay_client_toolkit::{
     },
 };
 use thing_core::{
-    KeyboardMode, Kind, Node, NodeId, PanelInputRegion, Point, Rect, Scale, SurfaceLayer,
+    HorizontalRange, KeyboardMode, Kind, Node, NodeId, PanelInputRegion, Point, Rect, Scale,
+    SurfaceLayer,
 };
 use thing_runtime::{
     Action, Event, OutputContext, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree,
@@ -557,6 +558,7 @@ struct Surface {
     hover_path: Vec<NodeId>,
     press_serial: Option<u32>,
     pressed_button: Option<u32>,
+    range_press: Option<NodeId>,
     configured: bool,
     dirty: bool,
     waiting: bool,
@@ -919,6 +921,7 @@ impl App {
             hover_path: Vec::new(),
             press_serial: None,
             pressed_button: None,
+            range_press: None,
             configured: false,
             dirty: true,
             waiting: false,
@@ -1084,6 +1087,7 @@ impl App {
             surface.hover_path.clear();
             surface.press_serial = None;
             surface.pressed_button = None;
+            surface.range_press = None;
         }
         surface.dirty = true;
         layer.wl_surface().commit();
@@ -1168,6 +1172,9 @@ impl App {
         };
         let wl = self.surfaces[index].role.surface().clone();
         let hovered = std::mem::take(&mut self.surfaces[index].hover_path);
+        let pressed = notify_hover
+            .then(|| self.surfaces[index].range_press)
+            .flatten();
         if let Err(error) = self.render.park() {
             self.error = Some(error);
         }
@@ -1177,6 +1184,9 @@ impl App {
             self.clear_keyboard_focus();
         }
         if notify_hover {
+            if let Some(id) = pressed {
+                self.dispatch(owner.output.clone(), id, Event::Pressed(false), None);
+            }
             for id in hovered {
                 self.dispatch(owner.output.clone(), id, Event::Hover(false), None);
             }
@@ -1565,6 +1575,7 @@ impl App {
     }
 
     fn invalidate_output(&mut self, output: &wl_output::WlOutput) {
+        self.reconcile_range_presses(output);
         while let Some(index) = self.surfaces.iter().position(|surface| {
             if &surface.output != output {
                 return false;
@@ -1593,7 +1604,7 @@ impl App {
         self.reconcile_hover_intent();
     }
 
-    fn slider(&mut self, surface: usize, id: NodeId, x: f32) {
+    fn range_input(&mut self, surface: usize, id: NodeId, x: f32) {
         let output = self.surfaces[surface].output.clone();
         let key = self.surfaces[surface].key.clone();
         let Some(node) = self
@@ -1603,7 +1614,7 @@ impl App {
         else {
             return;
         };
-        if node.kind != Kind::Slider || !node.enabled {
+        if !matches!(node.kind, Kind::Slider | Kind::Range) || !node.enabled {
             return;
         }
         let Some(bounds) = self.surfaces[surface]
@@ -1614,9 +1625,41 @@ impl App {
         else {
             return;
         };
-        let fraction = (x - bounds.x - 8.0) / (bounds.width - 16.0).max(1.0);
-        let value = node.slider.value_at(fraction as f64);
+        let span = match node.kind {
+            Kind::Slider => HorizontalRange::unclamped_inset(bounds, 8.0),
+            Kind::Range => HorizontalRange::inset(bounds, node.range_inset),
+            _ => unreachable!("range kind checked above"),
+        };
+        let value = node.slider.value_at(f64::from(span.fraction_at(x)));
         self.dispatch(output, id, Event::Change(value), None);
+    }
+
+    fn reconcile_range_presses(&mut self, output: &wl_output::WlOutput) {
+        let stale: Vec<_> = self
+            .surfaces
+            .iter()
+            .filter(|surface| &surface.output == output)
+            .filter_map(|surface| {
+                let id = surface.range_press?;
+                (!self.configurations.active_press_is_available(output, id))
+                    .then(|| (surface.role.surface().clone(), id))
+            })
+            .collect();
+        for (wl, id) in stale {
+            if let Some(index) = self.index(&wl) {
+                let surface = &mut self.surfaces[index];
+                if surface.input.pressed == Some(id) {
+                    surface.input.pressed = None;
+                }
+                surface.pressed_button = None;
+                surface.press_serial = None;
+                surface.range_press = None;
+                surface.dirty = true;
+            }
+            if self.configurations.has_active_press(output, id) {
+                self.dispatch(output.clone(), id, Event::Pressed(false), None);
+            }
+        }
     }
 
     fn remove_popup(&mut self, index: usize, notify_runtime: bool, suppress_hover: bool) {
@@ -1625,6 +1668,9 @@ impl App {
         let wl = self.surfaces[index].role.surface().clone();
         let mode = self.surfaces[index].role.popup_mode().cloned();
         let hovered = std::mem::take(&mut self.surfaces[index].hover_path);
+        let pressed = notify_runtime
+            .then(|| self.surfaces[index].range_press)
+            .flatten();
         if let Err(error) = self.render.park() {
             self.error = Some(error);
         }
@@ -1636,6 +1682,9 @@ impl App {
             self.clear_keyboard_focus();
         }
         if notify_runtime {
+            if let Some(id) = pressed {
+                self.dispatch(output.clone(), id, Event::Pressed(false), None);
+            }
             for hovered in hovered {
                 self.dispatch(output.clone(), hovered, Event::Hover(false), None);
             }
@@ -2114,6 +2163,7 @@ impl App {
 
     fn clear_pointer_state(&mut self, preserve_keyboard_hover: bool) {
         let mut leaving = Vec::new();
+        let mut pressed = Vec::new();
         for surface in &mut self.surfaces {
             leaving.extend(
                 std::mem::take(&mut surface.hover_path)
@@ -2121,11 +2171,20 @@ impl App {
                     .map(|id| (surface.output.clone(), id)),
             );
             surface.pointer_position = None;
+            pressed.extend(
+                surface
+                    .range_press
+                    .take()
+                    .map(|id| (surface.output.clone(), id)),
+            );
             surface.input.hovered = None;
             surface.input.pressed = None;
             surface.press_serial = None;
             surface.pressed_button = None;
             surface.dirty = true;
+        }
+        for (output, id) in pressed {
+            self.dispatch(output, id, Event::Pressed(false), None);
         }
         for (output, id) in leaving {
             self.dispatch(output, id, Event::Hover(false), None);
@@ -2304,7 +2363,7 @@ impl App {
             return false;
         };
         let event_surface = self.surfaces[index].role.surface().clone();
-        let origin = keyboard_input_serial(direct, serial)
+        let origin = direct_input_serial(direct, serial)
             .and_then(|serial| self.input_origin(event_surface.clone(), serial));
         let Some(action) = widget_key_action(node.kind, event.keysym, direct) else {
             return false;
@@ -2348,23 +2407,23 @@ impl App {
 fn widget_key_action(kind: Kind, keysym: Keysym, direct: bool) -> Option<WidgetKeyAction> {
     match (kind, keysym) {
         (Kind::Button, Keysym::Return | Keysym::space) if direct => Some(WidgetKeyAction::Activate),
-        (Kind::Slider, Keysym::Left | Keysym::Down) => {
+        (Kind::Slider | Kind::Range, Keysym::Left | Keysym::Down) => {
             Some(WidgetKeyAction::Slider(SliderKeyAction::Decrease))
         }
-        (Kind::Slider, Keysym::Right | Keysym::Up) => {
+        (Kind::Slider | Kind::Range, Keysym::Right | Keysym::Up) => {
             Some(WidgetKeyAction::Slider(SliderKeyAction::Increase))
         }
-        (Kind::Slider, Keysym::Home) if direct => {
+        (Kind::Slider | Kind::Range, Keysym::Home) if direct => {
             Some(WidgetKeyAction::Slider(SliderKeyAction::Minimum))
         }
-        (Kind::Slider, Keysym::End) if direct => {
+        (Kind::Slider | Kind::Range, Keysym::End) if direct => {
             Some(WidgetKeyAction::Slider(SliderKeyAction::Maximum))
         }
         _ => None,
     }
 }
 
-fn keyboard_input_serial(direct: bool, serial: u32) -> Option<u32> {
+fn direct_input_serial(direct: bool, serial: u32) -> Option<u32> {
     direct.then_some(serial)
 }
 
@@ -3245,7 +3304,9 @@ impl PointerHandler for App {
                     if surface.pressed_button == Some(0x110)
                         && let Some(id) = surface.input.pressed
                     {
-                        self.slider(index, id, point.x);
+                        let output = surface.output.clone();
+                        self.range_input(index, id, point.x);
+                        self.reconcile_range_presses(&output);
                     }
                 }
                 PointerEventKind::Leave { .. } => {
@@ -3253,7 +3314,8 @@ impl PointerHandler for App {
                     self.surfaces[index].dirty = true;
                 }
                 PointerEventKind::Press { button, serial, .. }
-                    if matches!(button, 0x110..=0x112) =>
+                    if matches!(button, 0x110..=0x112)
+                        && self.surfaces[index].range_press.is_none() =>
                 {
                     self.clear_key_repeat();
                     let surface = &mut self.surfaces[index];
@@ -3266,7 +3328,28 @@ impl PointerHandler for App {
                     if button == 0x110
                         && let Some(id) = hit
                     {
-                        self.slider(index, id, point.x);
+                        let output = surface.output.clone();
+                        let key = surface.key.clone();
+                        let event_surface = surface.role.surface().clone();
+                        let kind = self
+                            .configurations
+                            .surface_root(&output, &key)
+                            .and_then(|root| root.find(id))
+                            .map(|node| node.kind);
+                        if kind == Some(Kind::Range) {
+                            self.surfaces[index].range_press = Some(id);
+                            self.dispatch(output.clone(), id, Event::Pressed(true), None);
+                            self.reconcile_range_presses(&output);
+                        }
+                        if kind == Some(Kind::Slider)
+                            || (kind == Some(Kind::Range)
+                                && self.configurations.has_active_press(&output, id))
+                        {
+                            if let Some(index) = self.index(&event_surface) {
+                                self.range_input(index, id, point.x);
+                                self.reconcile_range_presses(&output);
+                            }
+                        }
                     }
                 }
                 PointerEventKind::Release {
@@ -3277,10 +3360,17 @@ impl PointerHandler for App {
                     self.surfaces[index].pressed_button = None;
                     self.surfaces[index].pointer_position = Some(point);
                     let pressed = self.surfaces[index].input.pressed.take();
+                    let range_press = self.surfaces[index].range_press.take();
                     let popup_serial = self.surfaces[index].press_serial.take();
                     let output = self.surfaces[index].output.clone();
                     let event_surface = self.surfaces[index].role.surface().clone();
                     self.surfaces[index].dirty = true;
+                    if let Some(id) = range_press {
+                        let origin = direct_input_serial(true, release_serial)
+                            .and_then(|serial| self.input_origin(event_surface, serial));
+                        self.dispatch(output, id, Event::Pressed(false), origin);
+                        continue;
+                    }
                     if let Some(id) = pressed.filter(|id| Some(*id) == hit) {
                         self.dispatch(
                             output,
@@ -3359,8 +3449,8 @@ mod input_tests {
     use thing_ui::{Layout, Measurer, Size};
 
     use super::{
-        RepeatSession, RepeatTimerAction, SliderKeyAction, WidgetKeyAction,
-        focused_widget_is_interactive, keyboard_input_serial, scroll_distance, widget_key_action,
+        RepeatSession, RepeatTimerAction, SliderKeyAction, WidgetKeyAction, direct_input_serial,
+        focused_widget_is_interactive, scroll_distance, widget_key_action,
     };
 
     struct FixedMeasurer;
@@ -3466,12 +3556,21 @@ mod input_tests {
         assert!(WidgetKeyAction::Slider(SliderKeyAction::Increase).repeats());
         assert!(!WidgetKeyAction::Slider(SliderKeyAction::Minimum).repeats());
         assert!(!WidgetKeyAction::Slider(SliderKeyAction::Maximum).repeats());
+
+        assert_eq!(
+            widget_key_action(Kind::Range, Keysym::Left, false),
+            Some(WidgetKeyAction::Slider(SliderKeyAction::Decrease))
+        );
+        assert_eq!(
+            widget_key_action(Kind::Range, Keysym::Home, true),
+            Some(WidgetKeyAction::Slider(SliderKeyAction::Minimum))
+        );
     }
 
     #[test]
-    fn repeated_keys_cannot_reuse_an_activation_serial() {
-        assert_eq!(keyboard_input_serial(true, 42), Some(42));
-        assert_eq!(keyboard_input_serial(false, 42), None);
+    fn only_direct_input_can_supply_an_activation_serial() {
+        assert_eq!(direct_input_serial(true, 42), Some(42));
+        assert_eq!(direct_input_serial(false, 42), None);
     }
 
     #[test]
