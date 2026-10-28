@@ -336,6 +336,7 @@ export type ThingTextInputProperties = {
 
 export type ThingSecretInputProperties = {
     key: string?,
+    autofocus: boolean?,
     visible: ThingReactive<boolean>?,
     enabled: ThingReactive<boolean>?,
     style: ThingTextInputStyle?,

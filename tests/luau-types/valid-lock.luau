@@ -15,6 +15,7 @@ return ui.lock {
                     end,
                 },
                 ui.secret_input {
+                    autofocus = true,
                     placeholder = "password",
                     on_hover = function(inside)
                         local _inside: boolean = inside
