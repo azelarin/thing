@@ -347,6 +347,11 @@ struct PathTransform {
     translate_y: f64,
 }
 
+// femtovg computes a fourth-order flatness term in f32 after output scaling.
+// at the maximum scale of 16, this leaves more than three orders of magnitude
+// between the worst-case intermediate and f32::MAX.
+const MAX_RENDER_COORDINATE: f64 = 10_000_000.0;
+
 impl PathTransform {
     fn new(view_box: ViewBox, area: Rect, fit: PathFit) -> Option<Self> {
         if area.width <= 0.0 || area.height <= 0.0 {
@@ -387,10 +392,6 @@ impl PathTransform {
     }
 
     fn point(self, x: f32, y: f32) -> Option<(f32, f32)> {
-        // femtovg squares coordinate deltas while flattening curves. this limit
-        // leaves ample headroom for those calculations before values reach it.
-        const MAX_RENDER_COORDINATE: f64 = 1.0e18;
-
         let x = f64::from(x) * self.scale_x + self.translate_x;
         let y = f64::from(y) * self.scale_y + self.translate_y;
         (x.is_finite()
@@ -807,6 +808,26 @@ mod tests {
                 |_| {},
             )
             .unwrap();
+    }
+
+    #[test]
+    fn path_coordinate_limit_leaves_curve_flattening_headroom() {
+        let maximum_physical_coordinate = 16.0 * MAX_RENDER_COORDINATE;
+        let maximum_flatness_term = 256.0 * maximum_physical_coordinate.powi(4);
+        assert!(maximum_flatness_term < f64::from(f32::MAX));
+
+        let transform = PathTransform {
+            scale_x: 1.0,
+            scale_y: 1.0,
+            translate_x: 0.0,
+            translate_y: 0.0,
+        };
+        let boundary = MAX_RENDER_COORDINATE as f32;
+        assert_eq!(
+            transform.point(boundary, -boundary),
+            Some((boundary, -boundary))
+        );
+        assert_eq!(transform.point(boundary * 2.0, 0.0), None);
     }
 
     #[test]
