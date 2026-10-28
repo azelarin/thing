@@ -18,6 +18,8 @@ use super::{
 
 pub struct ProcessContext {
     child_mask: libc::sigset_t,
+    #[cfg(test)]
+    disabled: bool,
 }
 
 impl ProcessContext {
@@ -36,10 +38,32 @@ impl ProcessContext {
         Ok(Self {
             // SAFETY: successful pthread_sigmask initialized mask.
             child_mask: unsafe { mask.assume_init() },
+            #[cfg(test)]
+            disabled: false,
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn disabled_for_test() -> Self {
+        let mut mask = MaybeUninit::uninit();
+        // SAFETY: mask points to writable storage for a sigset_t.
+        let result = unsafe { libc::sigemptyset(mask.as_mut_ptr()) };
+        assert_eq!(result, 0);
+        Self {
+            // SAFETY: successful sigemptyset initialized mask.
+            child_mask: unsafe { mask.assume_init() },
+            disabled: true,
+        }
+    }
+
     pub fn spawn(&self) -> io::Result<OsProcess> {
+        #[cfg(test)]
+        if self.disabled {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "authentication helpers are disabled in this test",
+            ));
+        }
         let (parent, child) = Socket::pair(Domain::UNIX, Type::SEQPACKET, None)?;
         parent.set_nonblocking(true)?;
         // SAFETY: getpid has no preconditions.

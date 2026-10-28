@@ -40,7 +40,7 @@ zbus = { version = "5.19.0", default-features = false, features = ["async-io"] }
 
 [build-dependencies]
 # pam-sys disables bindgen's defaults without enabling a libclang loading mode.
-# This enables the supported runtime loader in the shared host build graph.
+# this enables the supported runtime loader in the shared host build graph.
 bindgen = { version = "0.69", default-features = false, features = ["runtime"] }
 
 [dev-dependencies]

@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod host_wire_tests;
 mod model;
 #[cfg(test)]
 mod wire_tests;
@@ -447,6 +449,39 @@ impl App {
             context.scale = surface.scale;
         }
         Some(context)
+    }
+
+    fn configure_output(&mut self, output: wl_output::WlOutput, qh: &QueueHandle<Self>) {
+        self.create_surface(output.clone(), qh);
+        let Some(context) = self.output_context(&output) else {
+            return;
+        };
+        let result = if self.configurations.contains(&output) {
+            self.configurations
+                .set_output_checked(&output, context, validate_lock_surfaces)
+        } else {
+            self.configurations
+                .add_checked(output.clone(), context, |runtime| {
+                    validate_lock_surfaces(runtime.surfaces())
+                })
+                .map(|()| true)
+        };
+        match result {
+            Ok(true) => {
+                if let Some(surface) = self
+                    .surfaces
+                    .iter_mut()
+                    .find(|surface| surface.output == output)
+                {
+                    surface.dirty = true;
+                }
+                self.update_watch();
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("thing: cannot configure lock output: {error}");
+            }
+        }
     }
 
     fn create_surface(&mut self, output: wl_output::WlOutput, qh: &QueueHandle<Self>) {
@@ -1632,7 +1667,7 @@ impl OutputHandler for App {
 
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         if !self.loading_outputs {
-            self.create_surface(output, qh);
+            self.configure_output(output, qh);
         }
     }
 
@@ -1645,36 +1680,7 @@ impl OutputHandler for App {
         if self.loading_outputs {
             return;
         }
-        self.create_surface(output.clone(), qh);
-        let Some(context) = self.output_context(&output) else {
-            return;
-        };
-        let result = if self.configurations.contains(&output) {
-            self.configurations
-                .set_output_checked(&output, context, validate_lock_surfaces)
-        } else {
-            self.configurations
-                .add_checked(output.clone(), context, |runtime| {
-                    validate_lock_surfaces(runtime.surfaces())
-                })
-                .map(|()| true)
-        };
-        match result {
-            Ok(true) => {
-                if let Some(surface) = self
-                    .surfaces
-                    .iter_mut()
-                    .find(|surface| surface.output == output)
-                {
-                    surface.dirty = true;
-                }
-                self.update_watch();
-            }
-            Ok(false) => {}
-            Err(error) => {
-                eprintln!("thing: cannot configure lock output: {error}");
-            }
-        }
+        self.configure_output(output, qh);
     }
 
     fn output_destroyed(
