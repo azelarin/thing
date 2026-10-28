@@ -597,6 +597,28 @@ mod tests {
     }
 
     #[test]
+    fn resolved_style_values_drive_opacity_and_hit_geometry_together() {
+        let mut root = Node::new(NodeId(1), Kind::Row);
+        root.style.opacity = 0.8;
+        let mut button = fixed(2, Kind::Button, 40.0, 20.0);
+        button.style.opacity = 0.5;
+        root.children.push(button);
+        let size = Size {
+            width: 100.0,
+            height: 20.0,
+        };
+
+        let layout = Layout::compute(&root, size, &mut FixedText).unwrap();
+        assert_eq!(layout.get(NodeId(2)).unwrap().opacity, 0.4);
+        assert_eq!(layout.hit_test(Point { x: 39.0, y: 10.0 }), Some(NodeId(2)));
+        assert_eq!(layout.hit_test(Point { x: 41.0, y: 10.0 }), None);
+
+        root.children[0].style.width = Some(80.0);
+        let layout = Layout::compute(&root, size, &mut FixedText).unwrap();
+        assert_eq!(layout.hit_test(Point { x: 60.0, y: 10.0 }), Some(NodeId(2)));
+    }
+
+    #[test]
     fn clips_overflow_and_excludes_hidden_and_disabled_controls() {
         let mut root = Node::new(NodeId(1), Kind::Row);
         root.style.gap = 0.0;

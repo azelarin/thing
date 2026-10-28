@@ -310,6 +310,7 @@ struct Surface {
     scale: Scale,
     viewport: Option<WpViewport>,
     fractional: Option<WpFractionalScaleV1>,
+    // geometry from the last successfully presented frame.
     layout: Option<Layout>,
     scroll: ScrollState,
     input: Interaction,
@@ -668,10 +669,6 @@ impl App {
             })
             .map(|_| surface.size);
         let geometry = panel::geometry(root, configured_size);
-        let size_changed = previous.is_none_or(|previous| {
-            previous.geometry.anchors != next.geometry.anchors
-                || previous.geometry.requested_size != next.geometry.requested_size
-        });
         apply_panel_geometry(layer, geometry);
         apply_input_region(
             &self.compositor,
@@ -680,9 +677,6 @@ impl App {
             surface.size,
         )?;
         surface.panel = Some(next);
-        if size_changed {
-            surface.layout = None;
-        }
         surface.dirty = true;
         layer.wl_surface().commit();
         Ok(())
@@ -737,8 +731,26 @@ impl App {
 
     fn draw(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
         self.render.check_error()?;
-        let configurations = &self.configurations;
         let now = Instant::now();
+        let mut ready_outputs = Vec::new();
+        for surface in &self.surfaces {
+            if surface.configured
+                && surface.dirty
+                && !surface.waiting
+                && surface.retry_at.is_none_or(|deadline| deadline <= now)
+                && !ready_outputs.contains(&surface.output)
+            {
+                ready_outputs.push(surface.output.clone());
+            }
+        }
+        for output in ready_outputs {
+            if self.configurations.advance(&output, now)? {
+                // animated panel dimensions must reach layer shell before this
+                // frame is laid out. pointer paths still update after present.
+                self.sync_panel(&output, false)?;
+            }
+        }
+        let configurations = &self.configurations;
         let mut presented = Vec::new();
         for (index, surface) in self.surfaces.iter_mut().enumerate() {
             if !surface.configured || !surface.dirty || surface.waiting {
@@ -775,13 +787,14 @@ impl App {
                 .window
                 .as_mut()
                 .ok_or("render surface was not initialized")?;
+            let mut scroll = surface.scroll.clone();
             let layout = self.render.layout(
                 root,
                 Size {
                     width: surface.size.0 as f32,
                     height: surface.size.1 as f32,
                 },
-                &mut surface.scroll,
+                &mut scroll,
             )?;
             let wl = surface.role.surface().clone();
             let viewport = surface.viewport.clone();
@@ -808,9 +821,11 @@ impl App {
             )?;
             match result {
                 FrameResult::Presented { redraw } => {
+                    let animating = configurations.layout_is_animating(&surface.output, &layout);
                     surface.waiting = true;
+                    surface.scroll = scroll;
                     surface.layout = Some(layout);
-                    surface.dirty = redraw;
+                    surface.dirty = redraw || animating;
                     presented.push(index);
                 }
                 #[cfg(feature = "vulkan")]
@@ -2251,7 +2266,6 @@ impl PopupHandler for App {
             let initial = !surface.configured;
             if surface.size != size {
                 surface.size = size;
-                surface.layout = None;
                 surface.dirty = true;
             }
             surface.configured = true;

@@ -400,6 +400,43 @@ style = {
 }
 ```
 
+### transitions
+
+`ui.transition` follows a numeric property function and moves smoothly to each
+new result:
+
+```luau
+local expanded = ui.state(false)
+
+ui.button {
+    on_click = function() expanded:set(not expanded:get()) end,
+    style = {
+        width = ui.transition(function()
+            return expanded:get() and 240 or 80
+        end, { duration = 180, easing = 'out_cubic' }),
+        opacity = ui.transition(function()
+            return expanded:get() and 1 or 0.6
+        end, { duration = 120 }),
+    },
+}
+```
+
+`duration` is a required whole number of milliseconds from 0 to 60,000. zero
+changes the value immediately. `easing` defaults to `out_cubic`; the other choices
+are `linear`, `in_cubic`, and `in_out_cubic`.
+
+transitions are available for `width`, `height`, `padding`, `padding_x`,
+`padding_y`, `gap`, `grow`, `radius`, `border_width`, and `opacity`. their property
+functions must return finite numbers, including for normally optional dimensions;
+they cannot move to or from an unspecified value. geometry changes go through the
+normal layout and hit testing paths.
+
+changing direction partway through starts from the transition's current value.
+the first configuration load and a successful reload start at the function's
+result without animating. a failed reload leaves an existing transition running.
+visibility changes remain immediate, so hiding a widget does not create an exit
+fade.
+
 a theme is an ordinary table returned from a module. for example, save this as
 `theme.luau` next to your panel:
 

@@ -9,6 +9,7 @@ mod properties;
 mod reconcile;
 mod services;
 mod state;
+mod transition;
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
 pub use services::{
     Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, MediaAction, MediaPlayer,
@@ -87,6 +88,7 @@ struct Binding {
     node: NodeId,
     property: String,
     function: Function,
+    transition: Option<transition::State>,
 }
 
 type Handlers = BTreeMap<(NodeId, &'static str), Function>;
@@ -274,6 +276,10 @@ impl Runtime {
 
     /// run an input handler. disabled or hidden widgets ignore input.
     pub fn dispatch(&mut self, id: NodeId, event: Event) -> Result<bool> {
+        self.dispatch_inner(id, event, None)
+    }
+
+    fn dispatch_inner(&mut self, id: NodeId, event: Event, now: Option<Instant>) -> Result<bool> {
         if matches!(event, Event::Hover(false)) && self.ended_hovers.remove(&id) {
             return Ok(false);
         }
@@ -309,7 +315,10 @@ impl Runtime {
             Event::Hover(inside) => handler.call::<()>(inside),
         };
         self.services.allow_actions(false);
-        let result = result.and_then(|()| self.refresh());
+        let result = result.and_then(|()| match now {
+            Some(now) => self.refresh_at(now),
+            None => self.refresh(),
+        });
         let result = match result {
             Ok(changed)
                 if matches!(event, Event::Hover(true))
@@ -322,7 +331,10 @@ impl Runtime {
                 let cleanup = handler.call::<()>(false);
                 self.services.allow_actions(false);
                 cleanup
-                    .and_then(|()| self.refresh())
+                    .and_then(|()| match now {
+                        Some(now) => self.refresh_at(now),
+                        None => self.refresh(),
+                    })
                     .map(|cleanup_changed| changed || cleanup_changed)
             }
             result => result,
@@ -336,6 +348,10 @@ impl Runtime {
     /// reevaluate only dirty properties and publish them together after validation.
     /// an error preserves the previous snapshot. a later state change can retry.
     pub fn refresh(&mut self) -> Result<bool> {
+        self.refresh_at(Instant::now())
+    }
+
+    fn refresh_at(&mut self, now: Instant) -> Result<bool> {
         let mut dirty = std::mem::take(&mut self.tracker.borrow_mut().dirty);
         if dirty.is_empty() {
             return Ok(false);
@@ -351,6 +367,7 @@ impl Runtime {
         let mut removed = BTreeSet::new();
         let mut handlers = Handlers::new();
         let mut sources = self.sources.clone();
+        let mut staged_transitions = BTreeMap::new();
         let result = (|| {
             for index in dirty {
                 if retired.contains(&index) {
@@ -368,12 +385,63 @@ impl Runtime {
                     for child in &node.children {
                         reconcile::ids(child, &mut old_ids);
                     }
+                    let previous_transitions: BTreeMap<_, _> = self
+                        .bindings
+                        .iter()
+                        .filter(|(_, binding)| old_ids.contains(&binding.node))
+                        .filter_map(|(index, binding)| {
+                            staged_transitions
+                                .get(index)
+                                .or(binding.transition.as_ref())
+                                .map(|state| {
+                                    ((binding.node, binding.property.clone()), state.clone())
+                                })
+                        })
+                        .collect();
                     sources.retain(|id, _| !old_ids.contains(id));
                     let mut seen = sources.values().copied().collect();
                     let mut children = self.detached_children(value, depth + 1, &mut seen)?;
                     let mapping = reconcile::preserve(&node.children, &mut children.nodes);
                     for binding in children.bindings.values_mut() {
                         binding.node = mapping.get(&binding.node).copied().unwrap_or(binding.node);
+                        let Some(initial) = binding.transition.as_ref() else {
+                            continue;
+                        };
+                        let Some(previous) =
+                            previous_transitions.get(&(binding.node, binding.property.clone()))
+                        else {
+                            continue;
+                        };
+                        binding.transition =
+                            Some(transition::State::inherit(previous, initial, now));
+                    }
+                    let transition_values: Vec<_> = children
+                        .bindings
+                        .values()
+                        .filter_map(|binding| {
+                            binding.transition.as_ref().map(|state| {
+                                (binding.node, binding.property.clone(), state.current())
+                            })
+                        })
+                        .collect();
+                    let apply_transitions = (|| {
+                        for (id, property, value) in transition_values {
+                            let child = children
+                                .nodes
+                                .iter_mut()
+                                .find_map(|child| child.find_mut(id))
+                                .ok_or_else(|| {
+                                    Error::runtime("transition refers to a missing list widget")
+                                })?;
+                            properties::apply(child, &property, transition::value(value))?;
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = apply_transitions {
+                        for index in children.bindings.keys() {
+                            self.tracker.borrow_mut().forget(*index);
+                        }
+                        return Err(error);
                     }
                     handlers.extend(children.handlers.into_iter().map(
                         |((id, event), function)| {
@@ -396,10 +464,35 @@ impl Runtime {
                     let node = candidate.find_mut(id).ok_or_else(|| {
                         Error::runtime("reactive binding refers to a missing widget")
                     })?;
-                    properties::apply(node, &property, value)?;
+                    if let Some(previous) = self.bindings[&index].transition.as_ref() {
+                        let target = transition::target(value, &property)?;
+                        let mut state = previous.clone();
+                        state.retarget(target, now);
+                        properties::apply(node, &property, transition::value(state.current()))?;
+                        staged_transitions.insert(index, state);
+                    } else {
+                        properties::apply(node, &property, value)?;
+                    }
                 }
             }
-            candidate.validate().map_err(Error::external)
+            candidate.validate().map_err(Error::external)?;
+            let mut target = candidate.clone();
+            for (index, binding) in &self.bindings {
+                if retired.contains(index) {
+                    continue;
+                }
+                let Some(state) = staged_transitions
+                    .get(index)
+                    .or(binding.transition.as_ref())
+                else {
+                    continue;
+                };
+                let node = target
+                    .find_mut(binding.node)
+                    .ok_or_else(|| Error::runtime("transition refers to a missing widget"))?;
+                properties::apply(node, &binding.property, transition::value(state.target()))?;
+            }
+            target.validate().map_err(Error::external)
         })();
         if let Err(error) = result {
             // only bindings made for the rejected candidate are discarded.
@@ -413,13 +506,90 @@ impl Runtime {
             self.bindings.remove(&index);
             self.tracker.borrow_mut().forget(index);
         }
+        for (index, transition) in staged_transitions {
+            self.bindings
+                .get_mut(&index)
+                .expect("a staged transition belongs to a live binding")
+                .transition = Some(transition);
+        }
         self.handlers.retain(|(id, _), _| !removed.contains(id));
         self.handlers.extend(handlers);
         self.sources = sources;
         let changed = candidate != self.root;
         self.root = candidate;
         self.deferred.clear();
+        Ok(changed || self.has_active_transitions())
+    }
+
+    /// advance active transitions to a monotonic point in time.
+    pub fn advance(&mut self, now: Instant) -> Result<bool> {
+        let mut candidate = self.root.clone();
+        let mut staged = BTreeMap::new();
+        for (index, binding) in &self.bindings {
+            let Some(previous) = binding
+                .transition
+                .as_ref()
+                .filter(|state| state.is_active())
+            else {
+                continue;
+            };
+            let mut state = previous.clone();
+            state.advance(now);
+            let node = candidate
+                .find_mut(binding.node)
+                .ok_or_else(|| Error::runtime("transition refers to a missing widget"))?;
+            properties::apply(node, &binding.property, transition::value(state.current()))?;
+            staged.insert(*index, state);
+        }
+        if staged.is_empty() {
+            return Ok(false);
+        }
+        candidate.validate().map_err(Error::external)?;
+        for (index, transition) in staged {
+            self.bindings
+                .get_mut(&index)
+                .expect("an active transition belongs to a live binding")
+                .transition = Some(transition);
+        }
+        let changed = candidate != self.root;
+        self.root = candidate;
         Ok(changed)
+    }
+
+    /// whether a widget has an active numeric style transition.
+    pub fn is_animating(&self, id: NodeId) -> bool {
+        self.bindings.values().any(|binding| {
+            binding.node == id
+                && binding
+                    .transition
+                    .as_ref()
+                    .is_some_and(transition::State::is_active)
+        })
+    }
+
+    /// whether any widget in a set has an active numeric style transition.
+    pub fn is_any_animating(&self, ids: impl IntoIterator<Item = NodeId>) -> bool {
+        let active: BTreeSet<_> = self
+            .bindings
+            .values()
+            .filter_map(|binding| {
+                binding
+                    .transition
+                    .as_ref()
+                    .is_some_and(transition::State::is_active)
+                    .then_some(binding.node)
+            })
+            .collect();
+        ids.into_iter().any(|id| active.contains(&id))
+    }
+
+    fn has_active_transitions(&self) -> bool {
+        self.bindings.values().any(|binding| {
+            binding
+                .transition
+                .as_ref()
+                .is_some_and(transition::State::is_active)
+        })
     }
 
     /// load a replacement without changing the current runtime.
@@ -537,7 +707,28 @@ impl Runtime {
     }
 
     fn property(&mut self, node: &mut Node, property: String, value: Value) -> Result<()> {
-        let value = if let Value::Function(function) = value {
+        let descriptor = match &value {
+            Value::UserData(value) => value
+                .borrow::<transition::Descriptor>()
+                .ok()
+                .map(|descriptor| descriptor.parts()),
+            _ => None,
+        };
+        let value = if let Some((function, spec)) = descriptor {
+            if !transition::supports(&property) {
+                return Err(Error::runtime(format!(
+                    "transitions are not supported for {property}"
+                )));
+            }
+            let index = self.bind(node.id, property.clone(), function)?;
+            let value = self.evaluate_binding(index)?;
+            let target = transition::target(value, &property)?;
+            self.bindings
+                .get_mut(&index)
+                .expect("the transition binding was just inserted")
+                .transition = Some(transition::State::new(spec, target));
+            transition::value(target)
+        } else if let Value::Function(function) = value {
             let index = self.bind(node.id, property.clone(), function)?;
             self.evaluate_binding(index)?
         } else {
@@ -557,6 +748,7 @@ impl Runtime {
                 node,
                 property,
                 function,
+                transition: None,
             },
         );
         Ok(index)
@@ -682,6 +874,347 @@ fn install_ui(lua: &Lua, tracker: Rc<RefCell<Tracker>>) -> Result<()> {
             })
         })?,
     )?;
+    ui.set(
+        "transition",
+        lua.create_function(|_, (function, options): (Function, Table)| {
+            transition::Descriptor::new(function, options)
+        })?,
+    )?;
     ui.set_readonly(true);
     lua.globals().set("ui", ui)
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use std::{fs, time::Duration};
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn load(source: &str) -> (TempDir, PathBuf, Runtime) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("panel.luau");
+        fs::write(&path, source).unwrap();
+        let runtime = Runtime::load(&path).unwrap();
+        (directory, path, runtime)
+    }
+
+    fn child_with_key<'a>(node: &'a Node, key: &str) -> &'a Node {
+        fn find<'a>(node: &'a Node, key: &str) -> Option<&'a Node> {
+            if node.key.as_deref() == Some(key) {
+                return Some(node);
+            }
+            node.children.iter().find_map(|child| find(child, key))
+        }
+        find(node, key).unwrap()
+    }
+
+    fn close(left: f32, right: f32) {
+        assert!((left - right).abs() < 0.001, "{left} != {right}");
+    }
+
+    #[test]
+    fn numeric_transitions_advance_and_retarget_without_jumping() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local expanded = ui.state(false)
+            return ui.panel { children = { ui.button {
+                on_click = function() expanded:set(not expanded:get()) end,
+                style = {
+                    width = ui.transition(function()
+                        return expanded:get() and 200 or 100
+                    end, { duration = 100, easing = 'linear' }),
+                    opacity = ui.transition(function()
+                        return expanded:get() and 1 or 0.5
+                    end, { duration = 100, easing = 'linear' }),
+                },
+            } } }
+            "#,
+        );
+        let button = runtime.root.children[0].id;
+        close(runtime.root.children[0].style.width.unwrap(), 100.0);
+        close(runtime.root.children[0].style.opacity, 0.5);
+
+        let start = Instant::now();
+        assert!(
+            runtime
+                .dispatch_inner(button, Event::Click, Some(start))
+                .unwrap()
+        );
+        close(runtime.root.children[0].style.width.unwrap(), 100.0);
+        assert!(runtime.is_animating(button));
+
+        assert!(runtime.advance(start + Duration::from_millis(40)).unwrap());
+        close(runtime.root.children[0].style.width.unwrap(), 140.0);
+        close(runtime.root.children[0].style.opacity, 0.7);
+
+        assert!(
+            runtime
+                .dispatch_inner(
+                    button,
+                    Event::Click,
+                    Some(start + Duration::from_millis(40)),
+                )
+                .unwrap()
+        );
+        close(runtime.root.children[0].style.width.unwrap(), 140.0);
+
+        runtime.advance(start + Duration::from_millis(90)).unwrap();
+        close(runtime.root.children[0].style.width.unwrap(), 120.0);
+        close(runtime.root.children[0].style.opacity, 0.6);
+        runtime.advance(start + Duration::from_millis(140)).unwrap();
+        close(runtime.root.children[0].style.width.unwrap(), 100.0);
+        close(runtime.root.children[0].style.opacity, 0.5);
+        assert!(!runtime.is_animating(button));
+    }
+
+    #[test]
+    fn keyed_children_keep_their_transition_segment() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local expanded = ui.state(false)
+            local revision = ui.state(0)
+            return ui.panel { children = {
+                ui.button {
+                    key = 'toggle',
+                    on_click = function()
+                        expanded:set(true)
+                        revision:set(revision:get() + 1)
+                    end,
+                },
+                ui.button {
+                    key = 'rebuild',
+                    on_click = function() revision:set(revision:get() + 1) end,
+                },
+                ui.column { children = function()
+                    local _ = revision:get()
+                    return { ui.row {
+                        key = 'stable',
+                        style = { width = ui.transition(function()
+                            return expanded:get() and 200 or 100
+                        end, { duration = 100, easing = 'linear' }) },
+                    } }
+                end },
+            } }
+            "#,
+        );
+        let toggle = child_with_key(runtime.root(), "toggle").id;
+        let rebuild = child_with_key(runtime.root(), "rebuild").id;
+        let stable = child_with_key(runtime.root(), "stable").id;
+        let start = Instant::now();
+
+        runtime
+            .dispatch_inner(toggle, Event::Click, Some(start))
+            .unwrap();
+        assert_eq!(child_with_key(runtime.root(), "stable").id, stable);
+        runtime.advance(start + Duration::from_millis(40)).unwrap();
+        close(
+            child_with_key(runtime.root(), "stable")
+                .style
+                .width
+                .unwrap(),
+            140.0,
+        );
+
+        runtime
+            .dispatch_inner(
+                rebuild,
+                Event::Click,
+                Some(start + Duration::from_millis(40)),
+            )
+            .unwrap();
+        close(
+            child_with_key(runtime.root(), "stable")
+                .style
+                .width
+                .unwrap(),
+            140.0,
+        );
+        runtime.advance(start + Duration::from_millis(100)).unwrap();
+        close(
+            child_with_key(runtime.root(), "stable")
+                .style
+                .width
+                .unwrap(),
+            200.0,
+        );
+        assert!(!runtime.is_animating(stable));
+    }
+
+    #[test]
+    fn removed_children_drop_their_transition_state() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local expanded = ui.state(false)
+            local present = ui.state(true)
+            return ui.panel { children = {
+                ui.button {
+                    key = 'start',
+                    on_click = function() expanded:set(true) end,
+                },
+                ui.button {
+                    key = 'remove',
+                    on_click = function() present:set(false) end,
+                },
+                ui.column { children = function()
+                    if not present:get() then return {} end
+                    return { ui.row {
+                        key = 'animated',
+                        style = { width = ui.transition(function()
+                            return expanded:get() and 200 or 100
+                        end, { duration = 100, easing = 'linear' }) },
+                    } }
+                end },
+            } }
+            "#,
+        );
+        let start_button = child_with_key(runtime.root(), "start").id;
+        let remove_button = child_with_key(runtime.root(), "remove").id;
+        let animated = child_with_key(runtime.root(), "animated").id;
+        let start = Instant::now();
+
+        runtime
+            .dispatch_inner(start_button, Event::Click, Some(start))
+            .unwrap();
+        runtime.advance(start + Duration::from_millis(40)).unwrap();
+        assert!(runtime.is_animating(animated));
+        runtime
+            .dispatch_inner(
+                remove_button,
+                Event::Click,
+                Some(start + Duration::from_millis(40)),
+            )
+            .unwrap();
+        assert!(runtime.root().find(animated).is_none());
+        assert!(!runtime.is_animating(animated));
+        assert!(!runtime.advance(start + Duration::from_millis(50)).unwrap());
+    }
+
+    #[test]
+    fn invalid_targets_preserve_the_previous_snapshot() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local opacity = ui.state(0.5)
+            return ui.panel { children = {
+                ui.button {
+                    key = 'start',
+                    on_click = function() opacity:set(1) end,
+                },
+                ui.button {
+                    key = 'invalid',
+                    on_click = function() opacity:set(2) end,
+                },
+                ui.row {
+                key = 'animated',
+                style = { opacity = ui.transition(function()
+                    return opacity:get()
+                end, { duration = 100, easing = 'linear' }) },
+            } } }
+            "#,
+        );
+        let start_button = child_with_key(runtime.root(), "start").id;
+        let invalid_button = child_with_key(runtime.root(), "invalid").id;
+        let animated = child_with_key(runtime.root(), "animated").id;
+        let start = Instant::now();
+        runtime
+            .dispatch_inner(start_button, Event::Click, Some(start))
+            .unwrap();
+        runtime.advance(start + Duration::from_millis(40)).unwrap();
+        close(
+            child_with_key(runtime.root(), "animated").style.opacity,
+            0.7,
+        );
+
+        assert!(
+            runtime
+                .dispatch_inner(
+                    invalid_button,
+                    Event::Click,
+                    Some(start + Duration::from_millis(40)),
+                )
+                .is_err()
+        );
+        close(
+            child_with_key(runtime.root(), "animated").style.opacity,
+            0.7,
+        );
+        assert!(runtime.is_animating(animated));
+        runtime.advance(start + Duration::from_millis(50)).unwrap();
+        close(
+            child_with_key(runtime.root(), "animated").style.opacity,
+            0.75,
+        );
+    }
+
+    #[test]
+    fn failed_and_successful_reloads_have_explicit_transition_semantics() {
+        let (_directory, path, mut runtime) = load(
+            r#"
+            local expanded = ui.state(false)
+            return ui.panel { children = { ui.button {
+                on_click = function() expanded:set(true) end,
+                style = { width = ui.transition(function()
+                    return expanded:get() and 200 or 100
+                end, { duration = 100, easing = 'linear' }) },
+            } } }
+            "#,
+        );
+        let button = runtime.root.children[0].id;
+        let start = Instant::now();
+        runtime
+            .dispatch_inner(button, Event::Click, Some(start))
+            .unwrap();
+
+        fs::write(&path, "return ui.text { text = 'invalid root' }").unwrap();
+        assert!(runtime.reload(&path).is_err());
+        runtime.advance(start + Duration::from_millis(50)).unwrap();
+        close(runtime.root.children[0].style.width.unwrap(), 150.0);
+
+        fs::write(
+            &path,
+            r#"return ui.panel { style = { width = ui.transition(function()
+                return 40
+            end, { duration = 100 }) } }"#,
+        )
+        .unwrap();
+        runtime.reload(&path).unwrap();
+        close(runtime.root.style.width.unwrap(), 40.0);
+        assert!(!runtime.is_animating(runtime.root.id));
+    }
+
+    #[test]
+    fn transition_options_and_targets_are_strict() {
+        for source in [
+            "return ui.panel { style = { width = ui.transition(function() return 1 end, {}) } }",
+            "return ui.panel { style = { width = ui.transition(function() return 1 end, { duration = -1 }) } }",
+            "return ui.panel { style = { width = ui.transition(function() return 1 end, { duration = 10.5 }) } }",
+            "return ui.panel { style = { width = ui.transition(function() return 1 end, { duration = 10, easing = 'bounce' }) } }",
+            "return ui.panel { style = { width = ui.transition(function() return nil end, { duration = 10 }) } }",
+            "return ui.panel { style = { font_size = ui.transition(function() return 14 end, { duration = 10 }) } }",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("panel.luau");
+            fs::write(&path, source).unwrap();
+            assert!(Runtime::load(path).is_err(), "accepted {source}");
+        }
+    }
+
+    #[test]
+    fn every_numeric_style_transition_is_accepted() {
+        let (_directory, _path, runtime) = load(
+            r#"
+            local function fixed(value)
+                return ui.transition(function() return value end, { duration = 0 })
+            end
+            return ui.panel { children = { ui.row { style = {
+                width = fixed(100), height = fixed(40), padding = fixed(1),
+                padding_x = fixed(2), padding_y = fixed(3), gap = fixed(4),
+                grow = fixed(0), radius = fixed(5), border_width = fixed(1),
+                opacity = fixed(0.8),
+            } } } }
+            "#,
+        );
+        assert!(!runtime.has_active_transitions());
+    }
 }
