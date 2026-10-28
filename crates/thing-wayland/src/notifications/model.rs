@@ -22,16 +22,26 @@ impl Urgency {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CriticalTimeout {
+    Never,
+    HonorRequest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TimeoutPolicy {
+    /// one caller-selected fallback for requests that use the server default.
     pub(crate) fallback_ms: Option<u32>,
-    pub(crate) critical_never_expires: bool,
+    /// how critical urgency interacts with a client's requested timeout.
+    pub(crate) critical: CriticalTimeout,
 }
 
 impl Default for TimeoutPolicy {
     fn default() -> Self {
+        // this adapter is intentionally separate from protocol parsing so a shell
+        // policy can replace it without changing freedesktop request semantics.
         Self {
             fallback_ms: Some(5_000),
-            critical_never_expires: true,
+            critical: CriticalTimeout::Never,
         }
     }
 }
@@ -364,7 +374,7 @@ fn effective_timeout(
     if request.expire_timeout_ms < -1 {
         return Err(ModelError::InvalidTimeout);
     }
-    if urgency == Urgency::Critical && policy.critical_never_expires {
+    if urgency == Urgency::Critical && policy.critical == CriticalTimeout::Never {
         return Ok(None);
     }
     if request.expire_timeout_ms == 0 {
@@ -439,7 +449,7 @@ mod tests {
     fn injected_policy_can_honor_critical_requests_and_change_the_fallback() {
         let mut model = Model::new(TimeoutPolicy {
             fallback_ms: Some(2_500),
-            critical_never_expires: false,
+            critical: CriticalTimeout::HonorRequest,
         });
         let mut critical = request("critical");
         critical.hints.urgency = Some(2);

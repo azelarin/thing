@@ -177,19 +177,15 @@ impl Notifications {
 pub(crate) async fn serve(
     address: &str,
     timeout_policy: TimeoutPolicy,
-) -> Result<(Connection, Notifications), String> {
+) -> zbus::Result<(Connection, Notifications)> {
     let notifications = Notifications::new(timeout_policy);
-    let connection = zbus::connection::Builder::address(address)
-        .map_err(|error| error.to_string())?
-        .serve_at(OBJECT_PATH, notifications.clone())
-        .map_err(|error| error.to_string())?
-        .name(BUS_NAME)
-        .map_err(|error| error.to_string())?
+    let connection = zbus::connection::Builder::address(address)?
+        .serve_at(OBJECT_PATH, notifications.clone())?
+        .name(BUS_NAME)?
         .allow_name_replacements(false)
         .replace_existing_names(false)
         .build()
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     Ok((connection, notifications))
 }
 
@@ -483,6 +479,65 @@ mod tests {
     }
 
     #[test]
+    fn shell_dismissal_and_expiry_emit_their_standard_reasons() {
+        let mut bus = Bus::start();
+        async_io::block_on(async {
+            let (server_connection, server) =
+                serve(&bus.address, TimeoutPolicy::default()).await.unwrap();
+            let client = zbus::connection::Builder::address(bus.address.as_str())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let proxy = TestNotificationsProxy::new(&client).await.unwrap();
+            let mut closed = proxy.receive_notification_closed().await.unwrap();
+            let emitter = SignalEmitter::new(&server_connection, OBJECT_PATH).unwrap();
+
+            let dismissed_id = proxy
+                .notify(
+                    "test app",
+                    0,
+                    "",
+                    "dismissed",
+                    "",
+                    Vec::new(),
+                    HashMap::new(),
+                    0,
+                )
+                .await
+                .unwrap();
+            let key = server.active()[0].key;
+            server.dismiss(key, &emitter).await.unwrap();
+            let signal = closed.next().await.unwrap();
+            let args = signal.args().unwrap();
+            assert_eq!(*args.id(), dismissed_id);
+            assert_eq!(*args.reason(), CloseReason::Dismissed.code());
+
+            let expired_id = proxy
+                .notify(
+                    "test app",
+                    0,
+                    "",
+                    "expired",
+                    "",
+                    Vec::new(),
+                    HashMap::new(),
+                    1,
+                )
+                .await
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            assert_eq!(server.expire(&emitter).await.unwrap(), 1);
+            let signal = closed.next().await.unwrap();
+            let args = signal.args().unwrap();
+            assert_eq!(*args.id(), expired_id);
+            assert_eq!(*args.reason(), CloseReason::Expired.code());
+            assert!(server.active().is_empty());
+        });
+        bus.stop();
+    }
+
+    #[test]
     fn ownership_never_queues_or_replaces_an_existing_server() {
         let mut bus = Bus::start();
         async_io::block_on(async {
@@ -498,7 +553,7 @@ mod tests {
                 Ok(_) => panic!("a second server unexpectedly acquired the notification name"),
                 Err(error) => error,
             };
-            assert!(error.contains("already taken"), "{error}");
+            assert!(matches!(error, zbus::Error::NameTaken));
             let current = zbus::fdo::DBusProxy::new(&first)
                 .await
                 .unwrap()

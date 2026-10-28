@@ -1411,6 +1411,9 @@ impl App {
                     self.request_launch(LaunchRequest { argv, cwd }, origin.as_ref());
                     Ok(())
                 }
+                Action::DismissNotification { .. } | Action::InvokeNotification { .. } => {
+                    Err("notification server is disabled".into())
+                }
                 action @ (Action::SetVolume(_)
                 | Action::SetMuted(_)
                 | Action::SetDefaultSink(_)
