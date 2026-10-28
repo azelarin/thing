@@ -17,6 +17,7 @@ pub enum Kind {
     Stack,
     Scroll,
     Text,
+    TextInput,
     Image,
     Path,
     Button,
@@ -455,7 +456,10 @@ impl Kind {
     }
 
     pub fn is_interactive(self) -> bool {
-        matches!(self, Self::Button | Self::Slider | Self::Range)
+        matches!(
+            self,
+            Self::Button | Self::Slider | Self::Range | Self::TextInput
+        )
     }
 
     fn is_range_visual(self) -> bool {
@@ -502,6 +506,9 @@ pub struct Style {
     pub disabled_opacity: f32,
     pub focus_ring_color: Color,
     pub focus_ring_width: f32,
+    pub placeholder_color: Color,
+    pub selection_color: Color,
+    pub caret_color: Color,
     pub font_size: f32,
     pub font_weight: f32,
     pub font_family: String,
@@ -542,6 +549,9 @@ impl Default for Style {
             disabled_opacity: 0.45,
             focus_ring_color: Color([137, 180, 250, 255]),
             focus_ring_width: 2.0,
+            placeholder_color: Color([255, 255, 255, 128]),
+            selection_color: Color([137, 180, 250, 128]),
+            caret_color: Color::WHITE,
             font_size: 14.0,
             font_weight: 400.0,
             font_family: "sans-serif".into(),
@@ -711,6 +721,7 @@ pub struct Node {
     pub kind: Kind,
     pub style: Style,
     pub text: String,
+    pub placeholder: String,
     pub max_lines: Option<u32>,
     pub text_overflow: TextOverflow,
     pub image: Image,
@@ -740,6 +751,7 @@ impl Node {
             kind,
             style: Style::default(),
             text: String::new(),
+            placeholder: String::new(),
             max_lines: None,
             text_overflow: TextOverflow::Clip,
             image: Image::default(),
@@ -907,6 +919,10 @@ impl Node {
             return Err(TreeError(
                 "ellipsis currently requires max_lines = 1".into(),
             ));
+        }
+        if self.kind == Kind::TextInput {
+            validate_single_line(&self.text, "text input value")?;
+            validate_single_line(&self.placeholder, "text input placeholder")?;
         }
         for value in [
             style.width,
@@ -1098,6 +1114,16 @@ impl fmt::Display for TreeError {
     }
 }
 
+fn validate_single_line(value: &str, name: &str) -> Result<(), TreeError> {
+    const MAX_BYTES: usize = 1024 * 1024;
+    if value.len() > MAX_BYTES || value.contains(['\0', '\n', '\r']) {
+        return Err(TreeError(format!(
+            "{name} must be at most 1 MiB and contain no NUL or line breaks"
+        )));
+    }
+    Ok(())
+}
+
 impl Error for TreeError {}
 
 #[cfg(test)]
@@ -1218,6 +1244,19 @@ mod tests {
             row.validate().unwrap_err().to_string(),
             "max_lines and overflow are available only on text widgets"
         );
+    }
+
+    #[test]
+    fn text_inputs_are_single_line_and_bounded() {
+        let mut input = Node::new(NodeId(1), Kind::TextInput);
+        input.text = "naïve 👨‍👩‍👧".into();
+        input.placeholder = "search".into();
+        assert!(input.validate().is_ok());
+
+        input.text = "two\nlines".into();
+        assert!(input.validate().is_err());
+        input.text = "x".repeat(1024 * 1024 + 1);
+        assert!(input.validate().is_err());
     }
 
     #[test]

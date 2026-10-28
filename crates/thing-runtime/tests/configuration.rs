@@ -905,6 +905,86 @@ fn rejects_invalid_text_layout_options() {
 }
 
 #[test]
+fn controlled_text_inputs_publish_only_accepted_values() {
+    let (_directory, path) = fixture(
+        r#"
+        local value = ui.state('start')
+        local submitted = ui.state('')
+        return ui.panel { children = {
+            ui.text_input {
+                value = function() return value:get() end,
+                placeholder = 'search',
+                on_change = function(next)
+                    if next == 'rejected' then error('no') end
+                    value:set(next)
+                end,
+                on_submit = function(next) submitted:set(next) end,
+                style = {
+                    placeholder_color = '#11223344',
+                    selection_color = '#55667788',
+                    caret_color = '#99aabbcc',
+                    text_align = 'end',
+                    tabular_digits = true,
+                },
+            },
+            ui.text { text = function() return submitted:get() end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let input = runtime.root().unwrap().children[0].id;
+    let node = &runtime.root().unwrap().children[0];
+    assert_eq!(node.kind, Kind::TextInput);
+    assert_eq!(node.text, "start");
+    assert_eq!(node.placeholder, "search");
+    assert_eq!(
+        node.style.placeholder_color,
+        Color([0x11, 0x22, 0x33, 0x44])
+    );
+    assert_eq!(node.style.selection_color, Color([0x55, 0x66, 0x77, 0x88]));
+    assert_eq!(node.style.caret_color, Color([0x99, 0xaa, 0xbb, 0xcc]));
+    assert_eq!(node.style.text_align, TextAlign::End);
+    assert!(node.style.tabular_digits);
+
+    assert!(
+        runtime
+            .dispatch(input, Event::TextChange("naïve 👨‍👩‍👧".into()))
+            .unwrap()
+    );
+    assert_eq!(runtime.root().unwrap().children[0].text, "naïve 👨‍👩‍👧");
+    assert!(
+        runtime
+            .dispatch(input, Event::TextChange("rejected".into()))
+            .is_err()
+    );
+    assert_eq!(runtime.root().unwrap().children[0].text, "naïve 👨‍👩‍👧");
+    assert!(
+        runtime
+            .dispatch(input, Event::Submit("naïve 👨‍👩‍👧".into()))
+            .unwrap()
+    );
+    assert_eq!(runtime.root().unwrap().children[1].text, "naïve 👨‍👩‍👧");
+    assert!(
+        runtime
+            .dispatch(input, Event::TextChange("two\nlines".into()))
+            .is_err()
+    );
+}
+
+#[test]
+fn text_inputs_require_a_controlled_value_and_change_handler() {
+    for source in [
+        "return ui.panel { children = { ui.text_input { on_change = function() end } } }",
+        "return ui.panel { children = { ui.text_input { value = '' } } }",
+        "return ui.panel { children = { ui.text_input { value = '', on_change = true } } }",
+        "return ui.panel { children = { ui.text_input { value = 'two\\nlines', on_change = function() end } } }",
+    ] {
+        let (_directory, path) = fixture(source);
+        assert!(Runtime::load(path).is_err(), "accepted {source}");
+    }
+}
+
+#[test]
 fn parses_flex_layout_controls() {
     let (_directory, path) = fixture(
         r#"

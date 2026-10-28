@@ -484,6 +484,8 @@ pub(crate) fn apply_transition(node: &mut Node, name: &str, value: Resolved) -> 
 pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
     match name {
         "text" if node.kind == Kind::Text => node.text = string(value, name)?,
+        "value" if node.kind == Kind::TextInput => node.text = string(value, name)?,
+        "placeholder" if node.kind == Kind::TextInput => node.placeholder = string(value, name)?,
         "max_lines" if node.kind == Kind::Text => node.max_lines = max_lines(value, name)?,
         "overflow" if node.kind == Kind::Text => node.text_overflow = text_overflow(value, name)?,
         "source" if node.kind == Kind::Image => node.image.source = optional_string(value, name)?,
@@ -592,13 +594,22 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "style.disabled_opacity" => node.style.disabled_opacity = number(value, name)? as f32,
         "style.focus_ring_color" => node.style.focus_ring_color = color(value, name)?,
         "style.focus_ring_width" => node.style.focus_ring_width = number(value, name)? as f32,
+        "style.placeholder_color" if node.kind == Kind::TextInput => {
+            node.style.placeholder_color = string(value, name)?.parse().map_err(Error::external)?
+        }
+        "style.selection_color" if node.kind == Kind::TextInput => {
+            node.style.selection_color = string(value, name)?.parse().map_err(Error::external)?
+        }
+        "style.caret_color" if node.kind == Kind::TextInput => {
+            node.style.caret_color = string(value, name)?.parse().map_err(Error::external)?
+        }
         "style.font_size" => node.style.font_size = number(value, name)? as f32,
         "style.font_weight" => node.style.font_weight = number(value, name)? as f32,
         "style.font_family" => node.style.font_family = string(value, name)?,
-        "style.text_align" if node.kind == Kind::Text => {
+        "style.text_align" if matches!(node.kind, Kind::Text | Kind::TextInput) => {
             node.style.text_align = text_align(value, name)?
         }
-        "style.tabular_digits" if node.kind == Kind::Text => {
+        "style.tabular_digits" if matches!(node.kind, Kind::Text | Kind::TextInput) => {
             node.style.tabular_digits = boolean(value, name)?
         }
         "style.opacity" => node.style.opacity = number(value, name)? as f32,
