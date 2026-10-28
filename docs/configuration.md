@@ -537,7 +537,83 @@ not rolled back. displayed values follow server replies.
 
 volume changes preserve channel balance. the service reconnects after a server
 failure and discards commands from the old connection.
-`thing check` uses unavailable/empty service defaults and never connects to audio.
+`thing check` uses unavailable/empty service defaults and never connects to audio
+or media players.
+
+## media
+
+`services.media` follows players that implement mpris, including browsers and
+most desktop music applications. `players:get()` returns an immutable array so
+the configuration can choose which players to show and how to arrange them.
+each record contains:
+
+| field | meaning |
+| --- | --- |
+| `id` | opaque id for this ownership lifetime |
+| `name` | mpris instance name on the session bus |
+| `playing` | whether this player reports that it is playing |
+| `title`, `artist`, `art_url` | current track metadata |
+| `identity`, `desktop_entry` | application identity supplied by the player |
+| `can_play_pause`, `can_next`, `can_previous`, `can_stop` | available controls for this player |
+
+controls are event-handler actions. check the matching capability and pass the
+record's id to target that player:
+
+```luau
+local media = services.media
+
+local function player_row(player)
+    return ui.button {
+        key = player.id,
+        enabled = player.can_play_pause,
+        on_click = function() media.play_pause(player.id) end,
+        children = { ui.text { text = player.title } },
+    }
+end
+
+ui.column {
+    children = function()
+        local rows = {}
+        for _, player in media.players:get() do
+            table.insert(rows, player_row(player))
+        end
+        return rows
+    end,
+}
+```
+
+targeting a player does not change the shared selection. playback events may
+change it later. ids are deliberately opaque: use them unchanged as widget keys
+and action arguments, and do not keep one after its player disappears. a player
+receives a new id whenever it gives up and reacquires its bus name, including
+after the session bus restarts.
+
+for a compact, single-player widget, `available` says whether the service has a
+selection and `selected_id` contains its id. the `playing`, `title`, `artist`,
+`art_url`, `identity`, `desktop_entry`, `can_play_pause`, `can_next`,
+`can_previous`, and `can_stop` signals mirror that record. `error` contains a
+connection failure message, or an empty string. the service selects the player
+that most recently began playing. while it is paused and another player is still
+playing, the active player takes its place. when nothing is playing, the player
+that most recently began playing is selected again.
+
+calling `play_pause()`, `next()`, `previous()`, or `stop()` without an id controls
+that selection. passing `nil` has the same effect. an explicit id never changes
+the selection by itself.
+
+an empty, malformed, or non-string id fails inside the event handler. a
+well-formed id that is no longer in the current player list reaches the media
+service, which rejects it and reports the error in the terminal.
+
+state changes come from player events rather than assumptions about an accepted
+action. the service tracks players joining and leaving the session bus,
+reconnects after the bus is restarted, and does not replay commands across a
+disconnection.
+
+`art_url` is mpris metadata, not an image path. it may contain a `file:` url or a
+remote url. `ui.image` currently accepts local filesystem paths and does not fetch
+urls, so passing `art_url` directly to `source` is not supported. playback
+position, seeking, and remote artwork loading are not part of this api yet.
 
 ## popups and input
 

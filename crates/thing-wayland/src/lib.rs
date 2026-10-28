@@ -7,6 +7,7 @@ mod egl;
 mod host;
 mod hover;
 mod launch;
+mod media;
 mod niri;
 mod panel;
 mod popup;

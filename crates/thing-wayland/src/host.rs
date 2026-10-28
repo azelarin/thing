@@ -66,6 +66,7 @@ use crate::{
     configuration::Configurations,
     hover::{Command as HoverCommand, HoverKey, HoverState, HoverTarget},
     launch::{self, LaunchRequest, Launcher, PendingLaunches},
+    media::Media,
     niri::Niri,
     panel::{self, Geometry, ResolvedInputRegion},
     popup::{self, Position as PopupPosition},
@@ -127,6 +128,8 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
     let render = render?;
     let (audio_ping, audio_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let audio = Audio::start(audio_ping).map_err(|e| format!("cannot start audio worker: {e}"))?;
+    let (media_ping, media_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
+    let media = Media::start(media_ping).map_err(|e| format!("cannot start media worker: {e}"))?;
     let (niri_ping, niri_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let niri = Niri::start(niri_ping).map_err(|e| format!("cannot start niri worker: {e}"))?;
     let mut app = App {
@@ -137,6 +140,7 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
         reload_at: None,
         hover: HoverState::default(),
         audio,
+        media,
         niri,
         launcher,
         pending_launches: PendingLaunches::new(),
@@ -190,6 +194,10 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
     event_loop
         .handle()
         .insert_source(audio_source, |_, _, app| app.update_audio())
+        .map_err(|e| e.to_string())?;
+    event_loop
+        .handle()
+        .insert_source(media_source, |_, _, app| app.update_media())
         .map_err(|e| e.to_string())?;
     WaylandSource::new(connection.clone(), queue)
         .insert(event_loop.handle())
@@ -349,6 +357,7 @@ struct App {
     image_ping: calloop::ping::Ping,
     configurations: Configurations<wl_output::WlOutput>,
     audio: Audio,
+    media: Media,
     niri: Niri,
     launcher: Launcher,
     pending_launches: PendingLaunches<XdgActivationTokenV1>,
@@ -425,6 +434,15 @@ impl App {
             return;
         };
         if let Err(error) = self.configurations.set_audio(snapshot) {
+            eprintln!("thing: {error}");
+        }
+        self.refresh();
+    }
+    fn update_media(&mut self) {
+        let Some(snapshot) = self.media.take_snapshot() else {
+            return;
+        };
+        if let Err(error) = self.configurations.set_media(snapshot) {
             eprintln!("thing: {error}");
         }
         self.refresh();
@@ -938,6 +956,10 @@ impl App {
         for action in actions {
             let result = match action {
                 Action::Niri(action) => self.niri.send(action),
+                Action::Media { action, player } => self
+                    .media
+                    .send(action, player.as_deref())
+                    .map_err(str::to_owned),
                 Action::Launch { argv, cwd } => {
                     self.request_launch(LaunchRequest { argv, cwd }, origin.as_ref());
                     Ok(())
