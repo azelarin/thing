@@ -3581,12 +3581,14 @@ impl PointerHandler for App {
                         && let Some(id) = surface.input.pressed
                     {
                         let output = surface.output.clone();
+                        let event_surface = surface.role.surface().clone();
                         self.range_input(index, id, point.x);
                         self.reconcile_range_presses(&output);
-                        if self.surfaces[index]
-                            .text_input
-                            .as_ref()
-                            .is_some_and(|active| active.id == id)
+                        if let Some(index) = self.index(&event_surface)
+                            && self.surfaces[index]
+                                .text_input
+                                .as_ref()
+                                .is_some_and(|active| active.id == id)
                         {
                             self.focus_text_input(index, id, Some(point), true);
                             self.surfaces[index].dirty = true;
