@@ -450,6 +450,15 @@ declare extern type ThingAudioService with
     read set_default_source: (name: string) -> ()
 end
 
+declare extern type ThingClipboardService with
+    read available: ThingSignal<boolean>
+    read text: ThingSignal<string?>
+    read loading: ThingSignal<boolean>
+    read error: ThingSignal<string>
+    read set_text: (text: string) -> ()
+    read clear: () -> ()
+end
+
 declare extern type ThingClockService with
     read time: ThingSignal<string>
     read date: ThingSignal<string>
@@ -522,6 +531,7 @@ end
 
 declare extern type ThingServices with
     read audio: ThingAudioService
+    read clipboard: ThingClipboardService
     read clock: ThingClockService
     read media: ThingMediaService
     read notifications: ThingNotificationService
