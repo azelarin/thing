@@ -66,7 +66,7 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] scrolling containers
 - [x] consistent keyboard repeat
 - [x] text input with wayland input methods
-- [ ] text input clipboard shortcuts
+- [x] text input clipboard shortcuts
 - [x] vulkan rendering alongside opengl
 - [x] custom vector shapes
 - [x] spring animations

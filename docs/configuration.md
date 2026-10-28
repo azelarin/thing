@@ -323,9 +323,13 @@ the edited area so the compositor can place candidate windows nearby.
 this support is for ordinary, non-sensitive text. while a field is focused,
 thing may share a window of up to 4,000 bytes around its selection with the
 compositor and input method. `text_input` does not yet have content-purpose or
-password controls, so it cannot mark a field as secret. system clipboard
-shortcuts are also not available yet; the opt-in clipboard service described
-below is separate from focused-field copy and paste.
+password controls, so it cannot mark a field as secret.
+
+control-c copies selected text, and control-x copies then removes it. both require
+a non-empty selection. control-v reads text asynchronously and applies it only if
+the same field remains focused with the same value and selection. these shortcuts
+use the standard wayland clipboard and do not require the opt-in
+`services.clipboard` api described below.
 
 `centerbox` takes exactly three non-popup children: start, center, and end. give
 it an explicit height and width (or `grow = 1` inside a row). the middle child

@@ -105,6 +105,7 @@ impl FocusedClipboard {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn available(&self) -> bool {
         self.manager.is_some() && self.device.is_some()
     }
@@ -212,6 +213,12 @@ impl FocusedClipboard {
     pub(crate) fn take_paste_outcome(&mut self) -> Option<PasteOutcome> {
         self.process_completions();
         self.paste_result.take()
+    }
+
+    pub(crate) fn cancel_pending_paste(&mut self) {
+        self.process_completions();
+        self.cancel_paste();
+        self.paste_result = None;
     }
 
     pub(crate) fn set_text<D>(
