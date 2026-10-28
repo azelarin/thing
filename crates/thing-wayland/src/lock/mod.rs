@@ -9,7 +9,7 @@ use std::{
 };
 
 use calloop::{
-    EventLoop, Interest, Mode, PostAction,
+    EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken,
     generic::Generic,
     signals::{Signal, Signals},
     timer::{TimeoutAction, Timer},
@@ -17,10 +17,17 @@ use calloop::{
 use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_output, delegate_registry, delegate_session_lock,
+    delegate_compositor, delegate_keyboard, delegate_output, delegate_registry, delegate_seat,
+    delegate_session_lock,
     output::{OutputHandler, OutputInfo, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        Capability, SeatHandler, SeatState,
+        keyboard::{
+            KeyEvent, KeyboardHandler, Keymap, Keysym, Modifiers, RawModifiers, RepeatInfo,
+        },
+    },
     session_lock::{
         SessionLock, SessionLockHandler, SessionLockState, SessionLockSurface,
         SessionLockSurfaceConfigure,
@@ -33,11 +40,11 @@ use thing_runtime::{
     AuthenticationSnapshot, AuthenticationState, OutputContext, Scalar, ServiceSnapshot,
     SurfaceKey, SurfaceTree,
 };
-use thing_ui::{Interaction, Layout, PaintFrame, ScrollState, Size};
+use thing_ui::{Interaction, PaintFrame, ScrollState, SecretInputEditor, Size};
 use wayland_client::{
-    Connection, Dispatch, QueueHandle, delegate_noop,
+    Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     globals::registry_queue_init,
-    protocol::{wl_callback, wl_output, wl_surface},
+    protocol::{wl_callback, wl_keyboard, wl_output, wl_seat, wl_surface},
 };
 use wayland_protocols::wp::{
     fractional_scale::v1::client::{
@@ -51,16 +58,50 @@ use self::model::{Action as LifecycleAction, Lifecycle, Phase};
 use crate::{
     Renderer,
     authentication::{
-        AuthenticationBroker, Event as AuthenticationEvent, ProcessContext, harden_secret_process,
-        preflight_policy,
+        AttemptId, AuthenticationBroker, Event as AuthenticationEvent, ProcessContext,
+        harden_secret_process, preflight_policy,
     },
     configuration::Configurations,
+    focus::{ScopedUiTarget, SurfaceLayouts},
+    keyboard::{
+        RepeatSession, RepeatTimerAction, TextKeyAction, repeat_action_is_current, text_key_action,
+    },
     render::{FrameResult, Render, Window},
     watch::Watch,
 };
+use xkbcommon::xkb;
 
 const RELOAD_DELAY: Duration = Duration::from_millis(80);
 const AUTHENTICATION_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+#[derive(Debug, Eq, PartialEq)]
+enum SecretKeyRoute {
+    Apply(TextKeyAction),
+    Consume,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecretSubmitRoute {
+    Start,
+    Respond(AttemptId, u64),
+}
+
+fn secret_key_route(event: &KeyEvent, modifiers: Modifiers, direct: bool) -> SecretKeyRoute {
+    text_key_action(event, modifiers, direct).map_or(SecretKeyRoute::Consume, SecretKeyRoute::Apply)
+}
+
+fn secret_submit_route(
+    phase: Phase,
+    prompt: Option<(AttemptId, u64)>,
+    can_start: bool,
+) -> Option<SecretSubmitRoute> {
+    if phase != Phase::Locked {
+        return None;
+    }
+    prompt
+        .map(|(id, generation)| SecretSubmitRoute::Respond(id, generation))
+        .or(can_start.then_some(SecretSubmitRoute::Start))
+}
 
 /// lock the current Wayland session with the configured lock surfaces.
 pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
@@ -136,9 +177,19 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
         reload_at: None,
         authentication: AuthenticationBroker::new(process, 1),
         authentication_snapshot: authentication,
+        pending_prompt: None,
         surfaces: Vec::new(),
         registry: RegistryState::new(&globals),
         outputs: OutputState::new(&globals, &qh),
+        seats: SeatState::new(&globals, &qh),
+        seat: None,
+        keyboard: None,
+        keyboard_surface: None,
+        keyboard_keymap: None,
+        modifiers: Modifiers::default(),
+        repeat: RepeatSession::default(),
+        repeat_token: None,
+        loop_handle: event_loop.handle(),
         compositor,
         session_lock_state,
         session_lock: None,
@@ -260,13 +311,22 @@ struct Surface {
     scale: Scale,
     viewport: Option<WpViewport>,
     fractional: Option<WpFractionalScaleV1>,
-    layout: Option<Layout>,
+    layouts: SurfaceLayouts,
     scroll: ScrollState,
     input: Interaction,
+    focus_target: Option<ScopedUiTarget>,
+    secret_focused: bool,
+    secret_input: Option<ActiveSecretInput>,
+    autofocus_pending: bool,
     configured: bool,
     dirty: bool,
     waiting: bool,
     retry_at: Option<Instant>,
+}
+
+struct ActiveSecretInput {
+    target: ScopedUiTarget,
+    editor: SecretInputEditor,
 }
 
 impl Drop for Surface {
@@ -289,9 +349,19 @@ struct App {
     reload_at: Option<Instant>,
     authentication: AuthenticationBroker,
     authentication_snapshot: AuthenticationSnapshot,
+    pending_prompt: Option<(AttemptId, u64)>,
     surfaces: Vec<Surface>,
     registry: RegistryState,
     outputs: OutputState,
+    seats: SeatState,
+    seat: Option<wl_seat::WlSeat>,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    keyboard_surface: Option<wl_surface::WlSurface>,
+    keyboard_keymap: Option<xkb::Keymap>,
+    modifiers: Modifiers,
+    repeat: RepeatSession<wl_surface::WlSurface>,
+    repeat_token: Option<RegistrationToken>,
+    loop_handle: LoopHandle<'static, App>,
     compositor: CompositorState,
     session_lock_state: SessionLockState,
     session_lock: Option<SessionLock>,
@@ -385,9 +455,13 @@ impl App {
             scale,
             viewport,
             fractional,
-            layout: None,
+            layouts: SurfaceLayouts::default(),
             scroll: ScrollState::default(),
             input: Interaction::default(),
+            focus_target: None,
+            secret_focused: false,
+            secret_input: None,
+            autofocus_pending: true,
             configured: false,
             dirty: true,
             waiting: false,
@@ -403,6 +477,10 @@ impl App {
         else {
             return;
         };
+        let wl = self.surfaces[index].role.wl_surface().clone();
+        if self.keyboard_surface.as_ref() == Some(&wl) {
+            self.set_keyboard_surface(None);
+        }
         if let Err(error) = self.render.park() {
             self.fail(error);
         }
@@ -428,10 +506,15 @@ impl App {
             eprintln!("thing: lock reload failed; keeping the previous surfaces: {error}");
             return;
         }
+        self.clear_key_repeat();
         for surface in &mut self.surfaces {
-            surface.layout = None;
+            surface.layouts = SurfaceLayouts::default();
             surface.scroll = ScrollState::default();
             surface.input = Interaction::default();
+            surface.focus_target = None;
+            surface.secret_focused = false;
+            surface.secret_input = None;
+            surface.autofocus_pending = true;
             surface.dirty = true;
         }
         let wake = self.image_ping.clone();
@@ -472,7 +555,12 @@ impl App {
     fn poll_authentication(&mut self) {
         for event in self.authentication.poll(Instant::now()) {
             match event {
-                AuthenticationEvent::Prompt { text, .. } => {
+                AuthenticationEvent::Prompt {
+                    id,
+                    generation,
+                    text,
+                } => {
+                    self.pending_prompt = Some((id, generation));
                     self.set_authentication(AuthenticationSnapshot {
                         available: true,
                         state: AuthenticationState::Waiting,
@@ -487,11 +575,15 @@ impl App {
                     self.set_authentication(snapshot);
                 }
                 AuthenticationEvent::Authenticated { .. } => {
+                    self.pending_prompt = None;
+                    self.clear_secret_editors();
                     if self.lifecycle.authenticated() == LifecycleAction::UnlockAndSync {
                         self.unlock_and_sync();
                     }
                 }
                 AuthenticationEvent::Rejected { .. } => {
+                    self.pending_prompt = None;
+                    self.clear_secret_editors();
                     self.set_authentication(AuthenticationSnapshot {
                         available: true,
                         state: AuthenticationState::Rejected,
@@ -500,6 +592,8 @@ impl App {
                     });
                 }
                 AuthenticationEvent::Unavailable { .. } => {
+                    self.pending_prompt = None;
+                    self.clear_secret_editors();
                     self.set_authentication(AuthenticationSnapshot {
                         available: true,
                         state: AuthenticationState::Rejected,
@@ -517,6 +611,431 @@ impl App {
     fn invalidate_all(&mut self) {
         for surface in &mut self.surfaces {
             surface.dirty = true;
+        }
+    }
+
+    fn index(&self, wl: &wl_surface::WlSurface) -> Option<usize> {
+        self.surfaces
+            .iter()
+            .position(|surface| surface.role.wl_surface() == wl)
+    }
+
+    fn surface_target_is_current(&self, index: usize, target: &ScopedUiTarget) -> bool {
+        let Some(surface) = self.surfaces.get(index) else {
+            return false;
+        };
+        let Some(root) = self
+            .configurations
+            .surface_root(&surface.output, &SurfaceKey::Default)
+        else {
+            return false;
+        };
+        self.configurations.presented_target_is_current(
+            &surface.output,
+            &target.consumer,
+            root.id,
+            &target.target,
+        )
+    }
+
+    fn secret_node_and_width(&self, index: usize, target: &ScopedUiTarget) -> Option<(Node, f32)> {
+        if !self.surface_target_is_current(index, target) {
+            return None;
+        }
+        let surface = self.surfaces.get(index)?;
+        let id = target.target.node();
+        let placement = surface.layouts.input()?.get(id)?;
+        if !placement.interactive {
+            return None;
+        }
+        let node = self
+            .configurations
+            .surface_root(&surface.output, &SurfaceKey::Default)?
+            .find(id)?;
+        if node.kind != Kind::SecretInput {
+            return None;
+        }
+        let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
+        Some((
+            node.clone(),
+            (placement.bounds.width - 2.0 * padding_x).max(0.0),
+        ))
+    }
+
+    fn clear_surface_focus(&mut self, index: usize) {
+        let Some(surface) = self.surfaces.get(index) else {
+            return;
+        };
+        let owns_keyboard = self.keyboard_surface.as_ref() == Some(surface.role.wl_surface());
+        if owns_keyboard {
+            self.clear_key_repeat();
+        }
+        let surface = &mut self.surfaces[index];
+        surface.focus_target = None;
+        surface.secret_focused = false;
+        surface.secret_input = None;
+        surface.input.focus_from_pointer(None);
+        surface.dirty = true;
+    }
+
+    fn focus_from_keyboard(&mut self, index: usize, target: ScopedUiTarget) -> bool {
+        if !self.surface_target_is_current(index, &target) {
+            return false;
+        }
+        let id = target.target.node();
+        let focusable = self.surfaces[index]
+            .layouts
+            .input()
+            .is_some_and(|layout| layout.focus_order().any(|candidate| candidate == id));
+        if !focusable {
+            return false;
+        }
+        let secret = self.secret_node_and_width(index, &target);
+        let changed = self.surfaces[index].focus_target.as_ref() != Some(&target);
+        if changed {
+            self.clear_key_repeat();
+            self.surfaces[index].secret_input = None;
+        }
+        let surface = &mut self.surfaces[index];
+        surface.focus_target = Some(target.clone());
+        surface.secret_focused = secret.is_some();
+        surface.input.focus_from_keyboard(id);
+        if let Some((node, width)) = secret {
+            match surface.secret_input.as_mut() {
+                Some(active) if active.target == target => active.editor.prepare(&node, width),
+                _ => {
+                    surface.secret_input = Some(ActiveSecretInput {
+                        target,
+                        editor: SecretInputEditor::new(&node, width),
+                    });
+                }
+            }
+        } else {
+            surface.secret_input = None;
+        }
+        surface.dirty = true;
+        true
+    }
+
+    fn reconcile_surface_focus(&mut self, index: usize) {
+        if self.surfaces.get(index).is_none() {
+            return;
+        }
+        let current = self.surfaces[index].focus_target.clone();
+        if let Some(target) = current {
+            let id = target.target.node();
+            let focusable = self.surface_target_is_current(index, &target)
+                && self.surfaces[index]
+                    .layouts
+                    .input()
+                    .is_some_and(|layout| layout.focus_order().any(|candidate| candidate == id));
+            if focusable {
+                self.focus_from_keyboard(index, target);
+                return;
+            }
+            self.clear_surface_focus(index);
+        }
+
+        if self.keyboard_surface.as_ref() != Some(self.surfaces[index].role.wl_surface())
+            || self.surfaces[index].layouts.presented().is_none()
+            || !self.surfaces[index].autofocus_pending
+        {
+            return;
+        }
+        self.surfaces[index].autofocus_pending = false;
+        let output = self.surfaces[index].output.clone();
+        let Some(root) = self
+            .configurations
+            .surface_root(&output, &SurfaceKey::Default)
+        else {
+            return;
+        };
+        let (Some(consumer), Some(target)) = (
+            self.configurations.consumer(&output),
+            self.configurations.autofocus_target(&output, root.id),
+        ) else {
+            return;
+        };
+        self.focus_from_keyboard(
+            index,
+            ScopedUiTarget {
+                consumer: consumer.to_owned(),
+                target,
+            },
+        );
+    }
+
+    fn reconcile_layout_focus(&mut self) {
+        for index in 0..self.surfaces.len() {
+            self.reconcile_surface_focus(index);
+        }
+    }
+
+    fn clear_secret_editors(&mut self) {
+        for surface in &mut self.surfaces {
+            surface.secret_input = None;
+            surface.dirty = true;
+        }
+    }
+
+    fn set_keyboard_surface(&mut self, next: Option<wl_surface::WlSurface>) {
+        self.clear_key_repeat();
+        let previous = std::mem::replace(&mut self.keyboard_surface, next);
+        self.modifiers = Modifiers::default();
+        if let Some(previous) = previous.as_ref()
+            && self.keyboard_surface.as_ref() != Some(previous)
+            && let Some(index) = self.index(previous)
+        {
+            self.clear_surface_focus(index);
+        }
+        if let Some(index) = self
+            .keyboard_surface
+            .as_ref()
+            .and_then(|surface| self.index(surface))
+        {
+            self.surfaces[index].autofocus_pending = true;
+            self.surfaces[index].dirty = true;
+            self.reconcile_surface_focus(index);
+        }
+    }
+
+    fn clear_key_repeat(&mut self) {
+        let action = self.repeat.clear();
+        self.apply_repeat_timer(action);
+    }
+
+    fn apply_repeat_timer(&mut self, action: RepeatTimerAction) {
+        match action {
+            RepeatTimerAction::None => {}
+            RepeatTimerAction::Disarm => {
+                if let Some(token) = self.repeat_token.take() {
+                    self.loop_handle.remove(token);
+                }
+            }
+            RepeatTimerAction::Arm(delay) => {
+                if let Some(token) = self.repeat_token.take() {
+                    self.loop_handle.remove(token);
+                }
+                match self
+                    .loop_handle
+                    .insert_source(Timer::from_duration(delay), |_, _, app| {
+                        app.dispatch_key_repeat()
+                    }) {
+                    Ok(token) => self.repeat_token = Some(token),
+                    Err(error) => self.fail(format!("cannot start keyboard repeat: {error}")),
+                }
+            }
+        }
+    }
+
+    fn finish_key_press(&mut self, event: KeyEvent, key_repeats: bool, action_repeats: bool) {
+        let action = match self.keyboard_surface.clone() {
+            Some(surface) => self
+                .repeat
+                .press(event, surface, key_repeats, action_repeats),
+            None if key_repeats => self.repeat.clear(),
+            None => RepeatTimerAction::None,
+        };
+        self.apply_repeat_timer(action);
+    }
+
+    fn physical_key_repeats(&self, raw_code: u32) -> bool {
+        let Some(keycode) = raw_code.checked_add(8).map(xkb::Keycode::new) else {
+            return false;
+        };
+        self.keyboard_keymap
+            .as_ref()
+            .is_some_and(|keymap| keymap.key_repeats(keycode))
+    }
+
+    fn keyboard_focus_owner(&self) -> Option<(wl_surface::WlSurface, Option<ScopedUiTarget>)> {
+        let wl = self.keyboard_surface.clone()?;
+        let target = self
+            .index(&wl)
+            .and_then(|index| self.surfaces[index].focus_target.clone());
+        Some((wl, target))
+    }
+
+    fn dispatch_key_repeat(&mut self) -> TimeoutAction {
+        let Some(settings) = self.repeat.settings else {
+            self.repeat_token = None;
+            return TimeoutAction::Drop;
+        };
+        let Some(repeating) = self.repeat.key.as_mut() else {
+            self.repeat_token = None;
+            return TimeoutAction::Drop;
+        };
+        if !repeating.surface.is_alive()
+            || self.keyboard_surface.as_ref() != Some(&repeating.surface)
+        {
+            self.clear_key_repeat();
+            return TimeoutAction::Drop;
+        }
+        let elapsed = if repeating.first {
+            repeating.first = false;
+            settings.delay
+        } else {
+            settings.interval
+        };
+        repeating.event.time = repeating
+            .event
+            .time
+            .wrapping_add(elapsed.as_millis().min(u128::from(u32::MAX)) as u32);
+        let event = repeating.event.clone();
+        let raw_code = event.raw_code;
+        let surface = repeating.surface.clone();
+        let repeats = self.key(event, false);
+        let current = self.repeat.key.as_ref().is_some_and(|repeating| {
+            repeating.event.raw_code == raw_code && repeating.surface == surface
+        });
+        if !repeats || !current {
+            self.clear_key_repeat();
+            TimeoutAction::Drop
+        } else {
+            TimeoutAction::ToDuration(settings.interval)
+        }
+    }
+
+    fn key(&mut self, event: KeyEvent, direct: bool) -> bool {
+        let Some(index) = self
+            .keyboard_surface
+            .as_ref()
+            .and_then(|surface| self.index(surface))
+        else {
+            return false;
+        };
+        self.reconcile_surface_focus(index);
+        if let Some(repeats) = self.secret_input_key(index, &event, direct) {
+            return repeats;
+        }
+        if direct && matches!(event.keysym, Keysym::Tab | Keysym::ISO_Left_Tab) {
+            let order: Vec<_> = self.surfaces[index]
+                .layouts
+                .input()
+                .map(|layout| layout.focus_order().collect())
+                .unwrap_or_default();
+            if !order.is_empty() {
+                let current = self.surfaces[index]
+                    .input
+                    .focused
+                    .and_then(|id| order.iter().position(|candidate| *candidate == id));
+                let next = if self.modifiers.shift {
+                    current.map_or(order.len() - 1, |n| (n + order.len() - 1) % order.len())
+                } else {
+                    current.map_or(0, |n| (n + 1) % order.len())
+                };
+                if let Some(target) = self.surfaces[index].layouts.presented_target(order[next]) {
+                    self.focus_from_keyboard(index, target);
+                }
+            }
+        }
+        false
+    }
+
+    fn secret_input_key(&mut self, index: usize, event: &KeyEvent, direct: bool) -> Option<bool> {
+        let target = self.surfaces.get(index)?.focus_target.clone()?;
+        let was_secret = self.surfaces[index].secret_focused;
+        let Some((node, width)) = self.secret_node_and_width(index, &target) else {
+            if was_secret {
+                self.clear_surface_focus(index);
+                return Some(false);
+            }
+            return None;
+        };
+        if self.surfaces[index]
+            .secret_input
+            .as_ref()
+            .is_none_or(|active| active.target != target)
+        {
+            self.surfaces[index].secret_input = Some(ActiveSecretInput {
+                target,
+                editor: SecretInputEditor::new(&node, width),
+            });
+        }
+        self.surfaces[index].input.reveal_keyboard_focus();
+        self.surfaces[index].dirty = true;
+        let SecretKeyRoute::Apply(action) = secret_key_route(event, self.modifiers, direct) else {
+            return Some(false);
+        };
+        let repeats = action.repeats();
+        if action == TextKeyAction::Submit {
+            self.submit_secret(index, &node, width);
+            return Some(false);
+        }
+        let select = self.modifiers.shift;
+        let word = self.modifiers.ctrl && !self.modifiers.alt;
+        let editor = &mut self.surfaces[index]
+            .secret_input
+            .as_mut()
+            .expect("the secret editor was initialized")
+            .editor;
+        match action {
+            TextKeyAction::Insert(text) => {
+                editor.replace_selection(&text, &node, width);
+            }
+            TextKeyAction::Backspace => {
+                editor.backspace(word, &node, width);
+            }
+            TextKeyAction::Delete => {
+                editor.delete(word, &node, width);
+            }
+            TextKeyAction::MoveLeft => editor.move_left(select, word, &node, width),
+            TextKeyAction::MoveRight => editor.move_right(select, word, &node, width),
+            TextKeyAction::MoveToStart => editor.move_to_start(select, &node, width),
+            TextKeyAction::MoveToEnd => editor.move_to_end(select, &node, width),
+            TextKeyAction::SelectAll => editor.select_all(&node, width),
+            TextKeyAction::Submit => unreachable!(),
+        }
+        Some(repeats)
+    }
+
+    fn submit_secret(&mut self, index: usize, node: &Node, width: f32) {
+        let now = Instant::now();
+        let Some(route) = secret_submit_route(
+            self.lifecycle.phase(),
+            self.pending_prompt,
+            self.authentication.can_start(now),
+        ) else {
+            return;
+        };
+        let Some(active) = self.surfaces[index].secret_input.as_mut() else {
+            return;
+        };
+        let secret = active.editor.take(node, width);
+        self.clear_secret_editors();
+        let result = match route {
+            SecretSubmitRoute::Respond(id, generation) => {
+                self.pending_prompt = None;
+                self.authentication
+                    .respond(id, generation, secret, now)
+                    .map(|()| id)
+                    .map_err(|secret| {
+                        drop(secret);
+                        "authentication prompt is no longer current".to_owned()
+                    })
+            }
+            SecretSubmitRoute::Start => self.authentication.start(secret, now).map_err(|error| {
+                let message = error.error().to_string();
+                drop(error.into_secret());
+                message
+            }),
+        };
+        match result {
+            Ok(_) => self.set_authentication(AuthenticationSnapshot {
+                available: true,
+                state: AuthenticationState::Authenticating,
+                prompt: String::new(),
+                message: String::new(),
+            }),
+            Err(error) => {
+                eprintln!("thing: cannot start authentication helper: {error}");
+                self.set_authentication(AuthenticationSnapshot {
+                    available: true,
+                    state: AuthenticationState::Rejected,
+                    prompt: String::new(),
+                    message: "authentication helper failed".into(),
+                });
+            }
         }
     }
 
@@ -555,8 +1074,12 @@ impl App {
                 surface.dirty = true;
             }
         }
+        self.reconcile_layout_focus();
         let configurations = &self.configurations;
-        for surface in &mut self.surfaces {
+        let keyboard_surface = self.keyboard_surface.clone();
+        let mut presented = Vec::new();
+        let mut repeat_invalidated = false;
+        for (index, surface) in self.surfaces.iter_mut().enumerate() {
             if !surface.configured || !surface.dirty || surface.waiting {
                 continue;
             }
@@ -598,10 +1121,50 @@ impl App {
                 },
                 &mut scroll,
             )?;
+            if let Some(id) = surface.input.focused
+                && !layout.focus_order().any(|candidate| candidate == id)
+            {
+                repeat_invalidated |= keyboard_surface.as_ref() == Some(surface.role.wl_surface());
+                surface.focus_target = None;
+                surface.secret_focused = false;
+                surface.secret_input = None;
+                surface.input.focus_from_pointer(None);
+            }
+            let presented_ui = configurations
+                .presented_targets(&surface.output, root, &layout)
+                .ok_or("rendered lock output has no configuration consumer")?;
             let wl = surface.role.wl_surface().clone();
             let viewport = surface.viewport.clone();
             let logical = surface.size;
             let buffer_scale = surface.scale.factor().round() as i32;
+            let secret_input = (keyboard_surface.as_ref() == Some(surface.role.wl_surface())
+                && surface.secret_input.as_ref().is_some_and(|active| {
+                    Some(active.target.target.node()) == surface.input.focused
+                        && layout
+                            .get(active.target.target.node())
+                            .is_some_and(|placement| placement.interactive)
+                }))
+            .then(|| {
+                let active = surface
+                    .secret_input
+                    .as_mut()
+                    .expect("the active secret input was checked");
+                let id = active.target.target.node();
+                let placement = layout
+                    .get(id)
+                    .expect("the active secret input placement was checked");
+                let node = root
+                    .find(id)
+                    .expect("the active secret input belongs to the rendered tree");
+                let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
+                let width = (placement.bounds.width - 2.0 * padding_x).max(0.0);
+                active.editor.prepare(node, width);
+                &mut active.editor
+            });
+            let mut input = surface.input;
+            if keyboard_surface.as_ref() != Some(surface.role.wl_surface()) {
+                input.hide_keyboard_focus();
+            }
             let result = self.render.draw(
                 window,
                 PaintFrame {
@@ -609,9 +1172,9 @@ impl App {
                     layout: &layout,
                     physical,
                     scale: surface.scale.factor(),
-                    input: surface.input,
+                    input,
                     text_input: None,
-                    secret_input: None,
+                    secret_input,
                 },
                 || {
                     if let Some(viewport) = &viewport {
@@ -628,22 +1191,34 @@ impl App {
                     let animating = configurations.layout_is_animating(&surface.output, &layout);
                     surface.waiting = true;
                     surface.scroll = scroll;
-                    surface.layout = Some(layout);
+                    let (consumer, targets) = presented_ui;
+                    surface.layouts.publish(layout, root.id, consumer, targets);
                     surface.dirty = redraw || animating;
+                    presented.push(index);
                 }
                 #[cfg(feature = "vulkan")]
                 FrameResult::RetryAfter(delay) => {
                     surface.waiting = false;
                     surface.dirty = true;
+                    surface.layouts.stage_input(layout);
                     surface.retry_at = Some(Instant::now() + delay);
                 }
             }
+        }
+        if repeat_invalidated {
+            self.clear_key_repeat();
+        }
+        for index in presented {
+            self.reconcile_surface_focus(index);
         }
         Ok(())
     }
 
     fn fail(&mut self, error: String) {
         eprintln!("thing: lock host failed: {error}");
+        self.pending_prompt = None;
+        self.set_keyboard_surface(None);
+        self.clear_secret_editors();
         match self.lifecycle.failed() {
             LifecycleAction::DestroyAndExit => {
                 self.result = Err(error);
@@ -672,6 +1247,9 @@ impl App {
         if self.unlock_sync.is_some() {
             return;
         }
+        self.pending_prompt = None;
+        self.set_keyboard_surface(None);
+        self.clear_secret_editors();
         self.render.prepare_drop();
         if let Some(lock) = self.session_lock.take() {
             lock.unlock();
@@ -775,6 +1353,186 @@ impl CompositorHandler for App {
         _: &wl_surface::WlSurface,
         _: &wl_output::WlOutput,
     ) {
+    }
+}
+
+impl SeatHandler for App {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seats
+    }
+
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if self.seat.as_ref().is_some_and(|active| active != &seat) {
+            return;
+        }
+        self.seat = Some(seat.clone());
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            self.clear_key_repeat();
+            self.repeat.settings = None;
+            self.keyboard_keymap = None;
+            match self.seats.get_keyboard(qh, &seat, None) {
+                Ok(keyboard) => self.keyboard = Some(keyboard),
+                Err(error) => self.fail(format!("cannot acquire lock keyboard: {error}")),
+            }
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if self.seat.as_ref() != Some(&seat) || capability != Capability::Keyboard {
+            return;
+        }
+        if let Some(keyboard) = self.keyboard.take() {
+            keyboard.release();
+        }
+        self.repeat.settings = None;
+        self.keyboard_keymap = None;
+        self.set_keyboard_surface(None);
+    }
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        if self.seat.as_ref() != Some(&seat) {
+            return;
+        }
+        self.seat = None;
+        if let Some(keyboard) = self.keyboard.take() {
+            keyboard.release();
+        }
+        self.repeat.settings = None;
+        self.keyboard_keymap = None;
+        self.set_keyboard_surface(None);
+    }
+}
+
+impl KeyboardHandler for App {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
+        self.set_keyboard_surface(Some(surface.clone()));
+    }
+
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        if self.keyboard_surface.as_ref() == Some(surface) {
+            self.set_keyboard_surface(None);
+        }
+    }
+
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        let owner = self.keyboard_focus_owner();
+        let key_repeats = self.physical_key_repeats(event.raw_code);
+        let action_repeats = self.key(event.clone(), true);
+        self.finish_key_press(
+            event,
+            key_repeats,
+            repeat_action_is_current(action_repeats, &owner, &self.keyboard_focus_owner()),
+        );
+    }
+
+    fn repeat_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        if self.keyboard_surface.as_ref().is_some_and(|surface| {
+            self.repeat
+                .accepts_compositor_repeat(event.raw_code, surface)
+        }) && !self.key(event, false)
+        {
+            self.clear_key_repeat();
+        }
+    }
+
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        let action = self.repeat.release(event.raw_code);
+        self.apply_repeat_timer(action);
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        modifiers: Modifiers,
+        _: RawModifiers,
+        _: u32,
+    ) {
+        self.modifiers = modifiers;
+    }
+
+    fn update_repeat_info(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        info: RepeatInfo,
+    ) {
+        let action = self.repeat.update(info);
+        self.apply_repeat_timer(action);
+    }
+
+    fn update_keymap(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        keymap: Keymap<'_>,
+    ) {
+        self.clear_key_repeat();
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        self.keyboard_keymap = xkb::Keymap::new_from_string(
+            &context,
+            keymap.as_string(),
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::COMPILE_NO_FLAGS,
+        );
+        if self.keyboard_keymap.is_none() {
+            self.fail("cannot retain the lock keyboard keymap".into());
+        }
     }
 }
 
@@ -894,8 +1652,10 @@ impl Dispatch<wl_callback::WlCallback, ()> for App {
 }
 
 delegate_compositor!(App);
+delegate_keyboard!(App);
 delegate_output!(App);
 delegate_session_lock!(App);
+delegate_seat!(App);
 delegate_registry!(App);
 delegate_noop!(App: ignore WpFractionalScaleManagerV1);
 delegate_noop!(App: ignore WpViewporter);
@@ -906,7 +1666,7 @@ impl ProvidesRegistryState for App {
         &mut self.registry
     }
 
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 fn validate_lock_surfaces(surfaces: &[SurfaceTree]) -> Result<(), String> {
@@ -985,6 +1745,15 @@ fn first_secret_input(node: &Node) -> Option<NodeId> {
 mod tests {
     use super::*;
 
+    fn key(keysym: Keysym, utf8: Option<&str>) -> KeyEvent {
+        KeyEvent {
+            time: 1,
+            raw_code: 2,
+            keysym,
+            utf8: utf8.map(str::to_owned),
+        }
+    }
+
     #[test]
     fn lock_validation_requires_one_host_owned_secret_field() {
         let mut root = Node::new(NodeId(1), Kind::Lock);
@@ -1023,5 +1792,55 @@ mod tests {
             .children
             .push(Node::new(NodeId(3), Kind::SecretInput));
         assert!(validate_lock_surfaces(&[duplicate]).is_err());
+    }
+
+    #[test]
+    fn secret_focus_consumes_every_key_before_public_routing() {
+        assert_eq!(
+            secret_key_route(&key(Keysym::p, Some("p")), Modifiers::default(), true),
+            SecretKeyRoute::Apply(TextKeyAction::Insert("p".into()))
+        );
+        assert_eq!(
+            secret_key_route(&key(Keysym::Return, None), Modifiers::default(), true),
+            SecretKeyRoute::Apply(TextKeyAction::Submit)
+        );
+        assert_eq!(
+            secret_key_route(&key(Keysym::Return, None), Modifiers::default(), false),
+            SecretKeyRoute::Consume
+        );
+        assert_eq!(
+            secret_key_route(
+                &key(Keysym::c, Some("c")),
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+                true,
+            ),
+            SecretKeyRoute::Consume
+        );
+        assert_eq!(
+            secret_key_route(&key(Keysym::Tab, None), Modifiers::default(), true),
+            SecretKeyRoute::Consume
+        );
+    }
+
+    #[test]
+    fn secret_submission_is_locked_generation_and_prompt_scoped() {
+        let id = AttemptId {
+            lock: 4,
+            attempt: 7,
+        };
+        assert_eq!(secret_submit_route(Phase::Requesting, None, true), None);
+        assert_eq!(
+            secret_submit_route(Phase::Locked, None, true),
+            Some(SecretSubmitRoute::Start)
+        );
+        assert_eq!(secret_submit_route(Phase::Locked, None, false), None);
+        assert_eq!(
+            secret_submit_route(Phase::Locked, Some((id, 3)), false),
+            Some(SecretSubmitRoute::Respond(id, 3))
+        );
+        assert_eq!(secret_submit_route(Phase::FailedLocked, None, true), None);
     }
 }
