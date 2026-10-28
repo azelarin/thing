@@ -43,7 +43,7 @@ pub struct Layout {
 
 impl Layout {
     pub fn compute(root: &Node, size: Size, measurer: &mut impl Measurer) -> Result<Self, String> {
-        root.validate().map_err(|error| error.to_string())?;
+        root.validate_surface().map_err(|error| error.to_string())?;
         if ![size.width, size.height]
             .iter()
             .all(|v| v.is_finite() && (0.0..=100_000.0).contains(v))
@@ -420,5 +420,25 @@ mod tests {
         .unwrap();
         assert_eq!(layout.hit_test(Point { x: 25.0, y: 10.0 }), None);
         assert_eq!(layout.focus_order().collect::<Vec<_>>(), vec![NodeId(2)]);
+    }
+
+    #[test]
+    fn lays_out_an_automatic_popup_surface_with_an_external_anchor() {
+        let mut popup = Node::new(NodeId(1), Kind::Popup);
+        popup.popup.open_on_hover = true;
+        popup.style.width = Some(200.0);
+        popup.style.height = Some(80.0);
+
+        let layout = Layout::compute(
+            &popup,
+            Size {
+                width: 200.0,
+                height: 80.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+
+        assert_eq!(layout.get(popup.id).unwrap().bounds.width, 200.0);
     }
 }

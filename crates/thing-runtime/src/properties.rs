@@ -27,6 +27,16 @@ fn boolean(value: Value, name: &str) -> Result<bool> {
     }
 }
 
+fn milliseconds(value: Value, name: &str) -> Result<u32> {
+    let value = number(value, name)?;
+    if value.fract() != 0.0 || !(0.0..=60_000.0).contains(&value) {
+        return Err(Error::runtime(format!(
+            "{name} must be a whole number between 0 and 60,000"
+        )));
+    }
+    Ok(value as u32)
+}
+
 pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
     match name {
         "text" if node.kind == Kind::Text => node.text = string(value, name)?,
@@ -40,6 +50,18 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "min" if node.kind == Kind::Slider => node.slider.min = number(value, name)?,
         "max" if node.kind == Kind::Slider => node.slider.max = number(value, name)?,
         "step" if node.kind == Kind::Slider => node.slider.step = number(value, name)?,
+        "open_on_hover" if node.kind == Kind::Popup => {
+            node.popup.open_on_hover = boolean(value, name)?
+        }
+        "open_on_click" if node.kind == Kind::Popup => {
+            node.popup.open_on_click = boolean(value, name)?
+        }
+        "open_delay" if node.kind == Kind::Popup => {
+            node.popup.open_delay_ms = milliseconds(value, name)?
+        }
+        "close_delay" if node.kind == Kind::Popup => {
+            node.popup.close_delay_ms = milliseconds(value, name)?
+        }
         "style.width" => {
             node.style.width = if value.is_nil() {
                 None
