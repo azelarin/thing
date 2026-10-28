@@ -5,6 +5,6 @@ mod layout;
 mod paint;
 mod text;
 pub use femtovg::renderer::OpenGl;
-pub use layout::{Layout, Measurer, Placement, Size};
+pub use layout::{Layout, Measurer, Placement, ScrollState, Size};
 pub use paint::{Interaction, PaintFrame, Painter};
 pub use text::TextSystem;
