@@ -5,7 +5,7 @@ use std::{
 };
 
 use calloop::{
-    EventLoop, Interest, Mode, PostAction,
+    EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken,
     generic::Generic,
     timer::{TimeoutAction, Timer},
 };
@@ -19,7 +19,9 @@ use smithay_client_toolkit::{
     registry_handlers,
     seat::{
         Capability, SeatHandler, SeatState,
-        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
+        keyboard::{
+            KeyEvent, KeyboardHandler, Keymap, Keysym, Modifiers, RawModifiers, RepeatInfo,
+        },
         pointer::{AxisScroll, PointerEvent, PointerEventKind, PointerHandler},
     },
     shell::{
@@ -63,6 +65,7 @@ use wayland_protocols::{
         shell::client::xdg_positioner,
     },
 };
+use xkbcommon::xkb;
 
 use crate::{
     Renderer,
@@ -143,6 +146,9 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
     let media = Media::start(media_ping).map_err(|e| format!("cannot start media worker: {e}"))?;
     let (niri_ping, niri_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let niri = Niri::start(niri_ping).map_err(|e| format!("cannot start niri worker: {e}"))?;
+    let mut event_loop: EventLoop<'static, App> =
+        EventLoop::try_new().map_err(|error| error.to_string())?;
+    let loop_handle = event_loop.handle();
     let mut app = App {
         render,
         image_ping,
@@ -172,7 +178,11 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
         seat: None,
         keyboard_surface: None,
         queue: qh.clone(),
-        shift: false,
+        loop_handle,
+        modifiers: Modifiers::default(),
+        keyboard_keymap: None,
+        repeat: RepeatSession::default(),
+        repeat_token: None,
         loading_outputs: true,
         exit: false,
         error: None,
@@ -195,7 +205,6 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
     }
     app.loading_outputs = false;
     app.update_watch();
-    let mut event_loop: EventLoop<App> = EventLoop::try_new().map_err(|error| error.to_string())?;
     event_loop
         .handle()
         .insert_source(child_signals, |_, _, app| app.reap_children())
@@ -301,6 +310,155 @@ struct InputOrigin {
     seat: wl_seat::WlSeat,
     serial: u32,
     surface: wl_surface::WlSurface,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WidgetKeyAction {
+    Activate,
+    Slider(SliderKeyAction),
+}
+
+impl WidgetKeyAction {
+    fn repeats(self) -> bool {
+        matches!(
+            self,
+            Self::Slider(SliderKeyAction::Decrease | SliderKeyAction::Increase)
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SliderKeyAction {
+    Decrease,
+    Increase,
+    Minimum,
+    Maximum,
+}
+
+#[derive(Clone, Copy)]
+struct RepeatSettings {
+    delay: Duration,
+    interval: Duration,
+}
+
+impl RepeatSettings {
+    fn from_info(info: RepeatInfo) -> Option<Self> {
+        match info {
+            RepeatInfo::Repeat { rate, delay } => Some(Self {
+                delay: Duration::from_millis(u64::from(delay)),
+                interval: Duration::from_micros((1_000_000 / u64::from(rate.get())).max(1)),
+            }),
+            RepeatInfo::Disable => None,
+        }
+    }
+}
+
+struct RepeatingKey<S> {
+    event: KeyEvent,
+    surface: S,
+    first: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepeatTimerAction {
+    None,
+    Arm(Duration),
+    Disarm,
+}
+
+struct RepeatSession<S> {
+    settings: Option<RepeatSettings>,
+    key: Option<RepeatingKey<S>>,
+    host_armed: bool,
+}
+
+impl<S> Default for RepeatSession<S> {
+    fn default() -> Self {
+        Self {
+            settings: None,
+            key: None,
+            host_armed: false,
+        }
+    }
+}
+
+impl<S: PartialEq> RepeatSession<S> {
+    fn press(
+        &mut self,
+        event: KeyEvent,
+        surface: S,
+        key_repeats: bool,
+        action_repeats: bool,
+    ) -> RepeatTimerAction {
+        if !key_repeats {
+            return RepeatTimerAction::None;
+        }
+        if !action_repeats {
+            return self.clear();
+        }
+        self.key = Some(RepeatingKey {
+            event,
+            surface,
+            first: true,
+        });
+        match self.settings {
+            Some(settings) => {
+                self.host_armed = true;
+                RepeatTimerAction::Arm(settings.delay)
+            }
+            None if self.host_armed => {
+                self.host_armed = false;
+                RepeatTimerAction::Disarm
+            }
+            None => RepeatTimerAction::None,
+        }
+    }
+
+    fn update(&mut self, info: RepeatInfo) -> RepeatTimerAction {
+        self.settings = RepeatSettings::from_info(info);
+        match (self.settings, self.key.as_mut()) {
+            (Some(settings), Some(key)) => {
+                key.first = true;
+                self.host_armed = true;
+                RepeatTimerAction::Arm(settings.delay)
+            }
+            _ if self.host_armed => {
+                self.host_armed = false;
+                RepeatTimerAction::Disarm
+            }
+            _ => RepeatTimerAction::None,
+        }
+    }
+
+    fn release(&mut self, raw_code: u32) -> RepeatTimerAction {
+        if self
+            .key
+            .as_ref()
+            .is_some_and(|key| key.event.raw_code == raw_code)
+        {
+            self.clear()
+        } else {
+            RepeatTimerAction::None
+        }
+    }
+
+    fn clear(&mut self) -> RepeatTimerAction {
+        self.key = None;
+        if self.host_armed {
+            self.host_armed = false;
+            RepeatTimerAction::Disarm
+        } else {
+            RepeatTimerAction::None
+        }
+    }
+
+    fn accepts_compositor_repeat(&self, raw_code: u32, surface: &S) -> bool {
+        self.settings.is_none()
+            && self
+                .key
+                .as_ref()
+                .is_some_and(|key| key.event.raw_code == raw_code && &key.surface == surface)
+    }
 }
 
 struct PopupRole {
@@ -429,7 +587,11 @@ struct App {
     seat: Option<wl_seat::WlSeat>,
     keyboard_surface: Option<wl_surface::WlSurface>,
     queue: QueueHandle<App>,
-    shift: bool,
+    loop_handle: LoopHandle<'static, App>,
+    modifiers: Modifiers,
+    keyboard_keymap: Option<xkb::Keymap>,
+    repeat: RepeatSession<wl_surface::WlSurface>,
+    repeat_token: Option<RegistrationToken>,
     loading_outputs: bool,
     exit: bool,
     error: Option<String>,
@@ -437,6 +599,7 @@ struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.clear_key_repeat();
         for (_, token) in self.pending_launches.drain() {
             token.destroy();
         }
@@ -530,6 +693,7 @@ impl App {
         let wake = self.image_ping.clone();
         self.render.reset_painter(move || wake.ping())?;
         self.hover.clear();
+        self.clear_key_repeat();
         while let Some(index) = self
             .surfaces
             .iter()
@@ -537,7 +701,6 @@ impl App {
         {
             self.remove_popup(index, false, false);
         }
-        self.keyboard_surface = None;
         self.closed_surfaces.clear();
         let removed: Vec<_> = self
             .surfaces
@@ -554,6 +717,13 @@ impl App {
         let outputs: Vec<_> = self.configurations.keys().cloned().collect();
         for output in outputs {
             self.sync_output_surfaces(&output, true, qh)?;
+        }
+        if self
+            .keyboard_surface
+            .as_ref()
+            .is_some_and(|wl| self.index(wl).is_none())
+        {
+            self.clear_keyboard_focus();
         }
         self.update_watch();
         eprintln!("thing: reloaded {}", self.configurations.entry().display());
@@ -798,6 +968,8 @@ impl App {
         let root_id = root.id;
         let surface = &mut self.surfaces[index];
         let root_changed = surface.root != root_id;
+        let reset_input = force || root_changed;
+        let wl = surface.role.surface().clone();
         let Role::Panel(layer) = &surface.role else {
             return Ok(());
         };
@@ -817,7 +989,7 @@ impl App {
         )?;
         surface.root = root_id;
         surface.panel = Some(next);
-        if force || root_changed {
+        if reset_input {
             surface.layout = None;
             surface.scroll = ScrollState::default();
             surface.input = Interaction::default();
@@ -828,6 +1000,9 @@ impl App {
         }
         surface.dirty = true;
         layer.wl_surface().commit();
+        if reset_input && self.keyboard_surface.as_ref() == Some(&wl) {
+            self.clear_key_repeat();
+        }
         Ok(())
     }
 
@@ -910,7 +1085,7 @@ impl App {
         self.surfaces.remove(index);
         self.hover.remove_owner(owner);
         if self.keyboard_surface.as_ref() == Some(&wl) {
-            self.keyboard_surface = None;
+            self.clear_keyboard_focus();
         }
         if notify_hover {
             for id in hovered {
@@ -1353,7 +1528,7 @@ impl App {
             self.hover.close(&key, suppress_hover);
         }
         if self.keyboard_surface.as_ref() == Some(&wl) {
-            self.keyboard_surface = None;
+            self.clear_keyboard_focus();
         }
         if notify_runtime {
             for hovered in hovered {
@@ -1866,16 +2041,115 @@ impl App {
         self.reconcile_hover_intent();
     }
 
-    fn key(&mut self, event: KeyEvent, serial: u32, direct: bool, qh: &QueueHandle<Self>) {
-        let Some(index) = self.keyboard_surface.as_ref().and_then(|wl| self.index(wl)) else {
-            return;
+    fn clear_keyboard_focus(&mut self) {
+        self.clear_key_repeat();
+        self.keyboard_surface = None;
+        self.modifiers = Modifiers::default();
+    }
+
+    fn clear_key_repeat(&mut self) {
+        let action = self.repeat.clear();
+        self.apply_repeat_timer(action);
+    }
+
+    fn apply_repeat_timer(&mut self, action: RepeatTimerAction) {
+        match action {
+            RepeatTimerAction::None => {}
+            RepeatTimerAction::Disarm => {
+                if let Some(token) = self.repeat_token.take() {
+                    self.loop_handle.remove(token);
+                }
+            }
+            RepeatTimerAction::Arm(delay) => {
+                if let Some(token) = self.repeat_token.take() {
+                    self.loop_handle.remove(token);
+                }
+                let timer = Timer::from_duration(delay);
+                match self
+                    .loop_handle
+                    .insert_source(timer, |_, _, app| app.dispatch_key_repeat())
+                {
+                    Ok(token) => self.repeat_token = Some(token),
+                    Err(error) => {
+                        self.error = Some(format!("cannot start keyboard repeat: {error}"));
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_key_press(&mut self, event: KeyEvent, key_repeats: bool, action_repeats: bool) {
+        let action = match self.keyboard_surface.clone() {
+            Some(surface) => self
+                .repeat
+                .press(event, surface, key_repeats, action_repeats),
+            None if key_repeats => self.repeat.clear(),
+            None => RepeatTimerAction::None,
         };
-        if event.keysym == Keysym::Escape {
+        self.apply_repeat_timer(action);
+    }
+
+    fn physical_key_repeats(&self, raw_code: u32) -> bool {
+        let Some(keycode) = raw_code.checked_add(8).map(xkb::Keycode::new) else {
+            return false;
+        };
+        self.keyboard_keymap
+            .as_ref()
+            .is_some_and(|keymap| keymap.key_repeats(keycode))
+    }
+
+    fn dispatch_key_repeat(&mut self) -> TimeoutAction {
+        let Some(settings) = self.repeat.settings else {
+            self.repeat_token = None;
+            return TimeoutAction::Drop;
+        };
+        let Some(repeating) = self.repeat.key.as_mut() else {
+            self.repeat_token = None;
+            return TimeoutAction::Drop;
+        };
+        if !repeating.surface.is_alive()
+            || self.keyboard_surface.as_ref() != Some(&repeating.surface)
+        {
+            self.clear_key_repeat();
+            return TimeoutAction::Drop;
+        }
+
+        let elapsed = if repeating.first {
+            repeating.first = false;
+            settings.delay
+        } else {
+            settings.interval
+        };
+        repeating.event.time = repeating
+            .event
+            .time
+            .wrapping_add(elapsed.as_millis().min(u128::from(u32::MAX)) as u32);
+        let event = repeating.event.clone();
+        let raw_code = event.raw_code;
+        let surface = repeating.surface.clone();
+        let qh = self.queue.clone();
+        let repeats = self.key(event, 0, false, &qh);
+        let session_is_current = self.repeat.key.as_ref().is_some_and(|repeating| {
+            repeating.event.raw_code == raw_code && repeating.surface == surface
+        });
+        if !repeats || !session_is_current {
+            self.clear_key_repeat();
+            TimeoutAction::Drop
+        } else {
+            TimeoutAction::ToDuration(settings.interval)
+        }
+    }
+
+    fn key(&mut self, event: KeyEvent, serial: u32, direct: bool, qh: &QueueHandle<Self>) -> bool {
+        let Some(index) = self.keyboard_surface.as_ref().and_then(|wl| self.index(wl)) else {
+            return false;
+        };
+        if direct && event.keysym == Keysym::Escape {
             let owner = self.surfaces[index].owner();
             if self.surfaces[index].role.popup_mode().is_some() {
                 self.remove_popup(index, true, true);
                 self.reconcile_hover_intent();
-                return;
+                return false;
             }
             if let Some(popup) = self.surfaces.iter().position(|surface| {
                 surface.owner() == owner
@@ -1883,11 +2157,11 @@ impl App {
             }) {
                 self.remove_popup(popup, true, true);
                 self.reconcile_hover_intent();
-                return;
+                return false;
             }
         }
         let surface = &mut self.surfaces[index];
-        if event.keysym == Keysym::Tab || event.keysym == Keysym::ISO_Left_Tab {
+        if direct && (event.keysym == Keysym::Tab || event.keysym == Keysym::ISO_Left_Tab) {
             let order: Vec<_> = surface
                 .layout
                 .as_ref()
@@ -1898,7 +2172,7 @@ impl App {
                     .input
                     .focused
                     .and_then(|id| order.iter().position(|candidate| *candidate == id));
-                let next = if self.shift {
+                let next = if self.modifiers.shift {
                     current.map_or(order.len() - 1, |n| (n + order.len() - 1) % order.len())
                 } else {
                     current.map_or(0, |n| (n + 1) % order.len())
@@ -1907,11 +2181,14 @@ impl App {
                 surface.dirty = true;
             }
             self.reconcile_hover_intent();
-            return;
+            return false;
         }
         let Some(id) = surface.input.focused else {
-            return;
+            return false;
         };
+        if !focused_widget_is_interactive(surface.layout.as_ref(), id) {
+            return false;
+        }
         let output = surface.output.clone();
         let key = surface.key.clone();
         let Some(node) = self
@@ -1919,45 +2196,77 @@ impl App {
             .surface_root(&output, &key)
             .and_then(|root| root.find(id))
         else {
-            return;
+            return false;
         };
         let event_surface = self.surfaces[index].role.surface().clone();
-        let origin = direct
-            .then(|| self.input_origin(event_surface.clone(), serial))
-            .flatten();
-        if node.kind == Kind::Button
-            && (event.keysym == Keysym::Return || event.keysym == Keysym::space)
-        {
-            self.surfaces[index].input.reveal_keyboard_focus();
-            self.surfaces[index].dirty = true;
-            self.dispatch(output, id, Event::Click, origin);
-            if let Some(index) = self.index(&event_surface) {
-                self.sync_popup(index, serial, Some(id), qh);
+        let origin = keyboard_input_serial(direct, serial)
+            .and_then(|serial| self.input_origin(event_surface.clone(), serial));
+        let Some(action) = widget_key_action(node.kind, event.keysym, direct) else {
+            return false;
+        };
+        match action {
+            WidgetKeyAction::Activate => {
+                self.surfaces[index].input.reveal_keyboard_focus();
+                self.surfaces[index].dirty = true;
+                self.dispatch(output, id, Event::Click, origin);
+                if let Some(index) = self.index(&event_surface) {
+                    self.sync_popup(index, serial, Some(id), qh);
+                }
             }
-        } else if node.kind == Kind::Slider {
-            let slider = node.slider;
-            let step = if slider.step > 0.0 {
-                slider.step
-            } else {
-                (slider.max - slider.min) / 100.0
-            };
-            let value = match event.keysym {
-                Keysym::Left | Keysym::Down => slider.value - step,
-                Keysym::Right | Keysym::Up => slider.value + step,
-                Keysym::Home => slider.min,
-                Keysym::End => slider.max,
-                _ => return,
-            };
-            self.surfaces[index].input.reveal_keyboard_focus();
-            self.surfaces[index].dirty = true;
-            self.dispatch(
-                output,
-                id,
-                Event::Change(value.clamp(slider.min, slider.max)),
-                origin,
-            );
+            WidgetKeyAction::Slider(action) => {
+                let slider = node.slider;
+                let step = if slider.step > 0.0 {
+                    slider.step
+                } else {
+                    (slider.max - slider.min) / 100.0
+                };
+                let value = match action {
+                    SliderKeyAction::Decrease => slider.value - step,
+                    SliderKeyAction::Increase => slider.value + step,
+                    SliderKeyAction::Minimum => slider.min,
+                    SliderKeyAction::Maximum => slider.max,
+                };
+                self.surfaces[index].input.reveal_keyboard_focus();
+                self.surfaces[index].dirty = true;
+                self.dispatch(
+                    output,
+                    id,
+                    Event::Change(value.clamp(slider.min, slider.max)),
+                    origin,
+                );
+            }
         }
+        action.repeats()
     }
+}
+
+fn widget_key_action(kind: Kind, keysym: Keysym, direct: bool) -> Option<WidgetKeyAction> {
+    match (kind, keysym) {
+        (Kind::Button, Keysym::Return | Keysym::space) if direct => Some(WidgetKeyAction::Activate),
+        (Kind::Slider, Keysym::Left | Keysym::Down) => {
+            Some(WidgetKeyAction::Slider(SliderKeyAction::Decrease))
+        }
+        (Kind::Slider, Keysym::Right | Keysym::Up) => {
+            Some(WidgetKeyAction::Slider(SliderKeyAction::Increase))
+        }
+        (Kind::Slider, Keysym::Home) if direct => {
+            Some(WidgetKeyAction::Slider(SliderKeyAction::Minimum))
+        }
+        (Kind::Slider, Keysym::End) if direct => {
+            Some(WidgetKeyAction::Slider(SliderKeyAction::Maximum))
+        }
+        _ => None,
+    }
+}
+
+fn keyboard_input_serial(direct: bool, serial: u32) -> Option<u32> {
+    direct.then_some(serial)
+}
+
+fn focused_widget_is_interactive(layout: Option<&Layout>, id: NodeId) -> bool {
+    layout
+        .and_then(|layout| layout.get(id))
+        .is_some_and(|placement| placement.interactive)
 }
 
 fn panel_size(geometry: Geometry, output: (u32, u32)) -> (u32, u32) {
@@ -2593,7 +2902,7 @@ impl OutputHandler for App {
             .as_ref()
             .is_some_and(|wl| self.index(wl).is_none())
         {
-            self.keyboard_surface = None;
+            self.clear_keyboard_focus();
         }
     }
 }
@@ -2723,6 +3032,9 @@ impl SeatHandler for App {
                 }
             }
             Capability::Keyboard if self.keyboard.is_none() => {
+                self.clear_key_repeat();
+                self.repeat.settings = None;
+                self.keyboard_keymap = None;
                 match self.seats.get_keyboard(qh, &seat, None) {
                     Ok(keyboard) => self.keyboard = Some(keyboard),
                     Err(error) => self.error = Some(error.to_string()),
@@ -2747,11 +3059,13 @@ impl SeatHandler for App {
             pointer.release();
             self.clear_pointer_state(true);
         }
-        if capability == Capability::Keyboard
-            && let Some(keyboard) = self.keyboard.take()
-        {
-            keyboard.release();
-            self.keyboard_surface = None;
+        if capability == Capability::Keyboard {
+            if let Some(keyboard) = self.keyboard.take() {
+                keyboard.release();
+            }
+            self.repeat.settings = None;
+            self.keyboard_keymap = None;
+            self.clear_keyboard_focus();
             self.reconcile_hover_intent();
         }
     }
@@ -2764,7 +3078,9 @@ impl SeatHandler for App {
             if let Some(keyboard) = self.keyboard.take() {
                 keyboard.release();
             }
-            self.keyboard_surface = None;
+            self.repeat.settings = None;
+            self.keyboard_keymap = None;
+            self.clear_keyboard_focus();
             self.clear_pointer_state(false);
             for surface in &mut self.surfaces {
                 surface.input = Interaction::default();
@@ -2811,6 +3127,7 @@ impl PointerHandler for App {
                 PointerEventKind::Press { button, serial, .. }
                     if matches!(button, 0x110..=0x112) =>
                 {
+                    self.clear_key_repeat();
                     let surface = &mut self.surfaces[index];
                     surface.pointer_position = Some(point);
                     surface.input.pressed = hit;
@@ -2907,7 +3224,70 @@ fn scroll_distance(steps: f64) -> Option<f32> {
 
 #[cfg(test)]
 mod input_tests {
-    use super::scroll_distance;
+    use std::{num::NonZeroU32, time::Duration};
+
+    use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym, RepeatInfo};
+    use thing_core::{Kind, Node, NodeId};
+    use thing_ui::{Layout, Measurer, Size};
+
+    use super::{
+        RepeatSession, RepeatTimerAction, SliderKeyAction, WidgetKeyAction,
+        focused_widget_is_interactive, keyboard_input_serial, scroll_distance, widget_key_action,
+    };
+
+    struct FixedMeasurer;
+
+    impl Measurer for FixedMeasurer {
+        fn measure(&mut self, _: &Node, _: Option<f32>) -> Size {
+            Size {
+                width: 20.0,
+                height: 20.0,
+            }
+        }
+    }
+
+    fn slider_layout(parent_enabled: bool, slider_visible: bool) -> Layout {
+        let mut panel = Node::new(NodeId(1), Kind::Panel);
+        panel.style.width = Some(200.0);
+        panel.style.height = Some(50.0);
+        let mut row = Node::new(NodeId(2), Kind::Row);
+        row.enabled = parent_enabled;
+        let mut slider = Node::new(NodeId(3), Kind::Slider);
+        slider.visible = slider_visible;
+        slider.style.width = Some(100.0);
+        slider.style.height = Some(30.0);
+        row.children.push(slider);
+        panel.children.push(row);
+        Layout::compute(
+            &panel,
+            Size {
+                width: 200.0,
+                height: 50.0,
+            },
+            &mut FixedMeasurer,
+        )
+        .unwrap()
+    }
+
+    fn key_event(raw_code: u32, keysym: Keysym) -> KeyEvent {
+        KeyEvent {
+            time: 10,
+            raw_code,
+            keysym,
+            utf8: None,
+        }
+    }
+
+    fn right_key(raw_code: u32) -> KeyEvent {
+        key_event(raw_code, Keysym::Right)
+    }
+
+    fn enabled_repeat() -> RepeatInfo {
+        RepeatInfo::Repeat {
+            rate: NonZeroU32::new(25).unwrap(),
+            delay: 600,
+        }
+    }
 
     #[test]
     fn scroll_steps_convert_to_finite_logical_distance() {
@@ -2917,6 +3297,143 @@ mod input_tests {
         assert_eq!(scroll_distance(f64::NAN), None);
         assert_eq!(scroll_distance(f64::INFINITY), None);
         assert_eq!(scroll_distance(f64::MAX), None);
+    }
+
+    #[test]
+    fn button_activation_never_repeats() {
+        assert_eq!(
+            widget_key_action(Kind::Button, Keysym::Return, true),
+            Some(WidgetKeyAction::Activate)
+        );
+        assert_eq!(
+            widget_key_action(Kind::Button, Keysym::space, true),
+            Some(WidgetKeyAction::Activate)
+        );
+        assert_eq!(widget_key_action(Kind::Button, Keysym::Return, false), None);
+        assert_eq!(widget_key_action(Kind::Button, Keysym::space, false), None);
+        assert!(!WidgetKeyAction::Activate.repeats());
+    }
+
+    #[test]
+    fn slider_arrows_repeat_but_endpoints_do_not() {
+        assert_eq!(
+            widget_key_action(Kind::Slider, Keysym::Left, false),
+            Some(WidgetKeyAction::Slider(SliderKeyAction::Decrease))
+        );
+        assert_eq!(
+            widget_key_action(Kind::Slider, Keysym::Right, false),
+            Some(WidgetKeyAction::Slider(SliderKeyAction::Increase))
+        );
+        assert_eq!(
+            widget_key_action(Kind::Slider, Keysym::Home, true),
+            Some(WidgetKeyAction::Slider(SliderKeyAction::Minimum))
+        );
+        assert_eq!(
+            widget_key_action(Kind::Slider, Keysym::End, true),
+            Some(WidgetKeyAction::Slider(SliderKeyAction::Maximum))
+        );
+        assert_eq!(widget_key_action(Kind::Slider, Keysym::Home, false), None);
+        assert_eq!(widget_key_action(Kind::Slider, Keysym::End, false), None);
+        assert!(WidgetKeyAction::Slider(SliderKeyAction::Decrease).repeats());
+        assert!(WidgetKeyAction::Slider(SliderKeyAction::Increase).repeats());
+        assert!(!WidgetKeyAction::Slider(SliderKeyAction::Minimum).repeats());
+        assert!(!WidgetKeyAction::Slider(SliderKeyAction::Maximum).repeats());
+    }
+
+    #[test]
+    fn repeated_keys_cannot_reuse_an_activation_serial() {
+        assert_eq!(keyboard_input_serial(true, 42), Some(42));
+        assert_eq!(keyboard_input_serial(false, 42), None);
+    }
+
+    #[test]
+    fn keyboard_actions_require_an_interactive_focused_placement() {
+        let enabled = slider_layout(true, true);
+        assert!(focused_widget_is_interactive(Some(&enabled), NodeId(3)));
+
+        let disabled = slider_layout(false, true);
+        assert!(!focused_widget_is_interactive(Some(&disabled), NodeId(3)));
+
+        let hidden = slider_layout(true, false);
+        assert!(!focused_widget_is_interactive(Some(&hidden), NodeId(3)));
+        assert!(!focused_widget_is_interactive(None, NodeId(3)));
+    }
+
+    #[test]
+    fn repeat_session_transfers_ownership_without_losing_the_held_key() {
+        let mut session = RepeatSession::<u8>::default();
+        assert_eq!(session.update(RepeatInfo::Disable), RepeatTimerAction::None);
+        assert_eq!(
+            session.press(right_key(106), 7, true, true),
+            RepeatTimerAction::None
+        );
+        assert!(session.accepts_compositor_repeat(106, &7));
+        assert_eq!(session.key.as_ref().unwrap().event.raw_code, 106);
+
+        assert_eq!(
+            session.update(enabled_repeat()),
+            RepeatTimerAction::Arm(Duration::from_millis(600))
+        );
+        assert!(session.host_armed);
+        assert_eq!(session.key.as_ref().unwrap().surface, 7);
+        assert!(!session.accepts_compositor_repeat(106, &7));
+
+        assert_eq!(
+            session.update(RepeatInfo::Disable),
+            RepeatTimerAction::Disarm
+        );
+        assert!(!session.host_armed);
+        assert_eq!(session.key.as_ref().unwrap().event.raw_code, 106);
+        assert!(session.accepts_compositor_repeat(106, &7));
+    }
+
+    #[test]
+    fn release_and_focus_loss_clear_the_repeat_session() {
+        let mut session = RepeatSession::<u8>::default();
+        assert_eq!(session.update(enabled_repeat()), RepeatTimerAction::None);
+        assert_eq!(
+            session.press(right_key(106), 7, true, true),
+            RepeatTimerAction::Arm(Duration::from_millis(600))
+        );
+        assert_eq!(session.release(105), RepeatTimerAction::None);
+        assert!(session.key.is_some());
+        assert_eq!(session.release(106), RepeatTimerAction::Disarm);
+        assert!(session.key.is_none());
+        assert!(!session.host_armed);
+
+        assert_eq!(
+            session.press(right_key(106), 8, true, true),
+            RepeatTimerAction::Arm(Duration::from_millis(600))
+        );
+        assert_eq!(session.clear(), RepeatTimerAction::Disarm);
+        assert!(session.key.is_none());
+        assert!(!session.host_armed);
+    }
+
+    #[test]
+    fn physical_repeatability_controls_session_replacement() {
+        let mut session = RepeatSession::<u8>::default();
+        assert_eq!(session.update(enabled_repeat()), RepeatTimerAction::None);
+        assert_eq!(
+            session.press(right_key(106), 7, true, true),
+            RepeatTimerAction::Arm(Duration::from_millis(600))
+        );
+
+        assert_eq!(
+            session.press(key_event(42, Keysym::Shift_L), 8, false, false),
+            RepeatTimerAction::None
+        );
+        let held = session.key.as_ref().unwrap();
+        assert_eq!(held.event.raw_code, 106);
+        assert_eq!(held.surface, 7);
+        assert!(session.host_armed);
+
+        assert_eq!(
+            session.press(key_event(102, Keysym::Home), 8, true, false),
+            RepeatTimerAction::Disarm
+        );
+        assert!(session.key.is_none());
+        assert!(!session.host_armed);
     }
 }
 
@@ -2931,6 +3448,7 @@ impl KeyboardHandler for App {
         _: &[u32],
         _: &[Keysym],
     ) {
+        self.clear_keyboard_focus();
         self.keyboard_surface = Some(surface.clone());
         self.reconcile_hover_intent();
     }
@@ -2939,10 +3457,12 @@ impl KeyboardHandler for App {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _: u32,
     ) {
-        self.keyboard_surface = None;
+        if self.keyboard_surface.as_ref() == Some(surface) {
+            self.clear_keyboard_focus();
+        }
         self.reconcile_hover_intent();
     }
     fn press_key(
@@ -2953,17 +3473,27 @@ impl KeyboardHandler for App {
         serial: u32,
         event: KeyEvent,
     ) {
-        self.key(event, serial, true, qh);
+        let key_repeats = self.physical_key_repeats(event.raw_code);
+        let action_repeats = self.key(event.clone(), serial, true, qh);
+        self.finish_key_press(event, key_repeats, action_repeats);
     }
     fn repeat_key(
         &mut self,
         _: &Connection,
         qh: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
-        serial: u32,
+        _: u32,
         event: KeyEvent,
     ) {
-        self.key(event, serial, false, qh);
+        // wl_keyboard v10 lets the compositor take over repeat generation by
+        // disabling the client clock and sending repeated key states instead.
+        if self.keyboard_surface.as_ref().is_some_and(|surface| {
+            self.repeat
+                .accepts_compositor_repeat(event.raw_code, surface)
+        }) && !self.key(event, 0, false, qh)
+        {
+            self.clear_key_repeat();
+        }
     }
     fn release_key(
         &mut self,
@@ -2971,8 +3501,10 @@ impl KeyboardHandler for App {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: KeyEvent,
+        event: KeyEvent,
     ) {
+        let action = self.repeat.release(event.raw_code);
+        self.apply_repeat_timer(action);
     }
     fn update_modifiers(
         &mut self,
@@ -2984,7 +3516,38 @@ impl KeyboardHandler for App {
         _: RawModifiers,
         _: u32,
     ) {
-        self.shift = modifiers.shift;
+        self.modifiers = modifiers;
+    }
+
+    fn update_repeat_info(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        info: RepeatInfo,
+    ) {
+        let action = self.repeat.update(info);
+        self.apply_repeat_timer(action);
+    }
+
+    fn update_keymap(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        keymap: Keymap<'_>,
+    ) {
+        self.clear_key_repeat();
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        self.keyboard_keymap = xkb::Keymap::new_from_string(
+            &context,
+            keymap.as_string(),
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::COMPILE_NO_FLAGS,
+        );
+        if self.keyboard_keymap.is_none() {
+            self.error = Some("cannot retain the keyboard keymap".into());
+        }
     }
 }
 

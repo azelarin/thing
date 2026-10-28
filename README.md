@@ -55,7 +55,8 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] popup positioning controls
 - [x] hover popups
 - [x] scrolling containers
-- [ ] text input and consistent key repeat
+- [x] consistent keyboard repeat
+- [ ] text input
 - [x] vulkan rendering alongside opengl
 - [ ] drag and drop, animations, and custom shapes
 - [x] microphone controls
