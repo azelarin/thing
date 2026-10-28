@@ -41,6 +41,7 @@ const MAX_READ_BYTES_PER_TURN: usize = 64 * 1024;
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const GROUP_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+const POST_KILL_GROUP_SCAN_INTERVAL: Duration = Duration::from_millis(75);
 const STUCK_GROUP_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_STUCK_GROUP_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(5);
@@ -798,6 +799,10 @@ fn maintain(
         if escalation_due(run, now) {
             signal_owned(run, libc::SIGKILL);
             run.kill_sent = true;
+            run.group_scan_delay = POST_KILL_GROUP_SCAN_INTERVAL;
+            run.next_group_check = run
+                .next_group_check
+                .min(now + POST_KILL_GROUP_SCAN_INTERVAL);
         }
         if run.wait_status.is_none()
             && !run.identity_lost
@@ -974,10 +979,11 @@ fn escalation_due(run: &Run, now: Instant) -> bool {
 fn defer_group_scan(run: &mut Run, now: Instant, ordinary_delay: Duration) {
     let delay = if run.kill_sent {
         let delay = run.group_scan_delay;
-        run.group_scan_delay = run
-            .group_scan_delay
-            .saturating_mul(2)
-            .min(MAX_STUCK_GROUP_SCAN_INTERVAL);
+        run.group_scan_delay = if delay < STUCK_GROUP_SCAN_INTERVAL {
+            STUCK_GROUP_SCAN_INTERVAL
+        } else {
+            delay.saturating_mul(2).min(MAX_STUCK_GROUP_SCAN_INTERVAL)
+        };
         delay
     } else {
         ordinary_delay
@@ -1735,6 +1741,7 @@ fn initial_group_has_other_members(pgid: u32) -> io::Result<bool> {
             return Ok(true);
         }
     }
+    ensure_authoritative_procfs()?;
     Ok(false)
 }
 
@@ -2102,13 +2109,14 @@ mod tests {
 
         let run = runs.get_mut(&token).unwrap();
         run.kill_sent = true;
+        run.group_scan_delay = POST_KILL_GROUP_SCAN_INTERVAL;
         let now = Instant::now();
         defer_group_scan(run, now, GROUP_SCAN_INTERVAL);
-        assert_eq!(run.next_group_check, now + STUCK_GROUP_SCAN_INTERVAL);
-        assert_eq!(run.group_scan_delay, Duration::from_secs(2));
+        assert_eq!(run.next_group_check, now + POST_KILL_GROUP_SCAN_INTERVAL);
+        assert_eq!(run.group_scan_delay, STUCK_GROUP_SCAN_INTERVAL);
         let next = run.next_group_check;
         defer_group_scan(run, next, GROUP_SCAN_INTERVAL);
-        assert_eq!(run.group_scan_delay, Duration::from_secs(4));
+        assert_eq!(run.group_scan_delay, Duration::from_secs(2));
     }
 
     #[test]
@@ -2457,6 +2465,25 @@ mod tests {
     }
 
     #[test]
+    fn production_shutdown_reaps_a_group_after_its_leader_exits() {
+        let output = fixture("managed_process::tests::fake_manager_group_shutdown_parent")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = String::from_utf8(output.stdout).unwrap();
+        let pid = marker_pid(&output, "retired_descendant=");
+        assert!(
+            !process_exists(pid),
+            "managed descendant {pid} survived its parent"
+        );
+    }
+
+    #[test]
     #[ignore = "managed process fixture"]
     fn fake_child_output() {
         println!("hello from child");
@@ -2515,19 +2542,51 @@ mod tests {
 
     #[test]
     #[ignore = "managed process fixture"]
-    #[allow(clippy::zombie_processes)]
     fn fake_child_group() {
-        let mut descendant = Command::new(env::current_exe().unwrap());
-        descendant.args([
-            "--ignored",
-            "--exact",
-            "managed_process::tests::fake_child_ignore_term",
-            "--nocapture",
-            "--quiet",
-            "--test-threads=1",
-        ]);
-        let descendant = descendant.spawn().unwrap();
-        println!("descendant={}", descendant.id());
+        let mut pipe = [0; 2];
+        // SAFETY: pipe is valid output storage for two descriptors.
+        let pipe_result = unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(pipe_result, 0);
+        // SAFETY: the child branch never returns to Rust or touches shared
+        // runtime state; the parent continues the isolated fixture normally.
+        let descendant = unsafe { libc::fork() };
+        if descendant == -1 {
+            panic!(
+                "cannot fork managed process group fixture: {}",
+                io::Error::last_os_error()
+            );
+        }
+        if descendant == 0 {
+            // SAFETY: these descriptor, disposition, write, and wait operations
+            // are async-signal-safe after fork.
+            unsafe {
+                libc::close(pipe[0]);
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                let ready = [1_u8];
+                let _ = libc::write(pipe[1], ready.as_ptr().cast(), ready.len());
+                libc::close(pipe[1]);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        // SAFETY: the parent owns both pipe descriptors and waits only for the
+        // child's one-byte readiness signal.
+        unsafe {
+            libc::close(pipe[1]);
+            let mut ready = [0_u8];
+            loop {
+                let read = libc::read(pipe[0], ready.as_mut_ptr().cast(), ready.len());
+                if read == 1 {
+                    break;
+                }
+                assert!(
+                    read == -1 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                );
+            }
+            libc::close(pipe[0]);
+        }
+        println!("descendant={descendant}");
         std::io::stdout().flush().unwrap();
     }
 
@@ -2566,5 +2625,27 @@ mod tests {
             "managed child {pid} survived manager drop"
         );
         println!("retired_pid={pid}");
+    }
+
+    #[test]
+    #[ignore = "managed process fixture"]
+    fn fake_manager_group_shutdown_parent() {
+        let (_launcher, _signals) = crate::launch::prepare().unwrap();
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let manager = Manager::start(ping).unwrap();
+        manager.replace_scope(vec![definition("group")]).unwrap();
+        manager
+            .start_process("group", helper("group"), None)
+            .unwrap();
+        let state = wait_for(&manager, |state| {
+            state.status == Status::Stopping && state.stdout.contains("descendant=")
+        });
+        let pid = marker_pid(&state.stdout, "descendant=");
+        drop(manager);
+        assert!(
+            !process_exists(pid),
+            "managed descendant {pid} survived manager drop"
+        );
+        println!("retired_descendant={pid}");
     }
 }
