@@ -12,7 +12,7 @@ wgpu = ["femtovg/wgpu"]
 [dependencies]
 thing-core = { path = "../thing-core" }
 taffy = { version = "0.15.1", default-features = false, features = ["std", "taffy_tree", "flexbox", "content_size"] }
-femtovg = { version = "0.27.0", default-features = false, features = ["swash"] }
+femtovg = { version = "0.28.0", default-features = false, features = ["swash"] }
 parley = "0.6.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 resvg = { version = "0.47", default-features = false }
