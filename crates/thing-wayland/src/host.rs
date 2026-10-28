@@ -662,9 +662,11 @@ impl App {
     }
     fn refresh(&mut self) {
         let layer_shell_version = self.layer_shell_version;
-        for output in self.configurations.refresh_checked(|_, surfaces| {
+        let outputs = self.configurations.refresh_checked(|_, surfaces| {
             validate_surface_capabilities(surfaces, layer_shell_version)
-        }) {
+        });
+        self.update_watch();
+        for output in outputs {
             self.invalidate_output(&output);
         }
     }
@@ -1035,11 +1037,13 @@ impl App {
         if context.scale != scale {
             context.scale = scale;
             let layer_shell_version = self.layer_shell_version;
-            match self
+            let result = self
                 .configurations
                 .set_output_checked(output, context, |surfaces| {
                     validate_surface_capabilities(surfaces, layer_shell_version)
-                }) {
+                });
+            self.update_watch();
+            match result {
                 Ok(true) => self.invalidate_output(output),
                 Ok(false) => {}
                 Err(error) => eprintln!("thing: cannot update output scale: {error}"),
@@ -1360,21 +1364,22 @@ impl App {
         origin: Option<InputOrigin>,
     ) {
         let layer_shell_version = self.layer_shell_version;
-        let (changed, actions) =
-            match self
-                .configurations
-                .dispatch_checked(&output, id, event, |surfaces| {
-                    validate_surface_capabilities(surfaces, layer_shell_version)
-                }) {
-                Ok(result) => result,
-                Err(error) => {
-                    eprintln!("thing: {error}");
-                    // hover cleanup can fail after its first valid refresh was
-                    // published, so reconcile whichever snapshot remains.
-                    self.invalidate_output(&output);
-                    return;
-                }
-            };
+        let result = self
+            .configurations
+            .dispatch_checked(&output, id, event, |surfaces| {
+                validate_surface_capabilities(surfaces, layer_shell_version)
+            });
+        self.update_watch();
+        let (changed, actions) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("thing: {error}");
+                // hover cleanup can fail after its first valid refresh was
+                // published, so reconcile whichever snapshot remains.
+                self.invalidate_output(&output);
+                return;
+            }
+        };
         // a successful handler can remove its own popup. request activation
         // before invalidation destroys the surface that received the input.
         for action in actions {
@@ -2862,11 +2867,13 @@ impl OutputHandler for App {
             return;
         }
         let layer_shell_version = self.layer_shell_version;
-        match self
+        let result = self
             .configurations
             .set_output_checked(&output, context, |surfaces| {
                 validate_surface_capabilities(surfaces, layer_shell_version)
-            }) {
+            });
+        self.update_watch();
+        match result {
             Ok(true) => self.invalidate_output(&output),
             Ok(false) => {}
             Err(error) => eprintln!("thing: cannot update output: {error}"),

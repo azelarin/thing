@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, time::Duration};
+use std::{collections::BTreeSet, fs, path::PathBuf, time::Duration};
 use tempfile::TempDir;
 use thing_core::{Color, CrossAlign, KeyboardMode, Kind, MainAlign, TextAlign, TextOverflow};
 use thing_runtime::{
@@ -31,6 +31,68 @@ fn loads_typed_luau_and_relative_theme_modules() {
     let runtime = Runtime::load(&path).unwrap();
     assert_eq!(runtime.root().unwrap().children[0].text, "42");
     assert_eq!(runtime.files().len(), 2);
+}
+
+#[test]
+fn resolves_assets_from_their_defining_module_in_late_closures() {
+    let directory = tempfile::tempdir().unwrap();
+    let nested = directory.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    let path = directory.path().join("panel.luau");
+    let module = nested.join("image.luau");
+    fs::write(
+        &path,
+        r#"
+        local selected = ui.state(false)
+        local image = require('./nested/image')
+        return ui.panel { children = {
+            image(selected),
+            ui.image { source = './literal.png' },
+            ui.button { on_click = function() selected:set(true) end },
+        } }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        &module,
+        r#"
+        local asset = ui.asset
+        return function(selected)
+            return ui.image { source = function()
+                local name = if selected:get() then './active.svg' else '../idle.svg'
+                return asset(name)
+            end }
+        end
+        "#,
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::load(&path).unwrap();
+    let idle = directory.path().join("idle.svg");
+    assert_eq!(
+        runtime.root().unwrap().children[0].image.source.as_deref(),
+        idle.to_str()
+    );
+    assert_eq!(
+        runtime.root().unwrap().children[1].image.source.as_deref(),
+        Some("./literal.png")
+    );
+    assert_eq!(
+        runtime.files().into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([path.clone(), module.clone(), idle.clone()])
+    );
+
+    let button = runtime.root().unwrap().children[2].id;
+    assert!(runtime.dispatch(button, Event::Click).unwrap());
+    let active = nested.join("active.svg");
+    assert_eq!(
+        runtime.root().unwrap().children[0].image.source.as_deref(),
+        active.to_str()
+    );
+    assert_eq!(
+        runtime.files().into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([path, module, idle, active])
+    );
 }
 
 #[test]
@@ -493,6 +555,7 @@ fn rejects_invalid_flex_layout_options() {
 fn failed_reload_preserves_widgets_and_local_state() {
     let (_directory, path) = fixture(
         r#"
+        ui.asset('./old.svg')
         local count = ui.state(0)
         return ui.panel { children = {
             ui.text { text = function() return tostring(count:get()) end },
@@ -504,9 +567,15 @@ fn failed_reload_preserves_widgets_and_local_state() {
     let button = runtime.root().unwrap().children[1].id;
     runtime.dispatch(button, Event::Click).unwrap();
     let before = runtime.root().unwrap().clone();
-    fs::write(&path, "return ui.panel { nope = true }").unwrap();
+    let files = runtime.files();
+    fs::write(
+        &path,
+        "ui.asset('./candidate.svg')\nreturn ui.panel { nope = true }",
+    )
+    .unwrap();
     assert!(runtime.reload(&path).is_err());
     assert_eq!(runtime.root().unwrap(), &before);
+    assert_eq!(runtime.files(), files);
     runtime.dispatch(button, Event::Click).unwrap();
     assert_eq!(runtime.root().unwrap().children[0].text, "2");
     fs::write(&path, "return ui.panel {}").unwrap();
