@@ -28,6 +28,7 @@ pub struct Placement {
     pub interactive: bool,
     pub enabled: bool,
     pub opacity: f32,
+    pub(crate) disabled_opacity: f32,
 }
 
 /// scroll offsets for one surface, measured in logical pixels.
@@ -86,6 +87,7 @@ struct Inherited {
     clip: Rect,
     enabled: bool,
     opacity: f32,
+    disabled_opacity: f32,
     interactive_parent: Option<NodeId>,
     scroll_parent: Option<NodeId>,
 }
@@ -187,6 +189,7 @@ impl Layout {
                 clip,
                 enabled: true,
                 opacity: 1.0,
+                disabled_opacity: 1.0,
                 interactive_parent: None,
                 scroll_parent: None,
             },
@@ -286,6 +289,7 @@ impl Layout {
             clip,
             enabled,
             opacity,
+            disabled_opacity,
             interactive_parent,
             scroll_parent,
         } = inherited;
@@ -295,6 +299,13 @@ impl Layout {
             y: origin.y + geometry.location.y,
             width: geometry.size.width,
             height: geometry.size.height,
+        };
+        // a disabled branch inherits the factor chosen by the widget that
+        // disables it instead of compounding a factor at every descendant.
+        let disabled_opacity = if enabled && !node.enabled {
+            node.style.disabled_opacity
+        } else {
+            disabled_opacity
         };
         let enabled = enabled && node.enabled;
         let opacity = opacity * node.style.opacity;
@@ -315,6 +326,7 @@ impl Layout {
             interactive: enabled && node.kind.is_interactive(),
             enabled,
             opacity,
+            disabled_opacity,
         });
         self.pointer_regions.push(PointerRegion {
             bounds,
@@ -360,6 +372,7 @@ impl Layout {
                         clip: child_clip,
                         enabled,
                         opacity,
+                        disabled_opacity,
                         interactive_parent: pointer_interactive,
                         scroll_parent: child_scroll_parent,
                     },
@@ -470,6 +483,7 @@ fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thing_core::Style;
 
     struct FixedText;
     impl Measurer for FixedText {
@@ -605,6 +619,60 @@ mod tests {
         .unwrap();
         assert_eq!(layout.hit_test(Point { x: 25.0, y: 10.0 }), None);
         assert_eq!(layout.focus_order().collect::<Vec<_>>(), vec![NodeId(2)]);
+    }
+
+    #[test]
+    fn disabled_opacity_fades_an_inherited_branch_once() {
+        let mut root = fixed(1, Kind::Column, 100.0, 100.0);
+        root.style.opacity = 0.8;
+        let mut branch = fixed(2, Kind::Column, 100.0, 50.0);
+        branch.enabled = false;
+        branch.style.opacity = 0.5;
+        branch.style.disabled_opacity = 0.25;
+        let mut child = fixed(3, Kind::Button, 100.0, 20.0);
+        child.enabled = false;
+        child.style.opacity = 0.5;
+        child.style.disabled_opacity = 0.1;
+        branch.children.push(child);
+        root.children.push(branch);
+
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 100.0,
+                height: 100.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+
+        let opacity = |id| {
+            let placement = layout.get(NodeId(id)).unwrap();
+            placement.opacity * placement.disabled_opacity
+        };
+        assert!((opacity(1) - 0.8).abs() < f32::EPSILON);
+        assert!((opacity(2) - 0.1).abs() < f32::EPSILON);
+        assert!((opacity(3) - 0.05).abs() < f32::EPSILON);
+
+        root.style.opacity = 1.0;
+        root.children[0].style.opacity = 1.0;
+        root.children[0].style.disabled_opacity = Style::default().disabled_opacity;
+        root.children[0].children[0].style.opacity = 1.0;
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 100.0,
+                height: 100.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        let opacity = |id| {
+            let placement = layout.get(NodeId(id)).unwrap();
+            placement.opacity * placement.disabled_opacity
+        };
+        assert_eq!(opacity(2), 0.45);
+        assert_eq!(opacity(3), 0.45);
     }
 
     #[test]

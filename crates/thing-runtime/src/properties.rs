@@ -294,6 +294,17 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "style.border_color" => {
             node.style.border_color = string(value, name)?.parse().map_err(Error::external)?
         }
+        "style.hover_overlay" => {
+            node.style.hover_overlay = string(value, name)?.parse().map_err(Error::external)?
+        }
+        "style.pressed_overlay" => {
+            node.style.pressed_overlay = string(value, name)?.parse().map_err(Error::external)?
+        }
+        "style.disabled_opacity" => node.style.disabled_opacity = number(value, name)? as f32,
+        "style.focus_ring_color" => {
+            node.style.focus_ring_color = string(value, name)?.parse().map_err(Error::external)?
+        }
+        "style.focus_ring_width" => node.style.focus_ring_width = number(value, name)? as f32,
         "style.font_size" => node.style.font_size = number(value, name)? as f32,
         "style.font_weight" => node.style.font_weight = number(value, name)? as f32,
         "style.font_family" => node.style.font_family = string(value, name)?,
