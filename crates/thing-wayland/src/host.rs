@@ -37,7 +37,7 @@ use smithay_client_toolkit::{
 };
 use thing_core::{Kind, Node, NodeId, Point, Rect, Scale};
 use thing_runtime::{Action, Event, OutputContext, Scalar, ServiceSnapshot};
-use thing_ui::{Interaction, Layout, Painter, Size};
+use thing_ui::{Interaction, Layout, Painter, ScrollState, Size};
 use wayland_client::{
     Connection, Dispatch, QueueHandle, delegate_noop,
     globals::registry_queue_init,
@@ -252,6 +252,7 @@ struct Surface {
     viewport: Option<WpViewport>,
     fractional: Option<WpFractionalScaleV1>,
     layout: Option<Layout>,
+    scroll: ScrollState,
     input: Interaction,
     pointer_position: Option<Point>,
     hover_path: Vec<NodeId>,
@@ -401,6 +402,7 @@ impl App {
             };
             surface.root = root.id;
             surface.layout = None;
+            surface.scroll = ScrollState::default();
             surface.input = Interaction::default();
             surface.pointer_position = None;
             surface.hover_path.clear();
@@ -510,6 +512,7 @@ impl App {
             viewport,
             fractional,
             layout: None,
+            scroll: ScrollState::default(),
             input: Interaction::default(),
             pointer_position: None,
             hover_path: Vec::new(),
@@ -645,6 +648,7 @@ impl App {
                     width: surface.size.0 as f32,
                     height: surface.size.1 as f32,
                 },
+                &mut surface.scroll,
             )?;
             painter.paint(
                 root,
@@ -1863,11 +1867,25 @@ impl PointerHandler for App {
                     self.surfaces[index].pointer_position = Some(point);
                     let x = scroll_steps(horizontal);
                     let y = scroll_steps(vertical);
-                    if (x != 0.0 || y != 0.0)
-                        && let Some(id) = hit
-                    {
-                        let output = self.surfaces[index].output.clone();
+                    if x == 0.0 && y == 0.0 {
+                        continue;
+                    }
+                    let output = self.surfaces[index].output.clone();
+                    let handler = self.surfaces[index]
+                        .layout
+                        .as_ref()
+                        .and_then(|layout| layout.scroll_event_target(point))
+                        .filter(|id| self.configurations.has_scroll_handler(&output, *id));
+                    if let Some(id) = handler {
                         self.dispatch(output, id, Event::Scroll { x, y });
+                    } else if let Some(delta) = scroll_distance(y) {
+                        let surface = &mut self.surfaces[index];
+                        let changed = surface.layout.as_ref().is_some_and(|layout| {
+                            layout.scroll_y(point, delta, &mut surface.scroll)
+                        });
+                        if changed {
+                            surface.dirty = true;
+                        }
                     }
                 }
                 _ => {}
@@ -1884,6 +1902,27 @@ fn scroll_steps(axis: AxisScroll) -> f64 {
         f64::from(axis.discrete)
     } else {
         axis.absolute / 15.0
+    }
+}
+
+fn scroll_distance(steps: f64) -> Option<f32> {
+    const PIXELS_PER_STEP: f64 = 40.0;
+    let distance = (steps * PIXELS_PER_STEP) as f32;
+    (distance.is_finite() && distance != 0.0).then_some(distance)
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::scroll_distance;
+
+    #[test]
+    fn scroll_steps_convert_to_finite_logical_distance() {
+        assert_eq!(scroll_distance(1.0), Some(40.0));
+        assert_eq!(scroll_distance(-0.5), Some(-20.0));
+        assert_eq!(scroll_distance(0.0), None);
+        assert_eq!(scroll_distance(f64::NAN), None);
+        assert_eq!(scroll_distance(f64::INFINITY), None);
+        assert_eq!(scroll_distance(f64::MAX), None);
     }
 }
 
