@@ -238,6 +238,15 @@ pub enum TextOverflow {
     Ellipsis,
 }
 
+/// how an image is sized inside its content box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ImageFit {
+    #[default]
+    Contain,
+    Cover,
+    Fill,
+}
+
 /// placement on the cross axis of a flex container.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CrossAlign {
@@ -518,6 +527,7 @@ pub struct Node {
     pub max_lines: Option<u32>,
     pub text_overflow: TextOverflow,
     pub image: Image,
+    pub image_fit: ImageFit,
     pub popup: PopupOptions,
     pub slider: Slider,
     pub panel: PanelProperties,
@@ -537,6 +547,7 @@ impl Node {
             max_lines: None,
             text_overflow: TextOverflow::Clip,
             image: Image::default(),
+            image_fit: ImageFit::Contain,
             popup: PopupOptions::default(),
             slider: Slider::default(),
             panel: PanelProperties::default(),

@@ -234,7 +234,7 @@ widget kind; unkeyed children match by position and kind.
 | widget | additional properties |
 | --- | --- |
 | `text` | `text`: utf-8 string; optional `max_lines` and `overflow` |
-| `image` | one of `source`, `icon`, `app_id`; optional `icon_theme` |
+| `image` | one of `source`, `icon`, `app_id`; optional `icon_theme` and `fit` |
 | `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll`, `on_hover` |
 | `slider` | `min`, `max`, `value`, `step`, `on_change`, `on_hover` |
 | `popup` | `visible`, `open_on_hover`, `open_on_click`, `open_delay`, `close_delay`, `anchor`, `alignment`, `offset`, `constraints`, `on_hover`, `on_close` |
@@ -323,9 +323,9 @@ motion.
 
 ```luau
 ui.image {
-    app_id = 'firefox',
-    icon_theme = 'Papirus-Dark',
-    style = { width = 14, height = 14 },
+    source = '/absolute/path/to/cover.png',
+    fit = 'cover',
+    style = { width = 96, height = 64, radius = 6 },
 }
 ```
 
@@ -355,8 +355,11 @@ the process working directory.
 
 png, jpeg, webp, and path-based svg artwork are supported.
 svg text, embedded images, external references, animation, and svgz are not
-supported. images fit inside their content box without changing aspect ratio;
-the default box is 32×32 logical pixels. svgs rasterize at the output scale.
+supported. `fit` defaults to `contain`, which centers the complete image without
+changing its aspect ratio. `cover` preserves the aspect ratio while cropping the
+center to fill the content box. `fill` stretches the image to fill both axes.
+`style.radius` rounds the visible artwork inside any padding. the default image
+box is 32×32 logical pixels. svgs rasterize at the output scale.
 
 files are limited to 16 mib, raster input dimensions to 8192 per axis, and
 rendered images to 4096 per axis. the decoder allocation limit is 64 mib; the
