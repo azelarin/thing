@@ -6,54 +6,11 @@ use femtovg::{
 };
 use parley::PositionedLayoutItem;
 use thing_core::{
-    HorizontalRange, ImageFit, Kind, Node, NodeId, PathFillRule, PathFit, PathStrokeCap,
-    PathStrokeJoin, Rect, TextAlign, VectorSegment, ViewBox,
+    HorizontalRange, ImageFit, Kind, Node, PathFillRule, PathFit, PathStrokeCap, PathStrokeJoin,
+    Rect, TextAlign, VectorSegment, ViewBox,
 };
 
-use crate::{Layout, ScrollState, Size, TextInputEditor, TextSystem};
-
-/// transient input state belongs to the host, not to the widget snapshot.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Interaction {
-    pub hovered: Option<NodeId>,
-    pub pressed: Option<NodeId>,
-    pub focused: Option<NodeId>,
-    focus_visible: bool,
-}
-
-impl Interaction {
-    pub fn focus_from_pointer(&mut self, focused: Option<NodeId>) {
-        self.focused = focused;
-        self.focus_visible = false;
-    }
-
-    pub fn focus_from_keyboard(&mut self, focused: NodeId) {
-        self.focused = Some(focused);
-        self.focus_visible = true;
-    }
-
-    pub fn reveal_keyboard_focus(&mut self) {
-        self.focus_visible = self.focused.is_some();
-    }
-
-    pub fn keyboard_focused(&self) -> Option<NodeId> {
-        if self.focus_visible {
-            self.focused
-        } else {
-            None
-        }
-    }
-}
-
-/// renderer-independent inputs for one frame.
-pub struct PaintFrame<'a> {
-    pub root: &'a Node,
-    pub layout: &'a Layout,
-    pub physical: (u32, u32),
-    pub scale: f32,
-    pub input: Interaction,
-    pub text_input: Option<&'a mut TextInputEditor>,
-}
+use crate::{Interaction, Layout, PaintFrame, ScrollState, Size, TextInputEditor, TextSystem};
 
 /// renders a widget tree through femtovg.
 pub struct Painter<R: Renderer = OpenGl> {
@@ -680,8 +637,7 @@ fn interaction_overlay(node: &Node, input: Interaction) -> Option<thing_core::Co
 }
 
 fn focus_ring(node: &Node, input: Interaction) -> Option<(thing_core::Color, f32)> {
-    (input.focus_visible
-        && input.focused == Some(node.id)
+    (input.keyboard_focused() == Some(node.id)
         && node.style.focus_ring_width > 0.0
         && node.style.focus_ring_color.0[3] > 0)
         .then_some((node.style.focus_ring_color, node.style.focus_ring_width))
@@ -692,39 +648,18 @@ mod tests {
     use std::cell::Cell;
 
     use femtovg::renderer::Void;
-    use thing_core::Color as ThingColor;
+    use thing_core::{Color as ThingColor, NodeId};
 
     use super::*;
-
-    #[test]
-    fn focus_indicator_follows_the_input_method() {
-        let mut interaction = Interaction::default();
-        interaction.focus_from_pointer(Some(NodeId(1)));
-        assert_eq!(interaction.focused, Some(NodeId(1)));
-        assert!(!interaction.focus_visible);
-
-        interaction.reveal_keyboard_focus();
-        assert!(interaction.focus_visible);
-
-        interaction.focus_from_pointer(Some(NodeId(2)));
-        assert_eq!(interaction.focused, Some(NodeId(2)));
-        assert!(!interaction.focus_visible);
-
-        interaction.focus_from_keyboard(NodeId(3));
-        assert_eq!(interaction.focused, Some(NodeId(3)));
-        assert!(interaction.focus_visible);
-    }
 
     #[test]
     fn pressed_overlay_takes_precedence_and_transparency_disables_it() {
         let mut button = Node::new(NodeId(1), Kind::Button);
         button.style.hover_overlay = ThingColor([1, 2, 3, 4]);
         button.style.pressed_overlay = ThingColor([5, 6, 7, 8]);
-        let input = Interaction {
-            hovered: Some(button.id),
-            pressed: Some(button.id),
-            ..Interaction::default()
-        };
+        let mut input = Interaction::default();
+        input.hovered = Some(button.id);
+        input.pressed = Some(button.id);
         assert_eq!(
             interaction_overlay(&button, input),
             Some(button.style.pressed_overlay)
@@ -732,10 +667,8 @@ mod tests {
 
         button.style.pressed_overlay = ThingColor::TRANSPARENT;
         assert_eq!(interaction_overlay(&button, input), None);
-        let hover = Interaction {
-            hovered: Some(button.id),
-            ..Interaction::default()
-        };
+        let mut hover = Interaction::default();
+        hover.hovered = Some(button.id);
         assert_eq!(
             interaction_overlay(&button, hover),
             Some(button.style.hover_overlay)

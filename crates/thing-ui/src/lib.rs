@@ -1,6 +1,7 @@
 //! logical-pixel layout and input, independent of the window system and renderer.
 
 mod editor;
+mod frame;
 mod images;
 mod layout;
 mod paint;
@@ -12,6 +13,7 @@ pub use editor::{
 pub use femtovg::renderer::OpenGl;
 #[cfg(feature = "wgpu")]
 pub use femtovg::renderer::{WGPURenderOutput, WGPURenderer};
+pub use frame::{Interaction, PaintFrame};
 pub use layout::{Layout, Measurer, Placement, ScrollState, Size};
-pub use paint::{Interaction, PaintFrame, Painter};
+pub use paint::Painter;
 pub use text::TextSystem;
