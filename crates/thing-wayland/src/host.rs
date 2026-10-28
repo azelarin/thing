@@ -945,6 +945,8 @@ impl App {
                 action @ (Action::SetVolume(_)
                 | Action::SetMuted(_)
                 | Action::SetDefaultSink(_)
+                | Action::SetStreamVolume { .. }
+                | Action::SetStreamMuted { .. }
                 | Action::SetSourceVolume(_)
                 | Action::SetSourceMuted(_)
                 | Action::SetDefaultSource(_)) => self.audio.send(action).map_err(str::to_owned),

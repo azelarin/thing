@@ -439,6 +439,7 @@ read them inside property functions to subscribe to updates.
 | `services.audio.muted` | default output mute state |
 | `services.audio.device` | default output's server name |
 | `services.audio.devices` | immutable array of `{ name, description }` records |
+| `services.audio.streams` | immutable array of active output playback streams |
 | `services.audio.source_available` | whether a default input is available |
 | `services.audio.source_volume` | default input volume; `1` is 100%, server values may exceed it |
 | `services.audio.source_muted` | default input mute state |
@@ -467,6 +468,42 @@ return ui.panel {
 `set_default_source(name)`. selecting a device changes the server default;
 moving existing playback or recording streams depends on the audio server's
 policy.
+
+each item from `streams:get()` contains `id`, `application`, `app_id`, `name`,
+`icon`, `volume`, `muted`, and `volume_writable`. these are output playback
+streams; recording and capture streams are not included. `application` uses the
+server's application name, then its process binary, then the stream name.
+`app_id` uses the application id or process binary, and `name` uses the media
+name or stream name. `icon` is a theme icon name suitable for `ui.image`.
+metadata with no available value is an empty string. `volume` uses `1` for
+100%; server values may exceed it.
+
+the stream `id` is an opaque string for one stream lifetime. use it as a widget
+key and pass it back unchanged from an event handler:
+
+```luau
+ui.column {
+    children = function()
+        local rows = {}
+        for _, stream in services.audio.streams:get() do
+            table.insert(rows, ui.button {
+                key = stream.id,
+                on_click = function()
+                    services.audio.set_stream_muted(stream.id, not stream.muted)
+                end,
+                children = { ui.text { text = stream.application } },
+            })
+        end
+        return rows
+    end,
+}
+```
+
+`set_stream_volume(id, number)` accepts 0–1 and preserves channel balance.
+`set_stream_muted(id, boolean)` changes mute. check `volume_writable` before
+showing an enabled volume control; streams without writable volume remain in the
+list. ids change when a stream disappears or the server reconnects. the audio
+backend ignores ids absent from its latest confirmed snapshot.
 
 `sources` leaves out the monitor devices that audio servers create for recording
 an output. if a monitor is already the default input, it remains in the list so

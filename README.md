@@ -58,7 +58,7 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] vulkan rendering alongside opengl
 - [ ] drag and drop, animations, and custom shapes
 - [x] microphone controls
-- [ ] per-application audio controls
+- [x] per-application audio controls
 - [ ] media, tray, clipboard, and notification services
 - [ ] session locking and idle inhibition
 - [ ] accessibility and complete keyboard navigation

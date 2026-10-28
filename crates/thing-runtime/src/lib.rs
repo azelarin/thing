@@ -10,7 +10,7 @@ mod reconcile;
 mod services;
 mod state;
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
-pub use services::{Action, AudioDevice, AudioSnapshot, ServiceSnapshot};
+pub use services::{Action, AudioDevice, AudioSnapshot, AudioStream, ServiceSnapshot};
 
 use mlua::{Error, Function, Lua, Result, Table, Value, VmState};
 pub use state::Scalar;
@@ -166,6 +166,7 @@ impl Runtime {
         }
         services.set_devices(snapshot.devices)?;
         services.set_sources(snapshot.sources)?;
+        services.set_streams(snapshot.streams)?;
         services.set_niri(snapshot.niri)?;
         if let Some(output) = &output {
             services.set_output(output)?;

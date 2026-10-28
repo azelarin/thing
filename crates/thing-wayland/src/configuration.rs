@@ -225,7 +225,7 @@ mod tests {
 
     use tempfile::tempdir;
     use thing_core::{Kind, Scale};
-    use thing_runtime::AudioDevice;
+    use thing_runtime::{AudioDevice, AudioStream};
 
     use super::*;
 
@@ -416,7 +416,9 @@ mod tests {
             return ui.panel { children = { ui.text { text = function()
                 local sources = services.audio.sources:get()
                 local description = if #sources == 0 then 'none' else sources[1].description
-                return `{services.audio.volume:get()}:{services.audio.source_volume:get()}:{description}`
+                local streams = services.audio.streams:get()
+                local application = if #streams == 0 then 'none' else streams[1].application
+                return `{services.audio.volume:get()}:{services.audio.source_volume:get()}:{description}:{application}`
             end } } }
             "#,
         )
@@ -433,14 +435,24 @@ mod tests {
                     name: "microphone".into(),
                     description: "Microphone".into(),
                 }],
+                streams: vec![AudioStream {
+                    id: "stream-1".into(),
+                    application: "Firefox".into(),
+                    app_id: "firefox".into(),
+                    name: "Music".into(),
+                    icon: "firefox".into(),
+                    volume: 0.5,
+                    muted: false,
+                    volume_writable: true,
+                }],
                 ..AudioSnapshot::default()
             })
             .unwrap();
         assert_eq!(configurations.refresh(), vec![1]);
-        assert_eq!(text(&configurations, 1), "0.4:0.7:Microphone");
+        assert_eq!(text(&configurations, 1), "0.4:0.7:Microphone:Firefox");
 
         configurations.add(2, output("DP-2", 2560)).unwrap();
-        assert_eq!(text(&configurations, 2), "0.4:0.7:Microphone");
+        assert_eq!(text(&configurations, 2), "0.4:0.7:Microphone:Firefox");
         assert!(
             configurations
                 .set_audio(AudioSnapshot {
@@ -450,16 +462,26 @@ mod tests {
                         name: "webcam".into(),
                         description: "Webcam".into(),
                     }],
+                    streams: vec![AudioStream {
+                        id: "stream-2".into(),
+                        application: "Music".into(),
+                        app_id: "music".into(),
+                        name: "Playback".into(),
+                        icon: "music".into(),
+                        volume: 0.8,
+                        muted: false,
+                        volume_writable: true,
+                    }],
                     error: "bad\0error".into(),
                     ..AudioSnapshot::default()
                 })
                 .is_err()
         );
         assert!(configurations.refresh().is_empty());
-        assert_eq!(text(&configurations, 1), "0.4:0.7:Microphone");
-        assert_eq!(text(&configurations, 2), "0.4:0.7:Microphone");
+        assert_eq!(text(&configurations, 1), "0.4:0.7:Microphone:Firefox");
+        assert_eq!(text(&configurations, 2), "0.4:0.7:Microphone:Firefox");
         configurations.add(3, output("DP-3", 1920)).unwrap();
-        assert_eq!(text(&configurations, 3), "0.4:0.7:Microphone");
+        assert_eq!(text(&configurations, 3), "0.4:0.7:Microphone:Firefox");
     }
 
     #[test]
