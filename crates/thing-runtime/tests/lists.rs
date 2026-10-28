@@ -41,18 +41,21 @@ fn reordering_preserves_keys_and_updates_handlers_and_nested_bindings() {
         .set_audio_devices(vec![device("a", "A"), device("b", "B")])
         .unwrap();
     runtime.refresh().unwrap();
-    let first = runtime.root().children.clone();
+    let first = runtime.root().unwrap().children.clone();
     runtime
         .set_audio_devices(vec![device("b", "New B"), device("a", "A")])
         .unwrap();
     runtime.refresh().unwrap();
-    assert_eq!(runtime.root().children[0].id, first[1].id);
-    assert_eq!(runtime.root().children[1].id, first[0].id);
+    assert_eq!(runtime.root().unwrap().children[0].id, first[1].id);
+    assert_eq!(runtime.root().unwrap().children[1].id, first[0].id);
     assert_eq!(
-        runtime.root().children[0].children[0].id,
+        runtime.root().unwrap().children[0].children[0].id,
         first[1].children[0].id
     );
-    assert_eq!(runtime.root().children[0].children[0].text, "New B");
+    assert_eq!(
+        runtime.root().unwrap().children[0].children[0].text,
+        "New B"
+    );
     runtime.dispatch(first[1].id, Event::Click).unwrap();
     assert_eq!(
         runtime.take_actions(),
@@ -62,7 +65,10 @@ fn reordering_preserves_keys_and_updates_handlers_and_nested_bindings() {
         .set_service("clock.time", Scalar::String("14:20".into()))
         .unwrap();
     runtime.refresh().unwrap();
-    assert_eq!(runtime.root().children[0].children[1].text, "14:20");
+    assert_eq!(
+        runtime.root().unwrap().children[0].children[1].text,
+        "14:20"
+    );
 }
 
 #[test]
@@ -85,13 +91,13 @@ fn invalid_replacement_preserves_the_old_tree_and_callbacks_then_recovers() {
         } }
     "#,
     );
-    let before = runtime.root().clone();
+    let before = runtime.root().unwrap().clone();
     assert!(
         runtime
             .dispatch(before.children[1].id, Event::Click)
             .is_err()
     );
-    assert_eq!(runtime.root(), &before);
+    assert_eq!(runtime.root().unwrap(), &before);
     runtime
         .dispatch(before.children[0].children[0].id, Event::Click)
         .unwrap();
@@ -100,7 +106,7 @@ fn invalid_replacement_preserves_the_old_tree_and_callbacks_then_recovers() {
         .dispatch(before.children[2].id, Event::Click)
         .unwrap();
     assert_eq!(
-        runtime.root().children[0].children[0].id,
+        runtime.root().unwrap().children[0].children[0].id,
         before.children[0].children[0].id
     );
 }
@@ -125,11 +131,11 @@ fn removed_rows_stop_observing_state_and_cannot_receive_events() {
         } }
     "#,
     );
-    let removed = runtime.root().children[0].children[0].id;
+    let removed = runtime.root().unwrap().children[0].children[0].id;
     runtime
-        .dispatch(runtime.root().children[1].id, Event::Click)
+        .dispatch(runtime.root().unwrap().children[1].id, Event::Click)
         .unwrap();
-    assert!(runtime.root().children[0].children.is_empty());
+    assert!(runtime.root().unwrap().children[0].children.is_empty());
     runtime
         .set_service("clock.time", Scalar::String("14:21".into()))
         .unwrap();
@@ -147,12 +153,12 @@ fn changed_widget_kind_does_not_inherit_control_identity() {
         end }
     "#,
     );
-    let old = runtime.root().children[0].id;
+    let old = runtime.root().unwrap().children[0].id;
     runtime
         .set_service("audio.available", Scalar::Boolean(true))
         .unwrap();
     runtime.refresh().unwrap();
-    assert_ne!(runtime.root().children[0].id, old);
+    assert_ne!(runtime.root().unwrap().children[0].id, old);
 }
 
 #[test]
@@ -173,12 +179,12 @@ fn rejects_cached_widgets_reused_outside_the_replaced_subtree() {
         .set_service("clock.time", Scalar::String("12:00".into()))
         .unwrap();
     runtime.refresh().unwrap();
-    let before = runtime.root().clone();
+    let before = runtime.root().unwrap().clone();
     runtime
         .set_service("audio.available", Scalar::Boolean(true))
         .unwrap();
     assert!(runtime.refresh().is_err());
-    assert_eq!(runtime.root(), &before);
+    assert_eq!(runtime.root().unwrap(), &before);
 }
 
 #[test]
@@ -208,17 +214,17 @@ fn nested_lists_refresh_together_and_recover_from_a_partially_parsed_row() {
         end }
     "#,
     );
-    let original = runtime.root().clone();
+    let original = runtime.root().unwrap().clone();
     for value in ["bad", "12:00", "12:01"] {
         runtime
             .set_service("clock.time", Scalar::String(value.into()))
             .unwrap();
         if value == "bad" {
             assert!(runtime.refresh().is_err());
-            assert_eq!(runtime.root(), &original);
+            assert_eq!(runtime.root().unwrap(), &original);
         } else {
             runtime.refresh().unwrap();
-            let child = &runtime.root().children[0];
+            let child = &runtime.root().unwrap().children[0];
             assert_eq!(child.id, original.children[0].id);
             assert_eq!(child.children[0].id, original.children[0].children[0].id);
             assert_eq!(child.children[0].text, value.repeat(2));
@@ -243,14 +249,14 @@ fn repeated_replacement_does_not_leave_stale_callbacks_or_subscriptions() {
         end }
     "#,
     );
-    let id = runtime.root().children[0].id;
+    let id = runtime.root().unwrap().children[0].id;
     for generation in 0..500 {
         let value = generation.to_string();
         runtime
             .set_service("clock.time", Scalar::String(value.clone()))
             .unwrap();
         runtime.refresh().unwrap();
-        assert_eq!(runtime.root().children[0].id, id);
+        assert_eq!(runtime.root().unwrap().children[0].id, id);
         runtime.dispatch(id, Event::Click).unwrap();
         assert_eq!(runtime.take_actions(), vec![Action::SetDefaultSink(value)]);
     }

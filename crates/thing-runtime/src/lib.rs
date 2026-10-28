@@ -1,7 +1,7 @@
 //! embedded luau configurations and dependency-tracked widget properties.
 //!
-//! a [`Runtime`] owns a loaded configuration and its state. it exposes a validated
-//! [`thing_core::Node`] tree to the renderer.
+//! a [`Runtime`] owns a loaded configuration and its state. it exposes validated
+//! surface trees to the renderer.
 
 mod modules;
 mod niri;
@@ -27,6 +27,21 @@ use std::{
     time::{Duration, Instant},
 };
 use thing_core::{Kind, Node, NodeId, Scale};
+
+/// stable identity for one root surface in a loaded runtime.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SurfaceKey {
+    Default,
+    Named(String),
+}
+
+/// one configured surface and its compositor namespace.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceTree {
+    pub key: SurfaceKey,
+    pub namespace: String,
+    pub root: Node,
+}
 
 /// the wayland output for one runtime, measured in logical pixels.
 #[derive(Clone, Debug, PartialEq)]
@@ -100,10 +115,10 @@ struct Children {
     sources: BTreeMap<NodeId, u64>,
 }
 
-/// a loaded configuration, its state, and the current widget tree.
+/// a loaded configuration, its state, and the current surface trees.
 pub struct Runtime {
     lua: Lua,
-    root: Node,
+    surfaces: Vec<SurfaceTree>,
     tracker: Rc<RefCell<Tracker>>,
     bindings: BTreeMap<usize, Binding>,
     next_binding: usize,
@@ -184,7 +199,7 @@ impl Runtime {
         let exported = modules.load(&lua, path)?;
         let mut runtime = Self {
             lua,
-            root: Node::new(NodeId(0), Kind::Panel),
+            surfaces: Vec::new(),
             tracker,
             bindings: BTreeMap::new(),
             next_binding: 0,
@@ -199,18 +214,21 @@ impl Runtime {
             services,
             output,
         };
-        runtime.root = runtime.parse_node(exported, 0, &mut BTreeSet::new())?;
-        if runtime.root.kind != Kind::Panel {
-            return Err(Error::runtime(
-                "the entry file must return ui.panel { ... }",
-            ));
-        }
-        runtime.root.validate().map_err(Error::external)?;
+        runtime.surfaces = runtime.parse_surfaces(exported)?;
         Ok(runtime)
     }
 
-    pub fn root(&self) -> &Node {
-        &self.root
+    /// the first root, retained for callers that support one surface only.
+    pub fn root(&self) -> Option<&Node> {
+        self.surfaces.first().map(|surface| &surface.root)
+    }
+
+    pub fn surfaces(&self) -> &[SurfaceTree] {
+        &self.surfaces
+    }
+
+    pub fn surface(&self, key: &SurfaceKey) -> Option<&SurfaceTree> {
+        self.surfaces.iter().find(|surface| &surface.key == key)
     }
 
     /// files loaded by the configuration, including its entry file.
@@ -271,22 +289,43 @@ impl Runtime {
 
     /// whether an available widget has an explicit scroll handler.
     pub fn has_scroll_handler(&self, id: NodeId) -> bool {
-        is_available(&self.root, id) && self.handlers.contains_key(&(id, "on_scroll"))
+        self.is_available(id) && self.handlers.contains_key(&(id, "on_scroll"))
     }
 
     /// run an input handler. disabled or hidden widgets ignore input.
     pub fn dispatch(&mut self, id: NodeId, event: Event) -> Result<bool> {
-        self.dispatch_inner(id, event, None)
+        self.dispatch_checked(id, event, |_| Ok(()))
     }
 
+    /// run an input handler and validate its candidate surface trees before publishing them.
+    pub fn dispatch_checked(
+        &mut self,
+        id: NodeId,
+        event: Event,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<bool> {
+        self.dispatch_inner_checked(id, event, None, &validate)
+    }
+
+    #[cfg(test)]
     fn dispatch_inner(&mut self, id: NodeId, event: Event, now: Option<Instant>) -> Result<bool> {
+        self.dispatch_inner_checked(id, event, now, &|_| Ok(()))
+    }
+
+    fn dispatch_inner_checked(
+        &mut self,
+        id: NodeId,
+        event: Event,
+        now: Option<Instant>,
+        validate: &impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<bool> {
         if matches!(event, Event::Hover(false)) && self.ended_hovers.remove(&id) {
             return Ok(false);
         }
         if matches!(event, Event::Hover(true)) && self.ended_hovers.contains(&id) {
             return Ok(false);
         }
-        if !matches!(event, Event::Close | Event::Hover(false)) && !is_available(&self.root, id) {
+        if !matches!(event, Event::Close | Event::Hover(false)) && !self.is_available(id) {
             return Ok(false);
         }
         let name = match event {
@@ -315,14 +354,12 @@ impl Runtime {
             Event::Hover(inside) => handler.call::<()>(inside),
         };
         self.services.allow_actions(false);
-        let result = result.and_then(|()| match now {
-            Some(now) => self.refresh_at(now),
-            None => self.refresh(),
-        });
+        let now = now.unwrap_or_else(Instant::now);
+        let result = result.and_then(|()| self.refresh_at_checked(now, validate));
         let result = match result {
             Ok(changed)
                 if matches!(event, Event::Hover(true))
-                    && (self.root.find(id).is_none()
+                    && (self.find(id).is_none()
                         || !self.handlers.contains_key(&(id, "on_hover"))) =>
             {
                 self.ended_hovers.insert(id);
@@ -331,10 +368,7 @@ impl Runtime {
                 let cleanup = handler.call::<()>(false);
                 self.services.allow_actions(false);
                 cleanup
-                    .and_then(|()| match now {
-                        Some(now) => self.refresh_at(now),
-                        None => self.refresh(),
-                    })
+                    .and_then(|()| self.refresh_at_checked(now, validate))
                     .map(|cleanup_changed| changed || cleanup_changed)
             }
             result => result,
@@ -348,10 +382,22 @@ impl Runtime {
     /// reevaluate only dirty properties and publish them together after validation.
     /// an error preserves the previous snapshot. a later state change can retry.
     pub fn refresh(&mut self) -> Result<bool> {
-        self.refresh_at(Instant::now())
+        self.refresh_checked(|_| Ok(()))
     }
 
-    fn refresh_at(&mut self, now: Instant) -> Result<bool> {
+    /// reevaluate dirty properties and validate candidate surfaces before publishing them.
+    pub fn refresh_checked(
+        &mut self,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<bool> {
+        self.refresh_at_checked(Instant::now(), &validate)
+    }
+
+    fn refresh_at_checked(
+        &mut self,
+        now: Instant,
+        validate: &impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<bool> {
         let mut dirty = std::mem::take(&mut self.tracker.borrow_mut().dirty);
         if dirty.is_empty() {
             return Ok(false);
@@ -361,7 +407,7 @@ impl Runtime {
         // whole batch prevents unrelated, valid changes from being lost.
         self.deferred = dirty.clone();
         self.begin_call();
-        let mut candidate = self.root.clone();
+        let mut candidate = self.surfaces.clone();
         let checkpoint = self.next_binding;
         let mut retired = BTreeSet::new();
         let mut removed = BTreeSet::new();
@@ -378,9 +424,17 @@ impl Runtime {
                 let id = binding.node;
                 let property = binding.property.clone();
                 if property == "children" {
-                    let depth = reconcile::depth(&candidate, id)
+                    let (surface, depth) = candidate
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, surface)| {
+                            reconcile::depth(&surface.root, id).map(|depth| (index, depth))
+                        })
                         .ok_or_else(|| Error::runtime("list refers to a missing widget"))?;
-                    let node = candidate.find_mut(id).expect("depth located the widget");
+                    let node = candidate[surface]
+                        .root
+                        .find_mut(id)
+                        .expect("depth located the widget");
                     let mut old_ids = BTreeSet::new();
                     for child in &node.children {
                         reconcile::ids(child, &mut old_ids);
@@ -461,9 +515,12 @@ impl Runtime {
                     self.bindings.extend(children.bindings);
                     node.children = children.nodes;
                 } else {
-                    let node = candidate.find_mut(id).ok_or_else(|| {
-                        Error::runtime("reactive binding refers to a missing widget")
-                    })?;
+                    let node = candidate
+                        .iter_mut()
+                        .find_map(|surface| surface.root.find_mut(id))
+                        .ok_or_else(|| {
+                            Error::runtime("reactive binding refers to a missing widget")
+                        })?;
                     if let Some(previous) = self.bindings[&index].transition.as_ref() {
                         let target = transition::target(value, &property)?;
                         let mut state = previous.clone();
@@ -475,7 +532,10 @@ impl Runtime {
                     }
                 }
             }
-            candidate.validate().map_err(Error::external)?;
+            for surface in &candidate {
+                surface.root.validate().map_err(Error::external)?;
+            }
+            validate(&candidate).map_err(Error::runtime)?;
             let mut target = candidate.clone();
             for (index, binding) in &self.bindings {
                 if retired.contains(index) {
@@ -488,11 +548,16 @@ impl Runtime {
                     continue;
                 };
                 let node = target
-                    .find_mut(binding.node)
+                    .iter_mut()
+                    .find_map(|surface| surface.root.find_mut(binding.node))
                     .ok_or_else(|| Error::runtime("transition refers to a missing widget"))?;
                 properties::apply(node, &binding.property, transition::value(state.target()))?;
             }
-            target.validate().map_err(Error::external)
+            for surface in &target {
+                surface.root.validate().map_err(Error::external)?;
+            }
+            validate(&target).map_err(Error::runtime)?;
+            Ok(())
         })();
         if let Err(error) = result {
             // only bindings made for the rejected candidate are discarded.
@@ -515,15 +580,24 @@ impl Runtime {
         self.handlers.retain(|(id, _), _| !removed.contains(id));
         self.handlers.extend(handlers);
         self.sources = sources;
-        let changed = candidate != self.root;
-        self.root = candidate;
+        let changed = candidate != self.surfaces;
+        self.surfaces = candidate;
         self.deferred.clear();
         Ok(changed || self.has_active_transitions())
     }
 
     /// advance active transitions to a monotonic point in time.
     pub fn advance(&mut self, now: Instant) -> Result<bool> {
-        let mut candidate = self.root.clone();
+        self.advance_checked(now, |_| Ok(()))
+    }
+
+    /// advance transitions and validate the interpolated surfaces before publishing them.
+    pub fn advance_checked(
+        &mut self,
+        now: Instant,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<bool> {
+        let mut candidate = self.surfaces.clone();
         let mut staged = BTreeMap::new();
         for (index, binding) in &self.bindings {
             let Some(previous) = binding
@@ -536,7 +610,8 @@ impl Runtime {
             let mut state = previous.clone();
             state.advance(now);
             let node = candidate
-                .find_mut(binding.node)
+                .iter_mut()
+                .find_map(|surface| surface.root.find_mut(binding.node))
                 .ok_or_else(|| Error::runtime("transition refers to a missing widget"))?;
             properties::apply(node, &binding.property, transition::value(state.current()))?;
             staged.insert(*index, state);
@@ -544,15 +619,18 @@ impl Runtime {
         if staged.is_empty() {
             return Ok(false);
         }
-        candidate.validate().map_err(Error::external)?;
+        for surface in &candidate {
+            surface.root.validate().map_err(Error::external)?;
+        }
+        validate(&candidate).map_err(Error::runtime)?;
         for (index, transition) in staged {
             self.bindings
                 .get_mut(&index)
                 .expect("an active transition belongs to a live binding")
                 .transition = Some(transition);
         }
-        let changed = candidate != self.root;
-        self.root = candidate;
+        let changed = candidate != self.surfaces;
+        self.surfaces = candidate;
         Ok(changed)
     }
 
@@ -620,6 +698,43 @@ impl Runtime {
         result
     }
 
+    fn parse_surfaces(&mut self, exported: Value) -> Result<Vec<SurfaceTree>> {
+        let Value::Table(table) = exported else {
+            return Err(Error::runtime(
+                "the entry file must return ui.panel { ... } or a dense panel array",
+            ));
+        };
+        let single = !table.raw_get::<Value>("_kind")?.is_nil();
+        let roots = if single {
+            vec![table]
+        } else {
+            dense_root_tables(table)?
+        };
+        let mut seen_widgets = BTreeSet::new();
+        let mut seen_keys = BTreeSet::new();
+        let mut surfaces = Vec::with_capacity(roots.len());
+        for table in roots {
+            let key = surface_key(&table, !single)?;
+            if !seen_keys.insert(key.clone()) {
+                return Err(Error::runtime(format!("duplicate surface key {key:?}")));
+            }
+            let namespace = surface_namespace(&table, &key)?;
+            let root = self.parse_node(Value::Table(table), 0, &mut seen_widgets)?;
+            if root.kind != Kind::Panel {
+                return Err(Error::runtime(
+                    "every surface root must be ui.panel { ... }",
+                ));
+            }
+            root.validate().map_err(Error::external)?;
+            surfaces.push(SurfaceTree {
+                key,
+                namespace,
+                root,
+            });
+        }
+        Ok(surfaces)
+    }
+
     fn parse_node(&mut self, value: Value, depth: usize, seen: &mut BTreeSet<u64>) -> Result<Node> {
         if depth > 64 || seen.len() >= 10_000 {
             return Err(Error::runtime(
@@ -636,6 +751,14 @@ impl Runtime {
             ));
         }
         let kind = kind(&table.raw_get::<String>("_kind")?)?;
+        if depth == 0
+            && !table.raw_get::<Value>("edge")?.is_nil()
+            && !table.raw_get::<Value>("anchors")?.is_nil()
+        {
+            return Err(Error::runtime(
+                "a root panel cannot contain both edge and anchors",
+            ));
+        }
         let id = NodeId(self.next_node);
         self.next_node = self
             .next_node
@@ -647,7 +770,11 @@ impl Runtime {
             let (key, value) = pair?;
             match key.as_str() {
                 "_id" | "_kind" | "children" => {}
-                "edge" | "margins" | "exclusive_zone" | "input_region" if depth > 0 => {
+                "key" | "namespace" if depth == 0 => {}
+                "edge" | "anchors" | "layer" | "keyboard_mode" | "margins" | "exclusive_zone"
+                | "input_region"
+                    if depth > 0 =>
+                {
                     return Err(Error::runtime(format!(
                         "{key} is only supported on the root panel"
                     )));
@@ -801,6 +928,90 @@ impl Runtime {
             }
         }
     }
+
+    fn find(&self, id: NodeId) -> Option<&Node> {
+        self.surfaces
+            .iter()
+            .find_map(|surface| surface.root.find(id))
+    }
+
+    fn is_available(&self, id: NodeId) -> bool {
+        self.surfaces
+            .iter()
+            .any(|surface| is_available(&surface.root, id))
+    }
+}
+
+fn dense_root_tables(table: Table) -> Result<Vec<Table>> {
+    let length = table.raw_len();
+    if length > 64 {
+        return Err(Error::runtime("an entry may return at most 64 surfaces"));
+    }
+    let entries = table
+        .clone()
+        .pairs::<Value, Value>()
+        .collect::<Result<Vec<_>>>()?;
+    if entries.len() != length
+        || !entries.iter().all(|(key, _)| {
+            matches!(key, Value::Integer(index) if *index >= 1 && (*index as usize) <= length)
+        })
+    {
+        return Err(Error::runtime(
+            "the entry surface list must be a dense array",
+        ));
+    }
+    (1..=length)
+        .map(|index| match table.raw_get(index)? {
+            Value::Table(root) => Ok(root),
+            _ => Err(Error::runtime(
+                "every surface root must be ui.panel { ... }",
+            )),
+        })
+        .collect()
+}
+
+fn surface_key(table: &Table, required: bool) -> Result<SurfaceKey> {
+    match static_root_string(table, "key")? {
+        Some(key) => Ok(SurfaceKey::Named(key)),
+        None if required => Err(Error::runtime(
+            "every panel in a surface list needs a nonempty static key",
+        )),
+        None => Ok(SurfaceKey::Default),
+    }
+}
+
+fn surface_namespace(table: &Table, key: &SurfaceKey) -> Result<String> {
+    if let Some(namespace) = static_root_string(table, "namespace")? {
+        return Ok(namespace);
+    }
+    Ok(match key {
+        SurfaceKey::Default => "thing".into(),
+        SurfaceKey::Named(key) => format!("thing-{key}"),
+    })
+}
+
+fn static_root_string(table: &Table, name: &str) -> Result<Option<String>> {
+    match table.raw_get::<Value>(name)? {
+        Value::Nil => Ok(None),
+        Value::String(value) => {
+            let value = value.to_str()?.to_owned();
+            validate_surface_string(&value, name)?;
+            Ok(Some(value))
+        }
+        Value::Function(_) => Err(Error::runtime(format!(
+            "surface {name} must be a static string"
+        ))),
+        _ => Err(Error::runtime(format!("surface {name} must be a string"))),
+    }
+}
+
+fn validate_surface_string(value: &str, name: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 256 || value.contains('\0') {
+        return Err(Error::runtime(format!(
+            "surface {name} must be 1 to 256 bytes and contain no NUL"
+        )));
+    }
+    Ok(())
 }
 
 fn is_available(node: &Node, id: NodeId) -> bool {
@@ -910,6 +1121,17 @@ mod transition_tests {
         find(node, key).unwrap()
     }
 
+    fn root(runtime: &Runtime) -> &Node {
+        runtime.root().unwrap()
+    }
+
+    fn surface<'a>(runtime: &'a Runtime, key: &str) -> &'a Node {
+        &runtime
+            .surface(&SurfaceKey::Named(key.into()))
+            .unwrap()
+            .root
+    }
+
     fn close(left: f32, right: f32) {
         assert!((left - right).abs() < 0.001, "{left} != {right}");
     }
@@ -932,9 +1154,9 @@ mod transition_tests {
             } } }
             "#,
         );
-        let button = runtime.root.children[0].id;
-        close(runtime.root.children[0].style.width.unwrap(), 100.0);
-        close(runtime.root.children[0].style.opacity, 0.5);
+        let button = root(&runtime).children[0].id;
+        close(root(&runtime).children[0].style.width.unwrap(), 100.0);
+        close(root(&runtime).children[0].style.opacity, 0.5);
 
         let start = Instant::now();
         assert!(
@@ -942,12 +1164,12 @@ mod transition_tests {
                 .dispatch_inner(button, Event::Click, Some(start))
                 .unwrap()
         );
-        close(runtime.root.children[0].style.width.unwrap(), 100.0);
+        close(root(&runtime).children[0].style.width.unwrap(), 100.0);
         assert!(runtime.is_animating(button));
 
         assert!(runtime.advance(start + Duration::from_millis(40)).unwrap());
-        close(runtime.root.children[0].style.width.unwrap(), 140.0);
-        close(runtime.root.children[0].style.opacity, 0.7);
+        close(root(&runtime).children[0].style.width.unwrap(), 140.0);
+        close(root(&runtime).children[0].style.opacity, 0.7);
 
         assert!(
             runtime
@@ -958,15 +1180,179 @@ mod transition_tests {
                 )
                 .unwrap()
         );
-        close(runtime.root.children[0].style.width.unwrap(), 140.0);
+        close(root(&runtime).children[0].style.width.unwrap(), 140.0);
 
         runtime.advance(start + Duration::from_millis(90)).unwrap();
-        close(runtime.root.children[0].style.width.unwrap(), 120.0);
-        close(runtime.root.children[0].style.opacity, 0.6);
+        close(root(&runtime).children[0].style.width.unwrap(), 120.0);
+        close(root(&runtime).children[0].style.opacity, 0.6);
         runtime.advance(start + Duration::from_millis(140)).unwrap();
-        close(runtime.root.children[0].style.width.unwrap(), 100.0);
-        close(runtime.root.children[0].style.opacity, 0.5);
+        close(root(&runtime).children[0].style.width.unwrap(), 100.0);
+        close(root(&runtime).children[0].style.opacity, 0.5);
         assert!(!runtime.is_animating(button));
+    }
+
+    #[test]
+    fn shared_state_advances_transitions_across_surface_roots_together() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local expanded = ui.state(false)
+            local function width()
+                return expanded:get() and 200 or 100
+            end
+            return {
+                ui.panel { key = 'first', children = {
+                    ui.button { on_click = function() expanded:set(true) end },
+                    ui.row { style = { width = ui.transition(width, {
+                        duration = 100,
+                        easing = 'linear',
+                    }) } },
+                } },
+                ui.panel { key = 'second', children = {
+                    ui.row { style = { width = ui.transition(width, {
+                        duration = 100,
+                        easing = 'linear',
+                    }) } },
+                } },
+            }
+            "#,
+        );
+        let button = surface(&runtime, "first").children[0].id;
+        let first = surface(&runtime, "first").children[1].id;
+        let second = surface(&runtime, "second").children[0].id;
+        let start = Instant::now();
+
+        assert!(
+            runtime
+                .dispatch_inner(button, Event::Click, Some(start))
+                .unwrap()
+        );
+        assert!(runtime.is_animating(first));
+        assert!(runtime.is_animating(second));
+        assert!(runtime.advance(start + Duration::from_millis(40)).unwrap());
+        close(
+            surface(&runtime, "first").children[1].style.width.unwrap(),
+            140.0,
+        );
+        close(
+            surface(&runtime, "second").children[0].style.width.unwrap(),
+            140.0,
+        );
+    }
+
+    #[test]
+    fn invalid_transition_target_preserves_every_surface_root() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local invalid = ui.state(false)
+            return {
+                ui.panel { key = 'first', children = {
+                    ui.button { on_click = function() invalid:set(true) end },
+                    ui.row { style = { width = ui.transition(function()
+                        return invalid:get() and 200 or 100
+                    end, { duration = 100 }) } },
+                } },
+                ui.panel { key = 'second', children = {
+                    ui.row { style = { opacity = ui.transition(function()
+                        return invalid:get() and 2 or 0.5
+                    end, { duration = 100 }) } },
+                } },
+            }
+            "#,
+        );
+        let button = surface(&runtime, "first").children[0].id;
+        let first = surface(&runtime, "first").children[1].id;
+        let second = surface(&runtime, "second").children[0].id;
+
+        assert!(runtime.dispatch(button, Event::Click).is_err());
+        close(
+            surface(&runtime, "first").children[1].style.width.unwrap(),
+            100.0,
+        );
+        close(surface(&runtime, "second").children[0].style.opacity, 0.5);
+        assert!(!runtime.is_animating(first));
+        assert!(!runtime.is_animating(second));
+    }
+
+    #[test]
+    fn checked_refresh_rejects_a_transition_target_before_publication() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local expanded = ui.state(false)
+            return ui.panel { children = {
+                ui.button { on_click = function() expanded:set(true) end },
+                ui.row { style = { width = ui.transition(function()
+                    return expanded:get() and 200 or 100
+                end, { duration = 100, easing = 'linear' }) } },
+            } }
+            "#,
+        );
+        let button = root(&runtime).children[0].id;
+        let animated = root(&runtime).children[1].id;
+        let start = Instant::now();
+        let reject_target = |surfaces: &[SurfaceTree]| {
+            let width = surfaces[0].root.children[1].style.width.unwrap();
+            if (width - 200.0).abs() < 0.001 {
+                Err("target width is unsupported".into())
+            } else {
+                Ok(())
+            }
+        };
+
+        assert!(
+            runtime
+                .dispatch_inner_checked(button, Event::Click, Some(start), &reject_target)
+                .is_err()
+        );
+        close(root(&runtime).children[1].style.width.unwrap(), 100.0);
+        assert!(!runtime.is_animating(animated));
+    }
+
+    #[test]
+    fn checked_advance_rejects_an_intermediate_frame_without_advancing_state() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local expanded = ui.state(false)
+            return ui.panel { children = {
+                ui.button { on_click = function() expanded:set(true) end },
+                ui.row { style = { width = ui.transition(function()
+                    return expanded:get() and 200 or 100
+                end, { duration = 100, easing = 'linear' }) } },
+            } }
+            "#,
+        );
+        let button = root(&runtime).children[0].id;
+        let animated = root(&runtime).children[1].id;
+        let start = Instant::now();
+        let endpoints_only = |surfaces: &[SurfaceTree]| {
+            let width = surfaces[0].root.children[1].style.width.unwrap();
+            if width > 100.001 && width < 199.999 {
+                Err("intermediate width is unsupported".into())
+            } else {
+                Ok(())
+            }
+        };
+
+        assert!(
+            runtime
+                .dispatch_inner_checked(button, Event::Click, Some(start), &endpoints_only)
+                .unwrap()
+        );
+        assert!(runtime.is_animating(animated));
+        assert!(
+            runtime
+                .advance_checked(start + Duration::from_millis(50), endpoints_only)
+                .is_err()
+        );
+        close(root(&runtime).children[1].style.width.unwrap(), 100.0);
+        assert!(runtime.is_animating(animated));
+
+        assert!(
+            runtime
+                .advance_checked(start + Duration::from_millis(100), endpoints_only)
+                .unwrap()
+        );
+        close(root(&runtime).children[1].style.width.unwrap(), 200.0);
+        assert!(!runtime.is_animating(animated));
     }
 
     #[test]
@@ -999,18 +1385,18 @@ mod transition_tests {
             } }
             "#,
         );
-        let toggle = child_with_key(runtime.root(), "toggle").id;
-        let rebuild = child_with_key(runtime.root(), "rebuild").id;
-        let stable = child_with_key(runtime.root(), "stable").id;
+        let toggle = child_with_key(root(&runtime), "toggle").id;
+        let rebuild = child_with_key(root(&runtime), "rebuild").id;
+        let stable = child_with_key(root(&runtime), "stable").id;
         let start = Instant::now();
 
         runtime
             .dispatch_inner(toggle, Event::Click, Some(start))
             .unwrap();
-        assert_eq!(child_with_key(runtime.root(), "stable").id, stable);
+        assert_eq!(child_with_key(root(&runtime), "stable").id, stable);
         runtime.advance(start + Duration::from_millis(40)).unwrap();
         close(
-            child_with_key(runtime.root(), "stable")
+            child_with_key(root(&runtime), "stable")
                 .style
                 .width
                 .unwrap(),
@@ -1025,7 +1411,7 @@ mod transition_tests {
             )
             .unwrap();
         close(
-            child_with_key(runtime.root(), "stable")
+            child_with_key(root(&runtime), "stable")
                 .style
                 .width
                 .unwrap(),
@@ -1033,7 +1419,7 @@ mod transition_tests {
         );
         runtime.advance(start + Duration::from_millis(100)).unwrap();
         close(
-            child_with_key(runtime.root(), "stable")
+            child_with_key(root(&runtime), "stable")
                 .style
                 .width
                 .unwrap(),
@@ -1069,9 +1455,9 @@ mod transition_tests {
             } }
             "#,
         );
-        let start_button = child_with_key(runtime.root(), "start").id;
-        let remove_button = child_with_key(runtime.root(), "remove").id;
-        let animated = child_with_key(runtime.root(), "animated").id;
+        let start_button = child_with_key(root(&runtime), "start").id;
+        let remove_button = child_with_key(root(&runtime), "remove").id;
+        let animated = child_with_key(root(&runtime), "animated").id;
         let start = Instant::now();
 
         runtime
@@ -1086,7 +1472,7 @@ mod transition_tests {
                 Some(start + Duration::from_millis(40)),
             )
             .unwrap();
-        assert!(runtime.root().find(animated).is_none());
+        assert!(root(&runtime).find(animated).is_none());
         assert!(!runtime.is_animating(animated));
         assert!(!runtime.advance(start + Duration::from_millis(50)).unwrap());
     }
@@ -1113,16 +1499,16 @@ mod transition_tests {
             } } }
             "#,
         );
-        let start_button = child_with_key(runtime.root(), "start").id;
-        let invalid_button = child_with_key(runtime.root(), "invalid").id;
-        let animated = child_with_key(runtime.root(), "animated").id;
+        let start_button = child_with_key(root(&runtime), "start").id;
+        let invalid_button = child_with_key(root(&runtime), "invalid").id;
+        let animated = child_with_key(root(&runtime), "animated").id;
         let start = Instant::now();
         runtime
             .dispatch_inner(start_button, Event::Click, Some(start))
             .unwrap();
         runtime.advance(start + Duration::from_millis(40)).unwrap();
         close(
-            child_with_key(runtime.root(), "animated").style.opacity,
+            child_with_key(root(&runtime), "animated").style.opacity,
             0.7,
         );
 
@@ -1136,13 +1522,13 @@ mod transition_tests {
                 .is_err()
         );
         close(
-            child_with_key(runtime.root(), "animated").style.opacity,
+            child_with_key(root(&runtime), "animated").style.opacity,
             0.7,
         );
         assert!(runtime.is_animating(animated));
         runtime.advance(start + Duration::from_millis(50)).unwrap();
         close(
-            child_with_key(runtime.root(), "animated").style.opacity,
+            child_with_key(root(&runtime), "animated").style.opacity,
             0.75,
         );
     }
@@ -1160,7 +1546,7 @@ mod transition_tests {
             } } }
             "#,
         );
-        let button = runtime.root.children[0].id;
+        let button = root(&runtime).children[0].id;
         let start = Instant::now();
         runtime
             .dispatch_inner(button, Event::Click, Some(start))
@@ -1169,7 +1555,7 @@ mod transition_tests {
         fs::write(&path, "return ui.text { text = 'invalid root' }").unwrap();
         assert!(runtime.reload(&path).is_err());
         runtime.advance(start + Duration::from_millis(50)).unwrap();
-        close(runtime.root.children[0].style.width.unwrap(), 150.0);
+        close(root(&runtime).children[0].style.width.unwrap(), 150.0);
 
         fs::write(
             &path,
@@ -1179,8 +1565,8 @@ mod transition_tests {
         )
         .unwrap();
         runtime.reload(&path).unwrap();
-        close(runtime.root.style.width.unwrap(), 40.0);
-        assert!(!runtime.is_animating(runtime.root.id));
+        close(root(&runtime).style.width.unwrap(), 40.0);
+        assert!(!runtime.is_animating(root(&runtime).id));
     }
 
     #[test]

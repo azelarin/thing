@@ -25,7 +25,7 @@ fn loads_popup_placement_properties() {
     );
 
     let runtime = Runtime::load(path).unwrap();
-    let popup = runtime.root().children[0].children[0].popup;
+    let popup = runtime.root().unwrap().children[0].children[0].popup;
     assert_eq!(popup.anchor, PopupAnchor::Left);
     assert_eq!(popup.alignment, PopupAlignment::Center);
     assert_eq!(popup.offset, PopupOffset { x: -12, y: 8 });
@@ -63,9 +63,9 @@ fn popup_placement_properties_are_reactive_whole_values() {
     );
 
     let mut runtime = Runtime::load(path).unwrap();
-    let button = runtime.root().children[0].id;
+    let button = runtime.root().unwrap().children[0].id;
     assert_eq!(
-        runtime.root().children[0].children[0].popup,
+        runtime.root().unwrap().children[0].children[0].popup,
         PopupOptions {
             offset: PopupOffset { x: 0, y: 8 },
             ..PopupOptions::default()
@@ -73,7 +73,7 @@ fn popup_placement_properties_are_reactive_whole_values() {
     );
 
     assert!(runtime.dispatch(button, Event::Click).unwrap());
-    let popup = runtime.root().children[0].children[0].popup;
+    let popup = runtime.root().unwrap().children[0].children[0].popup;
     assert_eq!(popup.anchor, PopupAnchor::Right);
     assert_eq!(popup.alignment, PopupAlignment::Start);
     assert_eq!(popup.offset, PopupOffset { x: 4, y: 0 });
@@ -92,7 +92,7 @@ fn omitted_popup_placement_preserves_existing_defaults() {
         fixture("return ui.panel { children = { ui.button { children = { ui.popup {} } } } }");
     let runtime = Runtime::load(path).unwrap();
     assert_eq!(
-        runtime.root().children[0].children[0].popup,
+        runtime.root().unwrap().children[0].children[0].popup,
         PopupOptions::default()
     );
 }

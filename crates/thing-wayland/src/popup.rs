@@ -66,15 +66,26 @@ enum Side {
     Right,
 }
 
+#[cfg(test)]
 pub(crate) fn resolve(
     node: &Node,
     trigger: Rect,
     panel_edge: PanelEdge,
     parent_size: (u32, u32),
 ) -> Position {
-    let side = side(node.popup.anchor, panel_edge);
+    resolve_for_surface(node, trigger, Some(panel_edge), parent_size)
+        .expect("a panel edge resolves automatic popup placement")
+}
+
+pub(crate) fn resolve_for_surface(
+    node: &Node,
+    trigger: Rect,
+    panel_edge: Option<PanelEdge>,
+    parent_size: (u32, u32),
+) -> Option<Position> {
+    let side = side(node.popup.anchor, panel_edge)?;
     let (anchor, gravity) = anchors(side, node.popup.alignment);
-    Position {
+    Some(Position {
         size: (
             dimension(node.style.width, DEFAULT_WIDTH),
             dimension(node.style.height, DEFAULT_HEIGHT),
@@ -91,7 +102,7 @@ pub(crate) fn resolve(
             .popup
             .constraints
             .unwrap_or_else(|| default_constraints(side)),
-    }
+    })
 }
 
 pub(crate) fn configure(positioner: &XdgPositioner, position: Position, reactive: bool) {
@@ -116,18 +127,18 @@ pub(crate) fn configure(positioner: &XdgPositioner, position: Position, reactive
     }
 }
 
-fn side(anchor: PopupAnchor, panel_edge: PanelEdge) -> Side {
+fn side(anchor: PopupAnchor, panel_edge: Option<PanelEdge>) -> Option<Side> {
     match anchor {
-        PopupAnchor::Auto => match panel_edge {
+        PopupAnchor::Auto => Some(match panel_edge? {
             PanelEdge::Top => Side::Bottom,
             PanelEdge::Bottom => Side::Top,
             PanelEdge::Left => Side::Right,
             PanelEdge::Right => Side::Left,
-        },
-        PopupAnchor::Top => Side::Top,
-        PopupAnchor::Bottom => Side::Bottom,
-        PopupAnchor::Left => Side::Left,
-        PopupAnchor::Right => Side::Right,
+        }),
+        PopupAnchor::Top => Some(Side::Top),
+        PopupAnchor::Bottom => Some(Side::Bottom),
+        PopupAnchor::Left => Some(Side::Left),
+        PopupAnchor::Right => Some(Side::Right),
     }
 }
 

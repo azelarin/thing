@@ -45,11 +45,11 @@ fn lists_preserve_full_ids_are_immutable_and_survive_reload() {
     runtime.set_niri(snapshot.clone()).unwrap();
     runtime.refresh().unwrap();
     assert_eq!(
-        runtime.root().children[0].children[0].text,
+        runtime.root().unwrap().children[0].children[0].text,
         u64::MAX.to_string()
     );
     runtime
-        .dispatch(runtime.root().children[0].id, Event::Click)
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
         .unwrap();
     assert_eq!(
         runtime.take_actions(),
@@ -67,7 +67,7 @@ fn lists_preserve_full_ids_are_immutable_and_survive_reload() {
     );
     runtime.reload(&path).unwrap();
     assert_eq!(
-        runtime.root().children[0].children[0].text,
+        runtime.root().unwrap().children[0].children[0].text,
         u64::MAX.to_string()
     );
 }
@@ -88,7 +88,7 @@ fn rejects_untracked_actions_and_imprecise_or_invalid_ids() {
         let mut runtime = Runtime::load(&path).unwrap();
         assert!(
             runtime
-                .dispatch(runtime.root().children[0].id, Event::Click)
+                .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
                 .is_err()
         );
         assert!(runtime.take_actions().is_empty());
@@ -176,7 +176,7 @@ fn routes_window_clicks_volume_scroll_and_popup_controls() {
         runtime.set_service(name, value).unwrap();
     }
     runtime.refresh().unwrap();
-    let window = key(runtime.root(), "42").unwrap();
+    let window = key(runtime.root().unwrap(), "42").unwrap();
     runtime.dispatch(window, Event::Click).unwrap();
     assert_eq!(
         runtime.take_actions(),
@@ -187,7 +187,7 @@ fn routes_window_clicks_volume_scroll_and_popup_controls() {
         runtime.take_actions(),
         vec![Action::Niri(NiriAction::CloseWindow(42))]
     );
-    let volume = key(runtime.root(), "volume").unwrap();
+    let volume = key(runtime.root().unwrap(), "volume").unwrap();
     runtime.dispatch(volume, Event::Click).unwrap();
     assert_eq!(runtime.take_actions(), vec![Action::SetMuted(true)]);
     runtime
@@ -209,16 +209,16 @@ fn routes_window_clicks_volume_scroll_and_popup_controls() {
             .is_err()
     );
     runtime.dispatch(volume, Event::SecondaryClick).unwrap();
-    let popup = key(runtime.root(), "mixer").unwrap();
-    assert!(runtime.root().find(popup).unwrap().visible);
-    let device = key(runtime.root(), "speakers").unwrap();
+    let popup = key(runtime.root().unwrap(), "mixer").unwrap();
+    assert!(runtime.root().unwrap().find(popup).unwrap().visible);
+    let device = key(runtime.root().unwrap(), "speakers").unwrap();
     runtime.dispatch(device, Event::Click).unwrap();
     assert_eq!(
         runtime.take_actions(),
         vec![Action::SetDefaultSink("speakers".into())]
     );
     runtime.dispatch(popup, Event::Close).unwrap();
-    assert!(!runtime.root().find(popup).unwrap().visible);
+    assert!(!runtime.root().unwrap().find(popup).unwrap().visible);
 }
 
 fn key(node: &thing_core::Node, key: &str) -> Option<thing_core::NodeId> {

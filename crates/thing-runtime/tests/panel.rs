@@ -1,7 +1,10 @@
 use std::{fs, path::PathBuf};
 
 use tempfile::TempDir;
-use thing_core::{PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins, PanelProperties};
+use thing_core::{
+    KeyboardMode, PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins, PanelProperties,
+    SurfaceAnchors, SurfaceLayer,
+};
 use thing_runtime::{Event, Runtime};
 
 fn fixture(source: &str) -> (TempDir, PathBuf) {
@@ -26,10 +29,10 @@ fn loads_panel_surface_properties() {
     );
 
     let runtime = Runtime::load(path).unwrap();
-    assert_eq!(runtime.root().style.width, Some(480.0));
-    assert_eq!(runtime.root().style.height, Some(52.0));
+    assert_eq!(runtime.root().unwrap().style.width, Some(480.0));
+    assert_eq!(runtime.root().unwrap().style.height, Some(52.0));
     assert_eq!(
-        runtime.root().panel,
+        runtime.root().unwrap().panel,
         PanelProperties {
             edge: PanelEdge::Bottom,
             margins: PanelMargins {
@@ -39,13 +42,36 @@ fn loads_panel_surface_properties() {
                 left: -4,
             },
             exclusive_zone: Some(36),
-            input_region: PanelInputRegion::Rectangle(PanelInputRect {
+            input_region: PanelInputRegion::Rectangles(vec![PanelInputRect {
                 x: -2,
                 y: 4,
                 width: Some(480),
                 height: Some(36),
-            }),
+            }]),
+            ..PanelProperties::default()
         }
+    );
+}
+
+#[test]
+fn an_empty_input_rectangle_keeps_the_whole_surface_interactive() {
+    let (_directory, path) = fixture("return ui.panel { input_region = {} }");
+    let runtime = Runtime::load(path).unwrap();
+
+    assert_eq!(
+        runtime.root().unwrap().panel.input_region,
+        PanelInputRegion::Rectangles(vec![PanelInputRect::default()])
+    );
+}
+
+#[test]
+fn an_explicit_empty_rectangle_union_is_click_through() {
+    let (_directory, path) = fixture("return ui.panel { input_region = { rectangles = {} } }");
+    let runtime = Runtime::load(path).unwrap();
+
+    assert_eq!(
+        runtime.root().unwrap().panel.input_region,
+        PanelInputRegion::Rectangles(Vec::new())
     );
 }
 
@@ -76,21 +102,21 @@ fn panel_surface_properties_are_reactive() {
     );
 
     let mut runtime = Runtime::load(path).unwrap();
-    assert_eq!(runtime.root().panel.edge, PanelEdge::Top);
-    assert_eq!(runtime.root().panel.exclusive_zone, Some(36));
+    assert_eq!(runtime.root().unwrap().panel.edge, PanelEdge::Top);
+    assert_eq!(runtime.root().unwrap().panel.exclusive_zone, Some(36));
     assert_eq!(
-        runtime.root().panel.input_region,
-        PanelInputRegion::Rectangle(PanelInputRect {
+        runtime.root().unwrap().panel.input_region,
+        PanelInputRegion::Rectangles(vec![PanelInputRect {
             x: -2,
             height: Some(36),
             ..PanelInputRect::default()
-        })
+        }])
     );
 
-    let button = runtime.root().children[0].id;
+    let button = runtime.root().unwrap().children[0].id;
     assert!(runtime.dispatch(button, Event::Click).unwrap());
     assert_eq!(
-        runtime.root().panel,
+        runtime.root().unwrap().panel,
         PanelProperties {
             edge: PanelEdge::Left,
             margins: PanelMargins {
@@ -99,8 +125,145 @@ fn panel_surface_properties_are_reactive() {
                 ..PanelMargins::default()
             },
             exclusive_zone: None,
-            input_region: PanelInputRegion::Empty,
+            input_region: PanelInputRegion::Rectangles(Vec::new()),
+            ..PanelProperties::default()
         }
+    );
+}
+
+#[test]
+fn loads_explicit_surface_properties_and_rectangle_unions() {
+    let (_directory, path) = fixture(
+        r#"
+        return ui.panel {
+            anchors = { top = true, right = true, bottom = true, left = true },
+            layer = 'overlay',
+            keyboard_mode = 'exclusive',
+            exclusive_zone = 0,
+            input_region = {
+                rectangles = {
+                    { x = 2, width = 10, height = 12 },
+                    { y = 20, width = 30, height = 8 },
+                },
+            },
+        }
+        "#,
+    );
+
+    let runtime = Runtime::load(path).unwrap();
+    assert_eq!(
+        runtime.root().unwrap().panel,
+        PanelProperties {
+            anchors: Some(SurfaceAnchors {
+                top: true,
+                right: true,
+                bottom: true,
+                left: true,
+            }),
+            layer: SurfaceLayer::Overlay,
+            keyboard_mode: KeyboardMode::Exclusive,
+            exclusive_zone: Some(0),
+            input_region: PanelInputRegion::Rectangles(vec![
+                PanelInputRect {
+                    x: 2,
+                    width: Some(10),
+                    height: Some(12),
+                    ..PanelInputRect::default()
+                },
+                PanelInputRect {
+                    y: 20,
+                    width: Some(30),
+                    height: Some(8),
+                    ..PanelInputRect::default()
+                },
+            ]),
+            ..PanelProperties::default()
+        }
+    );
+}
+
+#[test]
+fn explicit_surface_properties_are_reactive_whole_values() {
+    let (_directory, path) = fixture(
+        r#"
+        local changed = ui.state(false)
+        return ui.panel {
+            style = { width = 80, height = 40 },
+            anchors = function()
+                if changed:get() then return { right = true } end
+                return { left = true }
+            end,
+            layer = function() return if changed:get() then 'bottom' else 'top' end,
+            keyboard_mode = function()
+                return if changed:get() then 'none' else 'on_demand'
+            end,
+            children = {
+                ui.button { on_click = function() changed:set(true) end },
+            },
+        }
+        "#,
+    );
+
+    let mut runtime = Runtime::load(path).unwrap();
+    assert_eq!(
+        runtime.root().unwrap().panel.anchors,
+        Some(SurfaceAnchors {
+            left: true,
+            ..SurfaceAnchors::default()
+        })
+    );
+    let button = runtime.root().unwrap().children[0].id;
+    assert!(runtime.dispatch(button, Event::Click).unwrap());
+    assert_eq!(
+        runtime.root().unwrap().panel.anchors,
+        Some(SurfaceAnchors {
+            right: true,
+            ..SurfaceAnchors::default()
+        })
+    );
+    assert_eq!(runtime.root().unwrap().panel.layer, SurfaceLayer::Bottom);
+    assert_eq!(
+        runtime.root().unwrap().panel.keyboard_mode,
+        KeyboardMode::None
+    );
+}
+
+#[test]
+fn rejects_sparse_or_oversized_input_region_lists() {
+    let (_directory, path) = fixture(
+        "return ui.panel { input_region = { rectangles = { [1] = { width = 1 }, [3] = { width = 1 } } } }",
+    );
+    assert!(
+        Runtime::load(path)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("dense list")
+    );
+
+    let (_directory, path) = fixture(
+        r#"
+        local regions = {}
+        for index = 1, 257 do regions[index] = { width = 1, height = 1 } end
+        return ui.panel { input_region = { rectangles = regions } }
+        "#,
+    );
+    assert!(
+        Runtime::load(path)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("at most 256")
+    );
+
+    let (_directory, path) =
+        fixture("return ui.panel { input_region = { { width = 1, height = 1 } } }");
+    assert!(
+        Runtime::load(path)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("rectangles table")
     );
 }
 
@@ -108,7 +271,7 @@ fn panel_surface_properties_are_reactive() {
 fn omitted_panel_properties_preserve_existing_defaults() {
     let (_directory, path) = fixture("return ui.panel {}");
     let runtime = Runtime::load(path).unwrap();
-    assert_eq!(runtime.root().panel, PanelProperties::default());
+    assert_eq!(runtime.root().unwrap().panel, PanelProperties::default());
 }
 
 #[test]
@@ -128,7 +291,7 @@ fn rejects_invalid_or_nested_panel_surface_properties() {
         ),
         (
             "return ui.panel { input_region = true }",
-            "input_region must be false or a rectangle table",
+            "input_region must be false, a rectangle",
         ),
         (
             "return ui.panel { input_region = { width = 0 } }",
@@ -141,6 +304,22 @@ fn rejects_invalid_or_nested_panel_surface_properties() {
         (
             "return ui.panel { children = { ui.panel { edge = 'left' } } }",
             "edge is only supported on the root panel",
+        ),
+        (
+            "return ui.panel { edge = 'top', anchors = { top = true } }",
+            "cannot contain both edge and anchors",
+        ),
+        (
+            "return ui.panel { style = { width = 40, height = 40 }, anchors = { diagonal = true } }",
+            "unknown anchor",
+        ),
+        (
+            "return ui.panel { style = { width = 40, height = 40 }, layer = 'middle' }",
+            "layer must be",
+        ),
+        (
+            "return ui.panel { style = { width = 40, height = 40 }, keyboard_mode = 'sometimes' }",
+            "keyboard_mode must be",
         ),
     ] {
         let (_directory, path) = fixture(source);

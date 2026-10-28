@@ -32,6 +32,63 @@ pub enum PanelEdge {
     Right,
 }
 
+/// explicit output-edge anchors for a surface.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SurfaceAnchors {
+    pub top: bool,
+    pub right: bool,
+    pub bottom: bool,
+    pub left: bool,
+}
+
+impl SurfaceAnchors {
+    /// returns the only edge that can own a positive exclusive zone.
+    pub fn exclusive_edge(self) -> Option<PanelEdge> {
+        let candidates = [
+            (
+                self.top && !self.bottom && self.left == self.right,
+                PanelEdge::Top,
+            ),
+            (
+                self.bottom && !self.top && self.left == self.right,
+                PanelEdge::Bottom,
+            ),
+            (
+                self.left && !self.right && self.top == self.bottom,
+                PanelEdge::Left,
+            ),
+            (
+                self.right && !self.left && self.top == self.bottom,
+                PanelEdge::Right,
+            ),
+        ];
+        let mut edges = candidates
+            .into_iter()
+            .filter_map(|(candidate, edge)| candidate.then_some(edge));
+        let edge = edges.next()?;
+        edges.next().is_none().then_some(edge)
+    }
+}
+
+/// compositor stacking layer for a surface.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SurfaceLayer {
+    Background,
+    Bottom,
+    #[default]
+    Top,
+    Overlay,
+}
+
+/// how a surface participates in keyboard focus.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyboardMode {
+    None,
+    #[default]
+    OnDemand,
+    Exclusive,
+}
+
 /// distances between a panel surface and the corresponding output edges.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PanelMargins {
@@ -53,28 +110,44 @@ pub struct PanelInputRect {
 }
 
 /// which part of a panel surface accepts pointer and touch input.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum PanelInputRegion {
     #[default]
     Full,
-    Empty,
-    Rectangle(PanelInputRect),
+    Rectangles(Vec<PanelInputRect>),
 }
 
 /// surface properties that are meaningful only on the root panel.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PanelProperties {
     pub edge: PanelEdge,
+    /// explicit anchors replace the edge shorthand when present.
+    pub anchors: Option<SurfaceAnchors>,
+    pub layer: SurfaceLayer,
+    pub keyboard_mode: KeyboardMode,
     pub margins: PanelMargins,
-    /// None reserves the configured thickness plus the opposite-edge margin.
-    /// Layer shell also adds the margin on the panel's own edge.
-    /// Some(-1) uses layer-shell's ignore-exclusive-zones behavior.
+    /// `None` lets the surface host choose the anchor mode's default.
+    /// `Some(-1)` requests placement without respecting other exclusive zones.
     pub exclusive_zone: Option<i32>,
     pub input_region: PanelInputRegion,
 }
 
+impl Default for PanelProperties {
+    fn default() -> Self {
+        Self {
+            edge: PanelEdge::Top,
+            anchors: None,
+            layer: SurfaceLayer::Top,
+            keyboard_mode: KeyboardMode::OnDemand,
+            margins: PanelMargins::default(),
+            exclusive_zone: None,
+            input_region: PanelInputRegion::Full,
+        }
+    }
+}
+
 impl PanelProperties {
-    fn validate(self) -> Result<(), TreeError> {
+    fn validate(&self, style: &Style) -> Result<(), TreeError> {
         const LIMIT: i32 = 100_000;
         if [
             self.margins.top,
@@ -97,7 +170,16 @@ impl PanelProperties {
                 "panel exclusive_zone must be -1 or between 0 and 100,000".into(),
             ));
         }
-        if let PanelInputRegion::Rectangle(rect) = self.input_region {
+        let rectangles = match &self.input_region {
+            PanelInputRegion::Full => &[][..],
+            PanelInputRegion::Rectangles(rectangles) => rectangles.as_slice(),
+        };
+        if rectangles.len() > 256 {
+            return Err(TreeError(
+                "panel input_region accepts at most 256 rectangles".into(),
+            ));
+        }
+        for rect in rectangles {
             if !(-LIMIT..=LIMIT).contains(&rect.x) || !(-LIMIT..=LIMIT).contains(&rect.y) {
                 return Err(TreeError(
                     "panel input_region coordinates must be between -100,000 and 100,000".into(),
@@ -110,6 +192,28 @@ impl PanelProperties {
             {
                 return Err(TreeError(
                     "panel input_region dimensions must be between 1 and 100,000".into(),
+                ));
+            }
+        }
+        if let Some(anchors) = self.anchors {
+            if style.width.is_none() && !(anchors.left && anchors.right) {
+                return Err(TreeError(
+                    "an explicitly anchored panel without a width must anchor left and right"
+                        .into(),
+                ));
+            }
+            if style.height.is_none() && !(anchors.top && anchors.bottom) {
+                return Err(TreeError(
+                    "an explicitly anchored panel without a height must anchor top and bottom"
+                        .into(),
+                ));
+            }
+            if self.exclusive_zone.is_some_and(|zone| zone > 0)
+                && anchors.exclusive_edge().is_none()
+            {
+                return Err(TreeError(
+                    "a positive panel exclusive_zone needs exactly one exclusive anchor edge"
+                        .into(),
                 ));
             }
         }
@@ -445,13 +549,35 @@ impl Node {
 
     /// validates widget properties, sibling keys, and tree depth and size limits.
     pub fn validate(&self) -> Result<(), TreeError> {
-        self.validate_inner(0, &mut HashSet::new(), None, &mut HashSet::new(), false)
+        self.validate_inner(
+            0,
+            &mut HashSet::new(),
+            None,
+            &mut HashSet::new(),
+            false,
+            self.allows_automatic_popup_anchor(),
+        )
     }
 
     /// validates a tree rendered as one surface. an automatic popup root may
     /// inherit its button anchor from the parent surface.
     pub fn validate_surface(&self) -> Result<(), TreeError> {
-        self.validate_inner(0, &mut HashSet::new(), None, &mut HashSet::new(), true)
+        self.validate_inner(
+            0,
+            &mut HashSet::new(),
+            None,
+            &mut HashSet::new(),
+            true,
+            self.allows_automatic_popup_anchor(),
+        )
+    }
+
+    fn allows_automatic_popup_anchor(&self) -> bool {
+        self.kind != Kind::Panel
+            || self
+                .panel
+                .anchors
+                .is_none_or(|anchors| anchors.exclusive_edge().is_some())
     }
 
     fn validate_inner(
@@ -461,6 +587,7 @@ impl Node {
         anchor: Option<NodeId>,
         automatic_popups: &mut HashSet<NodeId>,
         allow_external_anchor: bool,
+        allow_automatic_popup_anchor: bool,
     ) -> Result<(), TreeError> {
         if depth > 64 || ids.len() >= 10_000 {
             return Err(TreeError(
@@ -483,7 +610,7 @@ impl Node {
                 "panel surface properties are only valid on a panel".into(),
             ));
         }
-        self.panel.validate()?;
+        self.panel.validate(&self.style)?;
         if !self.kind.is_container() && !self.children.is_empty() {
             return Err(TreeError(format!(
                 "{:?} cannot contain children",
@@ -633,6 +760,14 @@ impl Node {
                 _ => {}
             }
         }
+        if self.kind == Kind::Popup
+            && self.popup.anchor == PopupAnchor::Auto
+            && !allow_automatic_popup_anchor
+        {
+            return Err(TreeError(
+                "popup anchor 'auto' needs an unambiguous panel anchor edge".into(),
+            ));
+        }
         self.popup.validate()?;
         let mut keys = HashSet::new();
         for child in &self.children {
@@ -647,6 +782,7 @@ impl Node {
                 anchor,
                 automatic_popups,
                 allow_external_anchor,
+                allow_automatic_popup_anchor,
             )?;
         }
         Ok(())
@@ -835,10 +971,10 @@ mod tests {
     #[test]
     fn validates_root_panel_surface_properties() {
         let mut root = Node::new(NodeId(0), Kind::Panel);
-        root.panel.input_region = PanelInputRegion::Rectangle(PanelInputRect {
+        root.panel.input_region = PanelInputRegion::Rectangles(vec![PanelInputRect {
             height: Some(36),
             ..PanelInputRect::default()
-        });
+        }]);
         assert!(root.validate().is_ok());
 
         root.panel.exclusive_zone = Some(-2);
@@ -859,6 +995,63 @@ mod tests {
                 .to_string()
                 .contains("only valid on the root panel")
         );
+    }
+
+    #[test]
+    fn validates_explicit_anchor_geometry_and_exclusivity() {
+        let mut root = Node::new(NodeId(0), Kind::Panel);
+        root.panel.anchors = Some(SurfaceAnchors {
+            top: true,
+            left: true,
+            right: true,
+            ..SurfaceAnchors::default()
+        });
+        root.style.height = Some(36.0);
+        root.panel.exclusive_zone = Some(36);
+        assert_eq!(
+            root.panel.anchors.unwrap().exclusive_edge(),
+            Some(PanelEdge::Top)
+        );
+        assert!(root.validate().is_ok());
+
+        root.style.height = None;
+        assert!(root.validate().unwrap_err().to_string().contains("height"));
+        root.style.height = Some(36.0);
+        root.panel.anchors = Some(SurfaceAnchors {
+            top: true,
+            right: true,
+            ..SurfaceAnchors::default()
+        });
+        root.style.width = Some(40.0);
+        assert!(
+            root.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("exclusive anchor edge")
+        );
+    }
+
+    #[test]
+    fn ambiguous_explicit_anchors_require_explicit_popup_anchors() {
+        let mut root = Node::new(NodeId(0), Kind::Panel);
+        root.panel.anchors = Some(SurfaceAnchors {
+            top: true,
+            right: true,
+            bottom: true,
+            left: true,
+        });
+        let mut popup = Node::new(NodeId(1), Kind::Popup);
+        root.children.push(popup.clone());
+        assert!(
+            root.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("popup anchor 'auto'")
+        );
+
+        popup.popup.anchor = PopupAnchor::Right;
+        root.children = vec![popup];
+        assert!(root.validate().is_ok());
     }
 
     #[test]

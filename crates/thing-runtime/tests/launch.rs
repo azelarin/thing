@@ -23,7 +23,7 @@ fn launch_preserves_arguments_and_working_directory() {
     );
 
     runtime
-        .dispatch(runtime.root().children[0].id, Event::Click)
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
         .unwrap();
     assert_eq!(
         runtime.take_actions(),
@@ -48,7 +48,7 @@ fn launch_accepts_an_omitted_working_directory() {
     );
 
     runtime
-        .dispatch(runtime.root().children[0].id, Event::Click)
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
         .unwrap();
     assert_eq!(
         runtime.take_actions(),
@@ -79,7 +79,7 @@ fn launch_rejects_invalid_arguments() {
         let (_directory, mut runtime) = runtime(&source);
         assert!(
             runtime
-                .dispatch(runtime.root().children[0].id, Event::Click)
+                .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
                 .is_err(),
             "accepted {arguments}"
         );
@@ -102,7 +102,7 @@ fn launch_rejects_invalid_working_directories() {
         let (_directory, mut runtime) = runtime(&source);
         assert!(
             runtime
-                .dispatch(runtime.root().children[0].id, Event::Click)
+                .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
                 .is_err(),
             "accepted {cwd}"
         );
@@ -124,11 +124,11 @@ fn failed_events_discard_launches() {
         "#,
     );
     runtime
-        .dispatch(runtime.root().children[0].id, Event::Click)
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
         .unwrap();
     assert!(
         runtime
-            .dispatch(runtime.root().children[1].id, Event::Click)
+            .dispatch(runtime.root().unwrap().children[1].id, Event::Click)
             .is_err()
     );
     assert_eq!(
@@ -165,7 +165,7 @@ fn launch_uses_the_service_action_limit() {
 
     assert!(
         runtime
-            .dispatch(runtime.root().children[0].id, Event::Click)
+            .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
             .is_err()
     );
     assert!(runtime.take_actions().is_empty());
