@@ -1,7 +1,8 @@
 use std::{collections::BTreeSet, fs, path::PathBuf, time::Duration};
 use tempfile::TempDir;
 use thing_core::{
-    Color, CrossAlign, ImageFit, KeyboardMode, Kind, MainAlign, TextAlign, TextOverflow,
+    Color, CrossAlign, ImageFit, KeyboardMode, Kind, MainAlign, PathFillRule, PathFit,
+    PathStrokeCap, PathStrokeJoin, TextAlign, TextOverflow, VectorSegment,
 };
 use thing_runtime::{
     Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, Event, Limits, Runtime, Scalar,
@@ -95,6 +96,87 @@ fn resolves_assets_from_their_defining_module_in_late_closures() {
         runtime.files().into_iter().collect::<BTreeSet<_>>(),
         BTreeSet::from([path, module, idle, active])
     );
+}
+
+#[test]
+fn loads_vector_paths_with_explicit_paint_controls() {
+    let (_directory, path) = fixture(
+        r#"
+        return ui.panel { children = { ui.path {
+            data = 'M 0 0 L 20 0 L 20 10 Z',
+            view_box = { x = 0, y = 0, width = 20, height = 10 },
+            fit = 'cover',
+            fill = '#12345678',
+            fill_rule = 'evenodd',
+            stroke = '#abcdef',
+            stroke_width = 2.5,
+            stroke_cap = 'round',
+            stroke_join = 'bevel',
+        } } }
+        "#,
+    );
+    let runtime = Runtime::load(path).unwrap();
+    let path = &runtime.root().unwrap().children[0];
+    assert_eq!(path.kind, Kind::Path);
+    assert_eq!(path.path.fit, PathFit::Cover);
+    assert_eq!(path.path.fill, Some(Color([0x12, 0x34, 0x56, 0x78])));
+    assert_eq!(path.path.fill_rule, PathFillRule::EvenOdd);
+    assert_eq!(path.path.stroke, Color([0xab, 0xcd, 0xef, 0xff]));
+    assert_eq!(path.path.stroke_width, 2.5);
+    assert_eq!(path.path.stroke_cap, PathStrokeCap::Round);
+    assert_eq!(path.path.stroke_join, PathStrokeJoin::Bevel);
+    assert!(path.path.segments.contains(&VectorSegment::Close));
+}
+
+#[test]
+fn invalid_reactive_path_data_preserves_the_last_valid_tree() {
+    let (_directory, path) = fixture(
+        r#"
+        local data = ui.state('M 0 0 L 10 10')
+        return ui.panel { children = {
+            ui.path {
+                key = 'drawing',
+                data = function() return data:get() end,
+                view_box = { x = 0, y = 0, width = 10, height = 10 },
+            },
+            ui.button {
+                key = 'invalid',
+                on_click = function() data:set('M 0 0 L 100001 0') end,
+            },
+            ui.button {
+                key = 'recover',
+                on_click = function() data:set('M 0 0 Q 5 10 10 0') end,
+            },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let original = runtime.root().unwrap().children[0].path.clone();
+    let invalid = runtime.root().unwrap().children[1].id;
+    let recover = runtime.root().unwrap().children[2].id;
+
+    assert!(runtime.dispatch(invalid, Event::Click).is_err());
+    assert_eq!(runtime.root().unwrap().children[0].path, original);
+
+    assert!(runtime.dispatch(recover, Event::Click).unwrap());
+    assert!(matches!(
+        runtime.root().unwrap().children[0].path.segments[1],
+        VectorSegment::Quadratic { .. }
+    ));
+}
+
+#[test]
+fn rejects_incomplete_and_invalid_vector_paths() {
+    for source in [
+        "return ui.panel { children = { ui.path { view_box = { x = 0, y = 0, width = 10, height = 10 } } } }",
+        "return ui.panel { children = { ui.path { data = 'M 0 0' } } }",
+        "return ui.panel { children = { ui.path { data = 'not a path', view_box = { x = 0, y = 0, width = 10, height = 10 } } } }",
+        "return ui.panel { children = { ui.path { data = 'M 0 0', view_box = { x = 0, y = 0, width = 0, height = 10 } } } }",
+        "return ui.panel { children = { ui.path { data = 'M 0 0', view_box = { x = 0, y = 0, width = 10, height = 10 }, fit = 'stretch' } } }",
+    ] {
+        let (_directory, path) = fixture(source);
+        assert!(Runtime::load(path).is_err(), "accepted {source}");
+    }
 }
 
 #[test]
@@ -240,6 +322,10 @@ fn range_parses_behavior_and_visual_children() {
             children = { ui.row { key = 'track', children = {
                 ui.text { key = 'label', text = 'level' },
                 ui.image { key = 'icon', icon = 'audio-volume-high' },
+                ui.path {
+                    key = 'shape', data = 'M 0 0 L 1 1',
+                    view_box = { x = 0, y = 0, width = 1, height = 1 },
+                },
             } } },
         } } }
         "#,
@@ -256,6 +342,7 @@ fn range_parses_behavior_and_visual_children() {
     assert_eq!(range.children[0].key.as_deref(), Some("track"));
     assert_eq!(range.children[0].children[0].kind, Kind::Text);
     assert_eq!(range.children[0].children[1].kind, Kind::Image);
+    assert_eq!(range.children[0].children[2].kind, Kind::Path);
 }
 
 #[test]

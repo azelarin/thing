@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 
 use femtovg::{
-    Canvas, Color, FontId, Paint, Path, PositionedGlyph, TextContext,
+    Canvas, Color, FillRule, FontId, LineCap, LineJoin, Paint, Path, PositionedGlyph, TextContext,
     renderer::{OpenGl, Renderer},
 };
 use parley::PositionedLayoutItem;
-use thing_core::{HorizontalRange, ImageFit, Kind, Node, NodeId, Rect};
+use thing_core::{
+    HorizontalRange, ImageFit, Kind, Node, NodeId, PathFillRule, PathFit, PathStrokeCap,
+    PathStrokeJoin, Rect, VectorSegment, ViewBox,
+};
 
 use crate::{Layout, ScrollState, Size, TextSystem};
 
@@ -147,6 +150,7 @@ impl<R: Renderer> Painter<R> {
                 Kind::Text => self.draw_text(node, bounds, clip)?,
                 Kind::Slider => self.draw_slider(node, bounds),
                 Kind::Image => self.draw_image(node, bounds, scale),
+                Kind::Path => self.draw_path(node, bounds)?,
                 _ => {}
             }
         }
@@ -279,6 +283,163 @@ impl<R: Renderer> Painter<R> {
             ),
         );
     }
+
+    fn draw_path(&mut self, node: &Node, bounds: Rect) -> Result<(), String> {
+        let Some(view_box) = node.path.view_box else {
+            return Ok(());
+        };
+        let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
+        let padding_y = node.style.padding_y.unwrap_or(node.style.padding);
+        let area = Rect {
+            x: bounds.x + padding_x,
+            y: bounds.y + padding_y,
+            width: (bounds.width - 2.0 * padding_x).max(0.0),
+            height: (bounds.height - 2.0 * padding_y).max(0.0),
+        };
+        let Some(transform) = PathTransform::new(view_box, area, node.path.fit) else {
+            return Ok(());
+        };
+        let path = transformed_path(&node.path.segments, transform)?;
+        self.canvas.intersect_rounded_scissor(
+            area.x,
+            area.y,
+            area.width,
+            area.height,
+            node.style
+                .radius
+                .min(area.width / 2.0)
+                .min(area.height / 2.0),
+        );
+
+        let fill = node.path.fill.unwrap_or(node.style.foreground);
+        if fill.0[3] > 0 {
+            let mut paint = Paint::color(color(fill));
+            paint.set_fill_rule(match node.path.fill_rule {
+                PathFillRule::NonZero => FillRule::NonZero,
+                PathFillRule::EvenOdd => FillRule::EvenOdd,
+            });
+            self.canvas.fill_path(&path, &paint);
+        }
+        if node.path.stroke_width > 0.0 && node.path.stroke.0[3] > 0 {
+            let mut paint = Paint::color(color(node.path.stroke));
+            paint.set_line_width(node.path.stroke_width);
+            paint.set_line_cap(match node.path.stroke_cap {
+                PathStrokeCap::Butt => LineCap::Butt,
+                PathStrokeCap::Round => LineCap::Round,
+                PathStrokeCap::Square => LineCap::Square,
+            });
+            paint.set_line_join(match node.path.stroke_join {
+                PathStrokeJoin::Miter => LineJoin::Miter,
+                PathStrokeJoin::Round => LineJoin::Round,
+                PathStrokeJoin::Bevel => LineJoin::Bevel,
+            });
+            self.canvas.stroke_path(&path, &paint);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PathTransform {
+    scale_x: f64,
+    scale_y: f64,
+    translate_x: f64,
+    translate_y: f64,
+}
+
+// femtovg computes a fourth-order flatness term in f32 after output scaling.
+// at the maximum scale of 16, this leaves more than three orders of magnitude
+// between the worst-case intermediate and f32::MAX.
+const MAX_RENDER_COORDINATE: f64 = 10_000_000.0;
+
+impl PathTransform {
+    fn new(view_box: ViewBox, area: Rect, fit: PathFit) -> Option<Self> {
+        if area.width <= 0.0 || area.height <= 0.0 {
+            return None;
+        }
+        let scale_x = f64::from(area.width) / f64::from(view_box.width);
+        let scale_y = f64::from(area.height) / f64::from(view_box.height);
+        let (scale_x, scale_y) = match fit {
+            PathFit::Contain => {
+                let scale = scale_x.min(scale_y);
+                (scale, scale)
+            }
+            PathFit::Cover => {
+                let scale = scale_x.max(scale_y);
+                (scale, scale)
+            }
+            PathFit::Fill => (scale_x, scale_y),
+        };
+        let width = f64::from(view_box.width) * scale_x;
+        let height = f64::from(view_box.height) * scale_y;
+        let transform = Self {
+            scale_x,
+            scale_y,
+            translate_x: f64::from(area.x) + (f64::from(area.width) - width) / 2.0
+                - f64::from(view_box.x) * scale_x,
+            translate_y: f64::from(area.y) + (f64::from(area.height) - height) / 2.0
+                - f64::from(view_box.y) * scale_y,
+        };
+        [
+            transform.scale_x,
+            transform.scale_y,
+            transform.translate_x,
+            transform.translate_y,
+        ]
+        .into_iter()
+        .all(f64::is_finite)
+        .then_some(transform)
+    }
+
+    fn point(self, x: f32, y: f32) -> Option<(f32, f32)> {
+        let x = f64::from(x) * self.scale_x + self.translate_x;
+        let y = f64::from(y) * self.scale_y + self.translate_y;
+        (x.is_finite()
+            && y.is_finite()
+            && x.abs() <= MAX_RENDER_COORDINATE
+            && y.abs() <= MAX_RENDER_COORDINATE)
+            .then_some((x as f32, y as f32))
+    }
+}
+
+fn transformed_path(segments: &[VectorSegment], transform: PathTransform) -> Result<Path, String> {
+    let mut path = Path::new();
+    for segment in segments {
+        match *segment {
+            VectorSegment::MoveTo { x, y } => {
+                let (x, y) = transform.point(x, y).ok_or_else(path_range_error)?;
+                path.move_to(x, y);
+            }
+            VectorSegment::LineTo { x, y } => {
+                let (x, y) = transform.point(x, y).ok_or_else(path_range_error)?;
+                path.line_to(x, y);
+            }
+            VectorSegment::CurveTo {
+                x1,
+                y1,
+                x2,
+                y2,
+                x,
+                y,
+            } => {
+                let (x1, y1) = transform.point(x1, y1).ok_or_else(path_range_error)?;
+                let (x2, y2) = transform.point(x2, y2).ok_or_else(path_range_error)?;
+                let (x, y) = transform.point(x, y).ok_or_else(path_range_error)?;
+                path.bezier_to(x1, y1, x2, y2, x, y);
+            }
+            VectorSegment::Quadratic { x1, y1, x, y } => {
+                let (x1, y1) = transform.point(x1, y1).ok_or_else(path_range_error)?;
+                let (x, y) = transform.point(x, y).ok_or_else(path_range_error)?;
+                path.quad_to(x1, y1, x, y);
+            }
+            VectorSegment::Close => path.close(),
+        }
+    }
+    Ok(path)
+}
+
+fn path_range_error() -> String {
+    "path coordinates exceed renderer limits after fitting".into()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -528,6 +689,32 @@ mod tests {
     }
 
     #[test]
+    fn path_fit_maps_negative_view_boxes_into_the_content_area() {
+        let view_box = ViewBox::new(-10.0, 20.0, 20.0, 10.0).unwrap();
+        let area = Rect {
+            x: 100.0,
+            y: 50.0,
+            width: 100.0,
+            height: 100.0,
+        };
+
+        let contain = PathTransform::new(view_box, area, PathFit::Contain).unwrap();
+        assert_eq!(contain.point(-10.0, 20.0), Some((100.0, 75.0)));
+        assert_eq!(contain.point(10.0, 30.0), Some((200.0, 125.0)));
+
+        let cover = PathTransform::new(view_box, area, PathFit::Cover).unwrap();
+        assert_eq!(cover.point(-10.0, 20.0), Some((50.0, 50.0)));
+        assert_eq!(cover.point(10.0, 30.0), Some((250.0, 150.0)));
+
+        let fill = PathTransform::new(view_box, area, PathFit::Fill).unwrap();
+        assert_eq!(fill.point(-10.0, 20.0), Some((100.0, 50.0)));
+        assert_eq!(fill.point(10.0, 30.0), Some((200.0, 150.0)));
+        assert!(
+            PathTransform::new(view_box, Rect { width: 0.0, ..area }, PathFit::Contain).is_none()
+        );
+    }
+
+    #[test]
     fn cover_and_fill_use_the_fit_aware_texture_without_a_second_crop() {
         let area = Rect {
             x: 1.25,
@@ -555,5 +742,136 @@ mod tests {
         };
         assert_eq!(image_radius(6.0, clip), 6.0);
         assert_eq!(image_radius(30.0, clip), 10.0);
+    }
+
+    #[test]
+    fn tiny_view_boxes_never_send_nonfinite_coordinates_to_the_renderer() {
+        let dimension = f32::from_bits(1);
+        let view_box = ViewBox::new(0.0, 0.0, dimension, dimension).unwrap();
+        let area = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 100_000.0,
+            height: 100_000.0,
+        };
+        let transform = PathTransform::new(view_box, area, PathFit::Contain).unwrap();
+
+        assert_eq!(
+            transform.point(dimension, dimension),
+            Some((100_000.0, 100_000.0))
+        );
+        assert!(
+            transformed_path(
+                &[
+                    VectorSegment::MoveTo { x: 0.0, y: 0.0 },
+                    VectorSegment::LineTo {
+                        x: dimension,
+                        y: dimension,
+                    },
+                ],
+                transform,
+            )
+            .is_ok()
+        );
+        assert_eq!(transform.point(1.0, 1.0), None);
+        assert!(transformed_path(&[VectorSegment::MoveTo { x: 1.0, y: 1.0 }], transform).is_err());
+
+        let mut root = Node::new(NodeId(1), Kind::Path);
+        root.path
+            .set_data("M 0 0 L 1.40129846e-45 0 L 1.40129846e-45 1.40129846e-45 Z".into())
+            .unwrap();
+        root.path.view_box = Some(view_box);
+        root.style.width = Some(100.0);
+        root.style.height = Some(100.0);
+        let mut painter = Painter::new(Void, || {}).unwrap();
+        let mut scroll = ScrollState::default();
+        let layout = painter
+            .layout(
+                &root,
+                Size {
+                    width: 100.0,
+                    height: 100.0,
+                },
+                &mut scroll,
+            )
+            .unwrap();
+        painter
+            .paint_to_output(
+                PaintFrame {
+                    root: &root,
+                    layout: &layout,
+                    physical: (100, 100),
+                    scale: 1.0,
+                    input: Interaction::default(),
+                },
+                (),
+                |_| {},
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn path_coordinate_limit_leaves_curve_flattening_headroom() {
+        let maximum_physical_coordinate = 16.0 * MAX_RENDER_COORDINATE;
+        let maximum_flatness_term = 256.0 * maximum_physical_coordinate.powi(4);
+        assert!(maximum_flatness_term < f64::from(f32::MAX));
+
+        let transform = PathTransform {
+            scale_x: 1.0,
+            scale_y: 1.0,
+            translate_x: 0.0,
+            translate_y: 0.0,
+        };
+        let boundary = MAX_RENDER_COORDINATE as f32;
+        assert_eq!(
+            transform.point(boundary, -boundary),
+            Some((boundary, -boundary))
+        );
+        assert_eq!(transform.point(boundary * 2.0, 0.0), None);
+    }
+
+    #[test]
+    fn vector_path_tessellates_with_fill_stroke_and_rounded_clipping() {
+        let mut root = Node::new(NodeId(1), Kind::Path);
+        root.path
+            .set_data("M 0 0 C 10 0 10 20 20 20 A 8 8 0 0 1 0 0 Z".into())
+            .unwrap();
+        root.path.view_box = Some(ViewBox::new(0.0, 0.0, 20.0, 20.0).unwrap());
+        root.path.fit = PathFit::Fill;
+        root.path.fill_rule = PathFillRule::EvenOdd;
+        root.path.stroke = ThingColor([255, 255, 255, 255]);
+        root.path.stroke_width = 2.0;
+        root.path.stroke_cap = PathStrokeCap::Round;
+        root.path.stroke_join = PathStrokeJoin::Bevel;
+        root.style.width = Some(80.0);
+        root.style.height = Some(40.0);
+        root.style.padding = 4.0;
+        root.style.radius = 8.0;
+
+        let mut painter = Painter::new(Void, || {}).unwrap();
+        let mut scroll = ScrollState::default();
+        let layout = painter
+            .layout(
+                &root,
+                Size {
+                    width: 80.0,
+                    height: 40.0,
+                },
+                &mut scroll,
+            )
+            .unwrap();
+        painter
+            .paint_to_output(
+                PaintFrame {
+                    root: &root,
+                    layout: &layout,
+                    physical: (80, 40),
+                    scale: 1.0,
+                    input: Interaction::default(),
+                },
+                (),
+                |_| {},
+            )
+            .unwrap();
     }
 }

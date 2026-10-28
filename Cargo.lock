@@ -1908,6 +1908,10 @@ dependencies = [
 [[package]]
 name = "thing-core"
 version = "0.1.0"
+dependencies = [
+ "kurbo",
+ "svgtypes",
+]
 
 [[package]]
 name = "thing-runtime"

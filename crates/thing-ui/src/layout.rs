@@ -159,6 +159,14 @@ impl Layout {
                                 width: 32.0,
                                 height: 32.0,
                             },
+                            Kind::Path => node
+                                .path
+                                .view_box
+                                .map(|view_box| Size {
+                                    width: view_box.width,
+                                    height: view_box.height,
+                                })
+                                .unwrap_or_default(),
                             _ => Size::default(),
                         };
                         tf::Size {
@@ -727,6 +735,28 @@ mod tests {
         assert_eq!(layout.get(NodeId(4)).unwrap().bounds.x, 39.0);
         assert_eq!(layout.hit_test(Point { x: 10.0, y: 10.0 }), Some(NodeId(2)));
         assert_eq!(layout.hit_test(Point { x: 36.0, y: 10.0 }), None);
+    }
+
+    #[test]
+    fn paths_use_the_view_box_as_their_intrinsic_size() {
+        let mut root = Node::new(NodeId(1), Kind::Row);
+        let mut path = Node::new(NodeId(2), Kind::Path);
+        path.path.set_data("M 0 0 L 40 20".into()).unwrap();
+        path.path.view_box = Some(thing_core::ViewBox::new(0.0, 0.0, 40.0, 20.0).unwrap());
+        path.style.padding = 3.0;
+        root.children.push(path);
+
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 100.0,
+                height: 50.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        assert_eq!(layout.get(NodeId(2)).unwrap().bounds.width, 46.0);
+        assert_eq!(layout.get(NodeId(2)).unwrap().bounds.height, 26.0);
     }
 
     #[test]
