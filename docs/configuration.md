@@ -174,6 +174,7 @@ surface properties belong on the root `ui.panel`.
 | `margins` | all zero | `{ top, right, bottom, left }` distances from the output edges |
 | `exclusive_zone` | automatic | workspace space reserved for the surface; `0` reserves nothing and `-1` ignores other exclusive zones |
 | `input_region` | whole surface | pointer and touch input rectangles, or `false` for click-through |
+| `on_key` | absent | handles keyboard presses while the surface has keyboard focus |
 
 `edge` is the convenient form for bars. a top or bottom bar fills the output
 width unless `style.width` is set; its height defaults to 36 logical pixels. a
@@ -270,7 +271,7 @@ widget kind; unkeyed children match by position and kind.
 | `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll`, `on_hover` |
 | `slider` | `min`, `max`, `value`, `step`, `on_change`, `on_hover` |
 | `range` | `children`, `min`, `max`, `value`, `step`, `inset`, `on_change`, `on_hover`, `on_pressed` |
-| `popup` | `visible`, `open_on_hover`, `open_on_click`, `open_delay`, `close_delay`, `anchor`, `alignment`, `offset`, `constraints`, `on_hover`, `on_close` |
+| `popup` | `visible`, `open_on_hover`, `open_on_click`, `open_delay`, `close_delay`, `anchor`, `alignment`, `offset`, `constraints`, `on_key`, `on_hover`, `on_close` |
 | containers | `children`: array of widgets, or a function returning one |
 
 use a positive `max_lines` to limit a text widget. omitted lines are clipped by
@@ -1430,6 +1431,40 @@ unkeyed positional replacement does not inherit focus or a queued action. hiding
 disabling, or removing the focused widget clears focus and text input state. a
 successful configuration reload starts a new focus lifetime and can apply its
 autofocus choice, while a failed reload leaves the current one alone.
+
+panels and popups may handle keys while their surface has keyboard focus. the
+callback runs before the built-in text, control, tab, and escape behavior:
+
+```luau
+local result = ui.button { key = 'first-result' }
+
+return ui.panel {
+    on_key = function(event)
+        if event.key == 'Down' then
+            ui.focus(result)
+            ui.reveal(result)
+            return true
+        end
+        return false
+    end,
+    children = { result },
+}
+```
+
+`on_key(event)` must return a boolean. `true` consumes the press; `false` runs
+the built-in behavior against the successfully refreshed tree. an error stops
+that fallback. when the keymap marks a key repeatable, repetition continues
+while either the callback consumes it or the built-in behavior repeats it. the
+callback runs first for each repeat with `repeated = true`; key releases are not
+exposed.
+
+the event is a read-only record. `key` is the case-sensitive XKB keysym name,
+such as `Down`, `Return`, `Escape`, or `a`; an unnamed symbol uses an eight-digit
+hexadecimal value such as `0x01000000`. `text` is the UTF-8 text produced by the
+physical press, or `nil` when it has no text, so shortcut matching should use
+`key`. repeats retain that press's `key` and `text`. `shift`, `ctrl`, `alt`, and
+`logo` report the effective modifier state when the callback runs; `logo` is
+commonly called super or the windows key.
 
 the host supports one grabbed popup at a time. an input event is required to open
 it. outside clicks and escape dismiss it and call `on_close`. tab/shift+tab move

@@ -97,6 +97,12 @@ local tray_menu_button = ui.button {
 }
 
 return ui.panel {
+    on_key = function(event)
+        if event.key == "Escape" or (event.ctrl and event.text == "c") then
+            return true
+        end
+        return event.repeated and event.shift and not event.alt and not event.logo
+    end,
     input_region = {
         rectangles = {
             { x = 0, y = 0, width = 320, height = 36 },
