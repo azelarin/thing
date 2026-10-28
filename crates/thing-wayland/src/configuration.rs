@@ -225,7 +225,7 @@ mod tests {
 
     use tempfile::tempdir;
     use thing_core::{Kind, Scale};
-    use thing_runtime::{AudioDevice, AudioStream};
+    use thing_runtime::{AudioDevice, AudioSource, AudioStream};
 
     use super::*;
 
@@ -418,7 +418,9 @@ mod tests {
                 local description = if #sources == 0 then 'none' else sources[1].description
                 local streams = services.audio.streams:get()
                 local application = if #streams == 0 then 'none' else streams[1].application
-                return `{services.audio.volume:get()}:{services.audio.source_volume:get()}:{description}:{application}`
+                local all_sources = services.audio.all_sources:get()
+                local monitor = if #all_sources == 0 then 'none' else tostring(all_sources[#all_sources].monitor)
+                return `{services.audio.volume:get()}:{services.audio.source_volume:get()}:{description}:{#all_sources}:{monitor}:{application}`
             end } } }
             "#,
         )
@@ -435,6 +437,18 @@ mod tests {
                     name: "microphone".into(),
                     description: "Microphone".into(),
                 }],
+                all_sources: vec![
+                    AudioSource {
+                        name: "microphone".into(),
+                        description: "Microphone".into(),
+                        monitor: false,
+                    },
+                    AudioSource {
+                        name: "speakers.monitor".into(),
+                        description: "Monitor of Speakers".into(),
+                        monitor: true,
+                    },
+                ],
                 streams: vec![AudioStream {
                     id: "stream-1".into(),
                     application: "Firefox".into(),
@@ -449,10 +463,16 @@ mod tests {
             })
             .unwrap();
         assert_eq!(configurations.refresh(), vec![1]);
-        assert_eq!(text(&configurations, 1), "0.4:0.7:Microphone:Firefox");
+        assert_eq!(
+            text(&configurations, 1),
+            "0.4:0.7:Microphone:2:true:Firefox"
+        );
 
         configurations.add(2, output("DP-2", 2560)).unwrap();
-        assert_eq!(text(&configurations, 2), "0.4:0.7:Microphone:Firefox");
+        assert_eq!(
+            text(&configurations, 2),
+            "0.4:0.7:Microphone:2:true:Firefox"
+        );
         assert!(
             configurations
                 .set_audio(AudioSnapshot {
@@ -462,6 +482,18 @@ mod tests {
                         name: "webcam".into(),
                         description: "Webcam".into(),
                     }],
+                    all_sources: vec![
+                        AudioSource {
+                            name: "duplicate".into(),
+                            description: "First".into(),
+                            monitor: false,
+                        },
+                        AudioSource {
+                            name: "duplicate".into(),
+                            description: "Second".into(),
+                            monitor: true,
+                        },
+                    ],
                     streams: vec![AudioStream {
                         id: "stream-2".into(),
                         application: "Music".into(),
@@ -472,16 +504,22 @@ mod tests {
                         muted: false,
                         volume_writable: true,
                     }],
-                    error: "bad\0error".into(),
                     ..AudioSnapshot::default()
                 })
                 .is_err()
         );
         assert!(configurations.refresh().is_empty());
-        assert_eq!(text(&configurations, 1), "0.4:0.7:Microphone:Firefox");
-        assert_eq!(text(&configurations, 2), "0.4:0.7:Microphone:Firefox");
+        for key in [1, 2] {
+            assert_eq!(
+                text(&configurations, key),
+                "0.4:0.7:Microphone:2:true:Firefox"
+            );
+        }
         configurations.add(3, output("DP-3", 1920)).unwrap();
-        assert_eq!(text(&configurations, 3), "0.4:0.7:Microphone:Firefox");
+        assert_eq!(
+            text(&configurations, 3),
+            "0.4:0.7:Microphone:2:true:Firefox"
+        );
     }
 
     #[test]

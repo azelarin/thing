@@ -28,7 +28,7 @@ use libpulse_binding::{
     time::MicroSeconds,
     volume::{ChannelVolumes, Volume},
 };
-use thing_runtime::{Action, AudioDevice, AudioSnapshot, AudioStream};
+use thing_runtime::{Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream};
 
 #[derive(Default)]
 struct Inbox {
@@ -646,6 +646,15 @@ fn audio_snapshot(state: &ServerState) -> AudioSnapshot {
             .filter(|source| !source.monitor || source.device.name == state.default_source)
             .map(|source| source.device.clone())
             .collect(),
+        all_sources: state
+            .sources
+            .values()
+            .map(|source| AudioSource {
+                name: source.device.name.clone(),
+                description: source.device.description.clone(),
+                monitor: source.monitor,
+            })
+            .collect(),
         error: String::new(),
     }
 }
@@ -996,6 +1005,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["microphone", "monitor-a"]
         );
+        assert_eq!(
+            snapshot
+                .all_sources
+                .iter()
+                .map(|source| (source.name.as_str(), source.monitor))
+                .collect::<Vec<_>>(),
+            vec![
+                ("microphone", false),
+                ("monitor-a", true),
+                ("monitor-b", true),
+            ]
+        );
 
         let snapshot = audio_snapshot(&ServerState {
             default_source: "missing".into(),
@@ -1006,6 +1027,7 @@ mod tests {
         assert_eq!(snapshot.source_volume, 0.0);
         assert_eq!(snapshot.source_device, "missing");
         assert_eq!(snapshot.sources.len(), 1);
+        assert_eq!(snapshot.all_sources.len(), 3);
     }
 
     #[test]

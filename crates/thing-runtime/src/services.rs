@@ -56,6 +56,14 @@ pub struct AudioStream {
     pub volume_writable: bool,
 }
 
+/// one input device, including output monitors exposed by the audio server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioSource {
+    pub name: String,
+    pub description: String,
+    pub monitor: bool,
+}
+
 /// one confirmed generation of output and input audio state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AudioSnapshot {
@@ -70,6 +78,7 @@ pub struct AudioSnapshot {
     pub source_muted: bool,
     pub source_device: String,
     pub sources: Vec<AudioDevice>,
+    pub all_sources: Vec<AudioSource>,
     pub error: String,
 }
 
@@ -100,6 +109,7 @@ impl AudioSnapshot {
         }
         validate_devices(&self.devices)?;
         validate_devices(&self.sources)?;
+        validate_sources(&self.all_sources)?;
         validate_streams(&self.streams)
     }
 }
@@ -110,6 +120,7 @@ pub struct ServiceSnapshot {
     pub(crate) values: BTreeMap<String, Scalar>,
     pub(crate) devices: Vec<AudioDevice>,
     pub(crate) sources: Vec<AudioDevice>,
+    pub(crate) all_sources: Vec<AudioSource>,
     pub(crate) streams: Vec<AudioStream>,
     pub(crate) niri: NiriState,
 }
@@ -133,6 +144,12 @@ impl ServiceSnapshot {
         Ok(())
     }
 
+    pub fn set_all_audio_sources(&mut self, sources: Vec<AudioSource>) -> Result<()> {
+        validate_sources(&sources)?;
+        self.all_sources = sources;
+        Ok(())
+    }
+
     pub fn set_audio(&mut self, audio: AudioSnapshot) -> Result<()> {
         audio.validate()?;
         for (name, value) in audio.values() {
@@ -140,6 +157,7 @@ impl ServiceSnapshot {
         }
         self.devices = audio.devices;
         self.sources = audio.sources;
+        self.all_sources = audio.all_sources;
         self.streams = audio.streams;
         Ok(())
     }
@@ -205,6 +223,31 @@ impl UserData for StreamList {
     }
 }
 
+struct SourceList {
+    tracker: Rc<RefCell<Tracker>>,
+    revision: usize,
+    sources: Rc<RefCell<Vec<AudioSource>>>,
+}
+
+impl UserData for SourceList {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |lua, this, ()| {
+            this.tracker.borrow_mut().read(this.revision);
+            let list = lua.create_table()?;
+            for (index, source) in this.sources.borrow().iter().enumerate() {
+                let item = lua.create_table()?;
+                item.set("name", source.name.as_str())?;
+                item.set("description", source.description.as_str())?;
+                item.set("monitor", source.monitor)?;
+                item.set_readonly(true);
+                list.raw_set(index + 1, item)?;
+            }
+            list.set_readonly(true);
+            Ok(list)
+        });
+    }
+}
+
 pub(crate) struct Services {
     tracker: Rc<RefCell<Tracker>>,
     signals: BTreeMap<String, usize>,
@@ -214,6 +257,8 @@ pub(crate) struct Services {
     devices_revision: usize,
     sources: Rc<RefCell<Vec<AudioDevice>>>,
     sources_revision: usize,
+    all_sources: Rc<RefCell<Vec<AudioSource>>>,
+    all_sources_revision: usize,
     streams: Rc<RefCell<Vec<AudioStream>>>,
     streams_revision: usize,
     niri: NiriData,
@@ -223,6 +268,7 @@ impl Services {
     pub fn install(lua: &Lua, tracker: Rc<RefCell<Tracker>>) -> Result<Self> {
         let devices_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let sources_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
+        let all_sources_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let streams_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let niri = lua.create_table()?;
         let niri_data = NiriData::install(&niri, tracker.clone())?;
@@ -235,6 +281,8 @@ impl Services {
             devices_revision,
             sources: Rc::default(),
             sources_revision,
+            all_sources: Rc::default(),
+            all_sources_revision,
             streams: Rc::default(),
             streams_revision,
             niri: niri_data,
@@ -257,6 +305,14 @@ impl Services {
                 tracker: result.tracker.clone(),
                 revision: sources_revision,
                 devices: result.sources.clone(),
+            },
+        )?;
+        audio.set(
+            "all_sources",
+            SourceList {
+                tracker: result.tracker.clone(),
+                revision: all_sources_revision,
+                sources: result.all_sources.clone(),
             },
         )?;
         audio.set(
@@ -489,6 +545,20 @@ impl Services {
         Ok(())
     }
 
+    pub fn set_all_sources(&self, sources: Vec<AudioSource>) -> Result<()> {
+        validate_sources(&sources)?;
+        if *self.all_sources.borrow() != sources {
+            *self.all_sources.borrow_mut() = sources;
+            let mut tracker = self.tracker.borrow_mut();
+            let revision = tracker.read(self.all_sources_revision);
+            tracker.write(
+                self.all_sources_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn set_streams(&self, streams: Vec<AudioStream>) -> Result<()> {
         validate_streams(&streams)?;
         if *self.streams.borrow() != streams {
@@ -507,9 +577,11 @@ impl Services {
         audio.validate()?;
         let devices_changed = *self.devices.borrow() != audio.devices;
         let sources_changed = *self.sources.borrow() != audio.sources;
+        let all_sources_changed = *self.all_sources.borrow() != audio.all_sources;
         let streams_changed = *self.streams.borrow() != audio.streams;
         let mut devices = self.devices.borrow_mut();
         let mut sources = self.sources.borrow_mut();
+        let mut all_sources = self.all_sources.borrow_mut();
         let mut streams = self.streams.borrow_mut();
         let mut tracker = self.tracker.borrow_mut();
         let mut updates = audio
@@ -531,6 +603,13 @@ impl Services {
                 Scalar::Boolean(revision != Scalar::Boolean(true)),
             ));
         }
+        if all_sources_changed {
+            let revision = tracker.read(self.all_sources_revision);
+            updates.push((
+                self.all_sources_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            ));
+        }
         if streams_changed {
             let revision = tracker.read(self.streams_revision);
             updates.push((
@@ -544,6 +623,9 @@ impl Services {
         }
         if sources_changed {
             *sources = audio.sources;
+        }
+        if all_sources_changed {
+            *all_sources = audio.all_sources;
         }
         if streams_changed {
             *streams = audio.streams;
@@ -563,6 +645,7 @@ impl Services {
             values,
             devices: self.devices.borrow().clone(),
             sources: self.sources.borrow().clone(),
+            all_sources: self.all_sources.borrow().clone(),
             streams: self.streams.borrow().clone(),
             niri: self.niri.snapshot(),
         }
@@ -755,6 +838,24 @@ fn validate_streams(streams: &[AudioStream]) -> Result<()> {
     }
 }
 
+fn validate_sources(sources: &[AudioSource]) -> Result<()> {
+    let mut names = BTreeSet::new();
+    let invalid = sources.len() > 512
+        || sources.iter().any(|source| {
+            source.name.is_empty()
+                || source.name.len() > 4096
+                || source.name.contains('\0')
+                || source.description.len() > 4096
+                || source.description.contains('\0')
+                || !names.insert(source.name.as_str())
+        });
+    if invalid {
+        Err(Error::runtime("invalid audio source list"))
+    } else {
+        Ok(())
+    }
+}
+
 fn enqueue(actions: &RefCell<Vec<Action>>, allowed: &Cell<bool>, action: Action) -> Result<()> {
     if !allowed.get() {
         return Err(Error::runtime(
@@ -793,6 +894,14 @@ mod tests {
         }
     }
 
+    fn source(name: &str, monitor: bool) -> AudioSource {
+        AudioSource {
+            name: name.into(),
+            description: name.into(),
+            monitor,
+        }
+    }
+
     #[test]
     fn audio_lists_have_independent_revisions() {
         let lua = Lua::new();
@@ -810,10 +919,15 @@ mod tests {
             .unwrap();
         tracker.borrow_mut().finish(2);
         tracker.borrow_mut().begin(3);
-        lua.load("return services.audio.streams:get()")
+        lua.load("return services.audio.all_sources:get()")
             .eval::<Value>()
             .unwrap();
         tracker.borrow_mut().finish(3);
+        tracker.borrow_mut().begin(4);
+        lua.load("return services.audio.streams:get()")
+            .eval::<Value>()
+            .unwrap();
+        tracker.borrow_mut().finish(4);
 
         services.set_sources(vec![device("microphone")]).unwrap();
         assert_eq!(tracker.borrow().dirty, BTreeSet::from([2]));
@@ -821,8 +935,13 @@ mod tests {
         services.set_devices(vec![device("speakers")]).unwrap();
         assert_eq!(tracker.borrow().dirty, BTreeSet::from([1]));
         tracker.borrow_mut().dirty.clear();
-        services.set_streams(vec![stream("stream-1")]).unwrap();
+        services
+            .set_all_sources(vec![source("speakers.monitor", true)])
+            .unwrap();
         assert_eq!(tracker.borrow().dirty, BTreeSet::from([3]));
+        tracker.borrow_mut().dirty.clear();
+        services.set_streams(vec![stream("stream-1")]).unwrap();
+        assert_eq!(tracker.borrow().dirty, BTreeSet::from([4]));
     }
 
     #[test]
@@ -840,6 +959,10 @@ mod tests {
                 source_volume: 0.6,
                 source_device: "microphone".into(),
                 sources: vec![device("microphone")],
+                all_sources: vec![
+                    source("microphone", false),
+                    source("speakers.monitor", true),
+                ],
                 streams: vec![stream("stream-1")],
                 ..AudioSnapshot::default()
             })
@@ -850,6 +973,18 @@ mod tests {
             available: false,
             devices: vec![device("headphones")],
             sources: vec![device("webcam")],
+            all_sources: vec![source("duplicate", false), source("duplicate", true)],
+            streams: vec![stream("stream-2")],
+            ..AudioSnapshot::default()
+        };
+        assert!(services.set_audio(invalid).is_err());
+        assert_eq!(services.snapshot(), before);
+
+        let invalid = AudioSnapshot {
+            available: false,
+            devices: vec![device("headphones")],
+            sources: vec![device("webcam")],
+            all_sources: vec![source("webcam", false)],
             streams: vec![AudioStream {
                 volume: f64::NAN,
                 ..stream("stream-2")
