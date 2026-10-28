@@ -60,6 +60,10 @@ use wayland_protocols::{
         ext_data_control_offer_v1::{self, ExtDataControlOfferV1},
         ext_data_control_source_v1::{self, ExtDataControlSourceV1},
     },
+    wp::text_input::zv3::client::{
+        zwp_text_input_manager_v3::ZwpTextInputManagerV3,
+        zwp_text_input_v3::{self, ZwpTextInputV3},
+    },
     wp::{
         fractional_scale::v1::client::{
             wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
@@ -89,6 +93,10 @@ use crate::{
     clipboard::{Clipboard, OfferData as ClipboardOfferData, SourceData as ClipboardSourceData},
     configuration::Configurations,
     hover::{Command as HoverCommand, HoverKey, HoverStates, HoverTarget},
+    input_method::{
+        ChangeCause as InputMethodChangeCause, CursorRectangle as InputMethodCursorRectangle,
+        Done as InputMethodDone, InputMethod, TextState as InputMethodTextState,
+    },
     launch::{self, LaunchRequest, Launcher, PendingLaunches},
     media::Media,
     niri::Niri,
@@ -189,6 +197,7 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
     } else {
         (None, None)
     };
+    let input_method = InputMethod::bind(&globals, &qh);
     let mut event_loop: EventLoop<'static, App> =
         EventLoop::try_new().map_err(|error| error.to_string())?;
     let (system_tray, system_tray_source) = match options.system_tray {
@@ -215,6 +224,7 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         notifications,
         system_tray,
         clipboard,
+        input_method,
         launcher,
         pending_launches: PendingLaunches::new(),
         surfaces: Vec::new(),
@@ -233,6 +243,7 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         keyboard: None,
         seat: None,
         keyboard_surface: None,
+        next_text_input_generation: 1,
         queue: qh.clone(),
         loop_handle,
         modifiers: Modifiers::default(),
@@ -625,7 +636,15 @@ struct Surface {
 
 struct ActiveTextInput {
     id: NodeId,
+    generation: u64,
     editor: TextInputEditor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationReset {
+    Reset,
+    Stale,
+    Exhausted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -681,6 +700,7 @@ pub(crate) struct App {
     notifications: Option<NotificationServer>,
     system_tray: Option<SystemTray>,
     clipboard: Option<Clipboard>,
+    input_method: InputMethod,
     launcher: Launcher,
     pending_launches: PendingLaunches<XdgActivationTokenV1>,
     watch: Rc<Watch>,
@@ -702,6 +722,7 @@ pub(crate) struct App {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     seat: Option<wl_seat::WlSeat>,
     keyboard_surface: Option<wl_surface::WlSurface>,
+    next_text_input_generation: u64,
     queue: QueueHandle<App>,
     loop_handle: LoopHandle<'static, App>,
     modifiers: Modifiers,
@@ -829,6 +850,7 @@ impl App {
         for output in outputs {
             self.invalidate_output(&output);
         }
+        self.reconcile_input_method(InputMethodChangeCause::Other);
     }
 
     fn reload(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
@@ -894,6 +916,7 @@ impl App {
             self.clear_keyboard_focus();
         }
         self.update_watch();
+        self.reconcile_input_method(InputMethodChangeCause::Other);
         eprintln!("thing: reloaded {}", self.configurations.entry().display());
         Ok(())
     }
@@ -1438,6 +1461,7 @@ impl App {
             self.sync_popup_placement(&owner, parent_presented, qh);
         }
         self.reconcile_presented_pointers(&presented);
+        self.reconcile_input_method(InputMethodChangeCause::Other);
         Ok(())
     }
 
@@ -1791,6 +1815,15 @@ impl App {
         Some((node.clone(), bounds))
     }
 
+    fn allocate_text_input_generation(&mut self) -> Option<u64> {
+        let Some(generation) = allocate_text_input_generation(&mut self.next_text_input_generation)
+        else {
+            self.error = Some("text input generation counter is exhausted".into());
+            return None;
+        };
+        Some(generation)
+    }
+
     fn focus_text_input(
         &mut self,
         surface: usize,
@@ -1810,8 +1843,13 @@ impl App {
             .as_ref()
             .is_some_and(|active| active.id == id);
         if !was_active {
+            let Some(generation) = self.allocate_text_input_generation() else {
+                self.surfaces[surface].text_input = None;
+                return false;
+            };
             self.surfaces[surface].text_input = Some(ActiveTextInput {
                 id,
+                generation,
                 editor: TextInputEditor::new(&node, width),
             });
         }
@@ -1834,6 +1872,220 @@ impl App {
         true
     }
 
+    fn input_method_text_state(&mut self) -> Option<InputMethodTextState> {
+        let entered = self.input_method.entered_surface()?.clone();
+        if !input_method_surface_has_keyboard_focus(&entered, self.keyboard_surface.as_ref()) {
+            return None;
+        }
+        let surface_index = self.index(&entered)?;
+        let (id, generation) = self.surfaces[surface_index]
+            .text_input
+            .as_ref()
+            .map(|active| (active.id, active.generation))?;
+        let interactive = active_text_input_is_current(
+            self.configurations.surface_root(
+                &self.surfaces[surface_index].output,
+                &self.surfaces[surface_index].key,
+            ),
+            self.surfaces[surface_index].layout.as_ref(),
+            self.surfaces[surface_index].input.focused,
+            id,
+        );
+        let Some((node, bounds)) = interactive
+            .then(|| self.text_input_node_and_bounds(surface_index, id))
+            .flatten()
+        else {
+            self.surfaces[surface_index].text_input = None;
+            self.surfaces[surface_index].dirty = true;
+            return None;
+        };
+        let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
+        let width = (bounds.width - 2.0 * padding_x).max(0.0);
+        let (state, composition_cleared) = {
+            let active = self.surfaces[surface_index]
+                .text_input
+                .as_mut()
+                .expect("the active text input was checked");
+            let composing = active.editor.is_composing();
+            active.editor.prepare(&node, width);
+            (
+                InputMethodTextState {
+                    generation,
+                    revision: active.editor.revision(),
+                    surrounding: active.editor.surrounding(),
+                    cursor_rectangle: input_method_cursor_rectangle(&node, bounds, &active.editor),
+                },
+                composing && !active.editor.is_composing(),
+            )
+        };
+        if composition_cleared {
+            self.surfaces[surface_index].dirty = true;
+        }
+        Some(state)
+    }
+
+    fn reconcile_input_method(&mut self, cause: InputMethodChangeCause) {
+        let state = self.input_method_text_state();
+        self.input_method.update(state, cause);
+    }
+
+    fn cancel_input_method_composition(&mut self, surface: &wl_surface::WlSurface) {
+        let Some(index) = self.index(surface) else {
+            return;
+        };
+        if cancel_active_text_input_composition(&mut self.surfaces[index].text_input) {
+            self.surfaces[index].dirty = true;
+        }
+    }
+
+    fn reset_input_method_generation(
+        &mut self,
+        surface: usize,
+        id: NodeId,
+        generation: u64,
+    ) -> bool {
+        let result = reset_active_text_input_generation(
+            &mut self.surfaces[surface].text_input,
+            id,
+            generation,
+            &mut self.next_text_input_generation,
+        );
+        match result {
+            GenerationReset::Reset => {
+                self.surfaces[surface].dirty = true;
+                true
+            }
+            GenerationReset::Stale => false,
+            GenerationReset::Exhausted => {
+                self.surfaces[surface].dirty = true;
+                self.error = Some("text input generation counter is exhausted".into());
+                false
+            }
+        }
+    }
+
+    fn apply_input_method_done(&mut self, done: InputMethodDone) {
+        let cause = self.apply_input_method_done_inner(done);
+        // done may resume deferred protocol state. always publish the editor's
+        // post-batch state, including when the batch was rejected.
+        self.reconcile_input_method(cause);
+    }
+
+    fn apply_input_method_done_inner(&mut self, done: InputMethodDone) -> InputMethodChangeCause {
+        let Some(generation) = done.generation else {
+            return InputMethodChangeCause::InputMethod;
+        };
+        let Some(entered) = self.input_method.entered_surface().cloned() else {
+            return InputMethodChangeCause::InputMethod;
+        };
+        let Some(surface_index) = self.index(&entered) else {
+            return InputMethodChangeCause::InputMethod;
+        };
+        let Some((id, active_generation)) = self.surfaces[surface_index]
+            .text_input
+            .as_ref()
+            .map(|active| (active.id, active.generation))
+        else {
+            return InputMethodChangeCause::InputMethod;
+        };
+        if active_generation != generation {
+            return InputMethodChangeCause::InputMethod;
+        }
+        if !input_method_surface_has_keyboard_focus(&entered, self.keyboard_surface.as_ref())
+            || !active_text_input_is_current(
+                self.configurations.surface_root(
+                    &self.surfaces[surface_index].output,
+                    &self.surfaces[surface_index].key,
+                ),
+                self.surfaces[surface_index].layout.as_ref(),
+                self.surfaces[surface_index].input.focused,
+                id,
+            )
+        {
+            self.surfaces[surface_index].text_input = None;
+            self.surfaces[surface_index].dirty = true;
+            return InputMethodChangeCause::Other;
+        }
+        let Some((node, bounds)) = self.text_input_node_and_bounds(surface_index, id) else {
+            return InputMethodChangeCause::Other;
+        };
+        let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
+        let width = (bounds.width - 2.0 * padding_x).max(0.0);
+        let (surrounding, revision, checkpoint, composition_cleared) = {
+            let active = self.surfaces[surface_index]
+                .text_input
+                .as_mut()
+                .expect("the active input method target was checked");
+            let composing = active.editor.is_composing();
+            active.editor.prepare(&node, width);
+            (
+                active.editor.surrounding(),
+                active.editor.revision(),
+                active.editor.checkpoint(),
+                composing && !active.editor.is_composing(),
+            )
+        };
+        if composition_cleared {
+            self.surfaces[surface_index].dirty = true;
+        }
+        if !done.accepts(generation, revision, &surrounding) {
+            self.cancel_input_method_composition(&entered);
+            self.reset_input_method_generation(surface_index, id, generation);
+            return InputMethodChangeCause::Other;
+        }
+        let Ok(batch) = done.batch else {
+            self.cancel_input_method_composition(&entered);
+            self.reset_input_method_generation(surface_index, id, generation);
+            return InputMethodChangeCause::Other;
+        };
+
+        let output = self.surfaces[surface_index].output.clone();
+        let outcome = {
+            let active = self.surfaces[surface_index]
+                .text_input
+                .as_mut()
+                .expect("the active input method target was checked");
+            active.editor.apply_ime_batch(batch)
+        };
+        let Ok(outcome) = outcome else {
+            self.cancel_input_method_composition(&entered);
+            self.reset_input_method_generation(surface_index, id, generation);
+            return InputMethodChangeCause::Other;
+        };
+        self.surfaces[surface_index].dirty = true;
+        if !outcome.changed {
+            return InputMethodChangeCause::InputMethod;
+        }
+
+        let proposed = outcome.surrounding.value;
+        self.dispatch(output, id, Event::TextChange(proposed.clone()), None);
+        let Some(surface_index) = self.index(&entered) else {
+            return InputMethodChangeCause::Other;
+        };
+        let Some((node, bounds)) = self.text_input_node_and_bounds(surface_index, id) else {
+            self.surfaces[surface_index].text_input = None;
+            return InputMethodChangeCause::Other;
+        };
+        let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
+        let width = (bounds.width - 2.0 * padding_x).max(0.0);
+        let Some(active) = self.surfaces[surface_index]
+            .text_input
+            .as_mut()
+            .filter(|active| active.id == id && active.generation == generation)
+        else {
+            return InputMethodChangeCause::Other;
+        };
+        let rejected =
+            reconcile_controlled_text_edit(&mut active.editor, &node, width, &proposed, checkpoint);
+        self.surfaces[surface_index].dirty = true;
+        if rejected {
+            self.reset_input_method_generation(surface_index, id, generation);
+            InputMethodChangeCause::Other
+        } else {
+            InputMethodChangeCause::InputMethod
+        }
+    }
+
     fn text_input_key(
         &mut self,
         surface: usize,
@@ -1851,15 +2103,22 @@ impl App {
         let repeats = action.repeats();
         let surface_state = &mut self.surfaces[surface];
         reveal_text_input_focus(&mut surface_state.input, &mut surface_state.dirty);
+        let generation = self.surfaces[surface]
+            .text_input
+            .as_ref()
+            .expect("the focused text input was initialized")
+            .generation;
 
         if action == TextKeyAction::Submit {
-            let value = self.surfaces[surface]
-                .text_input
-                .as_ref()
-                .expect("the focused text input was initialized")
-                .editor
-                .value()
-                .into_owned();
+            let (value, cancelled) = prepare_text_input_submit(
+                self.surfaces[surface]
+                    .text_input
+                    .as_mut()
+                    .expect("the focused text input was initialized"),
+            );
+            if cancelled {
+                self.reset_input_method_generation(surface, id, generation);
+            }
             self.dispatch(output, id, Event::Submit(value), origin);
             return false;
         }
@@ -1915,11 +2174,15 @@ impl App {
         let Some(active) = self.surfaces[surface]
             .text_input
             .as_mut()
-            .filter(|active| active.id == id)
+            .filter(|active| active.id == id && active.generation == generation)
         else {
             return repeats;
         };
-        reconcile_controlled_text_edit(&mut active.editor, &node, width, &proposed, checkpoint);
+        let rejected =
+            reconcile_controlled_text_edit(&mut active.editor, &node, width, &proposed, checkpoint);
+        if rejected {
+            self.reset_input_method_generation(surface, id, generation);
+        }
         repeats
     }
 
@@ -2473,6 +2736,11 @@ impl App {
     fn set_keyboard_surface(&mut self, next: Option<wl_surface::WlSurface>) {
         self.clear_key_repeat();
         let previous = std::mem::replace(&mut self.keyboard_surface, next);
+        if let Some(previous) = previous.as_ref()
+            && self.keyboard_surface.as_ref() != Some(previous)
+        {
+            self.cancel_input_method_composition(previous);
+        }
         self.modifiers = Modifiers::default();
         for surface in &mut self.surfaces {
             if keyboard_focus_transition_affects(
@@ -2483,6 +2751,7 @@ impl App {
                 surface.dirty = true;
             }
         }
+        self.reconcile_input_method(InputMethodChangeCause::Other);
     }
 
     fn clear_key_repeat(&mut self) {
@@ -2621,6 +2890,7 @@ impl App {
                 self.focus_text_input(index, focused, None, false);
             }
             self.reconcile_hover_intent();
+            self.reconcile_input_method(InputMethodChangeCause::Other);
             return false;
         }
         let Some(id) = surface.input.focused else {
@@ -2645,7 +2915,9 @@ impl App {
             let Some(action) = text_key_action(&event, self.modifiers, direct) else {
                 return false;
             };
-            return self.text_input_key(index, id, action, origin);
+            let repeats = self.text_input_key(index, id, action, origin);
+            self.reconcile_input_method(InputMethodChangeCause::Other);
+            return repeats;
         }
         let Some(action) = widget_key_action(node.kind, event.keysym, direct) else {
             return false;
@@ -2739,11 +3011,97 @@ fn reconcile_controlled_text_edit(
     width: f32,
     proposed: &str,
     checkpoint: TextInputCheckpoint,
-) {
-    if node.text != proposed {
+) -> bool {
+    let rejected = node.text != proposed;
+    if rejected {
         editor.restore(checkpoint);
+        editor.cancel_composition();
     }
     editor.prepare(node, width);
+    rejected
+}
+
+fn allocate_text_input_generation(next: &mut u64) -> Option<u64> {
+    let generation = *next;
+    if generation == 0 {
+        return None;
+    }
+    *next = generation.checked_add(1).unwrap_or(0);
+    Some(generation)
+}
+
+fn reset_active_text_input_generation(
+    active: &mut Option<ActiveTextInput>,
+    expected_id: NodeId,
+    expected_generation: u64,
+    next: &mut u64,
+) -> GenerationReset {
+    if !active
+        .as_ref()
+        .is_some_and(|active| active.id == expected_id && active.generation == expected_generation)
+    {
+        return GenerationReset::Stale;
+    }
+    let Some(generation) = allocate_text_input_generation(next) else {
+        *active = None;
+        return GenerationReset::Exhausted;
+    };
+    active
+        .as_mut()
+        .expect("the active text input was checked")
+        .generation = generation;
+    GenerationReset::Reset
+}
+
+fn prepare_text_input_submit(active: &mut ActiveTextInput) -> (String, bool) {
+    let cancelled = active.editor.cancel_composition();
+    (active.editor.value().into_owned(), cancelled)
+}
+
+fn cancel_active_text_input_composition(active: &mut Option<ActiveTextInput>) -> bool {
+    active
+        .as_mut()
+        .is_some_and(|active| active.editor.cancel_composition())
+}
+
+fn input_method_cursor_rectangle(
+    node: &Node,
+    bounds: Rect,
+    editor: &TextInputEditor,
+) -> InputMethodCursorRectangle {
+    let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
+    let padding_y = node.style.padding_y.unwrap_or(node.style.padding);
+    let content_height = (bounds.height - 2.0 * padding_y).max(0.0);
+    let offset_y = ((content_height - editor.layout().height()) / 2.0).max(0.0);
+    let area = editor.ime_cursor_area();
+    let x0 = bounds.x + padding_x + editor.text_offset_x() + area.x0 as f32;
+    let y0 = bounds.y + padding_y + offset_y + area.y0 as f32;
+    let x1 = bounds.x + padding_x + editor.text_offset_x() + area.x1 as f32;
+    let y1 = bounds.y + padding_y + offset_y + area.y1 as f32;
+    let x = floor_i32(x0);
+    let y = floor_i32(y0);
+    InputMethodCursorRectangle {
+        x,
+        y,
+        width: ceil_i32(x1).saturating_sub(x).max(1),
+        height: ceil_i32(y1).saturating_sub(y).max(1),
+    }
+}
+
+fn floor_i32(value: f32) -> i32 {
+    if value.is_finite() {
+        value.floor().clamp(i32::MIN as f32, i32::MAX as f32) as i32
+    } else {
+        0
+    }
+}
+
+fn ceil_i32(value: f32) -> i32 {
+    if value.is_finite() {
+        value.ceil().clamp(i32::MIN as f32, i32::MAX as f32) as i32
+    } else {
+        0
+    }
 }
 
 fn direct_input_serial(direct: bool, serial: u32) -> Option<u32> {
@@ -2762,6 +3120,13 @@ fn keyboard_leave_matches<T: PartialEq>(current: Option<&T>, leaving: &T) -> boo
     current == Some(leaving)
 }
 
+fn input_method_surface_has_keyboard_focus<T: PartialEq>(
+    entered: &T,
+    keyboard_surface: Option<&T>,
+) -> bool {
+    keyboard_surface == Some(entered)
+}
+
 fn reveal_text_input_focus(input: &mut Interaction, dirty: &mut bool) {
     input.reveal_keyboard_focus();
     *dirty = true;
@@ -2771,6 +3136,21 @@ fn focused_widget_is_interactive(layout: Option<&Layout>, id: NodeId) -> bool {
     layout
         .and_then(|layout| layout.get(id))
         .is_some_and(|placement| placement.interactive)
+}
+
+fn active_text_input_is_current(
+    root: Option<&Node>,
+    layout: Option<&Layout>,
+    focused: Option<NodeId>,
+    id: NodeId,
+) -> bool {
+    focused == Some(id)
+        && root.is_some_and(|root| {
+            root.find(id)
+                .is_some_and(|node| node.kind == Kind::TextInput)
+                && interactive_path(root, id).is_some()
+        })
+        && focused_widget_is_interactive(layout, id)
 }
 
 fn panel_size(geometry: Geometry, output: (u32, u32)) -> (u32, u32) {
@@ -3607,7 +3987,10 @@ impl SeatHandler for App {
                 self.repeat.settings = None;
                 self.keyboard_keymap = None;
                 match self.seats.get_keyboard(qh, &seat, None) {
-                    Ok(keyboard) => self.keyboard = Some(keyboard),
+                    Ok(keyboard) => {
+                        self.keyboard = Some(keyboard);
+                        self.input_method.attach_seat(&seat, qh);
+                    }
                     Err(error) => self.error = Some(error.to_string()),
                 }
             }
@@ -3637,6 +4020,7 @@ impl SeatHandler for App {
             self.repeat.settings = None;
             self.keyboard_keymap = None;
             self.clear_keyboard_focus();
+            self.input_method.detach_seat();
             self.reconcile_hover_intent();
         }
     }
@@ -3655,6 +4039,7 @@ impl SeatHandler for App {
             self.repeat.settings = None;
             self.keyboard_keymap = None;
             self.clear_keyboard_focus();
+            self.input_method.detach_seat();
             self.clear_pointer_state(false);
             for surface in &mut self.surfaces {
                 surface.input = Interaction::default();
@@ -3822,6 +4207,7 @@ impl PointerHandler for App {
             }
         }
         self.reconcile_pointer();
+        self.reconcile_input_method(InputMethodChangeCause::Other);
     }
 }
 
@@ -3846,14 +4232,18 @@ mod input_tests {
     use std::{num::NonZeroU32, time::Duration};
 
     use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym, Modifiers, RepeatInfo};
-    use thing_core::{Kind, Node, NodeId};
+    use thing_core::{Kind, Node, NodeId, Rect};
     use thing_ui::{Layout, Measurer, Size, TextInputEditor};
 
     use super::{
-        RepeatSession, RepeatTimerAction, SliderKeyAction, TextKeyAction, WidgetKeyAction,
-        direct_input_serial, focused_widget_is_interactive, keyboard_focus_transition_affects,
-        keyboard_leave_matches, reconcile_controlled_text_edit, reveal_text_input_focus,
-        scroll_distance, text_key_action, widget_key_action,
+        ActiveTextInput, GenerationReset, RepeatSession, RepeatTimerAction, SliderKeyAction,
+        TextKeyAction, WidgetKeyAction, active_text_input_is_current,
+        allocate_text_input_generation, cancel_active_text_input_composition, direct_input_serial,
+        focused_widget_is_interactive, input_method_cursor_rectangle,
+        input_method_surface_has_keyboard_focus, keyboard_focus_transition_affects,
+        keyboard_leave_matches, prepare_text_input_submit, reconcile_controlled_text_edit,
+        reset_active_text_input_generation, reveal_text_input_focus, scroll_distance,
+        text_key_action, widget_key_action,
     };
 
     struct FixedMeasurer;
@@ -3865,6 +4255,131 @@ mod input_tests {
                 height: 20.0,
             }
         }
+    }
+
+    #[test]
+    fn text_input_generations_never_wrap_or_repeat() {
+        let mut next = u64::MAX;
+        assert_eq!(allocate_text_input_generation(&mut next), Some(u64::MAX));
+        assert_eq!(next, 0);
+        assert_eq!(allocate_text_input_generation(&mut next), None);
+        assert_eq!(next, 0);
+    }
+
+    #[test]
+    fn input_method_cursor_rectangle_is_surface_local_and_nonempty() {
+        let mut node = Node::new(NodeId(1), Kind::TextInput);
+        node.text = "hello".into();
+        node.style.padding = 4.0;
+        let editor = TextInputEditor::new(&node, 112.0);
+        let rectangle = input_method_cursor_rectangle(
+            &node,
+            Rect {
+                x: 20.0,
+                y: 10.0,
+                width: 120.0,
+                height: 32.0,
+            },
+            &editor,
+        );
+
+        assert!(rectangle.x >= 24);
+        assert!(rectangle.y >= 14);
+        assert!(rectangle.width >= 1);
+        assert!(rectangle.height >= 1);
+    }
+
+    #[test]
+    fn input_method_cursor_rectangle_tracks_scrolled_rtl_preedit() {
+        let mut node = Node::new(NodeId(1), Kind::TextInput);
+        node.text = "abc אבג ".repeat(20);
+        node.style.padding = 4.0;
+        let mut editor = TextInputEditor::new(&node, 32.0);
+        editor
+            .apply_ime_batch(thing_ui::TextInputImeBatch {
+                preedit: Some(thing_ui::TextInputPreedit {
+                    text: "候補".into(),
+                    cursor: Some((6, 0)),
+                }),
+                ..thing_ui::TextInputImeBatch::default()
+            })
+            .unwrap();
+        let rectangle = input_method_cursor_rectangle(
+            &node,
+            Rect {
+                x: 50.0,
+                y: 12.0,
+                width: 40.0,
+                height: 32.0,
+            },
+            &editor,
+        );
+
+        assert!((54..=86).contains(&rectangle.x));
+        assert!(rectangle.y >= 16);
+        assert!(rectangle.width >= 1);
+        assert!(rectangle.height >= 1);
+    }
+
+    #[test]
+    fn refreshed_tree_invalidates_stale_text_input_targets() {
+        assert!(input_method_surface_has_keyboard_focus(&1, Some(&1)));
+        assert!(!input_method_surface_has_keyboard_focus(&1, Some(&2)));
+        assert!(!input_method_surface_has_keyboard_focus::<u8>(&1, None));
+
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        root.style.width = Some(200.0);
+        root.style.height = Some(50.0);
+        let mut row = Node::new(NodeId(2), Kind::Row);
+        row.children.push(Node::new(NodeId(3), Kind::TextInput));
+        root.children.push(row);
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 200.0,
+                height: 50.0,
+            },
+            &mut FixedMeasurer,
+        )
+        .unwrap();
+        assert!(active_text_input_is_current(
+            Some(&root),
+            Some(&layout),
+            Some(NodeId(3)),
+            NodeId(3)
+        ));
+
+        let mut hidden = root.clone();
+        hidden.children[0].visible = false;
+        assert!(!active_text_input_is_current(
+            Some(&hidden),
+            Some(&layout),
+            Some(NodeId(3)),
+            NodeId(3)
+        ));
+        let mut disabled = root.clone();
+        disabled.children[0].enabled = false;
+        assert!(!active_text_input_is_current(
+            Some(&disabled),
+            Some(&layout),
+            Some(NodeId(3)),
+            NodeId(3)
+        ));
+        let mut transformed = root.clone();
+        transformed.children[0].children[0].kind = Kind::Text;
+        assert!(!active_text_input_is_current(
+            Some(&transformed),
+            Some(&layout),
+            Some(NodeId(3)),
+            NodeId(3)
+        ));
+        root.children[0].children.clear();
+        assert!(!active_text_input_is_current(
+            Some(&root),
+            Some(&layout),
+            Some(NodeId(3)),
+            NodeId(3)
+        ));
     }
 
     fn slider_layout(parent_enabled: bool, slider_visible: bool) -> Layout {
@@ -4037,15 +4552,181 @@ mod input_tests {
         let checkpoint = editor.checkpoint();
         editor.select_all();
         assert!(editor.replace_selection("proposed"));
-        reconcile_controlled_text_edit(&mut editor, &node, 100.0, "proposed", checkpoint);
+        assert!(reconcile_controlled_text_edit(
+            &mut editor,
+            &node,
+            100.0,
+            "proposed",
+            checkpoint
+        ));
         assert_eq!(editor.value(), "old");
 
         let checkpoint = editor.checkpoint();
         editor.select_all();
         assert!(editor.replace_selection("accepted"));
         node.text = "accepted".into();
-        reconcile_controlled_text_edit(&mut editor, &node, 100.0, "accepted", checkpoint);
+        assert!(!reconcile_controlled_text_edit(
+            &mut editor,
+            &node,
+            100.0,
+            "accepted",
+            checkpoint
+        ));
         assert_eq!(editor.value(), "accepted");
+    }
+
+    #[test]
+    fn rejected_controlled_edits_do_not_restore_old_composition() {
+        let mut node = Node::new(NodeId(1), Kind::TextInput);
+        node.text = "old".into();
+        let mut editor = TextInputEditor::new(&node, 100.0);
+        editor
+            .apply_ime_batch(thing_ui::TextInputImeBatch {
+                preedit: Some(thing_ui::TextInputPreedit {
+                    text: "x".into(),
+                    cursor: Some((1, 1)),
+                }),
+                ..thing_ui::TextInputImeBatch::default()
+            })
+            .unwrap();
+        let checkpoint = editor.checkpoint();
+        assert!(editor.replace_selection("proposed"));
+
+        assert!(reconcile_controlled_text_edit(
+            &mut editor,
+            &node,
+            100.0,
+            "proposed",
+            checkpoint
+        ));
+
+        assert_eq!(editor.value(), "old");
+        assert!(!editor.is_composing());
+    }
+
+    #[test]
+    fn accepted_controlled_result_keeps_generation_but_rejected_and_invalid_reset() {
+        let id = NodeId(1);
+        let mut node = Node::new(id, Kind::TextInput);
+        node.text = "old".into();
+        let mut active = Some(ActiveTextInput {
+            id,
+            generation: 1,
+            editor: TextInputEditor::new(&node, 100.0),
+        });
+        let mut next = 2;
+
+        let editor = &mut active.as_mut().unwrap().editor;
+        let checkpoint = editor.checkpoint();
+        editor.select_all();
+        editor.replace_selection("accepted");
+        node.text = "accepted".into();
+        let rejected = reconcile_controlled_text_edit(editor, &node, 100.0, "accepted", checkpoint);
+        assert!(!rejected);
+        assert_eq!(active.as_ref().unwrap().generation, 1);
+
+        let editor = &mut active.as_mut().unwrap().editor;
+        let checkpoint = editor.checkpoint();
+        editor.select_all();
+        editor.replace_selection("rejected");
+        assert!(reconcile_controlled_text_edit(
+            editor, &node, 100.0, "rejected", checkpoint,
+        ));
+        assert_eq!(
+            reset_active_text_input_generation(&mut active, id, 1, &mut next),
+            GenerationReset::Reset
+        );
+        assert_eq!(active.as_ref().unwrap().generation, 2);
+
+        let editor = &mut active.as_mut().unwrap().editor;
+        let checkpoint = editor.checkpoint();
+        editor.select_all();
+        editor.replace_selection("proposal");
+        node.text = "transformed".into();
+        assert!(reconcile_controlled_text_edit(
+            editor, &node, 100.0, "proposal", checkpoint,
+        ));
+        assert_eq!(
+            reset_active_text_input_generation(&mut active, id, 2, &mut next),
+            GenerationReset::Reset
+        );
+        assert_eq!(active.as_ref().unwrap().generation, 3);
+
+        let invalid_batch_generation = 3;
+        assert_eq!(
+            reset_active_text_input_generation(
+                &mut active,
+                id,
+                invalid_batch_generation,
+                &mut next,
+            ),
+            GenerationReset::Reset
+        );
+        assert_eq!(active.as_ref().unwrap().generation, 4);
+        let unchanged_next = next;
+        let stale_done_generation = invalid_batch_generation;
+        assert_eq!(
+            reset_active_text_input_generation(&mut active, id, stale_done_generation, &mut next,),
+            GenerationReset::Stale
+        );
+        assert_eq!(active.as_ref().unwrap().generation, 4);
+        assert_eq!(next, unchanged_next);
+        next = 0;
+        assert_eq!(
+            reset_active_text_input_generation(&mut active, id, 4, &mut next),
+            GenerationReset::Exhausted
+        );
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn submit_and_repeated_enter_clear_preedit_without_submitting_it() {
+        let id = NodeId(1);
+        let mut node = Node::new(id, Kind::TextInput);
+        node.text = "old".into();
+        let mut active = Some(ActiveTextInput {
+            id,
+            generation: 1,
+            editor: TextInputEditor::new(&node, 100.0),
+        });
+        active
+            .as_mut()
+            .unwrap()
+            .editor
+            .apply_ime_batch(thing_ui::TextInputImeBatch {
+                preedit: Some(thing_ui::TextInputPreedit {
+                    text: "compose".into(),
+                    cursor: Some((7, 7)),
+                }),
+                ..thing_ui::TextInputImeBatch::default()
+            })
+            .unwrap();
+
+        let (value, cancelled) = prepare_text_input_submit(active.as_mut().unwrap());
+        assert!(cancelled);
+        assert_eq!(value, "old");
+        assert!(!active.as_ref().unwrap().editor.is_composing());
+        let mut next = 2;
+        assert_eq!(
+            reset_active_text_input_generation(&mut active, id, 1, &mut next),
+            GenerationReset::Reset
+        );
+
+        active
+            .as_mut()
+            .unwrap()
+            .editor
+            .apply_ime_batch(thing_ui::TextInputImeBatch {
+                preedit: Some(thing_ui::TextInputPreedit {
+                    text: "again".into(),
+                    cursor: None,
+                }),
+                ..thing_ui::TextInputImeBatch::default()
+            })
+            .unwrap();
+        assert!(cancel_active_text_input_composition(&mut active));
+        assert!(!cancel_active_text_input_composition(&mut active));
+        assert_eq!(active.as_ref().unwrap().generation, 2);
     }
 
     #[test]
@@ -4457,6 +5138,54 @@ impl Dispatch<ZwlrDataControlSourceV1, ClipboardSourceData> for App {
     }
 }
 
+impl Dispatch<ZwpTextInputV3, ()> for App {
+    fn event(
+        app: &mut Self,
+        _: &ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_text_input_v3::Event::Enter { surface } => {
+                if let Some(previous) = app.input_method.entered_surface().cloned() {
+                    app.cancel_input_method_composition(&previous);
+                }
+                app.input_method.enter(surface);
+                app.reconcile_input_method(InputMethodChangeCause::InputMethod);
+            }
+            zwp_text_input_v3::Event::Leave { surface } => {
+                if app.input_method.leave(&surface) {
+                    app.cancel_input_method_composition(&surface);
+                    app.reconcile_input_method(InputMethodChangeCause::InputMethod);
+                }
+            }
+            zwp_text_input_v3::Event::PreeditString {
+                text,
+                cursor_begin,
+                cursor_end,
+            } => app
+                .input_method
+                .preedit_string(text, cursor_begin, cursor_end),
+            zwp_text_input_v3::Event::CommitString { text } => {
+                app.input_method.commit_string(text);
+            }
+            zwp_text_input_v3::Event::DeleteSurroundingText {
+                before_length,
+                after_length,
+            } => app
+                .input_method
+                .delete_surrounding_text(before_length, after_length),
+            zwp_text_input_v3::Event::Done { serial } => {
+                let done = app.input_method.done(serial);
+                app.apply_input_method_done(done);
+            }
+            _ => {}
+        }
+    }
+}
+
 delegate_compositor!(App);
 delegate_output!(App);
 delegate_layer!(App);
@@ -4472,6 +5201,7 @@ delegate_noop!(App: ignore WpViewport);
 delegate_noop!(App: ignore XdgActivationV1);
 delegate_noop!(App: ignore ExtDataControlManagerV1);
 delegate_noop!(App: ignore ZwlrDataControlManagerV1);
+delegate_noop!(App: ignore ZwpTextInputManagerV3);
 delegate_noop!(App: ignore xdg_positioner::XdgPositioner);
 
 impl ProvidesRegistryState for App {

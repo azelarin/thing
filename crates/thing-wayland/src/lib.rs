@@ -8,6 +8,7 @@ mod data_transfer;
 mod egl;
 mod host;
 mod hover;
+mod input_method;
 mod launch;
 mod media;
 mod niri;

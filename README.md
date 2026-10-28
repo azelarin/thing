@@ -56,7 +56,8 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] hover popups
 - [x] scrolling containers
 - [x] consistent keyboard repeat
-- [ ] text input with IME and clipboard support
+- [x] text input with wayland input methods
+- [ ] text input clipboard shortcuts
 - [x] vulkan rendering alongside opengl
 - [x] custom vector shapes
 - [ ] drag and drop and spring animations

@@ -251,7 +251,7 @@ impl<R: Renderer> Painter<R> {
                 self.canvas
                     .fill_path(&path, &Paint::color(color(node.style.selection_color)));
             }
-            if node.text.is_empty() && !node.placeholder.is_empty() {
+            if editor.display_is_empty() && !node.placeholder.is_empty() {
                 self.draw_text_input_value(node, content, &node.placeholder, true)?;
             } else {
                 draw_layout(
@@ -263,6 +263,17 @@ impl<R: Renderer> Painter<R> {
                     content.y + offset_y,
                     node.style.foreground,
                 )?;
+            }
+            for (preedit, _) in editor.preedit_geometry() {
+                let mut path = Path::new();
+                path.rect(
+                    content.x + offset_x + preedit.x0 as f32,
+                    content.y + offset_y + preedit.y1 as f32 - 1.0,
+                    (preedit.x1 - preedit.x0).max(0.0) as f32,
+                    1.0,
+                );
+                self.canvas
+                    .fill_path(&path, &Paint::color(color(node.style.foreground)));
             }
             if let Some(caret) = editor.cursor_geometry() {
                 let mut path = Path::new();
