@@ -9,6 +9,7 @@ mod hover;
 mod launch;
 mod media;
 mod niri;
+mod notifications;
 mod panel;
 mod popup;
 mod power;
