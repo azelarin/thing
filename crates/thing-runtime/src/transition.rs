@@ -39,12 +39,12 @@ impl Easing {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Spec {
+struct TransitionSpec {
     duration: Duration,
     easing: Easing,
 }
 
-impl Spec {
+impl TransitionSpec {
     fn parse(options: Table) -> Result<Self> {
         let mut duration = None;
         let mut easing = Easing::OutCubic;
@@ -67,16 +67,112 @@ impl Spec {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SpringSpec {
+    damping: f64,
+    epsilon: f64,
+    angular_frequency: f64,
+    velocity_epsilon: f64,
+}
+
+impl SpringSpec {
+    fn parse(options: Table) -> Result<Self> {
+        let mut stiffness = None;
+        let mut damping = None;
+        let mut epsilon = 0.01;
+        for pair in options.pairs::<String, LuaValue>() {
+            let (name, value) = pair?;
+            match name.as_str() {
+                "stiffness" => stiffness = Some(positive(value, "spring stiffness")?),
+                "damping" => damping = Some(positive(value, "spring damping")?),
+                "epsilon" => epsilon = positive(value, "spring epsilon")?,
+                _ => return Err(Error::runtime(format!("unknown spring option {name:?}"))),
+            }
+        }
+        let stiffness =
+            stiffness.ok_or_else(|| Error::runtime("spring options must include stiffness"))?;
+        let damping =
+            damping.ok_or_else(|| Error::runtime("spring options must include damping"))?;
+        let angular_frequency = stiffness.sqrt();
+        let decay = damping * angular_frequency;
+        let velocity_epsilon = epsilon * angular_frequency;
+        let fast_mode = if damping > 1.0 {
+            let root = (damping - 1.0).sqrt() * (damping + 1.0).sqrt();
+            angular_frequency * (damping + root)
+        } else {
+            angular_frequency
+        };
+        if !decay.is_finite()
+            || decay <= 0.0
+            || !velocity_epsilon.is_finite()
+            || velocity_epsilon <= 0.0
+            || !fast_mode.is_finite()
+        {
+            return Err(Error::runtime("spring options are too small or too large"));
+        }
+        Ok(Self {
+            damping,
+            epsilon,
+            angular_frequency,
+            velocity_epsilon,
+        })
+    }
+
+    fn settled(self, position: f64, velocity: f64, target: f64) -> bool {
+        (position - target).abs() <= self.epsilon && velocity.abs() <= self.velocity_epsilon
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SpecKind {
+    Transition(TransitionSpec),
+    Spring(SpringSpec),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Spec(SpecKind);
+
+impl Spec {
+    fn transition(options: Table) -> Result<Self> {
+        Ok(Self(SpecKind::Transition(TransitionSpec::parse(options)?)))
+    }
+
+    fn spring(options: Table) -> Result<Self> {
+        Ok(Self(SpecKind::Spring(SpringSpec::parse(options)?)))
+    }
+
+    pub(crate) fn supports(self, property: &str) -> bool {
+        match self.0 {
+            SpecKind::Transition(_) => supports(property),
+            SpecKind::Spring(_) => numeric_property(property),
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self.0 {
+            SpecKind::Transition(_) => "transitions",
+            SpecKind::Spring(_) => "springs",
+        }
+    }
+}
+
 pub(crate) struct Descriptor {
     function: Function,
     spec: Spec,
 }
 
 impl Descriptor {
-    pub(crate) fn new(function: Function, options: Table) -> Result<Self> {
+    pub(crate) fn transition(function: Function, options: Table) -> Result<Self> {
         Ok(Self {
             function,
-            spec: Spec::parse(options)?,
+            spec: Spec::transition(options)?,
+        })
+    }
+
+    pub(crate) fn spring(function: Function, options: Table) -> Result<Self> {
+        Ok(Self {
+            function,
+            spec: Spec::spring(options)?,
         })
     }
 
@@ -117,28 +213,57 @@ struct Segment {
     started_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SpringMotion {
+    position: f64,
+    velocity: f64,
+    advanced_at: Option<Instant>,
+    active: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Motion {
+    Transition(Option<Segment>),
+    Spring(SpringMotion),
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct State {
     spec: Spec,
     current: Resolved,
     target: Resolved,
-    segment: Option<Segment>,
+    motion: Motion,
 }
 
 impl State {
     pub(crate) fn new(spec: Spec, target: Resolved) -> Self {
+        let motion = match spec.0 {
+            SpecKind::Transition(_) => Motion::Transition(None),
+            SpecKind::Spring(_) => {
+                let Resolved::Number(value) = target else {
+                    unreachable!("spring descriptors are accepted only for numeric properties")
+                };
+                Motion::Spring(SpringMotion {
+                    position: f64::from(value),
+                    velocity: 0.0,
+                    advanced_at: None,
+                    active: false,
+                })
+            }
+        };
         Self {
             spec,
             current: target,
             target,
-            segment: None,
+            motion,
         }
     }
 
     pub(crate) fn inherit(previous: &Self, initial: &Self, now: Instant) -> Self {
         let mut previous = previous.clone();
         previous.advance(now);
-        if previous.spec == initial.spec && previous.target == initial.target {
+        if previous.spec == initial.spec {
+            previous.retarget(initial.target, now);
             previous
         } else {
             let current = previous.current;
@@ -154,30 +279,59 @@ impl State {
             return;
         }
         self.target = target;
-        if self.current == target || self.spec.duration.is_zero() {
-            self.current = target;
-            self.segment = None;
-        } else {
-            self.segment = Some(Segment {
-                from: self.current,
-                started_at: now,
-            });
+        match (self.spec.0, &mut self.motion) {
+            (SpecKind::Transition(spec), Motion::Transition(segment)) => {
+                if self.current == target || spec.duration.is_zero() {
+                    self.current = target;
+                    *segment = None;
+                } else {
+                    *segment = Some(Segment {
+                        from: self.current,
+                        started_at: now,
+                    });
+                }
+            }
+            (SpecKind::Spring(spec), Motion::Spring(motion)) => {
+                let Resolved::Number(target) = target else {
+                    unreachable!("a spring target remains numeric")
+                };
+                motion.advanced_at = Some(
+                    motion
+                        .advanced_at
+                        .map_or(now, |advanced_at| advanced_at.max(now)),
+                );
+                motion.active = !spec.settled(motion.position, motion.velocity, f64::from(target));
+                if !motion.active {
+                    motion.position = f64::from(target);
+                    motion.velocity = 0.0;
+                    self.current = target.into();
+                }
+            }
+            _ => unreachable!("the animation state matches its specification"),
         }
     }
 
     pub(crate) fn advance(&mut self, now: Instant) {
-        let Some(segment) = self.segment else {
-            return;
-        };
-        let elapsed = now.saturating_duration_since(segment.started_at);
-        if elapsed >= self.spec.duration {
-            self.current = self.target;
-            self.segment = None;
-            return;
+        match (self.spec.0, &mut self.motion) {
+            (SpecKind::Transition(spec), Motion::Transition(segment)) => {
+                let Some(active) = *segment else {
+                    return;
+                };
+                let elapsed = now.saturating_duration_since(active.started_at);
+                if elapsed >= spec.duration {
+                    self.current = self.target;
+                    *segment = None;
+                    return;
+                }
+                let progress = elapsed.as_secs_f32() / spec.duration.as_secs_f32();
+                let eased = spec.easing.sample(progress.clamp(0.0, 1.0));
+                self.current = active.from.interpolate(self.target, eased);
+            }
+            (SpecKind::Spring(spec), Motion::Spring(motion)) => {
+                advance_spring(spec, motion, self.target, &mut self.current, now);
+            }
+            _ => unreachable!("the animation state matches its specification"),
         }
-        let progress = elapsed.as_secs_f32() / self.spec.duration.as_secs_f32();
-        let eased = self.spec.easing.sample(progress.clamp(0.0, 1.0));
-        self.current = segment.from.interpolate(self.target, eased);
     }
 
     pub(crate) fn current(&self) -> Resolved {
@@ -189,7 +343,163 @@ impl State {
     }
 
     pub(crate) fn is_active(&self) -> bool {
-        self.segment.is_some()
+        match self.motion {
+            Motion::Transition(segment) => segment.is_some(),
+            Motion::Spring(motion) => motion.active,
+        }
+    }
+}
+
+impl From<f32> for Resolved {
+    fn from(value: f32) -> Self {
+        Self::Number(value)
+    }
+}
+
+fn advance_spring(
+    spec: SpringSpec,
+    motion: &mut SpringMotion,
+    target: Resolved,
+    current: &mut Resolved,
+    now: Instant,
+) {
+    if !motion.active {
+        return;
+    }
+    let Resolved::Number(target) = target else {
+        unreachable!("a spring target remains numeric")
+    };
+    let advanced_at = motion.advanced_at.unwrap_or(now);
+    let Some(elapsed) = now.checked_duration_since(advanced_at) else {
+        return;
+    };
+    if elapsed.is_zero() {
+        return;
+    }
+    let target = f64::from(target);
+    let (position, velocity) = spring_step(
+        spec,
+        motion.position,
+        motion.velocity,
+        target,
+        elapsed.as_secs_f64(),
+    );
+    motion.advanced_at = Some(now);
+    if !position.is_finite() || position.abs() > f64::from(f32::MAX) || !velocity.is_finite() {
+        motion.position = target;
+        motion.velocity = 0.0;
+        motion.active = false;
+        *current = Resolved::Number(target as f32);
+        return;
+    }
+    motion.position = position;
+    motion.velocity = velocity;
+    if spec.settled(position, velocity, target) {
+        motion.position = target;
+        motion.velocity = 0.0;
+        motion.active = false;
+    }
+    *current = Resolved::Number(motion.position as f32);
+}
+
+fn spring_step(
+    spec: SpringSpec,
+    position: f64,
+    velocity: f64,
+    target: f64,
+    elapsed: f64,
+) -> (f64, f64) {
+    let displacement = position - target;
+    let frequency = spec.angular_frequency;
+    let damping = spec.damping;
+    let decay = damping * frequency;
+
+    if damping < 1.0 {
+        let damped = frequency * (1.0 - damping * damping).sqrt();
+        let phase = damped * elapsed;
+        let envelope = (-decay * elapsed).exp();
+        if envelope == 0.0 {
+            return (target, 0.0);
+        }
+        let normalized_sine = sinc(phase);
+        let damped_sine = envelope * frequency * elapsed * normalized_sine;
+        let damped_time_sine = envelope * elapsed * normalized_sine;
+        let next_displacement = envelope * displacement * phase.cos()
+            + velocity * damped_time_sine
+            + damping * displacement * damped_sine;
+        let next_velocity = envelope * velocity * phase.cos()
+            - frequency * displacement * damped_sine
+            - damping * velocity * damped_sine;
+        (target + next_displacement, next_velocity)
+    } else if damping == 1.0 {
+        let phase = frequency * elapsed;
+        let envelope = (-phase).exp();
+        if envelope == 0.0 {
+            return (target, 0.0);
+        }
+        let damped_phase = envelope * phase;
+        let next_displacement =
+            displacement * (envelope + damped_phase) + velocity * envelope * elapsed;
+        let next_velocity =
+            velocity * (envelope - damped_phase) - frequency * displacement * damped_phase;
+        (target + next_displacement, next_velocity)
+    } else {
+        let root = (damping - 1.0).sqrt() * (damping + 1.0).sqrt();
+        let grown = frequency * root;
+        let phase = grown * elapsed;
+        // the hyperbolic form avoids ill-conditioned coefficients while the
+        // modes remain close over this step. once their phase separates,
+        // explicit modes avoid cancellation between a large cosh and sinh.
+        if phase <= 1.0 {
+            let envelope = (-decay * elapsed).exp();
+            if envelope == 0.0 {
+                return (target, 0.0);
+            }
+            let normalized_sine = sinhc(phase);
+            let damped_frequency_sine = envelope * frequency * elapsed * normalized_sine;
+            let damped_decay_sine = envelope * decay * elapsed * normalized_sine;
+            let next_displacement = envelope * displacement * phase.cosh()
+                + velocity * envelope * elapsed * normalized_sine
+                + displacement * damped_decay_sine;
+            let next_velocity = envelope * velocity * phase.cosh()
+                - frequency * displacement * damped_frequency_sine
+                - velocity * damped_decay_sine;
+            return (target + next_displacement, next_velocity);
+        }
+        // `damping - root` loses the slow mode entirely for large damping.
+        // the reciprocal form is the same root, without subtracting two
+        // nearly equal values.
+        let slow = -frequency / (damping + root);
+        let fast = -frequency * (damping + root);
+        let mode_ratio = slow / fast;
+        let velocity_ratio = velocity / fast;
+        let denominator = mode_ratio - 1.0;
+        let slow_coefficient = (velocity_ratio - displacement) / denominator;
+        let fast_coefficient = (mode_ratio * displacement - velocity_ratio) / denominator;
+        let slow_term = slow_coefficient * (slow * elapsed).exp();
+        let fast_term = fast_coefficient * (fast * elapsed).exp();
+        (
+            target + slow_term + fast_term,
+            slow * slow_term + fast * fast_term,
+        )
+    }
+}
+
+fn sinc(value: f64) -> f64 {
+    if value.abs() < 1.0e-4 {
+        let squared = value * value;
+        1.0 - squared / 6.0 + squared * squared / 120.0
+    } else {
+        value.sin() / value
+    }
+}
+
+fn sinhc(value: f64) -> f64 {
+    if value.abs() < 1.0e-4 {
+        let squared = value * value;
+        1.0 + squared / 6.0 + squared * squared / 120.0
+    } else {
+        value.sinh() / value
     }
 }
 
@@ -201,12 +511,12 @@ pub(crate) fn target(value: LuaValue, property: &str) -> Result<Resolved> {
     if color_property(property) {
         let LuaValue::String(value) = value else {
             return Err(Error::runtime(format!(
-                "transition target for {property} must be a color string"
+                "animation target for {property} must be a color string"
             )));
         };
         return value.to_str()?.parse().map(Resolved::Color).map_err(|_| {
             Error::runtime(format!(
-                "transition target for {property} must be #RRGGBB or #RRGGBBAA"
+                "animation target for {property} must be #RRGGBB or #RRGGBBAA"
             ))
         });
     }
@@ -215,14 +525,14 @@ pub(crate) fn target(value: LuaValue, property: &str) -> Result<Resolved> {
         LuaValue::Number(value) => value,
         _ => {
             return Err(Error::runtime(format!(
-                "transition target for {property} must be a number"
+                "animation target for {property} must be a number"
             )));
         }
     };
     let number = number as f32;
     if !number.is_finite() {
         return Err(Error::runtime(format!(
-            "transition target for {property} must be finite"
+            "animation target for {property} must be finite"
         )));
     }
     Ok(Resolved::Number(number))
@@ -318,6 +628,20 @@ fn milliseconds(value: LuaValue) -> Result<Duration> {
     Ok(Duration::from_millis(number as u64))
 }
 
+fn positive(value: LuaValue, name: &str) -> Result<f64> {
+    let number = match value {
+        LuaValue::Integer(value) => value as f64,
+        LuaValue::Number(value) => value,
+        _ => return Err(Error::runtime(format!("{name} must be a positive number"))),
+    };
+    if !number.is_finite() || number <= 0.0 {
+        return Err(Error::runtime(format!(
+            "{name} must be a positive finite number"
+        )));
+    }
+    Ok(number)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +655,20 @@ mod tests {
             panic!("expected a numeric transition value");
         };
         value
+    }
+
+    fn transition_spec(duration: Duration, easing: Easing) -> Spec {
+        Spec(SpecKind::Transition(TransitionSpec { duration, easing }))
+    }
+
+    fn spring_spec(stiffness: f64, damping: f64, epsilon: f64) -> SpringSpec {
+        let angular_frequency = stiffness.sqrt();
+        SpringSpec {
+            damping,
+            epsilon,
+            angular_frequency,
+            velocity_epsilon: epsilon * angular_frequency,
+        }
     }
 
     #[test]
@@ -354,10 +692,7 @@ mod tests {
     #[test]
     fn retargeting_starts_from_the_displayed_value() {
         let start = Instant::now();
-        let spec = Spec {
-            duration: Duration::from_millis(100),
-            easing: Easing::Linear,
-        };
+        let spec = transition_spec(Duration::from_millis(100), Easing::Linear);
         let mut state = State::new(spec, Resolved::Number(0.0));
         state.retarget(Resolved::Number(10.0), start);
         state.advance(start + Duration::from_millis(40));
@@ -375,10 +710,7 @@ mod tests {
     #[test]
     fn an_unchanged_target_does_not_restart_a_segment() {
         let start = Instant::now();
-        let spec = Spec {
-            duration: Duration::from_millis(100),
-            easing: Easing::Linear,
-        };
+        let spec = transition_spec(Duration::from_millis(100), Easing::Linear);
         let mut state = State::new(spec, Resolved::Number(0.0));
         state.retarget(Resolved::Number(10.0), start);
         state.retarget(Resolved::Number(10.0), start + Duration::from_millis(40));
@@ -390,15 +722,130 @@ mod tests {
     fn zero_duration_snaps_to_the_target() {
         let start = Instant::now();
         let mut state = State::new(
-            Spec {
-                duration: Duration::ZERO,
-                easing: Easing::OutCubic,
-            },
+            transition_spec(Duration::ZERO, Easing::OutCubic),
             Resolved::Number(0.0),
         );
         state.retarget(Resolved::Number(10.0), start);
         assert_eq!(state.current(), Resolved::Number(10.0));
         assert!(!state.is_active());
+    }
+
+    #[test]
+    fn analytic_springs_do_not_depend_on_frame_partitioning() {
+        for damping in [0.5, 0.999_999_999, 1.0, 1.000_000_001, 2.0] {
+            let spec = spring_spec(170.0, damping, 0.001);
+            let direct = spring_step(spec, 0.0, 0.0, 100.0, 0.75);
+            let mut partitioned = (0.0, 0.0);
+            for _ in 0..15 {
+                partitioned = spring_step(spec, partitioned.0, partitioned.1, 100.0, 0.05);
+            }
+            assert!((direct.0 - partitioned.0).abs() < 1.0e-9);
+            assert!((direct.1 - partitioned.1).abs() < 1.0e-8);
+        }
+    }
+
+    #[test]
+    fn overdamped_forms_agree_across_the_phase_boundary() {
+        let spec = spring_spec(170.0, 2.0, 0.001);
+        let direct = spring_step(spec, 0.0, 0.0, 100.0, 0.06);
+        let mut partitioned = (0.0, 0.0);
+        for _ in 0..3 {
+            partitioned = spring_step(spec, partitioned.0, partitioned.1, 100.0, 0.02);
+        }
+
+        assert!((direct.0 - partitioned.0).abs() < 1.0e-10);
+        assert!((direct.1 - partitioned.1).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn spring_retargeting_preserves_momentum() {
+        let start = Instant::now();
+        let mut state = State::new(
+            Spec(SpecKind::Spring(spring_spec(100.0, 0.5, 0.001))),
+            Resolved::Number(0.0),
+        );
+        state.retarget(Resolved::Number(10.0), start);
+        state.advance(start + Duration::from_millis(100));
+        let before = number(state.current());
+
+        state.retarget(Resolved::Number(before), start + Duration::from_millis(100));
+        assert!(state.is_active());
+        state.advance(start + Duration::from_millis(110));
+        assert!(number(state.current()) > before);
+    }
+
+    #[test]
+    fn stale_spring_timestamps_do_not_rewind_motion() {
+        let start = Instant::now();
+        let mut state = State::new(
+            Spec(SpecKind::Spring(spring_spec(100.0, 0.8, 0.001))),
+            Resolved::Number(0.0),
+        );
+        state.retarget(Resolved::Number(100.0), start);
+        state.advance(start + Duration::from_millis(100));
+        let position = state.current();
+
+        state.advance(start + Duration::from_millis(50));
+        assert_eq!(state.current(), position);
+        state.advance(start + Duration::from_millis(110));
+        assert_ne!(state.current(), position);
+    }
+
+    #[test]
+    fn a_long_frame_settles_a_damped_spring_exactly() {
+        let start = Instant::now();
+        let mut state = State::new(
+            Spec(SpecKind::Spring(spring_spec(170.0, 0.82, 0.01))),
+            Resolved::Number(0.0),
+        );
+        state.retarget(Resolved::Number(100.0), start);
+        state.advance(start + Duration::from_secs(60));
+
+        assert_eq!(state.current(), Resolved::Number(100.0));
+        assert!(!state.is_active());
+    }
+
+    #[test]
+    fn heavily_overdamped_springs_keep_their_slow_mode() {
+        let spec = spring_spec(1.0, 1.0e16, 0.001);
+        let (position, velocity) = spring_step(spec, 0.0, 0.0, 100.0, 1.0e16);
+
+        assert!((position - 39.346_934).abs() < 0.000_1, "{position}");
+        assert!(velocity.is_finite());
+    }
+
+    #[test]
+    fn an_overdamped_fast_mode_does_not_gain_a_slow_tail() {
+        let spec = spring_spec(1.0, 10.0, 1.0e-20);
+        let root = 99.0_f64.sqrt();
+        let fast = -(10.0 + root);
+        let elapsed = 300.0 / root;
+        let expected = (fast * elapsed).exp();
+
+        let (position, velocity) = spring_step(spec, 1.0, fast, 0.0, elapsed);
+        assert!((position / expected - 1.0).abs() < 1.0e-12);
+        assert!((velocity / (fast * expected) - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn a_very_stiff_underdamped_spring_stays_finite() {
+        let spec = spring_spec(1.0e308, 1.0e-154, 0.01);
+
+        for elapsed in [1.0e-9, 0.001] {
+            let (position, velocity) = spring_step(spec, 0.0, 0.0, 100.0, elapsed);
+            assert!(position.is_finite(), "position at {elapsed}s: {position}");
+            assert!(velocity.is_finite(), "velocity at {elapsed}s: {velocity}");
+            assert!((0.0..=200.0).contains(&position), "{position}");
+        }
+    }
+
+    #[test]
+    fn an_extremely_overdamped_step_keeps_its_slow_mode() {
+        let spec = spring_spec(1.0, 5.0e306, 0.01);
+        let (position, velocity) = spring_step(spec, 0.0, 0.0, 100.0, 0.001);
+
+        assert!(position.abs() < 1.0e-12, "{position}");
+        assert!(velocity.is_finite(), "{velocity}");
     }
 
     #[test]

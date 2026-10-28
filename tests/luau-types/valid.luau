@@ -8,6 +8,9 @@ end, { duration = 120 })
 local accent = ui.transition(function()
     return "#89b4fa"
 end, { duration = 120, easing = "out_cubic" })
+local gap = ui.spring(function()
+    return 8
+end, { stiffness = 170, damping = 0.8, epsilon = 0.1 })
 
 local input = ui.text_input {
     value = function()
@@ -22,6 +25,7 @@ local input = ui.text_input {
     end,
     style = {
         width = width,
+        gap = gap,
         background = accent,
         placeholder_color = "#ffffff80",
     },

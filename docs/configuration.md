@@ -710,7 +710,7 @@ style = {
 }
 ```
 
-### transitions
+### transitions and springs
 
 `ui.transition` follows a numeric or color property function and moves smoothly
 to each new result:
@@ -738,11 +738,33 @@ ui.button {
 changes the value immediately. `easing` defaults to `out_cubic`; the other choices
 are `linear`, `in_cubic`, and `in_out_cubic`.
 
-numeric transitions are available for `width`, `height`, `padding`, `padding_x`,
-`padding_y`, `gap`, `grow`, `radius`, `border_width`, and `opacity`. their
-property functions must return finite numbers, including for normally optional
-dimensions; they cannot move to or from an unspecified value. geometry changes
-go through the normal layout and hit testing paths.
+`ui.spring` follows a numeric property without fixing the motion to a duration:
+
+```luau
+style = {
+    width = ui.spring(function()
+        return expanded:get() and 240 or 80
+    end, {
+        stiffness = 170,
+        damping = 0.8,
+        epsilon = 0.1,
+    }),
+}
+```
+
+`stiffness` and `damping` must be positive finite numbers. extreme combinations
+outside the solver's representable range are rejected. stiffness controls how
+quickly the value is pulled towards its target. damping is a ratio: below 1 is
+underdamped and oscillatory, 1 is critically damped, and above 1 is overdamped.
+`epsilon` defaults to 0.01 in the property's units. a spring stops when both its
+distance from the target is at most epsilon and its speed is at most
+`epsilon * sqrt(stiffness)` units per second.
+
+numeric transitions and springs are available for `width`, `height`, `padding`,
+`padding_x`, `padding_y`, `gap`, `grow`, `radius`, `border_width`, and `opacity`.
+their property functions must return finite numbers, including for normally
+optional dimensions; they cannot move to or from an unspecified value. geometry
+changes go through the normal layout and hit testing paths.
 
 color transitions are available for `background`, `foreground`, `border_color`,
 `hover_overlay`, `pressed_overlay`, and `focus_ring_color`. their property
@@ -750,9 +772,19 @@ functions return `#RRGGBB` or `#RRGGBBAA`. rgb channels are mixed in linear srgb
 after premultiplying them by alpha; alpha is mixed linearly. endpoints keep their
 exact channel values.
 
-changing direction partway through starts from the transition's current value.
+changing direction partway through starts from the value currently being
+calculated. a spring also keeps its velocity, so an interrupted movement does not
+stop and restart. keyed children keep that motion when a reactive list rebuilds
+them with the same spring options. removing a child cancels its motion.
+
+spring targets still have to be valid style values. when an underdamped spring
+temporarily overshoots a property's range, thing displays the nearest valid value
+without discarding the spring's internal position or velocity. this lets an
+opacity or size spring settle naturally instead of turning a valid target into a
+configuration error.
+
 the first configuration load and a successful reload start at the function's
-result without animating. a failed reload leaves an existing transition running.
+result without animating. a failed reload leaves existing motion running.
 visibility changes remain immediate, so hiding a widget does not create an exit
 fade.
 

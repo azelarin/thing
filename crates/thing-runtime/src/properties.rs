@@ -482,6 +482,22 @@ pub(crate) fn apply_transition(node: &mut Node, name: &str, value: Resolved) -> 
     }
 }
 
+pub(crate) fn apply_animation_frame(node: &mut Node, name: &str, value: Resolved) -> Result<()> {
+    // keep spring momentum outside a property's range while publishing only
+    // values the widget tree can represent.
+    let value = match value {
+        Resolved::Number(value) => Resolved::Number(match name {
+            "style.opacity" => value.clamp(0.0, 1.0),
+            "style.width" | "style.height" | "style.padding" | "style.padding_x"
+            | "style.padding_y" | "style.gap" | "style.grow" | "style.radius"
+            | "style.border_width" => value.clamp(0.0, 100_000.0),
+            _ => value,
+        }),
+        color => color,
+    };
+    apply_transition(node, name, value)
+}
+
 pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
     match name {
         "text" if node.kind == Kind::Text => node.text = string(value, name)?,
