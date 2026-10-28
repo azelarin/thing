@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, path::PathBuf, time::Instant};
 use thing_core::{Node, NodeId};
 use thing_runtime::{
     Action, AudioSnapshot, Event, MediaSnapshot, NiriState, NotificationSnapshot, OutputContext,
-    PowerSnapshot, Runtime, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree,
+    PowerSnapshot, Runtime, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTraySnapshot,
 };
 use thing_ui::Layout;
 
@@ -210,6 +210,24 @@ impl<K: Clone + Eq> Configurations<K> {
         Ok(())
     }
 
+    pub(crate) fn set_system_tray(
+        &mut self,
+        system_tray: SystemTraySnapshot,
+    ) -> Result<(), String> {
+        let mut services = self.services.clone();
+        services
+            .set_system_tray(system_tray.clone())
+            .map_err(|error| error.to_string())?;
+        for instance in &mut self.instances {
+            instance
+                .runtime
+                .set_system_tray(system_tray.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        self.services = services;
+        Ok(())
+    }
+
     pub(crate) fn set_notifications(
         &mut self,
         notifications: NotificationSnapshot,
@@ -370,7 +388,7 @@ mod tests {
     use thing_core::{KeyboardMode, Kind, Scale};
     use thing_runtime::{
         AudioDevice, AudioSource, AudioStream, MediaPlayer, Notification, NotificationButton,
-        NotificationUrgency, PowerDevice,
+        NotificationUrgency, PowerDevice, SystemTrayItem, SystemTraySnapshot,
     };
     use thing_ui::{Layout, Measurer, Size};
 
@@ -382,6 +400,28 @@ mod tests {
             width,
             height: 1080,
             scale: Scale::default(),
+        }
+    }
+
+    fn system_tray_item(id: &str) -> SystemTrayItem {
+        SystemTrayItem {
+            id: id.into(),
+            protocol_item_id: "mail".into(),
+            category: "Communications".into(),
+            title: "Mail".into(),
+            status: "Active".into(),
+            icon_name: "mail-unread".into(),
+            attention_icon_name: String::new(),
+            overlay_icon_name: String::new(),
+            tooltip_icon_name: String::new(),
+            tooltip_title: String::new(),
+            tooltip_text: String::new(),
+            item_is_menu: false,
+            has_menu: true,
+            has_icon_pixmap: false,
+            has_attention_icon_pixmap: false,
+            has_overlay_icon_pixmap: false,
+            has_tooltip_icon_pixmap: false,
         }
     }
 
@@ -1054,6 +1094,48 @@ mod tests {
         assert!(configurations.refresh().is_empty());
         for key in [1, 2] {
             assert_eq!(text(&configurations, key), "true:true:42:1:discharging");
+        }
+    }
+
+    #[test]
+    fn system_tray_updates_reach_existing_and_later_outputs_together() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            return ui.panel { children = { ui.text { text = function()
+                local items = services.system_tray.items:get()
+                local id = if #items == 0 then '' else items[1].id
+                local protocol_id = if #items == 0 then '' else items[1].protocol_item_id
+                local title = if #items == 0 then '' else items[1].title
+                return `{services.system_tray.available:get()}:{services.system_tray.watcher_owned:get()}:{services.system_tray.error:get()}:{#items}:{id}:{protocol_id}:{title}`
+            end } } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        configurations.add(2, output("DP-2", 2560)).unwrap();
+
+        configurations
+            .set_system_tray(SystemTraySnapshot {
+                available: true,
+                watcher_owned: true,
+                error: String::new(),
+                items: vec![system_tray_item("tray42")],
+            })
+            .unwrap();
+        assert_eq!(configurations.refresh(), vec![1, 2]);
+        for key in [1, 2] {
+            assert_eq!(text(&configurations, key), "true:true::1:tray42:mail:Mail");
+        }
+
+        configurations.add(3, output("DP-3", 3840)).unwrap();
+        assert_eq!(text(&configurations, 3), "true:true::1:tray42:mail:Mail");
+        configurations.reload().unwrap();
+        for key in [1, 2, 3] {
+            assert_eq!(text(&configurations, key), "true:true::1:tray42:mail:Mail");
         }
     }
 

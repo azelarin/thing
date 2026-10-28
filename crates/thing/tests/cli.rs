@@ -94,3 +94,60 @@ fn check_resolves_assets_without_using_the_process_working_directory() {
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("2 file(s)"));
 }
+
+#[test]
+fn system_tray_is_explicit_and_run_only() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("panel.luau");
+    fs::write(
+        &path,
+        "return ui.panel { children = { ui.text { text = tostring(services.system_tray.available:get()) } } }",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/missing/session-bus")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .arg("check")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .arg("check")
+        .args(["--system-tray", "host"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option"));
+
+    for arguments in [
+        &["run", "--system-tray", "host"][..],
+        &["run", "--system-tray=own-watcher"][..],
+        &["run", "--notification-server", "--system-tray", "host"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("expected an entry file"));
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .args(["run", "--system-tray"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected a value"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .args(["run", "--system-tray", "daemon"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected host or own-watcher"));
+}
