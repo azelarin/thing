@@ -45,8 +45,9 @@ use thing_core::{
 use thing_runtime::{
     Action, Event, KeyInput, ManagedProcessAction, ManagedProcessDefinition, OutputContext,
     PointerButton as RuntimePointerButton, PointerEvent as RuntimePointerEvent, PointerPhase,
-    Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTrayAction, SystemTrayMenuAction,
-    UiAction, UiTarget,
+    Scalar, ScrollInput as RuntimeScrollInput, ScrollSource as RuntimeScrollSource,
+    ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTrayAction, SystemTrayMenuAction, UiAction,
+    UiTarget,
 };
 use thing_ui::{
     Interaction, Layout, PaintFrame, ScrollState, Size, TextInputCheckpoint, TextInputEditor,
@@ -100,7 +101,10 @@ use crate::{
     Renderer, RunOptions, SystemTray,
     audio::Audio,
     clipboard::{Clipboard, OfferData as ClipboardOfferData, SourceData as ClipboardSourceData},
-    configuration::{Configurations, DispatchOutcome, PointerHandlerOutcome, RemovedConfiguration},
+    configuration::{
+        Configurations, DispatchOutcome, PointerHandlerOutcome, RemovedConfiguration,
+        ScrollHandlerOutcome,
+    },
     focused_clipboard::{FocusedClipboard, PasteId},
     hover::{Command as HoverCommand, HoverKey, HoverStates, HoverTarget},
     input_method::{
@@ -2224,6 +2228,32 @@ impl App {
         self.finish_dispatch(output, consumer, result, origin);
     }
 
+    fn dispatch_scroll(
+        &mut self,
+        output: wl_output::WlOutput,
+        target: &ScopedUiTarget,
+        input: RuntimeScrollInput,
+    ) -> Option<bool> {
+        let layer_shell_version = self.layer_shell_version;
+        let consumer = Some(target.consumer.clone());
+        let result = self.configurations.dispatch_scroll_checked(
+            &output,
+            &target.target,
+            input,
+            |surfaces| validate_surface_capabilities(surfaces, layer_shell_version),
+        );
+        match result {
+            Ok(Some(ScrollHandlerOutcome { consumed, dispatch })) => self
+                .finish_dispatch(output, consumer, Ok(dispatch), None)
+                .then_some(consumed),
+            Ok(None) => None,
+            Err(error) => {
+                self.finish_dispatch(output, consumer, Err(error), None);
+                None
+            }
+        }
+    }
+
     fn finish_dispatch(
         &mut self,
         output: wl_output::WlOutput,
@@ -2787,6 +2817,34 @@ impl App {
         )
     }
 
+    fn surface_scroll_target_is_current(&self, surface: usize, target: &ScopedUiTarget) -> bool {
+        let Some(surface) = self.surfaces.get(surface) else {
+            return false;
+        };
+        self.configurations.presented_scroll_target_is_current(
+            &surface.output,
+            &target.consumer,
+            surface.root,
+            &target.target,
+        )
+    }
+
+    fn surface_scroll_view_target_is_current(
+        &self,
+        surface: usize,
+        target: &ScopedUiTarget,
+    ) -> bool {
+        let Some(surface) = self.surfaces.get(surface) else {
+            return false;
+        };
+        self.configurations.presented_scroll_view_target_is_current(
+            &surface.output,
+            &target.consumer,
+            surface.root,
+            &target.target,
+        )
+    }
+
     fn scoped_target_identity_is_current_at(
         &self,
         output: &wl_output::WlOutput,
@@ -2839,6 +2897,26 @@ impl App {
     ) -> Option<ScopedUiTarget> {
         let target = self.surfaces.get(surface)?.layouts.presented_target(id)?;
         self.surface_pointer_target_is_current(surface, &target)
+            .then_some(target)
+    }
+
+    fn current_presented_scroll_target(
+        &self,
+        surface: usize,
+        id: NodeId,
+    ) -> Option<ScopedUiTarget> {
+        let target = self.surfaces.get(surface)?.layouts.presented_target(id)?;
+        self.surface_scroll_target_is_current(surface, &target)
+            .then_some(target)
+    }
+
+    fn current_presented_scroll_view_target(
+        &self,
+        surface: usize,
+        id: NodeId,
+    ) -> Option<ScopedUiTarget> {
+        let target = self.surfaces.get(surface)?.layouts.presented_target(id)?;
+        self.surface_scroll_view_target_is_current(surface, &target)
             .then_some(target)
     }
 
@@ -6052,6 +6130,7 @@ impl PointerHandler for App {
                 PointerEventKind::Axis {
                     horizontal,
                     vertical,
+                    source,
                     ..
                 } => {
                     self.surfaces[index].pointer_position = Some(point);
@@ -6061,39 +6140,77 @@ impl PointerHandler for App {
                         continue;
                     }
                     let output = self.surfaces[index].output.clone();
-                    let handler_id = self.surfaces[index]
+                    let event_surface = self.surfaces[index].role.surface().clone();
+                    let (handler_id, scroll_ids) = self.surfaces[index]
                         .layouts
                         .presented()
-                        .and_then(|layout| layout.scroll_event_target(point));
+                        .map(|layout| {
+                            (
+                                layout.scroll_event_target(point),
+                                layout.scroll_targets(point),
+                            )
+                        })
+                        .unwrap_or_default();
                     let handler =
-                        handler_id.and_then(|id| self.current_presented_target(index, id));
+                        handler_id.and_then(|id| self.current_presented_scroll_target(index, id));
                     if handler_id.is_some() && handler.is_none() {
                         continue;
                     }
-                    let scroll_id = self.surfaces[index]
-                        .layouts
-                        .presented()
-                        .and_then(|layout| layout.scroll_target(point));
-                    let scroll_target =
-                        scroll_id.and_then(|id| self.current_presented_target(index, id));
-                    if scroll_id.is_some() && scroll_target.is_none() {
+                    let Some(scroll_targets) = scroll_ids
+                        .iter()
+                        .map(|id| self.current_presented_scroll_view_target(index, *id))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        continue;
+                    };
+                    if let Some(target) = handler.as_ref() {
+                        let Some(bounds) = self.surfaces[index]
+                            .layouts
+                            .presented()
+                            .and_then(|layout| layout.get(target.target.node()))
+                            .map(|placement| placement.bounds)
+                        else {
+                            continue;
+                        };
+                        let Some(input) = runtime_scroll_input(
+                            bounds,
+                            x,
+                            y,
+                            event.position,
+                            &self.modifiers,
+                            source,
+                        ) else {
+                            continue;
+                        };
+                        let Some(consumed) = self.dispatch_scroll(output.clone(), target, input)
+                        else {
+                            continue;
+                        };
+                        if consumed {
+                            continue;
+                        }
+                    }
+                    let Some(index) = self.index(&event_surface) else {
+                        continue;
+                    };
+                    if handler
+                        .as_ref()
+                        .is_some_and(|target| !self.surface_scroll_target_is_current(index, target))
+                        || !scroll_targets
+                            .iter()
+                            .all(|target| self.surface_scroll_view_target_is_current(index, target))
+                    {
                         continue;
                     }
-                    if let Some(target) = handler.filter(|target| {
-                        self.configurations
-                            .has_scroll_handler(&output, target.target.node())
-                    }) {
-                        self.dispatch(output, target.target.node(), Event::Scroll { x, y }, None);
-                    } else if scroll_target.is_some()
-                        && let Some(delta) = scroll_distance(y)
-                    {
-                        let surface = &mut self.surfaces[index];
-                        let changed = surface.layouts.presented().is_some_and(|layout| {
-                            layout.scroll_y(point, delta, &mut surface.scroll)
-                        });
-                        if changed {
-                            surface.dirty = true;
-                        }
+                    let Some(delta) = scroll_distance(y) else {
+                        continue;
+                    };
+                    let surface = &mut self.surfaces[index];
+                    let changed = surface.layouts.presented().is_some_and(|layout| {
+                        layout.scroll_y_targets(&scroll_ids, delta, &mut surface.scroll)
+                    });
+                    if changed {
+                        surface.dirty = true;
                     }
                 }
                 _ => {}
@@ -6112,6 +6229,46 @@ fn scroll_steps(axis: AxisScroll) -> f64 {
     } else {
         axis.absolute / 15.0
     }
+}
+
+fn runtime_scroll_input(
+    bounds: Rect,
+    x: f64,
+    y: f64,
+    position: (f64, f64),
+    modifiers: &Modifiers,
+    source: Option<wl_pointer::AxisSource>,
+) -> Option<RuntimeScrollInput> {
+    let input = RuntimeScrollInput {
+        x,
+        y,
+        local_x: position.0 - f64::from(bounds.x),
+        local_y: position.1 - f64::from(bounds.y),
+        surface_x: position.0,
+        surface_y: position.1,
+        shift: modifiers.shift,
+        ctrl: modifiers.ctrl,
+        alt: modifiers.alt,
+        logo: modifiers.logo,
+        source: match source {
+            Some(wl_pointer::AxisSource::Wheel) => RuntimeScrollSource::Wheel,
+            Some(wl_pointer::AxisSource::Finger) => RuntimeScrollSource::Finger,
+            Some(wl_pointer::AxisSource::Continuous) => RuntimeScrollSource::Continuous,
+            Some(wl_pointer::AxisSource::WheelTilt) => RuntimeScrollSource::WheelTilt,
+            _ => RuntimeScrollSource::Unknown,
+        },
+    };
+    [
+        input.x,
+        input.y,
+        input.local_x,
+        input.local_y,
+        input.surface_x,
+        input.surface_y,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
+    .then_some(input)
 }
 
 fn runtime_pointer_button(button: u32) -> Option<RuntimePointerButton> {
@@ -6166,14 +6323,18 @@ fn scroll_distance(steps: f64) -> Option<f32> {
 mod input_tests {
     use std::{collections::BTreeMap, num::NonZeroU32, time::Duration};
 
-    use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym, Modifiers, RepeatInfo};
+    use smithay_client_toolkit::seat::{
+        keyboard::{KeyEvent, Keysym, Modifiers, RepeatInfo},
+        pointer::AxisScroll,
+    };
     use thing_core::{Kind, Node, NodeId, Rect};
     use thing_ui::{Layout, Measurer, Size, TextInputEditor};
+    use wayland_client::protocol::wl_pointer;
 
     use super::{
         ActiveTextInput, GenerationReset, MissingSurfacePolicy, PointerPhase, RepeatSession,
-        RepeatTimerAction, RuntimePointerButton, SliderKeyAction, SurfaceActionRoute,
-        SurfaceLayouts, TextClipboardAction, TextKeyAction, WidgetKeyAction,
+        RepeatTimerAction, RuntimePointerButton, RuntimeScrollSource, SliderKeyAction,
+        SurfaceActionRoute, SurfaceLayouts, TextClipboardAction, TextKeyAction, WidgetKeyAction,
         active_text_input_is_current, allocate_text_input_generation,
         cancel_active_text_input_composition, claim_autofocus, direct_input_serial,
         focused_widget_is_interactive, input_method_cursor_rectangle,
@@ -6181,9 +6342,9 @@ mod input_tests {
         keyboard_leave_matches, keyboard_surface_changed, paint_interaction,
         pending_paste_is_current, prepare_text_input_submit, reconcile_controlled_text_edit,
         repeat_action_is_current, reset_active_text_input_generation, retain_non_focus_actions,
-        reveal_text_input_focus, root_key_input, runtime_pointer_event, scroll_distance,
-        semantic_pointer_target, surface_action_route, text_clipboard_action, text_key_action,
-        widget_key_action,
+        reveal_text_input_focus, root_key_input, runtime_pointer_event, runtime_scroll_input,
+        scroll_distance, scroll_steps, semantic_pointer_target, surface_action_route,
+        text_clipboard_action, text_key_action, widget_key_action,
     };
 
     struct FixedMeasurer;
@@ -6549,12 +6710,86 @@ mod input_tests {
 
     #[test]
     fn scroll_steps_convert_to_finite_logical_distance() {
+        assert_eq!(
+            scroll_steps(AxisScroll {
+                value120: 30,
+                ..AxisScroll::default()
+            }),
+            0.25
+        );
+        assert_eq!(
+            scroll_steps(AxisScroll {
+                discrete: -1,
+                ..AxisScroll::default()
+            }),
+            -1.0
+        );
+        assert_eq!(
+            scroll_steps(AxisScroll {
+                absolute: 7.5,
+                ..AxisScroll::default()
+            }),
+            0.5
+        );
         assert_eq!(scroll_distance(1.0), Some(40.0));
         assert_eq!(scroll_distance(-0.5), Some(-20.0));
         assert_eq!(scroll_distance(0.0), None);
         assert_eq!(scroll_distance(f64::NAN), None);
         assert_eq!(scroll_distance(f64::INFINITY), None);
         assert_eq!(scroll_distance(f64::MAX), None);
+    }
+
+    #[test]
+    fn scroll_metadata_uses_handler_local_coordinates_and_axis_source() {
+        let modifiers = Modifiers {
+            shift: true,
+            ctrl: false,
+            alt: true,
+            logo: false,
+            ..Modifiers::default()
+        };
+        let input = runtime_scroll_input(
+            Rect {
+                x: 10.0,
+                y: 20.0,
+                width: 100.0,
+                height: 40.0,
+            },
+            0.25,
+            -0.5,
+            (14.0, 25.0),
+            &modifiers,
+            Some(wl_pointer::AxisSource::WheelTilt),
+        )
+        .unwrap();
+        assert_eq!(input.x, 0.25);
+        assert_eq!(input.y, -0.5);
+        assert_eq!(input.local_x, 4.0);
+        assert_eq!(input.local_y, 5.0);
+        assert_eq!(input.surface_x, 14.0);
+        assert_eq!(input.surface_y, 25.0);
+        assert!(input.shift);
+        assert!(!input.ctrl);
+        assert!(input.alt);
+        assert!(!input.logo);
+        assert_eq!(input.source, RuntimeScrollSource::WheelTilt);
+
+        assert!(
+            runtime_scroll_input(
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                f64::NAN,
+                0.0,
+                (0.0, 0.0),
+                &Modifiers::default(),
+                None,
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -6,7 +6,8 @@ use thing_core::{
 };
 use thing_runtime::{
     Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, Event, KeyInput, Limits,
-    PointerButton, PointerEvent, PointerPhase, Runtime, Scalar, UiAction,
+    PointerButton, PointerEvent, PointerPhase, Runtime, Scalar, ScrollInput, ScrollSource,
+    UiAction,
 };
 
 fn fixture(source: &str) -> (TempDir, PathBuf) {
@@ -40,6 +41,22 @@ fn pointer_event(phase: PointerPhase, x: f64, y: f64) -> PointerEvent {
         ctrl: false,
         alt: true,
         logo: false,
+    }
+}
+
+fn scroll_input() -> ScrollInput {
+    ScrollInput {
+        x: 0.25,
+        y: -0.5,
+        local_x: 4.0,
+        local_y: 5.0,
+        surface_x: 14.0,
+        surface_y: 25.0,
+        shift: true,
+        ctrl: false,
+        alt: true,
+        logo: false,
+        source: ScrollSource::Wheel,
     }
 }
 
@@ -607,8 +624,10 @@ fn pointer_areas_require_handlers_and_reject_focus_semantics() {
     for source in [
         "return ui.panel { children = { ui.pointer_area {} } }",
         "return ui.panel { children = { ui.pointer_area { on_pointer = true } } }",
+        "return ui.panel { children = { ui.pointer_area { on_scroll = true } } }",
         "return ui.panel { children = { ui.pointer_area { autofocus = true, on_pointer = function() end } } }",
         "return ui.panel { children = { ui.row { on_pointer = function() end } } }",
+        "return ui.panel { children = { ui.row { on_scroll = function() end } } }",
     ] {
         let (_directory, path) = fixture(source);
         assert!(Runtime::load(path).is_err(), "accepted {source}");
@@ -621,6 +640,94 @@ fn pointer_areas_require_handlers_and_reject_focus_semantics() {
     let button = runtime.root().unwrap().children[0].id;
     assert!(runtime.pointer_target(button).is_some());
     assert!(runtime.focus_target(button).is_some());
+}
+
+#[test]
+fn scroll_only_pointer_areas_receive_readonly_metadata_without_press_semantics() {
+    let (_directory, path) = fixture(
+        r#"
+        local result = ui.state('waiting')
+        return ui.panel { children = {
+            ui.pointer_area {
+                on_scroll = function(x, y, event)
+                    assert(x == 0.25 and y == -0.5)
+                    assert(event.local_x == 4 and event.local_y == 5)
+                    assert(event.surface_x == 14 and event.surface_y == 25)
+                    assert(event.shift and not event.ctrl and event.alt and not event.logo)
+                    assert(event.source == 'wheel')
+                    local writable = pcall(function() event.local_x = 0 end)
+                    assert(not writable)
+                    result:set('received')
+                    return false
+                end,
+            },
+            ui.text { text = function() return result:get() end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let area = runtime.root().unwrap().children[0].id;
+    assert!(runtime.pointer_target(area).is_none());
+    assert!(runtime.focus_target(area).is_none());
+    assert!(runtime.active_pointer_target().is_none());
+
+    let target = runtime.scroll_target(area).unwrap();
+    let outcome = runtime
+        .dispatch_scroll_checked(&target, scroll_input(), |_| Ok(()))
+        .unwrap()
+        .unwrap();
+    assert!(outcome.changed);
+    assert!(!outcome.consumed);
+    assert_eq!(runtime.root().unwrap().children[1].text, "received");
+    assert!(runtime.active_pointer_target().is_none());
+}
+
+#[test]
+fn scroll_return_values_preserve_legacy_consumption_and_fail_closed() {
+    let (_directory, path) = fixture(
+        r#"
+        local focus = ui.button {}
+        return ui.panel { children = {
+            focus,
+            ui.button { on_scroll = function(_x, _y) end },
+            ui.button { on_scroll = function() return true end },
+            ui.button { on_scroll = function()
+                services.audio.set_muted(true)
+                ui.focus(focus)
+                return 'invalid'
+            end },
+        } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let ids = runtime
+        .root()
+        .unwrap()
+        .children
+        .iter()
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+
+    for id in &ids[1..3] {
+        let target = runtime.scroll_target(*id).unwrap();
+        let outcome = runtime
+            .dispatch_scroll_checked(&target, scroll_input(), |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert!(outcome.consumed);
+    }
+
+    let target = runtime.scroll_target(ids[3]).unwrap();
+    let error = runtime
+        .dispatch_scroll_checked(&target, scroll_input(), |_| Ok(()))
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("on_scroll must return a boolean or nil")
+    );
+    assert!(runtime.take_actions().is_empty());
+    assert!(runtime.take_ui_actions().is_empty());
 }
 
 fn pointer_replacement_fixture(key: &str) -> (TempDir, Runtime) {

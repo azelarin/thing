@@ -100,8 +100,8 @@ CASES = (
     Case(
         "invalid-pointer-area.luau",
         (
-            "missing field 'on_pointer'",
             "Expected this to be 'boolean?', but got 'number'",
+            "Expected this to be 'number', but got",
         ),
     ),
 )

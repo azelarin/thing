@@ -27,6 +27,7 @@ pub struct Placement {
     pub clip: Rect,
     pub interactive: bool,
     pub pointer_events: bool,
+    pub scroll_events: bool,
     pub enabled: bool,
     pub opacity: f32,
     pub(crate) disabled_opacity: f32,
@@ -89,7 +90,7 @@ struct RevealRegion {
 struct PointerRegion {
     bounds: Rect,
     clip: Rect,
-    interactive: Option<NodeId>,
+    scroll_handler: Option<NodeId>,
     scroll: Option<NodeId>,
 }
 
@@ -100,7 +101,7 @@ struct Inherited {
     enabled: bool,
     opacity: f32,
     disabled_opacity: f32,
-    interactive_parent: Option<NodeId>,
+    scroll_handler_parent: Option<NodeId>,
     scroll_parent: Option<NodeId>,
 }
 
@@ -237,7 +238,7 @@ impl Layout {
                 enabled: true,
                 opacity: 1.0,
                 disabled_opacity: 1.0,
-                interactive_parent: None,
+                scroll_handler_parent: None,
                 scroll_parent: None,
             },
         )?;
@@ -257,6 +258,7 @@ impl Layout {
             .filter_map(|(placement, region)| {
                 (placement.interactive
                     || placement.pointer_events
+                    || placement.scroll_events
                     || region.scroll == Some(placement.id))
                 .then_some(placement.id)
             })
@@ -295,10 +297,10 @@ impl Layout {
             .map(|region| region.id)
     }
 
-    /// the nearest interactive widget on the topmost painted branch at `point`.
+    /// the deepest scroll handler on the topmost painted branch at `point`.
     pub fn scroll_event_target(&self, point: Point) -> Option<NodeId> {
         self.pointer_region(point)
-            .and_then(|region| region.interactive)
+            .and_then(|region| region.scroll_handler)
     }
 
     /// the innermost scroll viewport under `point`.
@@ -306,19 +308,49 @@ impl Layout {
         self.pointer_region(point).and_then(|region| region.scroll)
     }
 
+    /// scroll viewports under a point, ordered from innermost to outermost.
+    pub fn scroll_targets(&self, point: Point) -> Vec<NodeId> {
+        let mut targets = Vec::new();
+        let mut current = self.scroll_target(point);
+        while let Some(id) = current {
+            let Some(area) = self.scroll_areas.iter().find(|area| area.id == id) else {
+                return Vec::new();
+            };
+            targets.push(id);
+            current = area.parent;
+        }
+        targets
+    }
+
     /// scroll the innermost vertical viewport under `point`. when that viewport
     /// is already at its limit, the event bubbles through its scroll ancestors.
     pub fn scroll_y(&self, point: Point, delta: f32, state: &mut ScrollState) -> bool {
+        self.scroll_y_targets(&self.scroll_targets(point), delta, state)
+    }
+
+    /// scroll one exact presented viewport chain without retargeting geometry.
+    pub fn scroll_y_targets(
+        &self,
+        targets: &[NodeId],
+        delta: f32,
+        state: &mut ScrollState,
+    ) -> bool {
         if !delta.is_finite() || delta == 0.0 {
             return false;
         }
-        let Some(id) = self.scroll_target(point) else {
-            return false;
-        };
-        let Some(mut area) = self.scroll_areas.iter().find(|area| area.id == id) else {
-            return false;
-        };
-        loop {
+        for (index, id) in targets.iter().copied().enumerate() {
+            let Some(area) = self.scroll_areas.iter().find(|area| area.id == id) else {
+                return false;
+            };
+            let expected_parent = targets.get(index + 1).copied();
+            if area.parent != expected_parent {
+                return false;
+            }
+        }
+        for id in targets.iter().copied() {
+            let Some(area) = self.scroll_areas.iter().find(|area| area.id == id) else {
+                return false;
+            };
             let current = state.offset(area.id).clamp(0.0, area.max_offset);
             let can_move = if delta > 0.0 {
                 current < area.max_offset
@@ -330,18 +362,8 @@ impl Layout {
                 state.set(area.id, next);
                 return next != current;
             }
-            let Some(parent) = area.parent else {
-                return false;
-            };
-            let Some(parent_area) = self
-                .scroll_areas
-                .iter()
-                .find(|candidate| candidate.id == parent)
-            else {
-                return false;
-            };
-            area = parent_area;
         }
+        false
     }
 
     /// make a visible, enabled widget vertically visible in every enclosing
@@ -503,7 +525,7 @@ impl Layout {
             enabled,
             opacity,
             disabled_opacity,
-            interactive_parent,
+            scroll_handler_parent,
             scroll_parent,
         } = inherited;
         let geometry = tree.layout(ids[&node.id]).map_err(|e| e.to_string())?;
@@ -522,10 +544,10 @@ impl Layout {
         };
         let enabled = enabled && node.enabled;
         let opacity = opacity * node.style.opacity;
-        let pointer_interactive = if enabled && node.kind.is_interactive() {
+        let pointer_scroll_handler = if enabled && node.scroll_events {
             Some(node.id)
         } else {
-            interactive_parent
+            scroll_handler_parent
         };
         let pointer_scroll = if node.kind == Kind::Scroll && enabled {
             Some(node.id)
@@ -538,6 +560,7 @@ impl Layout {
             clip,
             interactive: enabled && node.kind.is_interactive(),
             pointer_events: enabled && node.pointer_events,
+            scroll_events: enabled && node.scroll_events,
             enabled,
             opacity,
             disabled_opacity,
@@ -545,7 +568,7 @@ impl Layout {
         self.pointer_regions.push(PointerRegion {
             bounds,
             clip,
-            interactive: pointer_interactive,
+            scroll_handler: pointer_scroll_handler,
             scroll: pointer_scroll,
         });
         let Some(child_clip) = bounds.intersection(clip) else {
@@ -581,7 +604,7 @@ impl Layout {
                         enabled,
                         opacity,
                         disabled_opacity,
-                        interactive_parent: pointer_interactive,
+                        scroll_handler_parent: pointer_scroll_handler,
                         scroll_parent: child_scroll_parent,
                     },
                 )?;
@@ -1067,6 +1090,68 @@ mod tests {
             Some(NodeId(4))
         );
         assert_eq!(layout.hit_test(Point { x: 10.0, y: 10.0 }), Some(NodeId(3)));
+    }
+
+    #[test]
+    fn scroll_only_pointer_areas_route_without_press_or_focus_semantics() {
+        let mut area = fixed(1, Kind::PointerArea, 100.0, 40.0);
+        area.scroll_events = true;
+        area.children.push(fixed(2, Kind::Row, 20.0, 20.0));
+        let layout = Layout::compute(
+            &area,
+            Size {
+                width: 100.0,
+                height: 40.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+
+        let point = Point { x: 10.0, y: 10.0 };
+        assert_eq!(layout.scroll_event_target(point), Some(NodeId(1)));
+        assert_eq!(layout.pointer_event_target(point), None);
+        assert_eq!(layout.hit_test(point), None);
+        assert!(layout.focus_order().next().is_none());
+        assert_eq!(layout.pointer_targets().collect::<Vec<_>>(), [NodeId(1)]);
+
+        let mut nested = fixed(3, Kind::PointerArea, 20.0, 20.0);
+        nested.scroll_events = true;
+        area.children.clear();
+        area.children.push(nested);
+        let layout = Layout::compute(
+            &area,
+            Size {
+                width: 100.0,
+                height: 40.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        assert_eq!(layout.scroll_event_target(point), Some(NodeId(3)));
+        assert_eq!(
+            layout.scroll_event_target(Point { x: 50.0, y: 10.0 }),
+            Some(NodeId(1))
+        );
+    }
+
+    #[test]
+    fn frontmost_noninteractive_content_occludes_scroll_handlers() {
+        let mut stack = fixed(1, Kind::Stack, 100.0, 40.0);
+        let mut background = fixed(2, Kind::PointerArea, 100.0, 40.0);
+        background.scroll_events = true;
+        stack.children.push(background);
+        stack.children.push(fixed(3, Kind::Row, 100.0, 40.0));
+
+        let layout = Layout::compute(
+            &stack,
+            Size {
+                width: 100.0,
+                height: 40.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        assert_eq!(layout.scroll_event_target(Point { x: 10.0, y: 10.0 }), None);
     }
 
     #[test]
@@ -1759,6 +1844,13 @@ mod tests {
         let mut state = ScrollState::default();
         let layout = scrolled(&root, size, &mut state);
 
+        assert_eq!(layout.scroll_targets(point), [NodeId(4), NodeId(2)]);
+        assert!(!layout.scroll_y_targets(&[NodeId(4)], 20.0, &mut state));
+        assert!(!layout.scroll_y_targets(&[NodeId(2), NodeId(4)], 20.0, &mut state));
+        assert!(!layout.scroll_y_targets(&[NodeId(4), NodeId(2), NodeId(99)], 20.0, &mut state));
+        assert_eq!(state.offset(NodeId(4)), 0.0);
+        assert_eq!(state.offset(NodeId(2)), 0.0);
+
         assert!(layout.scroll_y(point, 70.0, &mut state));
         assert_eq!(state.offset(NodeId(4)), 50.0);
         assert_eq!(state.offset(NodeId(2)), 0.0);
@@ -1890,7 +1982,9 @@ mod tests {
         let mut root = Node::new(NodeId(1), Kind::CenterBox);
         root.children.push(fixed(2, Kind::Row, 10.0, 40.0));
         let mut scroll = fixed(3, Kind::Scroll, 80.0, 40.0);
-        scroll.children.push(fixed(4, Kind::Button, 80.0, 80.0));
+        let mut handler = fixed(4, Kind::Button, 80.0, 80.0);
+        handler.scroll_events = true;
+        scroll.children.push(handler);
         root.children.push(scroll);
         root.children.push(fixed(5, Kind::Row, 80.0, 40.0));
         let mut state = ScrollState::default();
