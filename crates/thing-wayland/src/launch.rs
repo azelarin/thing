@@ -210,7 +210,6 @@ impl Launcher {
 }
 
 pub(crate) fn prepare() -> calloop::Result<(Launcher, Signals)> {
-    reset_sigchld_disposition()?;
     let child_mask = ChildSignalMask::capture()?;
     match Signals::new(&[Signal::SIGCHLD]) {
         Ok(signals) => Ok((Launcher::new(child_mask), signals)),
@@ -220,6 +219,18 @@ pub(crate) fn prepare() -> calloop::Result<(Launcher, Signals)> {
             }
             Err(error)
         }
+    }
+}
+
+pub(crate) fn prepare_managed_sigchld() -> io::Result<()> {
+    reset_sigchld_disposition()?;
+    if sigchld_is_reapable()? {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "managed processes require the default SIGCHLD disposition",
+        ))
     }
 }
 

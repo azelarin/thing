@@ -366,27 +366,34 @@ pub(crate) struct Manager {
 
 impl Manager {
     pub(crate) fn start(ping: Ping) -> io::Result<Self> {
-        if !crate::launch::sigchld_is_reapable()? {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "managed processes require the default SIGCHLD disposition",
-            ));
-        }
-        Self::start_inner(ping, Limits::default(), Some(ManagerLease::acquire()?))
+        Self::start_inner(
+            ping,
+            Limits::default(),
+            Some(ManagerLease::acquire()?),
+            true,
+        )
     }
 
     #[cfg(test)]
     fn start_with_limits(ping: Ping, limits: Limits) -> io::Result<Self> {
-        Self::start_inner(ping, limits, None)
+        Self::start_inner(ping, limits, None, false)
     }
 
     #[cfg(test)]
     fn start_with_singleton(ping: Ping, limits: Limits) -> io::Result<Self> {
-        Self::start_inner(ping, limits, Some(ManagerLease::acquire()?))
+        Self::start_inner(ping, limits, Some(ManagerLease::acquire()?), false)
     }
 
-    fn start_inner(ping: Ping, limits: Limits, lease: Option<ManagerLease>) -> io::Result<Self> {
+    fn start_inner(
+        ping: Ping,
+        limits: Limits,
+        lease: Option<ManagerLease>,
+        prepare_sigchld: bool,
+    ) -> io::Result<Self> {
         ensure_authoritative_procfs()?;
+        if prepare_sigchld {
+            crate::launch::prepare_managed_sigchld()?;
+        }
         let setup = ChildSetup::capture()?;
         let (wake, reader) = UnixStream::pair()?;
         wake.set_nonblocking(true)?;
@@ -2463,7 +2470,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_restores_reapable_sigchld_for_managed_children() {
+    fn manager_start_restores_reapable_sigchld_for_managed_children() {
         let mut command =
             fixture("managed_process::tests::fake_manager_with_inherited_sigchld_ignore");
         // SAFETY: the closure changes only its own signal disposition with an
@@ -2641,9 +2648,10 @@ mod tests {
     fn fake_manager_with_inherited_sigchld_ignore() {
         assert!(!crate::launch::sigchld_is_reapable().unwrap());
         let (_launcher, _signals) = crate::launch::prepare().unwrap();
-        assert!(crate::launch::sigchld_is_reapable().unwrap());
+        assert!(!crate::launch::sigchld_is_reapable().unwrap());
         let (ping, _source) = calloop::ping::make_ping().unwrap();
         let manager = Manager::start(ping).unwrap();
+        assert!(crate::launch::sigchld_is_reapable().unwrap());
         manager.replace_scope(vec![definition("query")]).unwrap();
         manager
             .start_process("query", helper("output"), None)
