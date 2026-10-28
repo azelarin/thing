@@ -4,7 +4,7 @@ use thing_core::NodeId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HoverKey<K> {
-    pub output: K,
+    pub owner: K,
     pub anchor: NodeId,
     pub popup: NodeId,
 }
@@ -20,6 +20,119 @@ pub(crate) struct HoverTarget<K> {
 pub(crate) enum Command<K> {
     Open(HoverTarget<K>),
     Close(HoverKey<K>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HoverStates<K> {
+    states: Vec<(K, HoverState<K>)>,
+}
+
+impl<K> Default for HoverStates<K> {
+    fn default() -> Self {
+        Self { states: Vec::new() }
+    }
+}
+
+impl<K: Clone + Eq> HoverStates<K> {
+    pub fn reconcile(&mut self, owner: K, desired: Option<HoverTarget<K>>, now: Instant) {
+        debug_assert!(
+            desired
+                .as_ref()
+                .is_none_or(|target| target.key.owner == owner)
+        );
+        if let Some((_, state)) = self
+            .states
+            .iter_mut()
+            .find(|(candidate, _)| candidate == &owner)
+        {
+            state.reconcile(desired, now);
+        } else if desired.is_some() {
+            let mut state = HoverState::default();
+            state.reconcile(desired, now);
+            self.states.push((owner, state));
+        }
+    }
+
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.states
+            .iter()
+            .filter_map(|(_, state)| state.next_deadline())
+            .min()
+    }
+
+    pub fn take_due(&mut self, now: Instant) -> Option<Command<K>> {
+        self.states
+            .iter_mut()
+            .find_map(|(_, state)| state.take_due(now))
+    }
+
+    pub fn opened(&mut self, target: HoverTarget<K>) -> Option<HoverKey<K>> {
+        let owner = target.key.owner.clone();
+        self.state_mut(&owner).opened(target)
+    }
+
+    pub fn close(&mut self, key: &HoverKey<K>, suppress: bool) {
+        if let Some(state) = self.state_mut_if_present(&key.owner) {
+            state.close(key, suppress);
+        }
+    }
+
+    pub fn defer(&mut self, target: HoverTarget<K>) {
+        let owner = target.key.owner.clone();
+        self.state_mut(&owner).defer(target);
+    }
+
+    pub fn resume(&mut self, key: &HoverKey<K>, now: Instant) {
+        if let Some(state) = self.state_mut_if_present(&key.owner) {
+            state.resume(key, now);
+        }
+    }
+
+    pub fn wants(&self, key: &HoverKey<K>) -> bool {
+        self.states
+            .iter()
+            .find(|(owner, _)| owner == &key.owner)
+            .is_some_and(|(_, state)| state.wants(key))
+    }
+
+    pub fn clear(&mut self) {
+        for (_, state) in &mut self.states {
+            state.clear();
+        }
+        self.states.clear();
+    }
+
+    pub fn remove_owner(&mut self, owner: &K) -> Option<HoverKey<K>> {
+        let index = self
+            .states
+            .iter()
+            .position(|(candidate, _)| candidate == owner)?;
+        let (_, mut state) = self.states.remove(index);
+        state.remove_owner(owner)
+    }
+
+    pub fn owners(&self) -> impl Iterator<Item = &K> {
+        self.states.iter().map(|(owner, _)| owner)
+    }
+
+    fn state_mut(&mut self, owner: &K) -> &mut HoverState<K> {
+        if let Some(index) = self
+            .states
+            .iter()
+            .position(|(candidate, _)| candidate == owner)
+        {
+            return &mut self.states[index].1;
+        }
+        self.states.push((owner.clone(), HoverState::default()));
+        &mut self.states.last_mut().expect("state was inserted").1
+    }
+
+    fn state_mut_if_present(&mut self, owner: &K) -> Option<&mut HoverState<K>> {
+        self.states
+            .iter_mut()
+            .find(|(candidate, _)| candidate == owner)
+            .map(|(_, state)| state)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +248,13 @@ impl<K: Clone + Eq> HoverState<K> {
     }
 
     pub fn opened(&mut self, target: HoverTarget<K>) -> Option<HoverKey<K>> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.target.key == target.key)
+        {
+            self.pending = None;
+        }
         self.deferred = None;
         self.close_at = None;
         self.active.replace(target).map(|previous| previous.key)
@@ -192,39 +312,35 @@ impl<K: Clone + Eq> HoverState<K> {
         self.active.take().map(|active| active.key)
     }
 
-    pub fn remove_output(&mut self, output: &K) -> Option<HoverKey<K>> {
-        if self
-            .desired
-            .as_ref()
-            .is_some_and(|key| &key.output == output)
-        {
+    pub fn remove_owner(&mut self, owner: &K) -> Option<HoverKey<K>> {
+        if self.desired.as_ref().is_some_and(|key| &key.owner == owner) {
             self.desired = None;
         }
         if self
             .pending
             .as_ref()
-            .is_some_and(|pending| &pending.target.key.output == output)
+            .is_some_and(|pending| &pending.target.key.owner == owner)
         {
             self.pending = None;
         }
         if self
             .deferred
             .as_ref()
-            .is_some_and(|target| &target.key.output == output)
+            .is_some_and(|target| &target.key.owner == owner)
         {
             self.deferred = None;
         }
         if self
             .suppressed
             .as_ref()
-            .is_some_and(|key| &key.output == output)
+            .is_some_and(|key| &key.owner == owner)
         {
             self.suppressed = None;
         }
         if self
             .active
             .as_ref()
-            .is_some_and(|active| &active.key.output == output)
+            .is_some_and(|active| &active.key.owner == owner)
         {
             self.close_at = None;
             return self.active.take().map(|active| active.key);
@@ -237,10 +353,10 @@ impl<K: Clone + Eq> HoverState<K> {
 mod tests {
     use super::*;
 
-    fn target(output: u8, popup: u64, open: u64, close: u64) -> HoverTarget<u8> {
+    fn target(owner: u8, popup: u64, open: u64, close: u64) -> HoverTarget<u8> {
         HoverTarget {
             key: HoverKey {
-                output,
+                owner,
                 anchor: NodeId(popup - 1),
                 popup: NodeId(popup),
             },
@@ -329,6 +445,29 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_requeued_target_clears_its_duplicate_request() {
+        let now = Instant::now();
+        let first = target(1, 2, 0, 400);
+        let second = target(1, 4, 100, 250);
+        let mut state = HoverState::default();
+        open(&mut state, &first, now);
+
+        state.reconcile(Some(second.clone()), now);
+        assert_eq!(
+            state.take_due(now + second.open_delay),
+            Some(Command::Open(second.clone()))
+        );
+        state.close(&first.key, false);
+        state.reconcile(Some(second.clone()), now + second.open_delay);
+        assert_eq!(state.opened(second.clone()), None);
+        assert_eq!(
+            state.take_due(now + second.open_delay + second.open_delay),
+            None
+        );
+        assert_eq!(state.active(), Some(&second));
+    }
+
+    #[test]
     fn switching_before_open_cancels_the_stale_deadline() {
         let now = Instant::now();
         let first = target(1, 2, 100, 100);
@@ -400,7 +539,7 @@ mod tests {
         open(&mut state, &first, now);
         state.reconcile(Some(second.clone()), now);
 
-        assert_eq!(state.remove_output(&1), Some(first.key));
+        assert_eq!(state.remove_owner(&1), Some(first.key));
         assert_eq!(state.clear(), None);
         assert_eq!(state.take_due(now + Duration::from_secs(1)), None);
     }
@@ -412,7 +551,49 @@ mod tests {
         let mut state = HoverState::default();
         state.reconcile(Some(target), now);
 
-        assert_eq!(state.remove_output(&1), None);
+        assert_eq!(state.remove_owner(&1), None);
         assert_eq!(state.take_due(now + Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn owners_keep_independent_open_and_close_deadlines() {
+        let now = Instant::now();
+        let first = target(1, 2, 0, 400);
+        let second = target(2, 4, 100, 250);
+        let mut states = HoverStates::default();
+
+        states.reconcile(1, Some(first.clone()), now);
+        assert_eq!(states.take_due(now), Some(Command::Open(first.clone())));
+        assert_eq!(states.opened(first.clone()), None);
+        states.reconcile(1, None, now + Duration::from_millis(10));
+        states.reconcile(2, Some(second.clone()), now + Duration::from_millis(10));
+
+        assert_eq!(
+            states.take_due(now + Duration::from_millis(110)),
+            Some(Command::Open(second.clone()))
+        );
+        assert_eq!(states.opened(second), None);
+        assert_eq!(
+            states.take_due(now + Duration::from_millis(410)),
+            Some(Command::Close(first.key))
+        );
+    }
+
+    #[test]
+    fn owner_suppression_survives_popup_teardown_until_intent_leaves() {
+        let now = Instant::now();
+        let target = target(1, 2, 0, 0);
+        let mut states = HoverStates::default();
+
+        states.reconcile(1, Some(target.clone()), now);
+        assert_eq!(states.take_due(now), Some(Command::Open(target.clone())));
+        assert_eq!(states.opened(target.clone()), None);
+        states.close(&target.key, true);
+        states.reconcile(1, Some(target.clone()), now);
+        assert_eq!(states.take_due(now), None);
+
+        states.reconcile(1, None, now);
+        states.reconcile(1, Some(target.clone()), now);
+        assert_eq!(states.take_due(now), Some(Command::Open(target)));
     }
 }

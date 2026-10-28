@@ -77,7 +77,7 @@ fn media_state_is_reactive_and_replaced_together() {
         .unwrap();
     assert!(runtime.refresh().unwrap());
     assert_eq!(
-        runtime.root().children[0].text,
+        runtime.root().unwrap().children[0].text,
         "true|p1|true|Track|Artist|Player|player|true|true|false|true|1|p1|org.mpris.MediaPlayer2.test"
     );
 
@@ -96,7 +96,7 @@ fn media_state_is_reactive_and_replaced_together() {
     }
     assert!(!runtime.refresh().unwrap());
     assert_eq!(
-        runtime.root().children[0].text,
+        runtime.root().unwrap().children[0].text,
         "true|p1|true|Track|Artist|Player|player|true|true|false|true|1|p1|org.mpris.MediaPlayer2.test"
     );
 }
@@ -137,7 +137,7 @@ fn media_player_records_and_lists_are_read_only() {
 
         assert!(
             runtime
-                .dispatch(runtime.root().children[0].id, Event::Click)
+                .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
                 .is_err()
         );
         assert!(runtime.take_actions().is_empty());
@@ -157,7 +157,7 @@ fn malformed_media_player_ids_are_rejected_before_queueing() {
         let (_directory, mut runtime) = runtime(&source);
         assert!(
             runtime
-                .dispatch(runtime.root().children[0].id, Event::Click)
+                .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
                 .is_err(),
             "accepted {argument}"
         );
@@ -179,7 +179,7 @@ fn media_controls_queue_ordered_actions() {
     );
 
     runtime
-        .dispatch(runtime.root().children[0].id, Event::Click)
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
         .unwrap();
     assert_eq!(
         runtime.take_actions(),

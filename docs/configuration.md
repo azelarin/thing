@@ -1,7 +1,8 @@
 # configuration
 
-a configuration is a utf-8 `.luau` file that returns one `ui.panel`. type
-annotations are accepted, but `thing check` does not perform static type checking.
+a configuration is a utf-8 `.luau` file that returns one `ui.panel` or a dense
+array of panels. type annotations are accepted, but `thing check` does not
+perform static type checking.
 
 ## your first panel
 
@@ -46,9 +47,9 @@ sections below explain the rest of the api.
 
 ## outputs
 
-thing runs a separate configuration for each connected output. each has its own
-local state, so changing a counter on one monitor doesn't change the counters on
-other monitors. desktop services such as audio still describe the same system.
+thing runs a separate configuration for each connected output. all surfaces
+returned for one output share local state; another output gets its own runtime
+and state. desktop services such as audio still describe the same system.
 
 use `services.output` to read the output that owns your panel:
 
@@ -85,19 +86,81 @@ when you save a configuration, thing prepares a replacement for every output.
 if one fails, all outputs keep their current configuration. a successful reload
 resets each output's local state and closes its popups.
 
+## multiple surfaces
+
+return an array when one output needs independent surfaces, such as a bar and a
+drawer. every panel in the array needs a unique, static `key`:
+
+```luau
+local drawer_open = ui.state(false)
+
+return {
+    ui.panel {
+        key = 'bar',
+        style = { height = 36, padding = 6, background = '#191b22' },
+        children = {
+            ui.button {
+                on_click = function() drawer_open:set(not drawer_open:get()) end,
+                children = { ui.text { text = 'menu' } },
+            },
+        },
+    },
+    ui.panel {
+        key = 'drawer',
+        layer = 'overlay',
+        anchors = { top = true, right = true },
+        visible = function() return drawer_open:get() end,
+        style = { width = 320, height = 480, background = '#252936' },
+    },
+}
+```
+
+the two panels use the same `drawer_open` value because they belong to one
+output runtime. hiding a root destroys its wayland surface but keeps the runtime
+and its state; showing it creates the surface again. the array itself is chosen
+when the configuration loads and changes only on reload. returning an empty
+array is valid, which is useful when a configuration should skip an output.
+
+`key` identifies a surface across reactive updates. `namespace` sets its
+layer-shell namespace and is also static; it defaults to `thing-<key>`. the
+single-panel form keeps the `thing` namespace when neither value is set. keys
+and explicit namespaces must be nonempty strings of at most 256 bytes.
+
+an output may have at most 64 surfaces. ordering between surfaces on the same
+compositor layer is unspecified, so use different layers when their stacking
+order matters. popups remain attached to the root that contains them.
+
 ## panel surface
 
-surface properties belong on the root `ui.panel`. a top or bottom panel fills
-the output width unless `style.width` is set; its height defaults to 36 logical
-pixels. a left or right panel follows the same rule with the axes exchanged.
-a fixed panel is centered along the edge it occupies.
+surface properties belong on the root `ui.panel`.
 
 | property | default | meaning |
 | --- | --- | --- |
-| `edge` | `'top'` | `'top'`, `'bottom'`, `'left'`, or `'right'` |
+| `visible` | `true` | whether the surface is mapped |
+| `edge` | `'top'` | shorthand for a bar on `'top'`, `'bottom'`, `'left'`, or `'right'` |
+| `anchors` | absent | explicit `{ top, right, bottom, left }` output-edge anchors; cannot be combined with `edge` |
+| `layer` | `'top'` | `'background'`, `'bottom'`, `'top'`, or `'overlay'` |
+| `keyboard_mode` | `'on_demand'` | `'none'`, `'on_demand'`, or `'exclusive'` |
 | `margins` | all zero | `{ top, right, bottom, left }` distances from the output edges |
-| `exclusive_zone` | automatic | workspace space reserved for the panel; `0` reserves nothing and `-1` ignores other exclusive zones |
-| `input_region` | whole surface | `false` for click-through, or one rectangle `{ x, y, width, height }` |
+| `exclusive_zone` | automatic | workspace space reserved for the surface; `0` reserves nothing and `-1` ignores other exclusive zones |
+| `input_region` | whole surface | pointer and touch input rectangles, or `false` for click-through |
+
+`edge` is the convenient form for bars. a top or bottom bar fills the output
+width unless `style.width` is set; its height defaults to 36 logical pixels. a
+left or right bar follows the same rule with the axes exchanged. a fixed bar is
+centered along its edge.
+
+use `anchors` for other layer surfaces. an omitted width requires both `left`
+and `right`; an omitted height requires both `top` and `bottom`. an empty anchor
+table is valid when both dimensions are fixed and lets the compositor center the
+surface. explicit anchors reserve no space by default. a positive
+`exclusive_zone` requires one unambiguous owning edge, such as
+`{ top = true, left = true, right = true }`.
+
+`keyboard_mode = 'none'` leaves keyboard focus with ordinary applications.
+`'on_demand'` lets the compositor focus the surface after interaction, while
+`'exclusive'` requests focus whenever it is mapped. on-demand mode requires
+wlr-layer-shell version 4.
 
 automatic exclusivity follows the configured surface size. it includes the
 margin opposite the panel edge; the compositor also includes the margin on the
@@ -118,11 +181,26 @@ return ui.panel {
 input rectangles use surface-local logical pixels and are clipped to the
 surface. `x` and `y` default to zero. an omitted width or height extends from
 that origin to the corresponding far edge, so it follows compositor resizes.
-the region affects pointer and touch input, not keyboard focus.
+use the `rectangles` field to combine regions:
 
-surface properties may be functions just like other reactive properties. the
-function returns the whole value: for example, a reactive `margins` property
-returns the complete margins table.
+```luau
+input_region = {
+    rectangles = {
+        { x = 0, y = 0, width = 120, height = 36 },
+        { x = 240, y = 0, width = 120, height = 36 },
+    },
+}
+```
+
+a bare empty table retains the older meaning of one full-surface rectangle. use
+`false` for a click-through surface. an empty `rectangles` array also means no
+input, which makes `{ rectangles = regions }` suitable when a property function
+builds a list that may be empty. the region affects pointer and touch input, not
+keyboard focus.
+
+surface properties other than `key` and `namespace` may be functions just like
+other reactive properties. the function returns the whole value: for example,
+a reactive `margins` property returns the complete margins table.
 
 ## widgets and children
 
@@ -145,7 +223,8 @@ return ui.panel {
 ```
 
 a widget may appear in one position only. to reuse a design, write a function that
-creates a fresh widget. unknown properties are errors. trees are limited to 64 levels and 10,000 nodes.
+creates a fresh widget. unknown properties are errors. each tree is limited to 64
+levels. one output may contain at most 10,000 widgets across all its surfaces.
 
 every widget accepts `visible`, `enabled`, and an optional string `key`. a hidden
 or disabled ancestor also blocks input to its descendants. keys must be unique
@@ -292,9 +371,9 @@ writing the same value does not trigger an update.
 
 property functions must not change or create state. create state during setup and
 change it in event handlers. callbacks may mutate state before throwing an error;
-those state changes are not rolled back. widget updates are validated together.
-an invalid update leaves the current widgets unchanged and retries when another
-tracked dependency changes.
+those state changes are not rolled back. within one output, widget updates are
+validated together. an invalid update leaves that output's current widgets
+unchanged and retries when another tracked dependency changes.
 
 ## launching applications
 

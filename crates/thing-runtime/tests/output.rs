@@ -44,7 +44,7 @@ fn output_context_is_available_during_load_and_updates_reactively() {
         &ServiceSnapshot::default(),
     )
     .unwrap();
-    let text = |index: usize| runtime.root().children[index].text.as_str();
+    let text = |index: usize| runtime.root().unwrap().children[index].text.as_str();
     assert_eq!(text(0), "DP-1");
     assert_eq!(text(1), "DP-1");
     assert_eq!(text(2), "1920");
@@ -56,7 +56,7 @@ fn output_context_is_available_during_load_and_updates_reactively() {
         .set_output(output("HDMI-A-1", 2560, 1440, 240))
         .unwrap();
     assert!(runtime.refresh().unwrap());
-    let text = |index: usize| runtime.root().children[index].text.as_str();
+    let text = |index: usize| runtime.root().unwrap().children[index].text.as_str();
     assert_eq!(text(0), "DP-1");
     assert_eq!(text(1), "HDMI-A-1");
     assert_eq!(text(2), "2560");
@@ -77,7 +77,7 @@ fn display_free_load_uses_safe_output_defaults() {
         "#,
     );
     let mut runtime = Runtime::load(path).unwrap();
-    assert_eq!(runtime.root().children[0].text, "false||0|0|1");
+    assert_eq!(runtime.root().unwrap().children[0].text, "false||0|0|1");
     assert!(
         runtime
             .set_service("output.width", Scalar::Number(1920.0))
@@ -109,7 +109,7 @@ fn invalid_output_update_preserves_the_current_context() {
     };
     assert!(runtime.set_output(invalid).is_err());
     assert!(!runtime.refresh().unwrap());
-    assert_eq!(runtime.root().children[0].text, "DP-1");
+    assert_eq!(runtime.root().unwrap().children[0].text, "DP-1");
 
     let invalid = OutputContext {
         name: Some("bad\0name".into()),
@@ -141,10 +141,10 @@ fn runtimes_keep_output_context_and_local_state_isolated() {
         Runtime::load_for_output(&path, output("DP-1", 1920, 1080, 120), &snapshot).unwrap();
     let right = Runtime::load_for_output(&path, output("DP-2", 1280, 720, 120), &snapshot).unwrap();
 
-    left.dispatch(left.root().children[1].id, Event::Click)
+    left.dispatch(left.root().unwrap().children[1].id, Event::Click)
         .unwrap();
-    assert_eq!(left.root().children[0].text, "DP-1:1");
-    assert_eq!(right.root().children[0].text, "DP-2:0");
+    assert_eq!(left.root().unwrap().children[0].text, "DP-1:1");
+    assert_eq!(right.root().unwrap().children[0].text, "DP-2:0");
 }
 
 #[test]
@@ -167,14 +167,14 @@ fn replacement_load_preserves_output_and_services_without_mutating_the_old_runti
     let mut runtime =
         Runtime::load_for_output(&path, output("DP-1", 1920, 1080, 120), &snapshot).unwrap();
     runtime
-        .dispatch(runtime.root().children[3].id, Event::Click)
+        .dispatch(runtime.root().unwrap().children[3].id, Event::Click)
         .unwrap();
 
     let replacement = runtime.load_replacement(&path).unwrap();
-    assert_eq!(runtime.root().children[0].text, "1");
-    assert_eq!(replacement.root().children[0].text, "0");
-    assert_eq!(replacement.root().children[1].text, "DP-1");
-    assert_eq!(replacement.root().children[2].text, "12:34");
+    assert_eq!(runtime.root().unwrap().children[0].text, "1");
+    assert_eq!(replacement.root().unwrap().children[0].text, "0");
+    assert_eq!(replacement.root().unwrap().children[1].text, "DP-1");
+    assert_eq!(replacement.root().unwrap().children[2].text, "12:34");
 }
 
 #[test]
@@ -289,8 +289,8 @@ fn service_snapshot_rejects_invalid_replacements_atomically() {
 
     let runtime =
         Runtime::load_for_output(path, output("DP-1", 1920, 1080, 120), &snapshot).unwrap();
-    assert_eq!(runtime.root().children[0].text, "12:34");
-    assert_eq!(runtime.root().children[1].text, "Speakers");
-    assert_eq!(runtime.root().children[2].text, "Microphone");
-    assert_eq!(runtime.root().children[3].text, "Terminal");
+    assert_eq!(runtime.root().unwrap().children[0].text, "12:34");
+    assert_eq!(runtime.root().unwrap().children[1].text, "Speakers");
+    assert_eq!(runtime.root().unwrap().children[2].text, "Microphone");
+    assert_eq!(runtime.root().unwrap().children[3].text, "Terminal");
 }

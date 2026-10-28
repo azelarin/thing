@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf, time::Duration};
 use tempfile::TempDir;
-use thing_core::{Color, CrossAlign, Kind, MainAlign, TextAlign, TextOverflow};
+use thing_core::{Color, CrossAlign, KeyboardMode, Kind, MainAlign, TextAlign, TextOverflow};
 use thing_runtime::{
     Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, Event, Limits, Runtime, Scalar,
 };
@@ -29,7 +29,7 @@ fn loads_typed_luau_and_relative_theme_modules() {
     )
     .unwrap();
     let runtime = Runtime::load(&path).unwrap();
-    assert_eq!(runtime.root().children[0].text, "42");
+    assert_eq!(runtime.root().unwrap().children[0].text, "42");
     assert_eq!(runtime.files().len(), 2);
 }
 
@@ -51,9 +51,9 @@ fn updates_only_dependencies_that_were_read() {
     "#,
     );
     let mut runtime = Runtime::load(path).unwrap();
-    let button = runtime.root().children[2].id;
+    let button = runtime.root().unwrap().children[2].id;
     assert!(runtime.dispatch(button, Event::Click).unwrap());
-    assert_eq!(runtime.root().children[0].text, "1");
+    assert_eq!(runtime.root().unwrap().children[0].text, "1");
     assert!(!runtime.refresh().unwrap());
 }
 
@@ -83,7 +83,7 @@ fn interaction_styles_update_reactively() {
         "#,
     );
     let mut runtime = Runtime::load(path).unwrap();
-    let button = &runtime.root().children[0];
+    let button = &runtime.root().unwrap().children[0];
     assert_eq!(button.style.hover_overlay, Color::TRANSPARENT);
     assert_eq!(button.style.pressed_overlay, Color::TRANSPARENT);
     assert_eq!(button.style.disabled_opacity, 1.0);
@@ -92,7 +92,7 @@ fn interaction_styles_update_reactively() {
 
     let id = button.id;
     assert!(runtime.dispatch(id, Event::Click).unwrap());
-    let button = &runtime.root().children[0];
+    let button = &runtime.root().unwrap().children[0];
     assert_eq!(button.style.hover_overlay, Color([17, 17, 17, 34]));
     assert_eq!(button.style.pressed_overlay, Color([34, 34, 34, 68]));
     assert_eq!(button.style.disabled_opacity, 0.25);
@@ -120,13 +120,13 @@ fn subscriptions_follow_conditional_reads() {
     let mut runtime = Runtime::load(path).unwrap();
     assert!(
         runtime
-            .dispatch(runtime.root().children[1].id, Event::Click)
+            .dispatch(runtime.root().unwrap().children[1].id, Event::Click)
             .unwrap()
     );
-    assert_eq!(runtime.root().children[0].text, "b");
+    assert_eq!(runtime.root().unwrap().children[0].text, "b");
     assert!(
         !runtime
-            .dispatch(runtime.root().children[2].id, Event::Click)
+            .dispatch(runtime.root().unwrap().children[2].id, Event::Click)
             .unwrap()
     );
 }
@@ -150,7 +150,7 @@ fn writing_the_same_value_does_not_invalidate_bindings() {
     let mut runtime = Runtime::load(path).unwrap();
     assert!(
         !runtime
-            .dispatch(runtime.root().children[1].id, Event::Click)
+            .dispatch(runtime.root().unwrap().children[1].id, Event::Click)
             .unwrap()
     );
 }
@@ -170,14 +170,14 @@ fn hover_edges_update_state_even_after_the_widget_disables_itself() {
         "#,
     );
     let mut runtime = Runtime::load(path).unwrap();
-    let button = runtime.root().children[1].id;
+    let button = runtime.root().unwrap().children[1].id;
 
     assert!(runtime.dispatch(button, Event::Hover(true)).unwrap());
-    assert_eq!(runtime.root().children[0].text, "true");
-    assert!(!runtime.root().children[1].enabled);
+    assert_eq!(runtime.root().unwrap().children[0].text, "true");
+    assert!(!runtime.root().unwrap().children[1].enabled);
     assert!(runtime.dispatch(button, Event::Hover(false)).unwrap());
-    assert_eq!(runtime.root().children[0].text, "false");
-    assert!(runtime.root().children[1].enabled);
+    assert_eq!(runtime.root().unwrap().children[0].text, "false");
+    assert!(runtime.root().unwrap().children[1].enabled);
 }
 
 #[test]
@@ -211,15 +211,15 @@ fn hover_cleanup_uses_the_retired_handler() {
         "#,
     );
     let mut runtime = Runtime::load(path).unwrap();
-    let button = runtime.root().children[1].children[0].id;
+    let button = runtime.root().unwrap().children[1].children[0].id;
 
     assert!(runtime.dispatch(button, Event::Hover(true)).unwrap());
-    assert_eq!(runtime.root().children[0].text, "1:1:false");
-    assert_eq!(runtime.root().children[1].children[0].id, button);
+    assert_eq!(runtime.root().unwrap().children[0].text, "1:1:false");
+    assert_eq!(runtime.root().unwrap().children[1].children[0].id, button);
     assert!(!runtime.dispatch(button, Event::Hover(false)).unwrap());
-    assert_eq!(runtime.root().children[0].text, "1:1:false");
+    assert_eq!(runtime.root().unwrap().children[0].text, "1:1:false");
     assert!(runtime.dispatch(button, Event::Hover(true)).unwrap());
-    assert_eq!(runtime.root().children[0].text, "2:2:false");
+    assert_eq!(runtime.root().unwrap().children[0].text, "2:2:false");
 }
 
 #[test]
@@ -243,13 +243,56 @@ fn hover_cleanup_runs_after_the_target_is_removed() {
         "#,
     );
     let mut runtime = Runtime::load(path).unwrap();
-    let old = runtime.root().children[1].children[0].id;
+    let old = runtime.root().unwrap().children[1].children[0].id;
 
     assert!(runtime.dispatch(old, Event::Hover(true)).unwrap());
-    assert_eq!(runtime.root().children[0].text, "false");
-    let replacement = runtime.root().children[1].children[0].id;
+    assert_eq!(runtime.root().unwrap().children[0].text, "false");
+    let replacement = runtime.root().unwrap().children[1].children[0].id;
     assert_ne!(replacement, old);
     assert!(!runtime.dispatch(old, Event::Hover(false)).unwrap());
+}
+
+#[test]
+fn hover_cleanup_validation_keeps_the_first_valid_refresh() {
+    let (_directory, path) = fixture(
+        r#"
+        local present = ui.state(true)
+        local demand = ui.state(false)
+        return ui.panel {
+            keyboard_mode = function()
+                return if demand:get() then 'on_demand' else 'none'
+            end,
+            children = { ui.row { children = function()
+                if not present:get() then return {} end
+                return { ui.button {
+                    on_hover = function(inside)
+                        if inside then present:set(false) else demand:set(true) end
+                    end,
+                } }
+            end } },
+        }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let button = runtime.root().unwrap().children[0].children[0].id;
+
+    let error = runtime
+        .dispatch_checked(button, Event::Hover(true), |surfaces| {
+            if surfaces
+                .iter()
+                .any(|surface| surface.root.panel.keyboard_mode == KeyboardMode::OnDemand)
+            {
+                Err("unsupported keyboard mode".into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
+    assert!(error.to_string().contains("unsupported keyboard mode"));
+    let root = runtime.root().unwrap();
+    assert!(root.children[0].children.is_empty());
+    assert_eq!(root.panel.keyboard_mode, KeyboardMode::None);
 }
 
 #[test]
@@ -266,7 +309,7 @@ fn parses_automatic_popup_activation_and_delays() {
         "#,
     );
     let runtime = Runtime::load(path).unwrap();
-    let popup = &runtime.root().children[0].children[0];
+    let popup = &runtime.root().unwrap().children[0].children[0];
 
     assert!(popup.popup.open_on_hover);
     assert!(popup.popup.open_on_click);
@@ -313,7 +356,7 @@ fn reports_scroll_handlers_even_when_they_do_not_change_state() {
     "#,
     );
     let mut runtime = Runtime::load(path).unwrap();
-    let buttons = &runtime.root().children;
+    let buttons = &runtime.root().unwrap().children;
     assert!(runtime.has_scroll_handler(buttons[0].id));
     assert!(!runtime.has_scroll_handler(buttons[1].id));
     assert!(!runtime.has_scroll_handler(buttons[2].id));
@@ -338,7 +381,7 @@ fn parses_text_overflow_alignment_and_tabular_digits() {
         "#,
     );
     let runtime = Runtime::load(path).unwrap();
-    let text = &runtime.root().children[0];
+    let text = &runtime.root().unwrap().children[0];
 
     assert_eq!(text.max_lines, Some(1));
     assert_eq!(text.text_overflow, TextOverflow::Ellipsis);
@@ -378,7 +421,7 @@ fn parses_flex_layout_controls() {
         "#,
     );
     let runtime = Runtime::load(path).unwrap();
-    let style = &runtime.root().children[0].style;
+    let style = &runtime.root().unwrap().children[0].style;
 
     assert_eq!(style.min_width, Some(40.0));
     assert_eq!(style.max_width, Some(240.0));
@@ -406,16 +449,25 @@ fn flex_layout_properties_recover_after_an_invalid_reactive_value() {
         "#,
     );
     let mut runtime = Runtime::load(path).unwrap();
-    assert_eq!(runtime.root().children[0].style.align, CrossAlign::Start);
+    assert_eq!(
+        runtime.root().unwrap().children[0].style.align,
+        CrossAlign::Start
+    );
 
-    let invalid = runtime.root().children[1].id;
+    let invalid = runtime.root().unwrap().children[1].id;
     assert!(runtime.dispatch(invalid, Event::Click).is_err());
-    assert_eq!(runtime.root().children[0].style.align, CrossAlign::Start);
+    assert_eq!(
+        runtime.root().unwrap().children[0].style.align,
+        CrossAlign::Start
+    );
     assert!(!runtime.refresh().unwrap());
 
-    let valid = runtime.root().children[2].id;
+    let valid = runtime.root().unwrap().children[2].id;
     assert!(runtime.dispatch(valid, Event::Click).unwrap());
-    assert_eq!(runtime.root().children[0].style.align, CrossAlign::End);
+    assert_eq!(
+        runtime.root().unwrap().children[0].style.align,
+        CrossAlign::End
+    );
 }
 
 #[test]
@@ -449,17 +501,17 @@ fn failed_reload_preserves_widgets_and_local_state() {
     "#,
     );
     let mut runtime = Runtime::load(&path).unwrap();
-    let button = runtime.root().children[1].id;
+    let button = runtime.root().unwrap().children[1].id;
     runtime.dispatch(button, Event::Click).unwrap();
-    let before = runtime.root().clone();
+    let before = runtime.root().unwrap().clone();
     fs::write(&path, "return ui.panel { nope = true }").unwrap();
     assert!(runtime.reload(&path).is_err());
-    assert_eq!(runtime.root(), &before);
+    assert_eq!(runtime.root().unwrap(), &before);
     runtime.dispatch(button, Event::Click).unwrap();
-    assert_eq!(runtime.root().children[0].text, "2");
+    assert_eq!(runtime.root().unwrap().children[0].text, "2");
     fs::write(&path, "return ui.panel {}").unwrap();
     runtime.reload(&path).unwrap();
-    assert!(runtime.root().children.is_empty());
+    assert!(runtime.root().unwrap().children.is_empty());
 }
 
 #[test]
@@ -474,11 +526,11 @@ fn invalid_reactive_dimensions_do_not_reach_the_renderer() {
     "#,
     );
     let mut runtime = Runtime::load(path).unwrap();
-    let slider = runtime.root().children[1].id;
+    let slider = runtime.root().unwrap().children[1].id;
     assert!(runtime.dispatch(slider, Event::Change(-1.0)).is_err());
-    assert_eq!(runtime.root().children[0].style.width, Some(100.0));
+    assert_eq!(runtime.root().unwrap().children[0].style.width, Some(100.0));
     assert!(runtime.dispatch(slider, Event::Change(50.0)).unwrap());
-    assert_eq!(runtime.root().children[0].style.width, Some(50.0));
+    assert_eq!(runtime.root().unwrap().children[0].style.width, Some(50.0));
 }
 
 #[test]
@@ -547,10 +599,10 @@ fn disabled_parent_blocks_descendant_input() {
     "#,
     );
     let mut runtime = Runtime::load(path).unwrap();
-    assert_eq!(runtime.root().children[0].kind, Kind::Button);
+    assert_eq!(runtime.root().unwrap().children[0].kind, Kind::Button);
     assert!(
         !runtime
-            .dispatch(runtime.root().children[0].id, Event::Click)
+            .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
             .unwrap()
     );
 }
@@ -571,16 +623,16 @@ fn failed_batch_retries_every_affected_property() {
     let mut runtime = Runtime::load(path).unwrap();
     assert!(
         runtime
-            .dispatch(runtime.root().children[1].id, Event::Click)
+            .dispatch(runtime.root().unwrap().children[1].id, Event::Click)
             .is_err()
     );
-    assert_eq!(runtime.root().children[0].text, "before");
+    assert_eq!(runtime.root().unwrap().children[0].text, "before");
     assert!(!runtime.refresh().unwrap());
     runtime
-        .dispatch(runtime.root().children[2].id, Event::Click)
+        .dispatch(runtime.root().unwrap().children[2].id, Event::Click)
         .unwrap();
-    assert_eq!(runtime.root().children[0].text, "after");
-    assert_eq!(runtime.root().children[0].style.width, Some(30.0));
+    assert_eq!(runtime.root().unwrap().children[0].text, "after");
+    assert_eq!(runtime.root().unwrap().children[0].style.width, Some(30.0));
 }
 
 #[test]
@@ -614,10 +666,10 @@ fn services_are_reactive_and_read_only() {
         .set_service("clock.time", Scalar::String("12:34".into()))
         .unwrap();
     assert!(runtime.refresh().unwrap());
-    assert_eq!(runtime.root().children[0].text, "12:34");
+    assert_eq!(runtime.root().unwrap().children[0].text, "12:34");
     assert!(
         runtime
-            .dispatch(runtime.root().children[1].id, Event::Click)
+            .dispatch(runtime.root().unwrap().children[1].id, Event::Click)
             .is_err()
     );
     assert!(
@@ -648,16 +700,16 @@ fn failed_events_discard_their_service_actions() {
     );
     let mut runtime = Runtime::load(path).unwrap();
     runtime
-        .dispatch(runtime.root().children[0].id, Event::Click)
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
         .unwrap();
     assert!(
         runtime
-            .dispatch(runtime.root().children[1].id, Event::Click)
+            .dispatch(runtime.root().unwrap().children[1].id, Event::Click)
             .is_err()
     );
     assert!(
         runtime
-            .dispatch(runtime.root().children[2].id, Event::Click)
+            .dispatch(runtime.root().unwrap().children[2].id, Event::Click)
             .is_err()
     );
     assert_eq!(runtime.take_actions(), vec![Action::SetMuted(true)]);
@@ -690,7 +742,7 @@ fn reload_exposes_current_services_before_initializing_script_state() {
     )
     .unwrap();
     runtime.reload(path).unwrap();
-    assert_eq!(runtime.root().children[0].text, "0.75");
+    assert_eq!(runtime.root().unwrap().children[0].text, "0.75");
 }
 
 #[test]
@@ -716,17 +768,17 @@ fn device_lists_are_immutable_reactive_and_preserved_on_reload() {
         }])
         .unwrap();
     assert!(runtime.refresh().unwrap());
-    assert_eq!(runtime.root().children[0].text, "Speakers");
+    assert_eq!(runtime.root().unwrap().children[0].text, "Speakers");
     assert!(
         runtime
-            .dispatch(runtime.root().children[1].id, Event::Click)
+            .dispatch(runtime.root().unwrap().children[1].id, Event::Click)
             .is_err()
     );
     runtime.reload(&path).unwrap();
-    assert_eq!(runtime.root().children[0].text, "Speakers");
+    assert_eq!(runtime.root().unwrap().children[0].text, "Speakers");
     runtime.set_audio_devices(Vec::new()).unwrap();
     assert!(runtime.refresh().unwrap());
-    assert_eq!(runtime.root().children[0].text, "none");
+    assert_eq!(runtime.root().unwrap().children[0].text, "none");
 }
 
 #[test]
@@ -802,18 +854,27 @@ fn audio_controls_follow_server_updates_and_dismiss_popups() {
         .unwrap();
     runtime.refresh().unwrap();
     runtime
-        .dispatch(key(runtime.root(), "audio-toggle").unwrap(), Event::Click)
+        .dispatch(
+            key(runtime.root().unwrap(), "audio-toggle").unwrap(),
+            Event::Click,
+        )
         .unwrap();
-    let popup = key(runtime.root(), "audio-popup").unwrap();
-    assert!(runtime.root().find(popup).unwrap().visible);
+    let popup = key(runtime.root().unwrap(), "audio-popup").unwrap();
+    assert!(runtime.root().unwrap().find(popup).unwrap().visible);
     runtime
-        .dispatch(key(runtime.root(), "volume").unwrap(), Event::Change(0.7))
+        .dispatch(
+            key(runtime.root().unwrap(), "volume").unwrap(),
+            Event::Change(0.7),
+        )
         .unwrap();
     runtime
-        .dispatch(key(runtime.root(), "mute").unwrap(), Event::Click)
+        .dispatch(key(runtime.root().unwrap(), "mute").unwrap(), Event::Click)
         .unwrap();
     runtime
-        .dispatch(key(runtime.root(), "next-output").unwrap(), Event::Click)
+        .dispatch(
+            key(runtime.root().unwrap(), "next-output").unwrap(),
+            Event::Click,
+        )
         .unwrap();
     assert_eq!(
         runtime.take_actions(),
@@ -824,7 +885,7 @@ fn audio_controls_follow_server_updates_and_dismiss_popups() {
         ]
     );
     runtime.dispatch(popup, Event::Close).unwrap();
-    assert!(!runtime.root().find(popup).unwrap().visible);
+    assert!(!runtime.root().unwrap().find(popup).unwrap().visible);
 }
 
 #[test]
@@ -868,23 +929,23 @@ fn microphone_state_is_reactive_preserved_and_controllable() {
         .unwrap();
     assert!(runtime.refresh().unwrap());
     assert_eq!(
-        runtime.root().children[0].text,
+        runtime.root().unwrap().children[0].text,
         "true:1.25:true:microphone:Microphone"
     );
 
     for index in 1..=3 {
         runtime
-            .dispatch(runtime.root().children[index].id, Event::Click)
+            .dispatch(runtime.root().unwrap().children[index].id, Event::Click)
             .unwrap();
     }
     assert!(
         runtime
-            .dispatch(runtime.root().children[4].id, Event::Click)
+            .dispatch(runtime.root().unwrap().children[4].id, Event::Click)
             .is_err()
     );
     assert!(
         runtime
-            .dispatch(runtime.root().children[5].id, Event::Click)
+            .dispatch(runtime.root().unwrap().children[5].id, Event::Click)
             .is_err()
     );
     assert_eq!(
@@ -898,7 +959,7 @@ fn microphone_state_is_reactive_preserved_and_controllable() {
 
     runtime.reload(path).unwrap();
     assert_eq!(
-        runtime.root().children[0].text,
+        runtime.root().unwrap().children[0].text,
         "true:1.25:true:microphone:Microphone"
     );
 }
@@ -948,20 +1009,20 @@ fn playback_streams_are_reactive_preserved_and_controllable() {
         .unwrap();
     assert!(runtime.refresh().unwrap());
     assert_eq!(
-        runtime.root().children[0].text,
+        runtime.root().unwrap().children[0].text,
         "stream-1:Firefox:firefox:Music:firefox:1.25:true:true"
     );
 
     runtime
-        .dispatch(runtime.root().children[1].id, Event::Click)
+        .dispatch(runtime.root().unwrap().children[1].id, Event::Click)
         .unwrap();
     runtime
-        .dispatch(runtime.root().children[2].id, Event::Click)
+        .dispatch(runtime.root().unwrap().children[2].id, Event::Click)
         .unwrap();
     for index in 3..=5 {
         assert!(
             runtime
-                .dispatch(runtime.root().children[index].id, Event::Click)
+                .dispatch(runtime.root().unwrap().children[index].id, Event::Click)
                 .is_err()
         );
     }
@@ -981,7 +1042,7 @@ fn playback_streams_are_reactive_preserved_and_controllable() {
 
     runtime.reload(&path).unwrap();
     assert_eq!(
-        runtime.root().children[0].text,
+        runtime.root().unwrap().children[0].text,
         "stream-1:Firefox:firefox:Music:firefox:1.25:true:true"
     );
     runtime
@@ -991,7 +1052,7 @@ fn playback_streams_are_reactive_preserved_and_controllable() {
         })
         .unwrap();
     assert!(runtime.refresh().unwrap());
-    assert_eq!(runtime.root().children[0].text, "none");
+    assert_eq!(runtime.root().unwrap().children[0].text, "none");
 }
 
 #[test]
@@ -1034,18 +1095,18 @@ fn complete_audio_sources_are_reactive_bounded_and_read_only() {
         .unwrap();
     assert!(runtime.refresh().unwrap());
     assert_eq!(
-        runtime.root().children[0].text,
+        runtime.root().unwrap().children[0].text,
         "2:microphone:false:speakers.monitor:true"
     );
     assert!(
         runtime
-            .dispatch(runtime.root().children[1].id, Event::Click)
+            .dispatch(runtime.root().unwrap().children[1].id, Event::Click)
             .is_err()
     );
 
     runtime.reload(&path).unwrap();
     assert_eq!(
-        runtime.root().children[0].text,
+        runtime.root().unwrap().children[0].text,
         "2:microphone:false:speakers.monitor:true"
     );
     assert!(
@@ -1073,7 +1134,7 @@ fn complete_audio_sources_are_reactive_bounded_and_read_only() {
         .collect();
     assert!(runtime.set_all_audio_sources(too_many).is_err());
     assert_eq!(
-        runtime.root().children[0].text,
+        runtime.root().unwrap().children[0].text,
         "2:microphone:false:speakers.monitor:true"
     );
 }

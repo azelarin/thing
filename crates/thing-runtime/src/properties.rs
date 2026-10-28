@@ -1,7 +1,8 @@
 use mlua::{Error, Result, Table, Value};
 use thing_core::{
-    CrossAlign, Kind, MainAlign, Node, PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins,
-    PopupAlignment, PopupAnchor, PopupConstraints, PopupOffset, TextAlign, TextOverflow,
+    CrossAlign, KeyboardMode, Kind, MainAlign, Node, PanelEdge, PanelInputRect, PanelInputRegion,
+    PanelMargins, PopupAlignment, PopupAnchor, PopupConstraints, PopupOffset, SurfaceAnchors,
+    SurfaceLayer, TextAlign, TextOverflow,
 };
 
 pub(crate) fn string(value: Value, name: &str) -> Result<String> {
@@ -60,6 +61,51 @@ fn panel_edge(value: Value) -> Result<PanelEdge> {
     }
 }
 
+fn surface_anchors(value: Value) -> Result<Option<SurfaceAnchors>> {
+    if value.is_nil() {
+        return Ok(None);
+    }
+    let Value::Table(table) = value else {
+        return Err(Error::runtime("anchors must be a table"));
+    };
+    let mut anchors = SurfaceAnchors::default();
+    for pair in table.pairs::<String, Value>() {
+        let (name, value) = pair?;
+        let target = match name.as_str() {
+            "top" => &mut anchors.top,
+            "right" => &mut anchors.right,
+            "bottom" => &mut anchors.bottom,
+            "left" => &mut anchors.left,
+            _ => return Err(Error::runtime(format!("unknown anchor {name:?}"))),
+        };
+        *target = boolean(value, &format!("anchors.{name}"))?;
+    }
+    Ok(Some(anchors))
+}
+
+fn surface_layer(value: Value) -> Result<SurfaceLayer> {
+    match string(value, "layer")?.as_str() {
+        "background" => Ok(SurfaceLayer::Background),
+        "bottom" => Ok(SurfaceLayer::Bottom),
+        "top" => Ok(SurfaceLayer::Top),
+        "overlay" => Ok(SurfaceLayer::Overlay),
+        _ => Err(Error::runtime(
+            "layer must be 'background', 'bottom', 'top', or 'overlay'",
+        )),
+    }
+}
+
+fn keyboard_mode(value: Value) -> Result<KeyboardMode> {
+    match string(value, "keyboard_mode")?.as_str() {
+        "none" => Ok(KeyboardMode::None),
+        "on_demand" => Ok(KeyboardMode::OnDemand),
+        "exclusive" => Ok(KeyboardMode::Exclusive),
+        _ => Err(Error::runtime(
+            "keyboard_mode must be 'none', 'on_demand', or 'exclusive'",
+        )),
+    }
+}
+
 fn panel_margins(value: Value) -> Result<PanelMargins> {
     let Value::Table(table) = value else {
         return Err(Error::runtime("margins must be a table"));
@@ -90,12 +136,80 @@ fn exclusive_zone(value: Value) -> Result<Option<i32>> {
 fn panel_input_region(value: Value) -> Result<PanelInputRegion> {
     match value {
         Value::Nil => Ok(PanelInputRegion::Full),
-        Value::Boolean(false) => Ok(PanelInputRegion::Empty),
-        Value::Table(table) => panel_input_rect(table).map(PanelInputRegion::Rectangle),
+        Value::Boolean(false) => Ok(PanelInputRegion::Rectangles(Vec::new())),
+        Value::Table(table) => panel_input_rectangles(table),
         _ => Err(Error::runtime(
-            "input_region must be false or a rectangle table",
+            "input_region must be false, a rectangle, or a rectangles table",
         )),
     }
+}
+
+fn panel_input_rectangles(table: Table) -> Result<PanelInputRegion> {
+    let entries = table
+        .clone()
+        .pairs::<Value, Value>()
+        .collect::<Result<Vec<_>>>()?;
+    if entries.is_empty() {
+        return Ok(PanelInputRegion::Rectangles(
+            vec![PanelInputRect::default()],
+        ));
+    }
+    if entries.len() == 1
+        && matches!(
+            &entries[0].0,
+            Value::String(name) if name.as_bytes() == b"rectangles"
+        )
+    {
+        let Value::Table(rectangles) = table.raw_get::<Value>("rectangles")? else {
+            return Err(Error::runtime(
+                "input_region.rectangles must be a dense rectangle list",
+            ));
+        };
+        return panel_input_rect_list(rectangles);
+    }
+    if entries
+        .iter()
+        .all(|(key, _)| matches!(key, Value::String(_)))
+    {
+        return panel_input_rect(table).map(|rect| PanelInputRegion::Rectangles(vec![rect]));
+    }
+    Err(Error::runtime(
+        "input_region must be a rectangle or a rectangles table",
+    ))
+}
+
+fn panel_input_rect_list(table: Table) -> Result<PanelInputRegion> {
+    let length = table.raw_len();
+    let entries = table
+        .clone()
+        .pairs::<Value, Value>()
+        .collect::<Result<Vec<_>>>()?;
+    if entries.len() != length
+        || !entries.iter().all(|(key, _)| {
+            matches!(key, Value::Integer(index) if *index >= 1 && (*index as usize) <= length)
+        })
+    {
+        return Err(Error::runtime(
+            "input_region rectangles must be a dense list",
+        ));
+    }
+    if length > 256 {
+        return Err(Error::runtime(
+            "input_region accepts at most 256 rectangles",
+        ));
+    }
+    let rectangles = (1..=length)
+        .map(|index| {
+            let value = table.raw_get(index)?;
+            let Value::Table(rectangle) = value else {
+                return Err(Error::runtime(
+                    "input_region list entries must be rectangle tables",
+                ));
+            };
+            panel_input_rect(rectangle)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PanelInputRegion::Rectangles(rectangles))
 }
 
 fn panel_input_rect(table: Table) -> Result<PanelInputRect> {
@@ -297,6 +411,11 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
             node.popup.constraints = popup_constraints(value)?
         }
         "edge" if node.kind == Kind::Panel => node.panel.edge = panel_edge(value)?,
+        "anchors" if node.kind == Kind::Panel => node.panel.anchors = surface_anchors(value)?,
+        "layer" if node.kind == Kind::Panel => node.panel.layer = surface_layer(value)?,
+        "keyboard_mode" if node.kind == Kind::Panel => {
+            node.panel.keyboard_mode = keyboard_mode(value)?
+        }
         "margins" if node.kind == Kind::Panel => node.panel.margins = panel_margins(value)?,
         "exclusive_zone" if node.kind == Kind::Panel => {
             node.panel.exclusive_zone = exclusive_zone(value)?

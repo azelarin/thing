@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, path::PathBuf, time::Instant};
 use thing_core::{Node, NodeId};
 use thing_runtime::{
     Action, AudioSnapshot, Event, MediaSnapshot, NiriState, OutputContext, Runtime, Scalar,
-    ServiceSnapshot,
+    ServiceSnapshot, SurfaceKey, SurfaceTree,
 };
 use thing_ui::Layout;
 
@@ -37,12 +37,23 @@ impl<K: Clone + Eq> Configurations<K> {
         &self.entry
     }
 
+    #[cfg(test)]
     pub(crate) fn add(&mut self, key: K, output: OutputContext) -> Result<(), String> {
+        self.add_checked(key, output, |_| Ok(()))
+    }
+
+    pub(crate) fn add_checked(
+        &mut self,
+        key: K,
+        output: OutputContext,
+        validate: impl FnOnce(&Runtime) -> Result<(), String>,
+    ) -> Result<(), String> {
         if self.contains(&key) {
             return Ok(());
         }
         let runtime = Runtime::load_for_output(&self.entry, output.clone(), &self.services)
             .map_err(|error| error.to_string())?;
+        validate(&runtime)?;
         self.instances.push(Instance {
             key,
             output,
@@ -91,15 +102,35 @@ impl<K: Clone + Eq> Configurations<K> {
             .map(|instance| &mut instance.runtime)
     }
 
+    #[cfg(test)]
     pub(crate) fn advance(&mut self, key: &K, now: Instant) -> Result<bool, String> {
+        self.advance_checked(key, now, |_| Ok(()))
+    }
+
+    pub(crate) fn advance_checked(
+        &mut self,
+        key: &K,
+        now: Instant,
+        validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
+    ) -> Result<bool, String> {
         self.runtime_mut(key)
-            .map(|runtime| runtime.advance(now))
+            .map(|runtime| runtime.advance_checked(now, validate))
             .transpose()
             .map(|changed| changed.unwrap_or(false))
             .map_err(|error| error.to_string())
     }
 
+    #[cfg(test)]
     pub(crate) fn set_output(&mut self, key: &K, output: OutputContext) -> Result<bool, String> {
+        self.set_output_checked(key, output, |_| Ok(()))
+    }
+
+    pub(crate) fn set_output_checked(
+        &mut self,
+        key: &K,
+        output: OutputContext,
+        validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
+    ) -> Result<bool, String> {
         let Some(instance) = self
             .instances
             .iter_mut()
@@ -117,7 +148,7 @@ impl<K: Clone + Eq> Configurations<K> {
         instance.output = output;
         instance
             .runtime
-            .refresh()
+            .refresh_checked(validate)
             .map_err(|error| error.to_string())
     }
 
@@ -177,31 +208,56 @@ impl<K: Clone + Eq> Configurations<K> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn refresh(&mut self) -> Vec<K> {
+        self.refresh_checked(|_, _| Ok(()))
+    }
+
+    pub(crate) fn refresh_checked(
+        &mut self,
+        validate: impl Fn(&K, &[SurfaceTree]) -> Result<(), String>,
+    ) -> Vec<K> {
         self.instances
             .iter_mut()
-            .filter_map(|instance| match instance.runtime.refresh() {
-                Ok(true) => Some(instance.key.clone()),
-                Ok(false) => None,
-                Err(error) => {
-                    eprintln!("thing: {error}");
-                    None
+            .filter_map(|instance| {
+                let key = &instance.key;
+                match instance
+                    .runtime
+                    .refresh_checked(|surfaces| validate(key, surfaces))
+                {
+                    Ok(true) => Some(instance.key.clone()),
+                    Ok(false) => None,
+                    Err(error) => {
+                        eprintln!("thing: {error}");
+                        None
+                    }
                 }
             })
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn dispatch(
         &mut self,
         key: &K,
         id: NodeId,
         event: Event,
     ) -> Result<(bool, Vec<Action>), String> {
+        self.dispatch_checked(key, id, event, |_| Ok(()))
+    }
+
+    pub(crate) fn dispatch_checked(
+        &mut self,
+        key: &K,
+        id: NodeId,
+        event: Event,
+        validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
+    ) -> Result<(bool, Vec<Action>), String> {
         let Some(runtime) = self.runtime_mut(key) else {
             return Ok((false, Vec::new()));
         };
         let changed = runtime
-            .dispatch(id, event)
+            .dispatch_checked(id, event, validate)
             .map_err(|error| error.to_string())?;
         Ok((changed, runtime.take_actions()))
     }
@@ -216,7 +272,16 @@ impl<K: Clone + Eq> Configurations<K> {
         self.reload_for(outputs)
     }
 
+    #[cfg(test)]
     pub(crate) fn reload_for(&mut self, outputs: Vec<(K, OutputContext)>) -> Result<(), String> {
+        self.reload_for_checked(outputs, |_, _| Ok(()))
+    }
+
+    pub(crate) fn reload_for_checked(
+        &mut self,
+        outputs: Vec<(K, OutputContext)>,
+        validate: impl Fn(&K, &Runtime) -> Result<(), String>,
+    ) -> Result<(), String> {
         let mut candidates = Vec::with_capacity(outputs.len());
         for (key, output) in outputs {
             if candidates
@@ -227,6 +292,7 @@ impl<K: Clone + Eq> Configurations<K> {
             }
             let runtime = Runtime::load_for_output(&self.entry, output.clone(), &self.services)
                 .map_err(|error| error.to_string())?;
+            validate(&key, &runtime)?;
             candidates.push(Instance {
                 key,
                 output,
@@ -245,8 +311,21 @@ impl<K: Clone + Eq> Configurations<K> {
         files.into_iter().collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn root(&self, key: &K) -> Option<&Node> {
-        self.runtime(key).map(Runtime::root)
+        self.runtime(key).and_then(Runtime::root)
+    }
+
+    pub(crate) fn surfaces(&self, key: &K) -> Option<&[SurfaceTree]> {
+        self.runtime(key).map(Runtime::surfaces)
+    }
+
+    pub(crate) fn surface(&self, key: &K, surface: &SurfaceKey) -> Option<&SurfaceTree> {
+        self.runtime(key)?.surface(surface)
+    }
+
+    pub(crate) fn surface_root(&self, key: &K, surface: &SurfaceKey) -> Option<&Node> {
+        self.surface(key, surface).map(|surface| &surface.root)
     }
 }
 
@@ -255,7 +334,7 @@ mod tests {
     use std::{fs, time::Duration};
 
     use tempfile::tempdir;
-    use thing_core::{Kind, Scale};
+    use thing_core::{KeyboardMode, Kind, Scale};
     use thing_runtime::{AudioDevice, AudioSource, AudioStream, MediaPlayer};
     use thing_ui::{Layout, Measurer, Size};
 
@@ -467,6 +546,104 @@ mod tests {
     }
 
     #[test]
+    fn checked_output_update_rejects_unsupported_candidate_and_preserves_previous_surface() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            return ui.panel {
+                keyboard_mode = function()
+                    return if services.output.width:get() > 2000 then 'on_demand' else 'none'
+                end,
+            }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        let reject_on_demand = |surfaces: &[SurfaceTree]| {
+            if surfaces
+                .iter()
+                .any(|surface| surface.root.panel.keyboard_mode == KeyboardMode::OnDemand)
+            {
+                Err("unsupported keyboard mode".into())
+            } else {
+                Ok(())
+            }
+        };
+
+        assert!(
+            configurations
+                .set_output_checked(&1, output("DP-1", 2560), reject_on_demand)
+                .is_err()
+        );
+        assert_eq!(
+            configurations.root(&1).unwrap().panel.keyboard_mode,
+            KeyboardMode::None
+        );
+        assert_eq!(configurations.output(&1).unwrap().width, 2560);
+
+        assert!(
+            !configurations
+                .set_output_checked(&1, output("DP-1", 1920), reject_on_demand)
+                .unwrap()
+        );
+        assert_eq!(
+            configurations.root(&1).unwrap().panel.keyboard_mode,
+            KeyboardMode::None
+        );
+    }
+
+    #[test]
+    fn checked_service_refresh_rejects_unsupported_candidate_and_preserves_previous_surface() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            return ui.panel {
+                keyboard_mode = function()
+                    return if services.clock.time:get() == 'unsupported'
+                        then 'on_demand' else 'none'
+                end,
+            }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        let reject_on_demand = |_: &u8, surfaces: &[SurfaceTree]| {
+            if surfaces
+                .iter()
+                .any(|surface| surface.root.panel.keyboard_mode == KeyboardMode::OnDemand)
+            {
+                Err("unsupported keyboard mode".into())
+            } else {
+                Ok(())
+            }
+        };
+
+        configurations
+            .set_service("clock.time", Scalar::String("unsupported".into()))
+            .unwrap();
+        assert!(configurations.refresh_checked(reject_on_demand).is_empty());
+        assert_eq!(
+            configurations.root(&1).unwrap().panel.keyboard_mode,
+            KeyboardMode::None
+        );
+
+        configurations
+            .set_service("clock.time", Scalar::String("supported".into()))
+            .unwrap();
+        assert!(configurations.refresh_checked(reject_on_demand).is_empty());
+        assert_eq!(
+            configurations.root(&1).unwrap().panel.keyboard_mode,
+            KeyboardMode::None
+        );
+    }
+
+    #[test]
     fn failed_reload_preserves_every_output() {
         let directory = tempdir().unwrap();
         let entry = directory.path().join("panel.luau");
@@ -487,6 +664,40 @@ mod tests {
         assert!(configurations.reload().is_err());
         assert_eq!(text(&configurations, 1), "DP-1");
         assert_eq!(text(&configurations, 2), "DP-2");
+    }
+
+    #[test]
+    fn failed_host_preflight_preserves_every_output() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            "return ui.panel { children = { ui.text { text = 'old' } } }",
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry.clone(), ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        configurations.add(2, output("DP-2", 2560)).unwrap();
+        fs::write(
+            &entry,
+            "return ui.panel { children = { ui.text { text = 'new' } } }",
+        )
+        .unwrap();
+
+        let result = configurations.reload_for_checked(
+            vec![(1, output("DP-1", 1920)), (2, output("DP-2", 2560))],
+            |key, _| {
+                if *key == 2 {
+                    Err("unsupported surface capability".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(text(&configurations, 1), "old");
+        assert_eq!(text(&configurations, 2), "old");
     }
 
     #[test]
