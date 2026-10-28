@@ -7,10 +7,10 @@ use std::{
 use thing_core::{Node, NodeId};
 use thing_runtime::{
     Action, AudioSnapshot, AuthenticationSnapshot, ClipboardSnapshot, Event, KeyInput,
-    ManagedProcessDefinition, ManagedProcessSnapshot, ManagedProcessState, MediaSnapshot, NiriState,
-    NotificationSnapshot, OutputContext, PointerDispatchOutcome as RuntimePointerOutcome,
-    PointerEvent, PowerSnapshot, Runtime, Scalar, ScrollInput, ServiceSnapshot, SurfaceKey, SurfaceTree,
-    SystemTraySnapshot, UiAction, UiTarget,
+    ManagedProcessDefinition, ManagedProcessSnapshot, ManagedProcessState, MediaSnapshot,
+    NiriState, NotificationSnapshot, OutputContext,
+    PointerDispatchOutcome as RuntimePointerOutcome, PointerEvent, PowerSnapshot, Runtime, Scalar,
+    ScrollInput, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTraySnapshot, UiAction, UiTarget,
 };
 use thing_ui::Layout;
 
@@ -253,7 +253,6 @@ impl<K: Clone + Eq> Configurations<K> {
         self.add_checked(key, output, |_| Ok(()))
     }
 
-    #[cfg(test)]
     pub(crate) fn add_checked(
         &mut self,
         key: K,
@@ -307,7 +306,6 @@ impl<K: Clone + Eq> Configurations<K> {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn remove(&mut self, key: &K) -> Option<String> {
         let removed = self.remove_with_processes(key, |_| Ok(()))?;
         removed
@@ -958,7 +956,6 @@ impl<K: Clone + Eq> Configurations<K> {
         self.reload_for_checked(outputs, |_, _| Ok(()))
     }
 
-    #[cfg(test)]
     pub(crate) fn reload_for_checked(
         &mut self,
         outputs: Vec<(K, OutputContext)>,
@@ -987,9 +984,7 @@ impl<K: Clone + Eq> Configurations<K> {
             {
                 return Err("duplicate output while reloading configuration".into());
             }
-            let runtime = self
-                .mode
-                .load(&self.entry, output.clone(), &services)?;
+            let runtime = self.mode.load(&self.entry, output.clone(), &services)?;
             validate(&key, &runtime)?;
             let consumer = allocate_consumer(&mut next_consumer)?;
             candidates.push(Instance {
