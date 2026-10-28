@@ -27,6 +27,11 @@ fn send(mut stream: &UnixStream, value: Value) {
     writeln!(stream, "{value}").unwrap();
 }
 
+fn initial_state(stream: &UnixStream, workspace: u64) {
+    send(stream, workspaces(workspace));
+    send(stream, json!({"WindowsChanged":{"windows":[]}}));
+}
+
 fn accept(listener: &UnixListener) -> UnixStream {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -140,7 +145,7 @@ fn worker_handles_split_frames_serializes_actions_and_stops_while_waiting_for_re
         assert_eq!(read(&mut BufReader::new(&events)), json!("EventStream"));
         events.write_all(b"{\"Ok\":\"Han").unwrap();
         events.write_all(b"dled\"}\n").unwrap();
-        send(&events, workspaces(u64::MAX));
+        initial_state(&events, u64::MAX);
         let commands = accept(&listener);
         let mut reader = BufReader::new(&commands);
         assert_eq!(
@@ -178,6 +183,34 @@ fn worker_handles_split_frames_serializes_actions_and_stops_while_waiting_for_re
 }
 
 #[test]
+fn subscription_does_not_publish_before_initial_state_is_complete() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("niri.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let events = accept(&listener);
+        assert_eq!(read(&mut BufReader::new(&events)), json!("EventStream"));
+        send(&events, json!({"Ok":"Handled"}));
+        send(&events, workspaces(1));
+    });
+    let (_sender, wake) = UnixStream::pair().unwrap();
+    wake.set_nonblocking(true).unwrap();
+    let shared = Mutex::new(Shared {
+        commands: VecDeque::from([NiriAction::FocusWindow(10)]),
+        ..Shared::default()
+    });
+    let mut snapshots = Vec::new();
+
+    assert!(session(&path, &shared, &wake, |snapshot| snapshots.push(snapshot)).is_err());
+    server.join().unwrap();
+    assert!(
+        snapshots.is_empty(),
+        "the service became available before workspaces and windows arrived"
+    );
+    assert_eq!(lock(&shared).commands.len(), 1);
+}
+
+#[test]
 fn disconnect_clears_stale_data_and_reconnect_replaces_it() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("niri.sock");
@@ -189,13 +222,13 @@ fn disconnect_clears_stale_data_and_reconnect_replaces_it() {
         let events = accept(&listener);
         assert_eq!(read(&mut BufReader::new(&events)), json!("EventStream"));
         send(&events, json!({"Ok":"Handled"}));
-        send(&events, workspaces(1));
+        initial_state(&events, 1);
         command.recv_timeout(Duration::from_secs(5)).unwrap();
         drop(events);
         let events = accept(&listener);
         read(&mut BufReader::new(&events));
         send(&events, json!({"Ok":"Handled"}));
-        send(&events, workspaces(2));
+        initial_state(&events, 2);
         finish.recv_timeout(Duration::from_secs(5)).unwrap();
     });
     let (ping, _source) = calloop::ping::make_ping().unwrap();
@@ -224,7 +257,7 @@ fn missing_niri_environment_needs_no_worker_and_rejects_actions() {
 }
 
 #[test]
-fn stalled_subscription_times_out_and_shutdown_interrupts_reconnect_wait() {
+fn partial_initial_state_times_out_and_shutdown_interrupts_reconnect_wait() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("niri.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -233,6 +266,8 @@ fn stalled_subscription_times_out_and_shutdown_interrupts_reconnect_wait() {
         let events = accept(&listener);
         let mut reader = BufReader::new(&events);
         assert_eq!(read(&mut reader), json!("EventStream"));
+        send(&events, json!({"Ok":"Handled"}));
+        send(&events, workspaces(1));
         let mut line = String::new();
         assert_eq!(reader.read_line(&mut line).unwrap(), 0);
     });

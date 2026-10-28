@@ -11,9 +11,15 @@ use thing_runtime::{NiriAction, NiriState, NiriWindow, Workspace};
 pub(super) struct Model {
     workspaces: BTreeMap<u64, Workspace>,
     windows: BTreeMap<u64, NiriWindow>,
+    workspaces_initialized: bool,
+    windows_initialized: bool,
 }
 
 impl Model {
+    pub fn is_initialized(&self) -> bool {
+        self.workspaces_initialized && self.windows_initialized
+    }
+
     pub fn snapshot(&self) -> NiriState {
         let mut workspaces: Vec<_> = self.workspaces.values().cloned().collect();
         workspaces.sort_by(|a, b| (&a.output, a.index).cmp(&(&b.output, b.index)));
@@ -48,6 +54,7 @@ impl Model {
             Event::WorkspacesChanged { workspaces } => {
                 check_count(workspaces.len())?;
                 self.workspaces = workspaces.into_iter().map(|w| (w.id, w.into())).collect();
+                self.workspaces_initialized = true;
             }
             Event::WorkspaceActivated { id, focused } => {
                 let output = self
@@ -73,6 +80,7 @@ impl Model {
             Event::WindowsChanged { windows } => {
                 check_count(windows.len())?;
                 self.windows = windows.into_iter().map(|w| (w.id, w.into())).collect();
+                self.windows_initialized = true;
             }
             Event::WindowOpenedOrChanged { window } => {
                 if window.is_focused {
