@@ -89,4 +89,12 @@ local tray_menu_button = ui.button {
     children = { ui.text { text = "menu" } },
 }
 
-return ui.panel { children = { input, clipboard_button, tray, tray_menu_button } }
+return ui.panel {
+    input_region = {
+        rectangles = {
+            { x = 0, y = 0, width = 320, height = 36 },
+            { x = 420, width = 80 },
+        },
+    },
+    children = { input, clipboard_button, tray, tray_menu_button },
+}

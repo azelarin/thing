@@ -235,8 +235,8 @@ a reactive `margins` property returns the complete margins table.
 ## widgets and children
 
 the current model has `panel`, `popup`, `row`, `centerbox`, `column`, `stack`,
-`scroll`, `text`, `image`, `path`, `button`, and `slider` constructors. pass
-properties in a table and children in a dense array:
+`scroll`, `text`, `text_input`, `image`, `path`, `button`, `slider`, and `range`
+constructors. pass properties in a table and children in a dense array:
 
 ```luau
 return ui.panel {

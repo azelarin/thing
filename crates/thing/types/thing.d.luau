@@ -69,7 +69,7 @@ export type ThingInputRectangle = {
 export type ThingInputRegion =
     false
     | ThingInputRectangle
-    | { rectangles: { any } }
+    | { rectangles: { ThingInputRectangle } }
 
 export type ThingPathViewBox = {
     x: number,

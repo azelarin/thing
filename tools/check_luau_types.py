@@ -56,6 +56,14 @@ CASES = (
         ),
     ),
     Case(
+        "invalid-input-region.luau",
+        (
+            "Property 'x' is not compatible.",
+            "Property 'width' is not compatible.",
+            "Expected this to be 'ThingInputRectangle', but got 'boolean'",
+        ),
+    ),
+    Case(
         "invalid-system-tray-menu.luau",
         (
             "Expected this to be 'string', but got 'number'",
