@@ -70,10 +70,10 @@ other editors can start the server with
 `--platform=standard --definitions:@thing=/path/to/thing.d.luau`. the same
 options work with `luau-lsp analyze` for a command-line type check.
 
-the definitions cover widget properties, state, and service records, which
-provides completion and catches ordinary type mistakes. they cannot express
-every numeric limit, placement rule, or relationship between properties, so
-keep using `thing check` for thing's runtime validation.
+the definitions describe widget properties, state, and service records. this
+gives editors useful completions and catches ordinary type mistakes. they
+cannot express every numeric limit, placement rule, or relationship between
+properties, so keep using `thing check` for thing's runtime validation.
 
 ## outputs
 
