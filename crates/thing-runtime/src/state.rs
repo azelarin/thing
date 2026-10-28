@@ -87,15 +87,21 @@ impl Tracker {
         });
     }
     pub fn write(&mut self, id: usize, value: Scalar) -> Result<()> {
+        self.write_batch([(id, value)])
+    }
+
+    pub fn write_batch(&mut self, values: impl IntoIterator<Item = (usize, Scalar)>) -> Result<()> {
         if self.evaluating.is_some() {
             return Err(Error::runtime(
                 "property functions must not change state; use an event handler",
             ));
         }
-        if self.values[id] != value {
-            self.values[id] = value;
-            if let Some(bindings) = self.subscribers.get(&id) {
-                self.dirty.extend(bindings);
+        for (id, value) in values {
+            if self.values[id] != value {
+                self.values[id] = value;
+                if let Some(bindings) = self.subscribers.get(&id) {
+                    self.dirty.extend(bindings);
+                }
             }
         }
         Ok(())

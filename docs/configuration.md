@@ -44,6 +44,47 @@ reports it in the terminal and keeps the previous configuration running.
 use `thing check ./panel.luau` to check a file without opening a panel. the
 sections below explain the rest of the api.
 
+## outputs
+
+thing runs a separate configuration for each connected output. each has its own
+local state, so changing a counter on one monitor doesn't change the counters on
+other monitors. desktop services such as audio still describe the same system.
+
+use `services.output` to read the output that owns your panel:
+
+| value | meaning |
+| --- | --- |
+| `available` | whether the configuration has a real output |
+| `name` | the compositor's output name, or an empty string if unavailable |
+| `width`, `height` | the output size in logical pixels, not the panel size |
+| `scale` | the rendering scale, such as `1` or `1.25` |
+
+these values are read-only signals. read them inside property functions to
+follow changes:
+
+```luau
+ui.text {
+    text = function()
+        local output = services.output
+        return `{output.name:get()}: {output.width:get()} × {output.height:get()}`
+    end,
+}
+```
+
+you can also read them during setup to choose a different layout for a particular
+output. those reads capture the current value; they don't subscribe to changes.
+the initial scale comes from the compositor's integer output scale. it can
+update after the compositor supplies its preferred fractional scale, so use a
+property function when your layout depends on it.
+
+`thing check` runs without a display. its output is unavailable, with an empty
+name, zero width and height, and a scale of `1`. output-specific branches still
+need to be tried on the desktop.
+
+when you save a configuration, thing prepares a replacement for every output.
+if one fails, all outputs keep their current configuration. a successful reload
+resets each output's local state and closes its popups.
+
 ## widgets and children
 
 the current model has `panel`, `popup`, `row`, `centerbox`, `column`, `stack`, `scroll`, `text`,

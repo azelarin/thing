@@ -1,5 +1,5 @@
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -14,7 +14,7 @@ use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
     delegate_registry, delegate_seat, delegate_xdg_popup, delegate_xdg_shell,
-    output::{OutputHandler, OutputState},
+    output::{OutputHandler, OutputInfo, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
@@ -36,7 +36,7 @@ use smithay_client_toolkit::{
     },
 };
 use thing_core::{Kind, Node, NodeId, Point, Rect, Scale};
-use thing_runtime::{Action, Event, Runtime, Scalar};
+use thing_runtime::{Action, Event, OutputContext, Scalar, ServiceSnapshot};
 use thing_ui::{Interaction, Layout, Painter, Size};
 use wayland_client::{
     Connection, Dispatch, QueueHandle, delegate_noop,
@@ -56,6 +56,7 @@ use wayland_protocols::{
 
 use crate::{
     audio::Audio,
+    configuration::Configurations,
     egl::{Graphics, Window},
     niri::Niri,
     watch::Watch,
@@ -67,22 +68,22 @@ pub fn run(entry: &Path) -> Result<(), String> {
     let entry = entry
         .canonicalize()
         .map_err(|error| format!("{}: {error}", entry.display()))?;
-    let mut runtime = Runtime::load(&entry).map_err(|error| error.to_string())?;
     let (time, date, next_minute) = crate::clock::read();
-    runtime
+    let mut services = ServiceSnapshot::default();
+    services
         .set_service("clock.time", Scalar::String(time))
         .map_err(|e| e.to_string())?;
-    runtime
+    services
         .set_service("clock.date", Scalar::String(date))
         .map_err(|e| e.to_string())?;
-    runtime.refresh().map_err(|e| e.to_string())?;
     let watch = Rc::new(Watch::new().map_err(|e| e.to_string())?);
     watch
-        .set_files(&runtime.files())
+        .set_files(std::slice::from_ref(&entry))
         .map_err(|e| e.to_string())?;
     let connection = Connection::connect_to_env()
         .map_err(|error| format!("cannot connect to Wayland: {error}"))?;
-    let (globals, queue) = registry_queue_init(&connection).map_err(|error| error.to_string())?;
+    let (globals, mut queue) =
+        registry_queue_init(&connection).map_err(|error| error.to_string())?;
     let qh = queue.handle();
     let compositor = CompositorState::bind(&globals, &qh).map_err(|error| error.to_string())?;
     let layer_shell = LayerShell::bind(&globals, &qh)
@@ -100,8 +101,7 @@ pub fn run(entry: &Path) -> Result<(), String> {
         painter: Some(painter),
         image_ping,
         graphics,
-        runtime,
-        entry,
+        configurations: Configurations::new(entry, services),
         watch: watch.clone(),
         reload_at: None,
         audio,
@@ -120,17 +120,28 @@ pub fn run(entry: &Path) -> Result<(), String> {
         seat: None,
         keyboard_surface: None,
         shift: false,
+        loading_outputs: true,
         exit: false,
         error: None,
     };
-    let outputs: Vec<_> = app.outputs.outputs().collect();
-    for output in outputs {
-        app.add_panel(output, &qh);
+    queue
+        .roundtrip(&mut app)
+        .map_err(|error| error.to_string())?;
+    let outputs: Vec<_> = app
+        .outputs
+        .outputs()
+        .filter_map(|output| app.output_context(&output).map(|context| (output, context)))
+        .collect();
+    app.configurations.reload_for(outputs.clone())?;
+    for (output, _) in outputs {
+        app.create_panel(output, &qh)?;
     }
+    app.loading_outputs = false;
+    app.update_watch();
     let mut event_loop: EventLoop<App> = EventLoop::try_new().map_err(|error| error.to_string())?;
     event_loop
         .handle()
-        .insert_source(image_source, |_, _, app| app.invalidate())
+        .insert_source(image_source, |_, _, app| app.invalidate_all())
         .map_err(|e| e.to_string())?;
     event_loop
         .handle()
@@ -159,10 +170,16 @@ pub fn run(entry: &Path) -> Result<(), String> {
         .handle()
         .insert_source(Timer::from_duration(next_minute), |_, _, app| {
             let (time, date, next) = crate::clock::read();
-            if let Err(error) = app.runtime.set_service("clock.time", Scalar::String(time)) {
+            if let Err(error) = app
+                .configurations
+                .set_service("clock.time", Scalar::String(time))
+            {
                 eprintln!("thing: {error}");
             }
-            if let Err(error) = app.runtime.set_service("clock.date", Scalar::String(date)) {
+            if let Err(error) = app
+                .configurations
+                .set_service("clock.date", Scalar::String(date))
+            {
                 eprintln!("thing: {error}");
             }
             app.refresh();
@@ -175,7 +192,7 @@ pub fn run(entry: &Path) -> Result<(), String> {
             .is_some_and(|deadline| deadline <= Instant::now())
         {
             app.reload_at = None;
-            app.reload()?;
+            app.reload(&qh)?;
         }
         app.draw(&qh)?;
         connection.flush().map_err(|error| error.to_string())?;
@@ -213,6 +230,7 @@ struct Surface {
     output: wl_output::WlOutput,
     root: NodeId,
     size: (u32, u32),
+    requested_height: u32,
     scale: Scale,
     viewport: Option<WpViewport>,
     fractional: Option<WpFractionalScaleV1>,
@@ -240,10 +258,9 @@ struct App {
     painter: Option<Painter>,
     image_ping: calloop::ping::Ping,
     graphics: Graphics,
-    runtime: Runtime,
+    configurations: Configurations<wl_output::WlOutput>,
     audio: Audio,
     niri: Niri,
-    entry: PathBuf,
     watch: Rc<Watch>,
     reload_at: Option<Instant>,
     surfaces: Vec<Surface>,
@@ -260,6 +277,7 @@ struct App {
     seat: Option<wl_seat::WlSeat>,
     keyboard_surface: Option<wl_surface::WlSurface>,
     shift: bool,
+    loading_outputs: bool,
     exit: bool,
     error: Option<String>,
 }
@@ -281,14 +299,14 @@ impl App {
             return;
         };
         let update = self
-            .runtime
+            .configurations
             .set_niri(snapshot.state)
             .and_then(|()| {
-                self.runtime
+                self.configurations
                     .set_service("niri.available", Scalar::Boolean(snapshot.available))
             })
             .and_then(|()| {
-                self.runtime
+                self.configurations
                     .set_service("niri.error", Scalar::String(snapshot.error))
             });
         if let Err(error) = update {
@@ -301,9 +319,7 @@ impl App {
             return;
         };
         let update = (|| -> Result<(), String> {
-            self.runtime
-                .set_audio_devices(snapshot.devices)
-                .map_err(|e| e.to_string())?;
+            self.configurations.set_audio_devices(snapshot.devices)?;
             for (name, value) in [
                 ("audio.available", Scalar::Boolean(snapshot.available)),
                 ("audio.volume", Scalar::Number(snapshot.volume)),
@@ -311,9 +327,7 @@ impl App {
                 ("audio.device", Scalar::String(snapshot.device)),
                 ("audio.error", Scalar::String(snapshot.error)),
             ] {
-                self.runtime
-                    .set_service(name, value)
-                    .map_err(|e| e.to_string())?;
+                self.configurations.set_service(name, value)?;
             }
             Ok(())
         })();
@@ -323,20 +337,24 @@ impl App {
         self.refresh();
     }
     fn refresh(&mut self) {
-        match self.runtime.refresh() {
-            Ok(true) => self.invalidate(),
-            Ok(false) => {}
-            Err(error) => eprintln!("thing: {error}"),
+        for output in self.configurations.refresh() {
+            self.invalidate_output(&output);
         }
     }
 
-    fn reload(&mut self) -> Result<(), String> {
-        if let Err(error) = self.runtime.reload(&self.entry) {
+    fn reload(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
+        let outputs = self
+            .outputs
+            .outputs()
+            .filter_map(|output| {
+                self.output_context(&output)
+                    .or_else(|| self.configurations.output(&output).cloned())
+                    .map(|context| (output, context))
+            })
+            .collect();
+        if let Err(error) = self.configurations.reload_for(outputs) {
             eprintln!("thing: reload failed; keeping the previous panel: {error}");
             return Ok(());
-        }
-        if let Err(error) = self.watch.set_files(&self.runtime.files()) {
-            eprintln!("thing: cannot watch all configuration files: {error}");
         }
         self.graphics.park()?;
         // release the previous configuration's glyph atlas and text layouts.
@@ -346,48 +364,83 @@ impl App {
         })?);
         self.surfaces
             .retain(|surface| matches!(surface.role, Role::Panel(_)));
+        self.surfaces
+            .retain(|surface| self.configurations.contains(&surface.output));
         self.keyboard_surface = None;
-        let height = self
-            .runtime
-            .root()
-            .style
-            .height
-            .unwrap_or(36.0)
-            .round()
-            .clamp(1.0, 4096.0) as u32;
+        let missing: Vec<_> = self
+            .configurations
+            .keys()
+            .filter(|output| {
+                !self.surfaces.iter().any(|surface| {
+                    matches!(surface.role, Role::Panel(_)) && &surface.output == *output
+                })
+            })
+            .cloned()
+            .collect();
+        for output in missing {
+            self.create_panel(output, qh)?;
+        }
         for surface in &mut self.surfaces {
-            surface.root = self.runtime.root().id;
+            let Some(root) = self.configurations.root(&surface.output) else {
+                continue;
+            };
+            surface.root = root.id;
             surface.layout = None;
             surface.input = Interaction::default();
             surface.press_serial = None;
             surface.pressed_button = None;
             surface.dirty = true;
             if let Role::Panel(layer) = &surface.role {
+                let height = panel_height(root);
+                surface.requested_height = height;
                 layer.set_size(0, height);
                 layer.set_exclusive_zone(height as i32);
                 layer.wl_surface().commit();
             }
         }
-        eprintln!("thing: reloaded {}", self.entry.display());
+        self.update_watch();
+        eprintln!("thing: reloaded {}", self.configurations.entry().display());
         Ok(())
     }
 
-    fn add_panel(&mut self, output: wl_output::WlOutput, qh: &QueueHandle<Self>) {
+    fn add_panel(
+        &mut self,
+        output: wl_output::WlOutput,
+        qh: &QueueHandle<Self>,
+    ) -> Result<(), String> {
         if self
             .surfaces
             .iter()
             .any(|surface| matches!(surface.role, Role::Panel(_)) && surface.output == output)
         {
-            return;
+            return Ok(());
         }
-        let height = self
-            .runtime
-            .root()
-            .style
-            .height
-            .unwrap_or(36.0)
-            .round()
-            .clamp(1.0, 4096.0) as u32;
+        if !self.configurations.contains(&output) {
+            let Some(context) = self.output_context(&output) else {
+                return Ok(());
+            };
+            self.configurations.add(output.clone(), context)?;
+        }
+        self.create_panel(output, qh)?;
+        self.update_watch();
+        Ok(())
+    }
+
+    fn create_panel(
+        &mut self,
+        output: wl_output::WlOutput,
+        qh: &QueueHandle<Self>,
+    ) -> Result<(), String> {
+        let root = self
+            .configurations
+            .root(&output)
+            .ok_or("output configuration is unavailable")?;
+        let height = panel_height(root);
+        let scale = self
+            .configurations
+            .output(&output)
+            .map(|context| context.scale)
+            .unwrap_or_default();
         let wl = self.compositor.create_surface(qh);
         let layer =
             self.layer_shell
@@ -399,12 +452,14 @@ impl App {
         let surface = self.make_surface(
             Role::Panel(layer),
             output,
-            self.runtime.root().id,
+            root.id,
             (800, height),
+            scale,
             qh,
         );
         surface.role.surface().commit();
         self.surfaces.push(surface);
+        Ok(())
     }
 
     fn make_surface(
@@ -413,6 +468,7 @@ impl App {
         output: wl_output::WlOutput,
         root: NodeId,
         size: (u32, u32),
+        scale: Scale,
         qh: &QueueHandle<Self>,
     ) -> Surface {
         let viewport = self
@@ -432,7 +488,8 @@ impl App {
             output,
             root,
             size,
-            scale: Scale::default(),
+            requested_height: size.1,
+            scale,
             viewport,
             fractional,
             layout: None,
@@ -442,6 +499,70 @@ impl App {
             configured: false,
             dirty: true,
             waiting: false,
+        }
+    }
+
+    fn output_context(&self, output: &wl_output::WlOutput) -> Option<OutputContext> {
+        let mut context = output_context(self.outputs.info(output)?)?;
+        if let Some(surface) = self
+            .surfaces
+            .iter()
+            .find(|surface| &surface.output == output && matches!(surface.role, Role::Panel(_)))
+        {
+            context.scale = surface.scale;
+        }
+        Some(context)
+    }
+
+    fn update_watch(&self) {
+        if let Err(error) = self.watch.set_files(&self.configurations.files()) {
+            eprintln!("thing: cannot watch all configuration files: {error}");
+        }
+    }
+
+    fn invalidate_all(&mut self) {
+        for surface in &mut self.surfaces {
+            surface.dirty = true;
+        }
+    }
+
+    fn sync_panel_height(&mut self, output: &wl_output::WlOutput) {
+        let Some(height) = self.configurations.root(output).map(panel_height) else {
+            return;
+        };
+        let Some(surface) = self
+            .surfaces
+            .iter_mut()
+            .find(|surface| &surface.output == output && matches!(surface.role, Role::Panel(_)))
+        else {
+            return;
+        };
+        if surface.requested_height == height {
+            return;
+        }
+        let Role::Panel(layer) = &surface.role else {
+            return;
+        };
+        surface.requested_height = height;
+        surface.layout = None;
+        surface.dirty = true;
+        layer.set_size(0, height);
+        layer.set_exclusive_zone(height as i32);
+        layer.wl_surface().commit();
+    }
+
+    fn set_output_scale(&mut self, output: &wl_output::WlOutput, scale: Scale) {
+        let Some(mut context) = self.configurations.output(output).cloned() else {
+            return;
+        };
+        if context.scale == scale {
+            return;
+        }
+        context.scale = scale;
+        match self.configurations.set_output(output, context) {
+            Ok(true) => self.invalidate_output(output),
+            Ok(false) => {}
+            Err(error) => eprintln!("thing: cannot update output scale: {error}"),
         }
     }
 
@@ -455,11 +576,15 @@ impl App {
         let Some(painter) = self.painter.as_mut() else {
             return Ok(());
         };
+        let configurations = &self.configurations;
         for surface in &mut self.surfaces {
             if !surface.configured || !surface.dirty || surface.waiting {
                 continue;
             }
-            let Some(root) = self.runtime.root().find(surface.root) else {
+            let Some(root) = configurations
+                .root(&surface.output)
+                .and_then(|root| root.find(surface.root))
+            else {
                 continue;
             };
             let physical = (
@@ -521,13 +646,18 @@ impl App {
         Ok(())
     }
 
-    fn dispatch(&mut self, id: NodeId, event: Event) {
-        match self.runtime.dispatch(id, event) {
-            Ok(true) => self.invalidate(),
-            Ok(false) => {}
-            Err(error) => eprintln!("thing: {error}"),
+    fn dispatch(&mut self, output: wl_output::WlOutput, id: NodeId, event: Event) {
+        let (changed, actions) = match self.configurations.dispatch(&output, id, event) {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("thing: {error}");
+                return;
+            }
+        };
+        if changed {
+            self.invalidate_output(&output);
         }
-        for action in self.runtime.take_actions() {
+        for action in actions {
             let result = match action {
                 Action::Niri(action) => self.niri.send(action),
                 action => self.audio.send(action).map_err(str::to_owned),
@@ -538,20 +668,36 @@ impl App {
         }
     }
 
-    fn invalidate(&mut self) {
-        let desired = find_popup(self.runtime.root(), None).map(|(id, _)| id);
+    fn invalidate_output(&mut self, output: &wl_output::WlOutput) {
+        let desired = self
+            .configurations
+            .root(output)
+            .and_then(|root| find_popup(root, None))
+            .map(|(id, _)| id);
         if let Some(index) = self.surfaces.iter().position(|surface| {
-            matches!(surface.role, Role::Popup(_)) && Some(surface.root) != desired
+            &surface.output == output
+                && matches!(surface.role, Role::Popup(_))
+                && Some(surface.root) != desired
         }) {
             self.close_popup(index);
         }
-        for surface in &mut self.surfaces {
+        self.sync_panel_height(output);
+        for surface in self
+            .surfaces
+            .iter_mut()
+            .filter(|surface| &surface.output == output)
+        {
             surface.dirty = true;
         }
     }
 
     fn slider(&mut self, surface: usize, id: NodeId, x: f32) {
-        let Some(node) = self.runtime.root().find(id) else {
+        let output = self.surfaces[surface].output.clone();
+        let Some(node) = self
+            .configurations
+            .root(&output)
+            .and_then(|root| root.find(id))
+        else {
             return;
         };
         if node.kind != Kind::Slider || !node.enabled {
@@ -566,29 +712,39 @@ impl App {
             return;
         };
         let fraction = (x - bounds.x - 8.0) / (bounds.width - 16.0).max(1.0);
-        self.dispatch(id, Event::Change(node.slider.value_at(fraction as f64)));
+        let value = node.slider.value_at(fraction as f64);
+        self.dispatch(output, id, Event::Change(value));
     }
 
     fn close_popup(&mut self, index: usize) {
         let id = self.surfaces[index].root;
+        let output = self.surfaces[index].output.clone();
         if let Err(error) = self.graphics.park() {
             self.error = Some(error);
         }
         self.surfaces.remove(index);
-        self.dispatch(id, Event::Close);
+        self.dispatch(output, id, Event::Close);
         self.keyboard_surface = None;
     }
 
     fn sync_popup(&mut self, parent: usize, serial: u32, qh: &QueueHandle<Self>) {
-        let desired = find_popup(self.runtime.root(), None);
+        let Some(parent_surface) = self.surfaces.get(parent) else {
+            return;
+        };
+        let parent_wl = parent_surface.role.surface().clone();
+        let output = parent_surface.output.clone();
+        let desired = self
+            .configurations
+            .root(&output)
+            .and_then(|root| find_popup(root, None));
         if let Some(index) = self
             .surfaces
             .iter()
             .position(|s| matches!(s.role, Role::Popup(_)))
         {
-            if desired
-                .as_ref()
-                .is_none_or(|(id, _)| *id != self.surfaces[index].root)
+            let current = &self.surfaces[index];
+            if current.output != output
+                || desired.as_ref().is_none_or(|(id, _)| *id != current.root)
             {
                 self.close_popup(index);
             } else {
@@ -596,16 +752,30 @@ impl App {
             }
         }
         // closing the previous popup may run a handler that changes visibility.
-        let Some((id, anchor_id)) = find_popup(self.runtime.root(), None) else {
+        let Some((id, anchor_id)) = self
+            .configurations
+            .root(&output)
+            .and_then(|root| find_popup(root, None))
+        else {
             return;
         };
-        let Some(parent) = self.surfaces.get(parent) else {
+        let Some(parent) = self
+            .index(&parent_wl)
+            .and_then(|index| self.surfaces.get(index))
+        else {
             return;
         };
         let Role::Panel(layer) = &parent.role else {
             return;
         };
-        let Some(node) = self.runtime.root().find(id) else {
+        let layer = layer.clone();
+        let parent_output = parent.output.clone();
+        let parent_scale = parent.scale;
+        let Some(node) = self
+            .configurations
+            .root(&output)
+            .and_then(|root| root.find(id))
+        else {
             return;
         };
         let width = node.style.width.unwrap_or(320.0).round().clamp(1.0, 4096.0) as i32;
@@ -650,9 +820,10 @@ impl App {
                 }
                 let surface = self.make_surface(
                     Role::Popup(popup),
-                    parent.output.clone(),
+                    parent_output,
                     id,
                     (width as u32, height as u32),
+                    parent_scale,
                     qh,
                 );
                 surface.role.surface().commit();
@@ -695,14 +866,22 @@ impl App {
         let Some(id) = surface.input.focused else {
             return;
         };
-        let Some(node) = self.runtime.root().find(id) else {
+        let output = surface.output.clone();
+        let Some(node) = self
+            .configurations
+            .root(&output)
+            .and_then(|root| root.find(id))
+        else {
             return;
         };
         if node.kind == Kind::Button
             && (event.keysym == Keysym::Return || event.keysym == Keysym::space)
         {
-            self.dispatch(id, Event::Click);
-            self.sync_popup(index, serial, qh);
+            let event_surface = self.surfaces[index].role.surface().clone();
+            self.dispatch(output, id, Event::Click);
+            if let Some(index) = self.index(&event_surface) {
+                self.sync_popup(index, serial, qh);
+            }
         } else if node.kind == Kind::Slider {
             let slider = node.slider;
             let step = if slider.step > 0.0 {
@@ -717,8 +896,79 @@ impl App {
                 Keysym::End => slider.max,
                 _ => return,
             };
-            self.dispatch(id, Event::Change(value.clamp(slider.min, slider.max)));
+            self.dispatch(
+                output,
+                id,
+                Event::Change(value.clamp(slider.min, slider.max)),
+            );
         }
+    }
+}
+
+fn panel_height(root: &Node) -> u32 {
+    root.style.height.unwrap_or(36.0).round().clamp(1.0, 4096.0) as u32
+}
+
+fn output_context(info: OutputInfo) -> Option<OutputContext> {
+    let integer_scale = info.scale_factor.clamp(1, 16) as u32;
+    let scale = Scale::from_120ths(integer_scale * 120).unwrap_or_default();
+    let logical_size = info.logical_size.and_then(valid_dimensions).or_else(|| {
+        let dimensions = info
+            .modes
+            .iter()
+            .find(|mode| mode.current)
+            .map(|mode| mode.dimensions)?;
+        let rotated = matches!(
+            info.transform,
+            wl_output::Transform::_90
+                | wl_output::Transform::_270
+                | wl_output::Transform::Flipped90
+                | wl_output::Transform::Flipped270
+        );
+        fallback_logical_size(dimensions, integer_scale, rotated)
+    })?;
+    Some(OutputContext {
+        name: info.name,
+        width: logical_size.0,
+        height: logical_size.1,
+        scale,
+    })
+}
+
+fn valid_dimensions((width, height): (i32, i32)) -> Option<(u32, u32)> {
+    Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
+        .filter(|(width, height)| *width > 0 && *height > 0)
+}
+
+fn fallback_logical_size(dimensions: (i32, i32), scale: u32, rotated: bool) -> Option<(u32, u32)> {
+    let (mut width, mut height) = valid_dimensions(dimensions)?;
+    if rotated {
+        std::mem::swap(&mut width, &mut height);
+    }
+    Some((width / scale, height / scale)).filter(|(width, height)| *width > 0 && *height > 0)
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::{fallback_logical_size, valid_dimensions};
+
+    #[test]
+    fn mode_fallback_applies_scale_and_rotation() {
+        assert_eq!(
+            fallback_logical_size((3840, 2160), 2, false),
+            Some((1920, 1080))
+        );
+        assert_eq!(
+            fallback_logical_size((3840, 2160), 2, true),
+            Some((1080, 1920))
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_or_invalid_output_dimensions() {
+        assert_eq!(valid_dimensions((0, 1080)), None);
+        assert_eq!(valid_dimensions((-1, 1080)), None);
+        assert_eq!(fallback_logical_size((1, 1), 2, false), None);
     }
 }
 
@@ -750,9 +1000,14 @@ impl CompositorHandler for App {
         if let Some(index) = self.index(wl) {
             let surface = &mut self.surfaces[index];
             if surface.fractional.is_none() {
-                surface.scale =
-                    Scale::from_120ths(scale.clamp(1, 16) as u32 * 120).unwrap_or_default();
+                let scale = Scale::from_120ths(scale.clamp(1, 16) as u32 * 120).unwrap_or_default();
+                surface.scale = scale;
                 surface.dirty = true;
+                let panel = matches!(surface.role, Role::Panel(_));
+                let output = surface.output.clone();
+                if panel {
+                    self.set_output_scale(&output, scale);
+                }
             }
         }
     }
@@ -792,9 +1047,37 @@ impl OutputHandler for App {
         &mut self.outputs
     }
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        self.add_panel(output, qh);
+        if self.loading_outputs {
+            return;
+        }
+        if let Err(error) = self.add_panel(output, qh) {
+            eprintln!("thing: cannot configure new output: {error}");
+        }
     }
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        if self.loading_outputs {
+            return;
+        }
+        let Some(context) = self.output_context(&output) else {
+            return;
+        };
+        if !self.configurations.contains(&output) {
+            if let Err(error) = self.add_panel(output, qh) {
+                eprintln!("thing: cannot configure output: {error}");
+            }
+            return;
+        }
+        match self.configurations.set_output(&output, context) {
+            Ok(true) => self.invalidate_output(&output),
+            Ok(false) => {}
+            Err(error) => eprintln!("thing: cannot update output: {error}"),
+        }
+    }
     fn output_destroyed(
         &mut self,
         _: &Connection,
@@ -812,6 +1095,8 @@ impl OutputHandler for App {
             self.error = Some(error);
         }
         self.surfaces.retain(|surface| surface.output != output);
+        self.configurations.remove(&output);
+        self.update_watch();
         if self
             .keyboard_surface
             .as_ref()
@@ -835,6 +1120,15 @@ impl LayerShellHandler for App {
                 self.error = Some(error);
             }
             self.surfaces.retain(|surface| surface.output != output);
+            self.configurations.remove(&output);
+            self.update_watch();
+            if self
+                .keyboard_surface
+                .as_ref()
+                .is_some_and(|wl| self.index(wl).is_none())
+            {
+                self.keyboard_surface = None;
+            }
         }
     }
     fn configure(
@@ -1027,9 +1321,12 @@ impl PointerHandler for App {
                     self.surfaces[index].pressed_button = None;
                     let pressed = self.surfaces[index].input.pressed.take();
                     let serial = self.surfaces[index].press_serial.take();
+                    let output = self.surfaces[index].output.clone();
+                    let event_surface = self.surfaces[index].role.surface().clone();
                     self.surfaces[index].dirty = true;
                     if let Some(id) = pressed.filter(|id| Some(*id) == hit) {
                         self.dispatch(
+                            output,
                             id,
                             match button {
                                 0x111 => Event::SecondaryClick,
@@ -1037,7 +1334,7 @@ impl PointerHandler for App {
                                 _ => Event::Click,
                             },
                         );
-                        if let Some(serial) = serial {
+                        if let Some((index, serial)) = self.index(&event_surface).zip(serial) {
                             self.sync_popup(index, serial, qh);
                         }
                     }
@@ -1052,7 +1349,8 @@ impl PointerHandler for App {
                     if (x != 0.0 || y != 0.0)
                         && let Some(id) = hit
                     {
-                        self.dispatch(id, Event::Scroll { x, y });
+                        let output = self.surfaces[index].output.clone();
+                        self.dispatch(output, id, Event::Scroll { x, y });
                     }
                 }
                 _ => {}
@@ -1150,8 +1448,14 @@ impl Dispatch<WpFractionalScaleV1, wl_surface::WlSurface> for App {
             && let Some(index) = app.index(wl)
             && let Some(scale) = Scale::from_120ths(scale)
         {
-            app.surfaces[index].scale = scale;
-            app.surfaces[index].dirty = true;
+            let surface = &mut app.surfaces[index];
+            surface.scale = scale;
+            surface.dirty = true;
+            let panel = matches!(surface.role, Role::Panel(_));
+            let output = surface.output.clone();
+            if panel {
+                app.set_output_scale(&output, scale);
+            }
         }
     }
 }
