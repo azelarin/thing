@@ -264,6 +264,7 @@ widget kind; unkeyed children match by position and kind.
 | widget | additional properties |
 | --- | --- |
 | `text` | `text`: utf-8 string; optional `max_lines` and `overflow` |
+| `text_input` | controlled `value` and `on_change`; optional `placeholder` and `on_submit` |
 | `image` | one of `source`, `icon`, `app_id`; optional `icon_theme` and `fit` |
 | `path` | `data`, `view_box`; optional fit, fill, and stroke controls |
 | `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll`, `on_hover` |
@@ -284,6 +285,36 @@ ui.text {
     style = { width = 96 },
 }
 ```
+
+`text_input` is a controlled, single-line field. keep its value in `ui.state`
+and return that state from the `value` property. `on_change` receives each
+proposed value; the field keeps an edit only when the handler publishes that
+value back through `value`:
+
+```luau
+local query = ui.state('')
+
+ui.text_input {
+    value = function() return query:get() end,
+    placeholder = 'search applications',
+    on_change = function(value) query:set(value) end,
+    on_submit = function(value)
+        services.launch({ 'my-launcher', value })
+    end,
+    style = { width = 280, padding_x = 10 },
+}
+```
+
+click and drag to select text, or use tab and shift-tab to move keyboard focus.
+arrow keys follow visual text order, including mixed right-to-left text. shift
+extends the selection; control adds word movement or deletion, and control-a
+selects everything. enter calls `on_submit`. values and placeholders are limited
+to one mib and cannot contain NUL or line breaks.
+
+this first text-entry layer handles text reported directly by the keyboard. it
+does not yet implement wayland's text-input protocol, so input-method preedit and
+on-screen keyboards are not supported. system clipboard shortcuts are also not
+available yet. both remain part of the incomplete text-input roadmap item.
 
 `centerbox` takes exactly three non-popup children: start, center, and end. give
 it an explicit height and width (or `grow = 1` inside a row). the middle child
@@ -609,6 +640,7 @@ put layout and paint values in `style`. dimensions use logical pixels.
 | `hover_overlay`, `pressed_overlay` | `#ffffff14`, `#ffffff28`; interactive control feedback |
 | `disabled_opacity` | `0.45`; fades a disabled widget and its descendants once |
 | `focus_ring_color`, `focus_ring_width` | `#89b4fa`, `2`; keyboard focus indicator |
+| `placeholder_color`, `selection_color`, `caret_color` | `#ffffff80`, `#89b4fa80`, white; `text_input` only |
 | `font_size` | `14` |
 | `font_weight` | `400`; a number from `1` to `1000`, with `700` for bold |
 | `font_family` | `sans-serif`, resolved through fontconfig |
