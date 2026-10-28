@@ -50,6 +50,10 @@ pub enum Action {
     },
     SetClipboardText(String),
     ClearClipboard,
+    ManagedProcess {
+        key: String,
+        action: ManagedProcessAction,
+    },
     Launch {
         argv: Vec<String>,
         cwd: Option<String>,
@@ -58,6 +62,96 @@ pub enum Action {
 
 const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_QUEUED_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
+
+/// a request for one configuration-managed process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ManagedProcessAction {
+    Start {
+        argv: Vec<String>,
+        cwd: Option<String>,
+    },
+    Stop,
+}
+
+/// the signal sent before a managed process is forcibly stopped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ManagedProcessShutdownSignal {
+    #[default]
+    Terminate,
+    Interrupt,
+}
+
+/// one process key declared while a configuration loads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedProcessDefinition {
+    pub key: String,
+    pub shutdown_signal: ManagedProcessShutdownSignal,
+}
+
+/// lifecycle state for one managed process incarnation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ManagedProcessStatus {
+    #[default]
+    Idle,
+    Starting,
+    Running,
+    Stopping,
+    Exited,
+    Failed,
+}
+
+impl ManagedProcessStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Exited => "exited",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn running(self) -> bool {
+        matches!(self, Self::Starting | Self::Running | Self::Stopping)
+    }
+}
+
+/// current output and exit state for one managed process key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedProcessState {
+    pub key: String,
+    pub status: ManagedProcessStatus,
+    pub stdout: Arc<str>,
+    pub stderr: Arc<str>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub exit_code: Option<i32>,
+    pub exit_signal: Option<i32>,
+    pub error: Arc<str>,
+}
+
+impl ManagedProcessState {
+    pub fn idle(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            status: ManagedProcessStatus::Idle,
+            stdout: Arc::from(""),
+            stderr: Arc::from(""),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            exit_code: None,
+            exit_signal: None,
+            error: Arc::from(""),
+        }
+    }
+}
+
+/// one process-wide generation of managed process state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManagedProcessSnapshot {
+    pub states: Vec<ManagedProcessState>,
+}
 
 /// a media playback control request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +181,11 @@ pub enum SystemTrayMenuAction {
 const MAX_LAUNCH_ARGUMENTS: usize = 256;
 const MAX_LAUNCH_ARGUMENT_BYTES: usize = 4096;
 const MAX_LAUNCH_BYTES: usize = 64 * 1024;
+const MAX_MANAGED_PROCESS_KEYS: usize = 32;
+const MAX_MANAGED_PROCESS_KEY_BYTES: usize = 128;
+const MAX_MANAGED_PROCESS_STREAM_BYTES: usize = 64 * 1024;
+const MAX_MANAGED_PROCESS_RETAINED_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MANAGED_PROCESS_ERROR_BYTES: usize = 4096;
 const MAX_TRAY_PIXMAPS: usize = 32;
 const MAX_TRAY_PIXMAP_SIDE: u32 = 4096;
 const MAX_TRAY_PIXMAP_BYTES: usize = 256 * 1024;
@@ -584,6 +683,7 @@ pub struct ServiceSnapshot {
     pub(crate) power_devices: Vec<PowerDevice>,
     pub(crate) notifications: Vec<Notification>,
     pub(crate) system_tray_items: Vec<SystemTrayItem>,
+    pub(crate) managed_processes: Vec<ManagedProcessState>,
     pub(crate) niri: NiriState,
 }
 
@@ -666,6 +766,12 @@ impl ServiceSnapshot {
         for (name, value) in clipboard.values() {
             self.values.insert(name.into(), value);
         }
+        Ok(())
+    }
+
+    pub fn set_managed_processes(&mut self, snapshot: ManagedProcessSnapshot) -> Result<()> {
+        validate_managed_process_states(&snapshot.states)?;
+        self.managed_processes = snapshot.states;
         Ok(())
     }
 
@@ -1015,6 +1121,20 @@ impl UserData for SourceList {
     }
 }
 
+#[derive(Clone)]
+struct ManagedProcessSignals {
+    definition: ManagedProcessDefinition,
+    status: usize,
+    running: usize,
+    stdout: usize,
+    stderr: usize,
+    stdout_truncated: usize,
+    stderr_truncated: usize,
+    exit_code: usize,
+    exit_signal: usize,
+    error: usize,
+}
+
 pub(crate) struct Services {
     tracker: Rc<RefCell<Tracker>>,
     signals: BTreeMap<String, usize>,
@@ -1038,6 +1158,9 @@ pub(crate) struct Services {
     notifications_revision: usize,
     system_tray_items: Rc<RefCell<Vec<SystemTrayItem>>>,
     system_tray_items_revision: usize,
+    managed_processes: Rc<RefCell<BTreeMap<String, ManagedProcessState>>>,
+    managed_process_signals: Rc<RefCell<BTreeMap<String, ManagedProcessSignals>>>,
+    managed_process_declarations_open: Rc<Cell<bool>>,
     niri: NiriData,
 }
 
@@ -1077,6 +1200,9 @@ impl Services {
             notifications_revision,
             system_tray_items: Rc::default(),
             system_tray_items_revision,
+            managed_processes: Rc::default(),
+            managed_process_signals: Rc::default(),
+            managed_process_declarations_open: Rc::new(Cell::new(true)),
             niri: niri_data,
         };
         let services = lua.create_table()?;
@@ -1442,6 +1568,54 @@ impl Services {
                 enqueue(&actions, &allowed, Action::Launch { argv, cwd })
             })?,
         )?;
+        let tracker = result.tracker.clone();
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        let states = result.managed_processes.clone();
+        let processes = result.managed_process_signals.clone();
+        let declarations_open = result.managed_process_declarations_open.clone();
+        services.set(
+            "process",
+            lua.create_function(move |lua, value: Value| {
+                if !declarations_open.get() {
+                    return Err(Error::runtime(
+                        "managed processes must be declared while the configuration loads",
+                    ));
+                }
+                let definition = managed_process_definition(value)?;
+                let existing = processes.borrow().get(&definition.key).cloned();
+                let signals = if let Some(signals) = existing {
+                    if signals.definition != definition {
+                        return Err(Error::runtime(format!(
+                            "managed process {:?} has conflicting declarations",
+                            definition.key
+                        )));
+                    }
+                    signals
+                } else {
+                    if processes.borrow().len() >= MAX_MANAGED_PROCESS_KEYS {
+                        return Err(Error::runtime(format!(
+                            "a configuration may declare at most {MAX_MANAGED_PROCESS_KEYS} managed processes"
+                        )));
+                    }
+                    let state = states
+                        .borrow()
+                        .get(&definition.key)
+                        .cloned()
+                        .unwrap_or_else(|| ManagedProcessState::idle(definition.key.clone()));
+                    let signals = create_managed_process_signals(
+                        &tracker,
+                        definition.clone(),
+                        &state,
+                    )?;
+                    processes
+                        .borrow_mut()
+                        .insert(definition.key.clone(), signals.clone());
+                    signals
+                };
+                managed_process_handle(lua, signals, &tracker, &actions, &allowed)
+            })?,
+        )?;
         services.set("audio", audio)?;
         services.set("clipboard", clipboard)?;
         services.set("clock", clock)?;
@@ -1458,6 +1632,39 @@ impl Services {
     pub fn allow_actions(&self, allowed: bool) {
         self.allowed.set(allowed);
     }
+
+    pub fn freeze_managed_process_declarations(&self) {
+        self.managed_process_declarations_open.set(false);
+    }
+
+    pub fn managed_process_definitions(&self) -> Vec<ManagedProcessDefinition> {
+        self.managed_process_signals
+            .borrow()
+            .values()
+            .map(|signals| signals.definition.clone())
+            .collect()
+    }
+
+    pub fn set_managed_processes(&self, snapshot: ManagedProcessSnapshot) -> Result<()> {
+        validate_managed_process_states(&snapshot.states)?;
+        let states = snapshot
+            .states
+            .into_iter()
+            .map(|state| (state.key.clone(), state))
+            .collect::<BTreeMap<_, _>>();
+        let mut updates = Vec::new();
+        for signals in self.managed_process_signals.borrow().values() {
+            let state = states
+                .get(&signals.definition.key)
+                .cloned()
+                .unwrap_or_else(|| ManagedProcessState::idle(signals.definition.key.clone()));
+            updates.extend(managed_process_updates(signals, &state));
+        }
+        self.tracker.borrow_mut().write_batch(updates)?;
+        *self.managed_processes.borrow_mut() = states;
+        Ok(())
+    }
+
     pub fn take_actions(&self) -> Vec<Action> {
         std::mem::take(&mut self.actions.borrow_mut())
     }
@@ -1809,6 +2016,7 @@ impl Services {
             power_devices: self.power_devices.borrow().clone(),
             notifications: self.notifications.borrow().clone(),
             system_tray_items: self.system_tray_items.borrow().clone(),
+            managed_processes: self.managed_processes.borrow().values().cloned().collect(),
             niri: self.niri.snapshot(),
         }
     }
@@ -1835,6 +2043,255 @@ impl Services {
     pub fn set_niri(&self, state: NiriState) -> Result<()> {
         self.niri.set(state)
     }
+}
+
+fn managed_process_state_values(state: &ManagedProcessState) -> [Scalar; 9] {
+    [
+        Scalar::String(state.status.as_str().into()),
+        Scalar::Boolean(state.status.running()),
+        Scalar::String(state.stdout.to_string()),
+        Scalar::String(state.stderr.to_string()),
+        Scalar::Boolean(state.stdout_truncated),
+        Scalar::Boolean(state.stderr_truncated),
+        state
+            .exit_code
+            .map_or(Scalar::Nil, |value| Scalar::Number(value.into())),
+        state
+            .exit_signal
+            .map_or(Scalar::Nil, |value| Scalar::Number(value.into())),
+        Scalar::String(state.error.to_string()),
+    ]
+}
+
+fn managed_process_updates(
+    signals: &ManagedProcessSignals,
+    state: &ManagedProcessState,
+) -> [(usize, Scalar); 9] {
+    let [
+        status,
+        running,
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+        exit_code,
+        exit_signal,
+        error,
+    ] = managed_process_state_values(state);
+    [
+        (signals.status, status),
+        (signals.running, running),
+        (signals.stdout, stdout),
+        (signals.stderr, stderr),
+        (signals.stdout_truncated, stdout_truncated),
+        (signals.stderr_truncated, stderr_truncated),
+        (signals.exit_code, exit_code),
+        (signals.exit_signal, exit_signal),
+        (signals.error, error),
+    ]
+}
+
+fn validate_managed_process_states(states: &[ManagedProcessState]) -> Result<()> {
+    if states.len() > MAX_MANAGED_PROCESS_KEYS {
+        return Err(Error::runtime("too many managed process states"));
+    }
+    let mut keys = BTreeSet::new();
+    let mut retained = 0_usize;
+    for state in states {
+        validate_managed_process_key(&state.key)?;
+        if !keys.insert(state.key.as_str()) {
+            return Err(Error::runtime("duplicate managed process state"));
+        }
+        if state.stdout.len() > MAX_MANAGED_PROCESS_STREAM_BYTES
+            || state.stderr.len() > MAX_MANAGED_PROCESS_STREAM_BYTES
+            || state.error.len() > MAX_MANAGED_PROCESS_ERROR_BYTES
+            || state.stdout.contains('\0')
+            || state.stderr.contains('\0')
+            || state.error.contains('\0')
+            || state.exit_code.is_some() && state.exit_signal.is_some()
+            || state
+                .exit_signal
+                .is_some_and(|signal| signal <= 0 || signal > 128)
+        {
+            return Err(Error::runtime("invalid managed process state"));
+        }
+        retained = retained
+            .checked_add(state.stdout.len())
+            .and_then(|value| value.checked_add(state.stderr.len()))
+            .ok_or_else(|| Error::runtime("managed process state is too large"))?;
+    }
+    if retained > MAX_MANAGED_PROCESS_RETAINED_BYTES {
+        return Err(Error::runtime(
+            "managed process state exceeds the 4 MiB retained output limit",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_managed_process_key(key: &str) -> Result<()> {
+    if key.is_empty() || key.len() > MAX_MANAGED_PROCESS_KEY_BYTES || key.contains('\0') {
+        Err(Error::runtime(format!(
+            "managed process keys must be 1 to {MAX_MANAGED_PROCESS_KEY_BYTES} bytes without NUL"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn managed_process_definition(value: Value) -> Result<ManagedProcessDefinition> {
+    let definition = match value {
+        Value::String(key) => ManagedProcessDefinition {
+            key: key.to_str()?.to_owned(),
+            shutdown_signal: ManagedProcessShutdownSignal::Terminate,
+        },
+        Value::Table(table) => {
+            for pair in table.clone().pairs::<Value, Value>() {
+                let (key, _) = pair?;
+                let Value::String(key) = key else {
+                    return Err(Error::runtime(
+                        "managed process options must use string keys",
+                    ));
+                };
+                let key = key.to_str()?;
+                if !matches!(key.as_ref(), "key" | "shutdown_signal") {
+                    return Err(Error::runtime(format!(
+                        "unknown managed process option {key:?}"
+                    )));
+                }
+            }
+            let key: String = table.get("key")?;
+            let shutdown_signal = match table.get::<Value>("shutdown_signal")? {
+                Value::Nil => ManagedProcessShutdownSignal::Terminate,
+                Value::String(value) if value.to_str()?.as_ref() == "terminate" => {
+                    ManagedProcessShutdownSignal::Terminate
+                }
+                Value::String(value) if value.to_str()?.as_ref() == "interrupt" => {
+                    ManagedProcessShutdownSignal::Interrupt
+                }
+                _ => {
+                    return Err(Error::runtime(
+                        "managed process shutdown_signal must be 'terminate' or 'interrupt'",
+                    ));
+                }
+            };
+            ManagedProcessDefinition {
+                key,
+                shutdown_signal,
+            }
+        }
+        _ => {
+            return Err(Error::runtime(
+                "services.process expects a key string or options table",
+            ));
+        }
+    };
+    validate_managed_process_key(&definition.key)?;
+    Ok(definition)
+}
+
+fn create_managed_process_signals(
+    tracker: &Rc<RefCell<Tracker>>,
+    definition: ManagedProcessDefinition,
+    state: &ManagedProcessState,
+) -> Result<ManagedProcessSignals> {
+    let values = managed_process_state_values(state);
+    let mut tracker = tracker.borrow_mut();
+    let mut ids = Vec::with_capacity(values.len());
+    for value in values {
+        ids.push(tracker.insert(value)?);
+    }
+    let [
+        status,
+        running,
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+        exit_code,
+        exit_signal,
+        error,
+    ] = ids.as_slice()
+    else {
+        unreachable!("managed process signal count is fixed");
+    };
+    Ok(ManagedProcessSignals {
+        definition,
+        status: *status,
+        running: *running,
+        stdout: *stdout,
+        stderr: *stderr,
+        stdout_truncated: *stdout_truncated,
+        stderr_truncated: *stderr_truncated,
+        exit_code: *exit_code,
+        exit_signal: *exit_signal,
+        error: *error,
+    })
+}
+
+fn managed_process_handle(
+    lua: &Lua,
+    signals: ManagedProcessSignals,
+    tracker: &Rc<RefCell<Tracker>>,
+    actions: &Rc<RefCell<Vec<Action>>>,
+    allowed: &Rc<Cell<bool>>,
+) -> Result<Table> {
+    let handle = lua.create_table()?;
+    for (name, id) in [
+        ("status", signals.status),
+        ("running", signals.running),
+        ("stdout", signals.stdout),
+        ("stderr", signals.stderr),
+        ("stdout_truncated", signals.stdout_truncated),
+        ("stderr_truncated", signals.stderr_truncated),
+        ("exit_code", signals.exit_code),
+        ("exit_signal", signals.exit_signal),
+        ("error", signals.error),
+    ] {
+        handle.set(
+            name,
+            Signal {
+                id,
+                tracker: tracker.clone(),
+                readonly: true,
+            },
+        )?;
+    }
+    let key = signals.definition.key.clone();
+    let start_actions = actions.clone();
+    let start_allowed = allowed.clone();
+    handle.set(
+        "start",
+        lua.create_function(move |_, (arguments, cwd): (Table, Value)| {
+            let argv = launch_arguments(arguments)?;
+            let cwd = launch_working_directory(cwd)?;
+            enqueue(
+                &start_actions,
+                &start_allowed,
+                Action::ManagedProcess {
+                    key: key.clone(),
+                    action: ManagedProcessAction::Start { argv, cwd },
+                },
+            )
+        })?,
+    )?;
+    let key = signals.definition.key;
+    let stop_actions = actions.clone();
+    let stop_allowed = allowed.clone();
+    handle.set(
+        "stop",
+        lua.create_function(move |_, ()| {
+            enqueue(
+                &stop_actions,
+                &stop_allowed,
+                Action::ManagedProcess {
+                    key: key.clone(),
+                    action: ManagedProcessAction::Stop,
+                },
+            )
+        })?,
+    )?;
+    handle.set_readonly(true);
+    Ok(handle)
 }
 
 fn launch_arguments(table: Table) -> Result<Vec<String>> {
@@ -2593,6 +3050,153 @@ mod tests {
             description: name.into(),
             monitor,
         }
+    }
+
+    fn process_state(key: &str, status: ManagedProcessStatus) -> ManagedProcessState {
+        ManagedProcessState {
+            key: key.into(),
+            status,
+            stdout: Arc::from("ready\n"),
+            stderr: Arc::from("warning\n"),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            exit_code: None,
+            exit_signal: None,
+            error: Arc::from(""),
+        }
+    }
+
+    #[test]
+    fn managed_process_declarations_and_actions_are_explicit() {
+        let lua = Lua::new();
+        let tracker = Rc::new(RefCell::new(Tracker::default()));
+        let services = Services::install(&lua, tracker).unwrap();
+        lua.load(
+            r#"
+            query = services.process('query')
+            recorder = services.process {
+                key = 'recorder',
+                shutdown_signal = 'interrupt',
+            }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(
+            services.managed_process_definitions(),
+            vec![
+                ManagedProcessDefinition {
+                    key: "query".into(),
+                    shutdown_signal: ManagedProcessShutdownSignal::Terminate,
+                },
+                ManagedProcessDefinition {
+                    key: "recorder".into(),
+                    shutdown_signal: ManagedProcessShutdownSignal::Interrupt,
+                },
+            ]
+        );
+        assert!(lua.load("query.start({'program'})").exec().is_err());
+
+        services.allow_actions(true);
+        lua.load("query.start({'program', '--flag'}, '/tmp'); recorder.stop()")
+            .exec()
+            .unwrap();
+        assert_eq!(
+            services.take_actions(),
+            vec![
+                Action::ManagedProcess {
+                    key: "query".into(),
+                    action: ManagedProcessAction::Start {
+                        argv: vec!["program".into(), "--flag".into()],
+                        cwd: Some("/tmp".into()),
+                    },
+                },
+                Action::ManagedProcess {
+                    key: "recorder".into(),
+                    action: ManagedProcessAction::Stop,
+                },
+            ]
+        );
+
+        services.freeze_managed_process_declarations();
+        assert!(lua.load("services.process('late')").exec().is_err());
+    }
+
+    #[test]
+    fn managed_process_state_is_shared_reactive_and_transactional() {
+        let lua = Lua::new();
+        let tracker = Rc::new(RefCell::new(Tracker::default()));
+        let services = Services::install(&lua, tracker.clone()).unwrap();
+        services
+            .set_managed_processes(ManagedProcessSnapshot {
+                states: vec![process_state("query", ManagedProcessStatus::Running)],
+            })
+            .unwrap();
+        lua.load("query = services.process('query')")
+            .exec()
+            .unwrap();
+        assert_eq!(
+            lua.load("return query.status:get(), query.running:get(), query.stdout:get()")
+                .eval::<(String, bool, String)>()
+                .unwrap(),
+            ("running".into(), true, "ready\n".into())
+        );
+
+        tracker.borrow_mut().begin(42);
+        lua.load("return query.stdout:get()")
+            .eval::<String>()
+            .unwrap();
+        tracker.borrow_mut().finish(42);
+        let mut exited = process_state("query", ManagedProcessStatus::Exited);
+        exited.stdout = Arc::from("complete\n");
+        exited.exit_code = Some(0);
+        services
+            .set_managed_processes(ManagedProcessSnapshot {
+                states: vec![exited.clone()],
+            })
+            .unwrap();
+        assert_eq!(tracker.borrow().dirty, BTreeSet::from([42]));
+        assert_eq!(
+            lua.load("return query.status:get(), query.running:get(), query.stdout:get(), query.exit_code:get()")
+                .eval::<(String, bool, String, i32)>()
+                .unwrap(),
+            ("exited".into(), false, "complete\n".into(), 0)
+        );
+        assert_eq!(services.snapshot().managed_processes, vec![exited]);
+
+        let before = services.snapshot();
+        let mut invalid = process_state("query", ManagedProcessStatus::Running);
+        invalid.stdout = Arc::from("x".repeat(MAX_MANAGED_PROCESS_STREAM_BYTES + 1));
+        assert!(
+            services
+                .set_managed_processes(ManagedProcessSnapshot {
+                    states: vec![invalid],
+                })
+                .is_err()
+        );
+        assert_eq!(services.snapshot(), before);
+    }
+
+    #[test]
+    fn managed_process_declarations_reject_conflicts_and_unknown_options() {
+        let lua = Lua::new();
+        let tracker = Rc::new(RefCell::new(Tracker::default()));
+        let services = Services::install(&lua, tracker).unwrap();
+        lua.load("first = services.process('same'); second = services.process('same')")
+            .exec()
+            .unwrap();
+        assert_eq!(services.managed_process_definitions().len(), 1);
+        assert!(
+            lua.load("services.process { key = 'same', shutdown_signal = 'interrupt' }")
+                .exec()
+                .is_err()
+        );
+        assert!(
+            lua.load("services.process { key = 'other', restart = true }")
+                .exec()
+                .is_err()
+        );
+        assert!(lua.load("services.process('')").exec().is_err());
     }
 
     #[test]
