@@ -83,6 +83,8 @@ type ThingAnimatedOptionalNumber = number | (() -> number?) | ThingTransition
 export type ThingStyle = {
     width: ThingAnimatedOptionalNumber?,
     height: ThingAnimatedOptionalNumber?,
+    width_fraction: ThingReactive<number?>?,
+    height_fraction: ThingReactive<number?>?,
     min_width: ThingReactive<number?>?,
     max_width: ThingReactive<number?>?,
     min_height: ThingReactive<number?>?,
@@ -117,6 +119,8 @@ export type ThingStyle = {
 export type ThingTextStyle = {
     width: ThingAnimatedOptionalNumber?,
     height: ThingAnimatedOptionalNumber?,
+    width_fraction: ThingReactive<number?>?,
+    height_fraction: ThingReactive<number?>?,
     min_width: ThingReactive<number?>?,
     max_width: ThingReactive<number?>?,
     min_height: ThingReactive<number?>?,
@@ -221,6 +225,22 @@ export type ThingSliderProperties = {
     value: ThingReactive<number>?,
     step: ThingReactive<number>?,
     on_change: ((value: number) -> ())?,
+    on_hover: ((inside: boolean) -> ())?,
+}
+
+export type ThingRangeProperties = {
+    key: string?,
+    visible: ThingReactive<boolean>?,
+    enabled: ThingReactive<boolean>?,
+    style: ThingStyle?,
+    children: ThingChildren?,
+    min: ThingReactive<number>?,
+    max: ThingReactive<number>?,
+    value: ThingReactive<number>?,
+    step: ThingReactive<number>?,
+    inset: ThingReactive<number>?,
+    on_change: ((value: number) -> ())?,
+    on_pressed: ((down: boolean) -> ())?,
     on_hover: ((inside: boolean) -> ())?,
 }
 
@@ -333,6 +353,26 @@ declare extern type ThingNotification with
     read action_icons: boolean
 end
 
+declare extern type ThingSystemTrayItem with
+    read id: string
+    read protocol_item_id: string
+    read category: string
+    read title: string
+    read status: string
+    read icon_name: string
+    read attention_icon_name: string
+    read overlay_icon_name: string
+    read tooltip_icon_name: string
+    read tooltip_title: string
+    read tooltip_text: string
+    read item_is_menu: boolean
+    read has_menu: boolean
+    read has_icon_pixmap: boolean
+    read has_attention_icon_pixmap: boolean
+    read has_overlay_icon_pixmap: boolean
+    read has_tooltip_icon_pixmap: boolean
+end
+
 declare extern type ThingNiriWorkspace with
     read id: string
     read index: number
@@ -423,6 +463,16 @@ declare extern type ThingNotificationService with
     read invoke: (key: string, action: string) -> ()
 end
 
+declare extern type ThingSystemTrayService with
+    read available: ThingSignal<boolean>
+    read watcher_owned: ThingSignal<boolean>
+    read error: ThingSignal<string>
+    read items: ThingSignal<ThingReadonlyArray<ThingSystemTrayItem>>
+    read activate: (id: string) -> ()
+    read secondary_activate: (id: string) -> ()
+    read context_menu: (id: string) -> ()
+end
+
 declare extern type ThingNiriService with
     read available: ThingSignal<boolean>
     read error: ThingSignal<string>
@@ -449,6 +499,7 @@ declare extern type ThingServices with
     read niri: ThingNiriService
     read output: ThingOutputService
     read power: ThingPowerService
+    read system_tray: ThingSystemTrayService
     read launch: (arguments: { string }, working_directory: string?) -> ()
 end
 
@@ -464,6 +515,7 @@ declare ui: {
     image: (properties: ThingImageProperties) -> ThingWidget,
     button: (properties: ThingButtonProperties) -> ThingWidget,
     slider: (properties: ThingSliderProperties) -> ThingWidget,
+    range: (properties: ThingRangeProperties) -> ThingWidget,
     state: <T>(initial: T & ThingStateValue) -> ThingState<T>,
     transition: (value: () -> number, options: ThingTransitionOptions) -> ThingTransition,
     asset: (relative_path: string) -> string,
