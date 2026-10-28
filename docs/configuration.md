@@ -1108,10 +1108,12 @@ not an action target and is not guaranteed to be unique.
 
 the other string fields are `category`, `title`, `status`, `icon_name`,
 `attention_icon_name`, `overlay_icon_name`, `tooltip_icon_name`,
-`tooltip_title`, and `tooltip_text`. `item_is_menu` and `has_menu` describe menu
-behavior. the four `has_*_icon_pixmap` fields report whether a bounded, valid
-pixmap was advertised. the normal and attention flags become false when the
-aggregate retention budget prevents thing from keeping their pixel data.
+`tooltip_title`, and `tooltip_text`. `item_is_menu` describes the item's primary
+activation behavior. `has_menu` says whether the item advertised a DBusMenu;
+when it is true, `menu` contains its root record. the four `has_*_icon_pixmap`
+fields report whether a bounded, valid pixmap was advertised. the normal and
+attention flags become false when the aggregate retention budget prevents thing
+from keeping their pixel data.
 
 `icon` is an opaque image handle ready for `ui.image.source`, or `nil` when the
 item has no usable icon. thing prefers the advertised theme name and falls back
@@ -1143,13 +1145,71 @@ ui.row {
 }
 ```
 
-the three actions are event-handler only. thing currently passes `(0, 0)` as
-their coordinates because wayland clients do not know global screen
-coordinates, and it does not expose the protocol's scroll action. pixmap payloads
-are limited to 512 kib per item and 32 mib across the tray. equal-size animation
-frames are not animated, and overlay and tooltip pixmaps are not composited.
-`has_menu` does not mean thing can render a DBusMenu layout; the context-menu
-action is only forwarded to the item. legacy XEmbed tray items are not supported.
+the three item actions are event-handler only. thing currently passes `(0, 0)`
+as their coordinates because wayland clients do not know global screen
+coordinates, and it does not expose the protocol's scroll action.
+
+### tray menus
+
+thing exposes DBusMenu data rather than choosing how a menu should look. a menu
+root has `id`, `loaded`, `loading`, `error`, and `children`. call
+`open_menu(root.id)` when your configuration begins showing it; the children
+then update through `services.system_tray.items`. call `close_menu(root.id)`
+when the presentation closes. these functions, and `activate_menu_item`, may
+only be called from event handlers.
+
+menu entries contain these read-only fields:
+
+| field | meaning |
+| --- | --- |
+| `id` | opaque target for menu actions |
+| `kind` | protocol item type, normally `standard` or `separator` |
+| `label`, `access_key` | display-ready label and its optional mnemonic key |
+| `enabled`, `visible` | current interaction and presentation state |
+| `icon_name` | optional theme icon name |
+| `shortcut` | immutable array of key-name arrays supplied by the application |
+| `toggle_type`, `toggle_state` | check or radio metadata; `0` is off, `1` is on, and other states are indeterminate |
+| `disposition` | protocol disposition such as `normal`, `informative`, or `warning` |
+| `has_submenu` | whether the entry can be opened as a submenu |
+| `loaded`, `loading`, `error`, `children` | lazy child state and the last valid child records |
+
+open a submenu with its own id just before revealing it. `open_menu` is
+idempotent for one output configuration, and separate outputs may hold the same
+branch open at once. `close_menu` releases the branch and any descendants for
+the calling configuration. a successful reload or a removed output releases
+its outstanding opens automatically. the lease belongs to the output
+configuration, not an individual widget. keep at most one live presentation of
+a branch in that configuration, call `open_menu` once when it appears, and call
+`close_menu` once when it disappears. repeated opens do not create separate
+leases. this matches thing's current one-grabbed-popup-per-output model.
+
+activate a visible, enabled, non-separator entry with
+`activate_menu_item(entry.id)`. ids are opaque and may change when an item,
+menu path, parent, or bus connection changes; use the current records rather
+than constructing or saving ids. stale actions are rejected.
+
+`loading` can be true while the previous children remain available. a failed
+refresh keeps those children and puts a bounded message in `error`, so a menu
+does not disappear because one request failed. labels already have DBusMenu's
+underscore mnemonic syntax removed; `access_key` preserves the first mnemonic.
+
+the menu transport retains at most 64 direct children, 16 levels and 256 nodes
+per menu. its cache is capped at 512 kib per menu, 2,048 nodes and 8 mib across
+one tray worker. the immutable snapshot is checked against the same limits and
+shares one menu-tree allocation across output runtimes instead of copying it for
+each output. closed cache branches are discarded least-recently-used when space
+is needed; open or loading branches are not evicted.
+
+the first menu API does not retain `icon-data` or apply `IconThemePath`, and it
+does not expose vendor properties, hover events, or grouped events. applications
+that send `ItemActivationRequested` cannot make thing open a particular custom
+presentation yet. thing also does not provide a menu widget, typeahead,
+menu-specific keyboard navigation, or an accessibility implementation; those
+remain responsibilities or future capabilities of the configuration layer.
+
+pixmap payloads are limited to 512 kib per item and 32 mib across the tray.
+equal-size animation frames are not animated, overlay and tooltip pixmaps are
+not composited, and legacy XEmbed tray items are not supported.
 
 ## clipboard
 

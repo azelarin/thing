@@ -10,6 +10,7 @@ use thing_ui::Layout;
 
 struct Instance<K> {
     key: K,
+    consumer: String,
     output: OutputContext,
     runtime: Runtime,
 }
@@ -19,6 +20,7 @@ pub(crate) struct Configurations<K> {
     entry: PathBuf,
     services: ServiceSnapshot,
     instances: Vec<Instance<K>>,
+    next_consumer: u64,
 }
 
 impl<K: Clone + Eq> Configurations<K> {
@@ -27,6 +29,7 @@ impl<K: Clone + Eq> Configurations<K> {
             entry,
             services,
             instances: Vec::new(),
+            next_consumer: 1,
         }
     }
 
@@ -55,16 +58,22 @@ impl<K: Clone + Eq> Configurations<K> {
         let runtime = Runtime::load_for_output(&self.entry, output.clone(), &self.services)
             .map_err(|error| error.to_string())?;
         validate(&runtime)?;
+        let consumer = allocate_consumer(&mut self.next_consumer)?;
         self.instances.push(Instance {
             key,
+            consumer,
             output,
             runtime,
         });
         Ok(())
     }
 
-    pub(crate) fn remove(&mut self, key: &K) {
-        self.instances.retain(|instance| &instance.key != key);
+    pub(crate) fn remove(&mut self, key: &K) -> Option<String> {
+        let index = self
+            .instances
+            .iter()
+            .position(|instance| &instance.key == key)?;
+        Some(self.instances.remove(index).consumer)
     }
 
     pub(crate) fn keys(&self) -> impl Iterator<Item = &K> {
@@ -104,6 +113,20 @@ impl<K: Clone + Eq> Configurations<K> {
             .iter()
             .find(|instance| &instance.key == key)
             .map(|instance| &instance.output)
+    }
+
+    pub(crate) fn consumer(&self, key: &K) -> Option<&str> {
+        self.instances
+            .iter()
+            .find(|instance| &instance.key == key)
+            .map(|instance| instance.consumer.as_str())
+    }
+
+    pub(crate) fn consumers(&self) -> Vec<String> {
+        self.instances
+            .iter()
+            .map(|instance| instance.consumer.clone())
+            .collect()
     }
 
     fn runtime_mut(&mut self, key: &K) -> Option<&mut Runtime> {
@@ -360,6 +383,7 @@ impl<K: Clone + Eq> Configurations<K> {
         validate: impl Fn(&K, &Runtime) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut candidates = Vec::with_capacity(outputs.len());
+        let mut next_consumer = self.next_consumer;
         for (key, output) in outputs {
             if candidates
                 .iter()
@@ -370,12 +394,15 @@ impl<K: Clone + Eq> Configurations<K> {
             let runtime = Runtime::load_for_output(&self.entry, output.clone(), &self.services)
                 .map_err(|error| error.to_string())?;
             validate(&key, &runtime)?;
+            let consumer = allocate_consumer(&mut next_consumer)?;
             candidates.push(Instance {
                 key,
+                consumer,
                 output,
                 runtime,
             });
         }
+        self.next_consumer = next_consumer;
         self.instances = candidates;
         Ok(())
     }
@@ -406,15 +433,24 @@ impl<K: Clone + Eq> Configurations<K> {
     }
 }
 
+fn allocate_consumer(next: &mut u64) -> Result<String, String> {
+    let value = *next;
+    *next = next
+        .checked_add(1)
+        .ok_or_else(|| "configuration generation space exhausted".to_owned())?;
+    Ok(format!("configuration{value}"))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::{fs, sync::Arc, time::Duration};
 
     use tempfile::tempdir;
     use thing_core::{KeyboardMode, Kind, Scale};
     use thing_runtime::{
         AudioDevice, AudioSource, AudioStream, MediaPlayer, Notification, NotificationButton,
-        NotificationUrgency, PowerDevice, SystemTrayItem, SystemTraySnapshot,
+        NotificationUrgency, PowerDevice, SystemTrayItem, SystemTrayMenu, SystemTrayMenuItem,
+        SystemTraySnapshot,
     };
     use thing_ui::{Layout, Measurer, Size};
 
@@ -444,8 +480,31 @@ mod tests {
             tooltip_title: String::new(),
             tooltip_text: String::new(),
             item_is_menu: false,
-            has_menu: false,
-            menu: None,
+            has_menu: true,
+            menu: Some(Arc::new(SystemTrayMenu {
+                id: format!("{id}-menu"),
+                loaded: true,
+                loading: false,
+                error: String::new(),
+                children: vec![SystemTrayMenuItem {
+                    id: format!("{id}-compose"),
+                    kind: "standard".into(),
+                    label: "Compose".into(),
+                    access_key: None,
+                    enabled: true,
+                    visible: true,
+                    icon_name: String::new(),
+                    shortcut: Vec::new(),
+                    toggle_type: String::new(),
+                    toggle_state: -1,
+                    disposition: "normal".into(),
+                    has_submenu: false,
+                    loaded: false,
+                    loading: false,
+                    error: String::new(),
+                    children: Vec::new(),
+                }],
+            })),
             has_icon_pixmap: false,
             has_attention_icon_pixmap: false,
             has_overlay_icon_pixmap: false,
@@ -521,6 +580,9 @@ mod tests {
         let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
         configurations.add(1, output("DP-1", 1920)).unwrap();
         configurations.add(2, output("DP-2", 2560)).unwrap();
+        let consumers = configurations.consumers();
+        assert_eq!(consumers.len(), 2);
+        assert_ne!(consumers[0], consumers[1]);
         assert_eq!(text(&configurations, 1), "DP-1:1920:0");
         assert_eq!(text(&configurations, 2), "DP-2:2560:0");
 
@@ -786,6 +848,7 @@ mod tests {
         let mut configurations = Configurations::new(entry.clone(), ServiceSnapshot::default());
         configurations.add(1, output("DP-1", 1920)).unwrap();
         configurations.add(2, output("DP-2", 2560)).unwrap();
+        let consumers = configurations.consumers();
         fs::write(
             &entry,
             "if services.output.name:get() == 'DP-2' then error('bad output') end\nreturn ui.panel { children = { ui.text { text = 'new' } } }",
@@ -793,6 +856,7 @@ mod tests {
         .unwrap();
 
         assert!(configurations.reload().is_err());
+        assert_eq!(configurations.consumers(), consumers);
         assert_eq!(text(&configurations, 1), "DP-1");
         assert_eq!(text(&configurations, 2), "DP-2");
     }
@@ -809,6 +873,7 @@ mod tests {
         let mut configurations = Configurations::new(entry.clone(), ServiceSnapshot::default());
         configurations.add(1, output("DP-1", 1920)).unwrap();
         configurations.add(2, output("DP-2", 2560)).unwrap();
+        let previous_consumers = configurations.consumers();
         fs::write(
             &entry,
             "return ui.panel { children = { ui.text { text = 'new' } } }",
@@ -827,6 +892,7 @@ mod tests {
         );
 
         assert!(result.is_err());
+        assert_eq!(configurations.consumers(), previous_consumers);
         assert_eq!(text(&configurations, 1), "old");
         assert_eq!(text(&configurations, 2), "old");
     }
@@ -843,6 +909,7 @@ mod tests {
         let mut configurations = Configurations::new(entry.clone(), ServiceSnapshot::default());
         configurations.add(1, output("DP-1", 1920)).unwrap();
         configurations.add(2, output("DP-2", 2560)).unwrap();
+        let previous_consumers = configurations.consumers();
         fs::write(
             &entry,
             "return ui.panel { children = { ui.text { text = 'new:' .. services.output.name:get() } } }",
@@ -850,6 +917,14 @@ mod tests {
         .unwrap();
 
         configurations.reload().unwrap();
+        let current_consumers = configurations.consumers();
+        assert_eq!(current_consumers.len(), 2);
+        assert_ne!(current_consumers[0], current_consumers[1]);
+        assert!(
+            current_consumers
+                .iter()
+                .all(|consumer| !previous_consumers.contains(consumer))
+        );
         assert_eq!(text(&configurations, 1), "new:DP-1");
         assert_eq!(text(&configurations, 2), "new:DP-2");
     }
@@ -885,12 +960,13 @@ mod tests {
             .set_service("clock.time", Scalar::String("12:34".into()))
             .unwrap();
         configurations.add(1, output("DP-1", 1920)).unwrap();
-        configurations.remove(&1);
+        let first_consumer = configurations.remove(&1).unwrap();
         configurations
             .set_service("clock.time", Scalar::String("12:35".into()))
             .unwrap();
 
         configurations.add(1, output("DP-1", 1920)).unwrap();
+        assert_ne!(configurations.consumer(&1), Some(first_consumer.as_str()));
         assert_eq!(text(&configurations, 1), "12:35");
     }
 
@@ -1137,7 +1213,8 @@ mod tests {
                 local id = if #items == 0 then '' else items[1].id
                 local protocol_id = if #items == 0 then '' else items[1].protocol_item_id
                 local title = if #items == 0 then '' else items[1].title
-                return `{services.system_tray.available:get()}:{services.system_tray.watcher_owned:get()}:{services.system_tray.error:get()}:{#items}:{id}:{protocol_id}:{title}`
+                local menu_label = if #items == 0 then '' else items[1].menu.children[1].label
+                return `{services.system_tray.available:get()}:{services.system_tray.watcher_owned:get()}:{services.system_tray.error:get()}:{#items}:{id}:{protocol_id}:{title}:{menu_label}`
             end } } }
             "#,
         )
@@ -1146,24 +1223,38 @@ mod tests {
         configurations.add(1, output("DP-1", 1920)).unwrap();
         configurations.add(2, output("DP-2", 2560)).unwrap();
 
+        let item = system_tray_item("tray42");
+        let menu = item.menu.as_ref().unwrap().clone();
         configurations
             .set_system_tray(SystemTraySnapshot {
                 available: true,
                 watcher_owned: true,
                 error: String::new(),
-                items: vec![system_tray_item("tray42")],
+                items: vec![item],
             })
             .unwrap();
+        assert_eq!(Arc::strong_count(&menu), 4);
         assert_eq!(configurations.refresh(), vec![1, 2]);
         for key in [1, 2] {
-            assert_eq!(text(&configurations, key), "true:true::1:tray42:mail:Mail");
+            assert_eq!(
+                text(&configurations, key),
+                "true:true::1:tray42:mail:Mail:Compose"
+            );
         }
 
         configurations.add(3, output("DP-3", 3840)).unwrap();
-        assert_eq!(text(&configurations, 3), "true:true::1:tray42:mail:Mail");
+        assert_eq!(Arc::strong_count(&menu), 5);
+        assert_eq!(
+            text(&configurations, 3),
+            "true:true::1:tray42:mail:Mail:Compose"
+        );
         configurations.reload().unwrap();
+        assert_eq!(Arc::strong_count(&menu), 5);
         for key in [1, 2, 3] {
-            assert_eq!(text(&configurations, key), "true:true::1:tray42:mail:Mail");
+            assert_eq!(
+                text(&configurations, key),
+                "true:true::1:tray42:mail:Mail:Compose"
+            );
         }
     }
 

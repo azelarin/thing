@@ -37,6 +37,10 @@ pub enum Action {
         action: SystemTrayAction,
         item: String,
     },
+    SystemTrayMenu {
+        action: SystemTrayMenuAction,
+        id: String,
+    },
     DismissNotification {
         key: u64,
     },
@@ -800,6 +804,9 @@ impl UserData for SystemTrayItemList {
                 item.set("tooltip_text", tray_item.tooltip_text.as_str())?;
                 item.set("item_is_menu", tray_item.item_is_menu)?;
                 item.set("has_menu", tray_item.has_menu)?;
+                if let Some(menu) = &tray_item.menu {
+                    item.set("menu", system_tray_menu_table(lua, menu)?)?;
+                }
                 item.set("has_icon_pixmap", tray_item.has_icon_pixmap)?;
                 item.set(
                     "has_attention_icon_pixmap",
@@ -814,6 +821,58 @@ impl UserData for SystemTrayItemList {
             Ok(list)
         });
     }
+}
+
+fn system_tray_menu_table(lua: &Lua, menu: &SystemTrayMenu) -> Result<Table> {
+    let value = lua.create_table()?;
+    value.set("id", menu.id.as_str())?;
+    value.set("loaded", menu.loaded)?;
+    value.set("loading", menu.loading)?;
+    value.set("error", menu.error.as_str())?;
+    value.set("children", system_tray_menu_children(lua, &menu.children)?)?;
+    value.set_readonly(true);
+    Ok(value)
+}
+
+fn system_tray_menu_children(lua: &Lua, children: &[SystemTrayMenuItem]) -> Result<Table> {
+    let list = lua.create_table()?;
+    for (index, child) in children.iter().enumerate() {
+        let item = lua.create_table()?;
+        item.set("id", child.id.as_str())?;
+        item.set("kind", child.kind.as_str())?;
+        item.set("label", child.label.as_str())?;
+        item.set("access_key", child.access_key.as_deref())?;
+        item.set("enabled", child.enabled)?;
+        item.set("visible", child.visible)?;
+        item.set("icon_name", child.icon_name.as_str())?;
+        item.set("shortcut", system_tray_shortcuts(lua, &child.shortcut)?)?;
+        item.set("toggle_type", child.toggle_type.as_str())?;
+        item.set("toggle_state", child.toggle_state)?;
+        item.set("disposition", child.disposition.as_str())?;
+        item.set("has_submenu", child.has_submenu)?;
+        item.set("loaded", child.loaded)?;
+        item.set("loading", child.loading)?;
+        item.set("error", child.error.as_str())?;
+        item.set("children", system_tray_menu_children(lua, &child.children)?)?;
+        item.set_readonly(true);
+        list.raw_set(index + 1, item)?;
+    }
+    list.set_readonly(true);
+    Ok(list)
+}
+
+fn system_tray_shortcuts(lua: &Lua, shortcuts: &[Vec<String>]) -> Result<Table> {
+    let list = lua.create_table()?;
+    for (index, shortcut) in shortcuts.iter().enumerate() {
+        let chord = lua.create_table()?;
+        for (part_index, part) in shortcut.iter().enumerate() {
+            chord.raw_set(part_index + 1, part.as_str())?;
+        }
+        chord.set_readonly(true);
+        list.raw_set(index + 1, chord)?;
+    }
+    list.set_readonly(true);
+    Ok(list)
 }
 
 struct PowerDeviceList {
@@ -1309,6 +1368,21 @@ impl Services {
                 lua.create_function(move |_, item: Value| {
                     let item = system_tray_item_id(item)?;
                     enqueue(&actions, &allowed, Action::SystemTray { action, item })
+                })?,
+            )?;
+        }
+        for (name, action) in [
+            ("open_menu", SystemTrayMenuAction::Open),
+            ("close_menu", SystemTrayMenuAction::Close),
+            ("activate_menu_item", SystemTrayMenuAction::Activate),
+        ] {
+            let actions = result.actions.clone();
+            let allowed = result.allowed.clone();
+            system_tray.set(
+                name,
+                lua.create_function(move |_, id: Value| {
+                    let id = system_tray_menu_id(id)?;
+                    enqueue(&actions, &allowed, Action::SystemTrayMenu { action, id })
                 })?,
             )?;
         }
@@ -1870,6 +1944,21 @@ fn system_tray_item_id(value: Value) -> Result<String> {
     if value.is_empty() || value.len() > 128 || value.contains('\0') {
         return Err(Error::runtime(
             "system tray item id must be nonempty, contain no NUL, and not exceed 128 bytes",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn system_tray_menu_id(value: Value) -> Result<String> {
+    let Value::String(value) = value else {
+        return Err(Error::runtime("system tray menu id must be a string"));
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| Error::runtime("system tray menu id must be valid utf-8"))?;
+    if value.is_empty() || value.len() > 128 || value.contains('\0') {
+        return Err(Error::runtime(
+            "system tray menu id must be nonempty, contain no NUL, and not exceed 128 bytes",
         ));
     }
     Ok(value.to_owned())

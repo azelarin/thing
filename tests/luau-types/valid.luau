@@ -54,9 +54,39 @@ local tray = ui.row {
                     return source
                 end,
             })
+            local menu = item.menu
+            if menu ~= nil then
+                local label = menu.error
+                for _, entry in menu.children do
+                    label = entry.label
+                    break
+                end
+                table.insert(children, ui.text { text = label })
+            end
         end
         return children
     end,
 }
 
-return ui.panel { children = { input, clipboard_button, tray } }
+local tray_menu_button = ui.button {
+    on_click = function()
+        local item = services.system_tray.items:get()[1]
+        local menu = item.menu
+        if menu == nil then return end
+
+        services.system_tray.open_menu(menu.id)
+        for _, entry in menu.children do
+            if entry.has_submenu then
+                services.system_tray.open_menu(entry.id)
+                services.system_tray.close_menu(entry.id)
+            elseif entry.visible and entry.enabled and entry.kind ~= "separator" then
+                services.system_tray.activate_menu_item(entry.id)
+            end
+            break
+        end
+        services.system_tray.close_menu(menu.id)
+    end,
+    children = { ui.text { text = "menu" } },
+}
+
+return ui.panel { children = { input, clipboard_button, tray, tray_menu_button } }

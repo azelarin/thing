@@ -1,8 +1,9 @@
-use std::fs;
+use std::{fs, sync::Arc};
 
 use thing_core::{ImageCandidate, ImagePixmap, ImageSource};
 use thing_runtime::{
-    Action, Event, Runtime, SystemTrayAction, SystemTrayItem, SystemTrayMenu, SystemTraySnapshot,
+    Action, Event, Runtime, SystemTrayAction, SystemTrayItem, SystemTrayMenu, SystemTrayMenuAction,
+    SystemTrayMenuItem, SystemTraySnapshot,
 };
 
 fn runtime(source: &str) -> (tempfile::TempDir, Runtime) {
@@ -29,13 +30,47 @@ fn item(id: &str) -> SystemTrayItem {
         tooltip_text: "one unread conversation".into(),
         item_is_menu: false,
         has_menu: true,
-        menu: Some(SystemTrayMenu {
+        menu: Some(Arc::new(SystemTrayMenu {
             id: format!("{id}-menu"),
-            loaded: false,
+            loaded: true,
             loading: false,
             error: String::new(),
-            children: Vec::new(),
-        }),
+            children: vec![SystemTrayMenuItem {
+                id: format!("{id}-recent"),
+                kind: "standard".into(),
+                label: "Recent".into(),
+                access_key: Some("R".into()),
+                enabled: true,
+                visible: true,
+                icon_name: "document-open-recent".into(),
+                shortcut: vec![vec!["Control".into(), "R".into()]],
+                toggle_type: String::new(),
+                toggle_state: -1,
+                disposition: "normal".into(),
+                has_submenu: true,
+                loaded: true,
+                loading: false,
+                error: String::new(),
+                children: vec![SystemTrayMenuItem {
+                    id: format!("{id}-document"),
+                    kind: "standard".into(),
+                    label: "Document".into(),
+                    access_key: None,
+                    enabled: true,
+                    visible: true,
+                    icon_name: String::new(),
+                    shortcut: Vec::new(),
+                    toggle_type: String::new(),
+                    toggle_state: -1,
+                    disposition: "normal".into(),
+                    has_submenu: false,
+                    loaded: false,
+                    loading: false,
+                    error: String::new(),
+                    children: Vec::new(),
+                }],
+            }],
+        })),
         has_icon_pixmap: true,
         has_attention_icon_pixmap: false,
         has_overlay_icon_pixmap: true,
@@ -113,6 +148,8 @@ fn system_tray_state_is_reactive_and_replaced_together() {
         ],
     )
     .unwrap();
+    let mut invalid_menu = item("tray2");
+    Arc::make_mut(invalid_menu.menu.as_mut().unwrap()).children[0].has_submenu = false;
     for invalid in [
         SystemTraySnapshot {
             available: false,
@@ -136,6 +173,19 @@ fn system_tray_state_is_reactive_and_replaced_together() {
             available: true,
             items: vec![SystemTrayItem {
                 icon: Some(oversized_icon),
+                ..item("tray2")
+            }],
+            ..SystemTraySnapshot::default()
+        },
+        SystemTraySnapshot {
+            available: true,
+            items: vec![invalid_menu],
+            ..SystemTraySnapshot::default()
+        },
+        SystemTraySnapshot {
+            available: true,
+            items: vec![SystemTrayItem {
+                has_menu: false,
                 ..item("tray2")
             }],
             ..SystemTraySnapshot::default()
@@ -272,6 +322,87 @@ fn system_tray_image_sources_are_opaque_and_reactive() {
 }
 
 #[test]
+fn system_tray_menu_trees_are_reactive_and_read_only() {
+    let source = r#"
+        return ui.panel { children = { ui.text { text = function()
+            local item = services.system_tray.items:get()[1]
+            if item == nil or item.menu == nil then return 'none' end
+            local menu = item.menu
+            local recent = menu.children[1]
+            local document = recent.children[1]
+            return table.concat({
+                menu.id, tostring(menu.loaded), tostring(menu.loading), menu.error,
+                recent.id, recent.kind, recent.label, recent.access_key or '',
+                tostring(recent.enabled), tostring(recent.visible), recent.icon_name,
+                recent.shortcut[1][1], recent.shortcut[1][2], recent.toggle_type,
+                tostring(recent.toggle_state), recent.disposition,
+                tostring(recent.has_submenu), tostring(recent.loaded),
+                tostring(recent.loading), recent.error, document.label,
+            }, '|')
+        end } } }
+    "#;
+    let (_directory, mut instance) = runtime(source);
+    instance
+        .set_system_tray(SystemTraySnapshot {
+            available: true,
+            items: vec![item("tray1")],
+            ..SystemTraySnapshot::default()
+        })
+        .unwrap();
+    assert!(instance.refresh().unwrap());
+    assert_eq!(
+        instance.root().unwrap().children[0].text,
+        "tray1-menu|true|false||tray1-recent|standard|Recent|R|true|true|document-open-recent|Control|R||-1|normal|true|true|false||Document"
+    );
+
+    let mut changed = item("tray1");
+    Arc::make_mut(changed.menu.as_mut().unwrap()).children[0].label = "History".into();
+    instance
+        .set_system_tray(SystemTraySnapshot {
+            available: true,
+            items: vec![changed],
+            ..SystemTraySnapshot::default()
+        })
+        .unwrap();
+    assert!(instance.refresh().unwrap());
+    assert!(
+        instance.root().unwrap().children[0]
+            .text
+            .contains("|History|")
+    );
+
+    for mutation in [
+        "item.menu.error = 'changed'",
+        "item.menu.children[1].label = 'changed'",
+        "item.menu.children[1].children[1] = {}",
+        "item.menu.children[1].shortcut[1][1] = 'Alt'",
+    ] {
+        let source = format!(
+            r#"
+            return ui.panel {{ children = {{ ui.button {{ on_click = function()
+                local item = services.system_tray.items:get()[1]
+                {mutation}
+            end }} }} }}
+            "#,
+        );
+        let (_directory, mut runtime) = runtime(&source);
+        runtime
+            .set_system_tray(SystemTraySnapshot {
+                available: true,
+                items: vec![item("tray1")],
+                ..SystemTraySnapshot::default()
+            })
+            .unwrap();
+        assert!(
+            runtime
+                .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
+                .is_err(),
+            "accepted {mutation}"
+        );
+    }
+}
+
+#[test]
 fn system_tray_actions_are_ordered_and_lifetime_targeted() {
     let (_directory, mut runtime) = runtime(
         r#"
@@ -279,6 +410,9 @@ fn system_tray_actions_are_ordered_and_lifetime_targeted() {
             services.system_tray.activate('tray1')
             services.system_tray.secondary_activate('tray2')
             services.system_tray.context_menu('tray3')
+            services.system_tray.open_menu('menu1')
+            services.system_tray.close_menu('menu2')
+            services.system_tray.activate_menu_item('menu3')
         end } } }
         "#,
     );
@@ -301,28 +435,42 @@ fn system_tray_actions_are_ordered_and_lifetime_targeted() {
                 action: SystemTrayAction::ContextMenu,
                 item: "tray3".into(),
             },
+            Action::SystemTrayMenu {
+                action: SystemTrayMenuAction::Open,
+                id: "menu1".into(),
+            },
+            Action::SystemTrayMenu {
+                action: SystemTrayMenuAction::Close,
+                id: "menu2".into(),
+            },
+            Action::SystemTrayMenu {
+                action: SystemTrayMenuAction::Activate,
+                id: "menu3".into(),
+            },
         ]
     );
 }
 
 #[test]
 fn malformed_system_tray_ids_are_rejected_before_queueing() {
-    for argument in ["''", "'bad\\0id'", "7", "{}", "nil"] {
-        let source = format!(
-            r#"
-            return ui.panel {{ children = {{ ui.button {{ on_click = function()
-                services.system_tray.activate({argument})
-            end }} }} }}
-            "#,
-        );
-        let (_directory, mut runtime) = runtime(&source);
-        assert!(
-            runtime
-                .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
-                .is_err(),
-            "accepted {argument}"
-        );
-        assert!(runtime.take_actions().is_empty());
+    for function in ["activate", "open_menu"] {
+        for argument in ["''", "'bad\\0id'", "7", "{}", "nil"] {
+            let source = format!(
+                r#"
+                return ui.panel {{ children = {{ ui.button {{ on_click = function()
+                    services.system_tray.{function}({argument})
+                end }} }} }}
+                "#,
+            );
+            let (_directory, mut runtime) = runtime(&source);
+            assert!(
+                runtime
+                    .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
+                    .is_err(),
+                "accepted {function}({argument})"
+            );
+            assert!(runtime.take_actions().is_empty());
+        }
     }
 }
 
@@ -330,6 +478,7 @@ fn malformed_system_tray_ids_are_rejected_before_queueing() {
 fn system_tray_actions_are_event_only_and_service_is_read_only() {
     for source in [
         "services.system_tray.activate('tray1'); return ui.panel {}",
+        "services.system_tray.open_menu('menu1'); return ui.panel {}",
         "return ui.panel { visible = function() services.system_tray.context_menu('tray1'); return true end }",
         "services.system_tray.available = true; return ui.panel {}",
         "services.system_tray.items = {}; return ui.panel {}",

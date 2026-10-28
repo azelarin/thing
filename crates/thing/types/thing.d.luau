@@ -452,10 +452,38 @@ declare extern type ThingSystemTrayItem with
     read tooltip_text: string
     read item_is_menu: boolean
     read has_menu: boolean
+    read menu: ThingSystemTrayMenu?
     read has_icon_pixmap: boolean
     read has_attention_icon_pixmap: boolean
     read has_overlay_icon_pixmap: boolean
     read has_tooltip_icon_pixmap: boolean
+end
+
+declare extern type ThingSystemTrayMenu with
+    read id: string
+    read loaded: boolean
+    read loading: boolean
+    read error: string
+    read children: ThingReadonlyArray<ThingSystemTrayMenuItem>
+end
+
+declare extern type ThingSystemTrayMenuItem with
+    read id: string
+    read kind: string
+    read label: string
+    read access_key: string?
+    read enabled: boolean
+    read visible: boolean
+    read icon_name: string
+    read shortcut: ThingReadonlyArray<ThingReadonlyArray<string>>
+    read toggle_type: string
+    read toggle_state: number
+    read disposition: string
+    read has_submenu: boolean
+    read loaded: boolean
+    read loading: boolean
+    read error: string
+    read children: ThingReadonlyArray<ThingSystemTrayMenuItem>
 end
 
 declare extern type ThingNiriWorkspace with
@@ -565,6 +593,9 @@ declare extern type ThingSystemTrayService with
     read activate: (id: string) -> ()
     read secondary_activate: (id: string) -> ()
     read context_menu: (id: string) -> ()
+    read open_menu: (id: string) -> ()
+    read close_menu: (id: string) -> ()
+    read activate_menu_item: (id: string) -> ()
 end
 
 declare extern type ThingNiriService with
