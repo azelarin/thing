@@ -73,7 +73,7 @@ fn system_tray_state_is_reactive_and_replaced_together() {
         .unwrap();
     assert!(runtime.refresh().unwrap());
     assert_eq!(
-        runtime.root().children[0].text,
+        runtime.root().unwrap().children[0].text,
         "true|true||1|tray1|chat|Communications|Chat|NeedsAttention|chat|chat-attention|chat-unread|dialog-information|new message|one unread conversation|false|true|true|false|true|false"
     );
 
@@ -126,7 +126,7 @@ fn system_tray_records_and_lists_are_read_only() {
 
         assert!(
             runtime
-                .dispatch(runtime.root().children[0].id, Event::Click)
+                .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
                 .is_err()
         );
         assert!(runtime.take_actions().is_empty());
@@ -146,7 +146,7 @@ fn system_tray_actions_are_ordered_and_lifetime_targeted() {
     );
 
     runtime
-        .dispatch(runtime.root().children[0].id, Event::Click)
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
         .unwrap();
     assert_eq!(
         runtime.take_actions(),
@@ -180,7 +180,7 @@ fn malformed_system_tray_ids_are_rejected_before_queueing() {
         let (_directory, mut runtime) = runtime(&source);
         assert!(
             runtime
-                .dispatch(runtime.root().children[0].id, Event::Click)
+                .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
                 .is_err(),
             "accepted {argument}"
         );
