@@ -117,6 +117,23 @@ impl PanelProperties {
     }
 }
 
+/// horizontal placement within a text widget's width.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextAlign {
+    #[default]
+    Start,
+    Center,
+    End,
+}
+
+/// behavior when a line limit omits part of the text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextOverflow {
+    #[default]
+    Clip,
+    Ellipsis,
+}
+
 impl Kind {
     pub fn is_container(self) -> bool {
         matches!(
@@ -153,6 +170,8 @@ pub struct Style {
     pub font_size: f32,
     pub font_weight: f32,
     pub font_family: String,
+    pub text_align: TextAlign,
+    pub tabular_digits: bool,
     pub background: Color,
     pub foreground: Color,
     pub opacity: f32,
@@ -174,6 +193,8 @@ impl Default for Style {
             font_size: 14.0,
             font_weight: 400.0,
             font_family: "sans-serif".into(),
+            text_align: TextAlign::Start,
+            tabular_digits: false,
             background: Color::TRANSPARENT,
             foreground: Color::WHITE,
             opacity: 1.0,
@@ -277,6 +298,8 @@ pub struct Node {
     pub kind: Kind,
     pub style: Style,
     pub text: String,
+    pub max_lines: Option<u32>,
+    pub text_overflow: TextOverflow,
     pub image: Image,
     pub popup: PopupOptions,
     pub slider: Slider,
@@ -294,6 +317,8 @@ impl Node {
             kind,
             style: Style::default(),
             text: String::new(),
+            max_lines: None,
+            text_overflow: TextOverflow::Clip,
             image: Image::default(),
             popup: PopupOptions::default(),
             slider: Slider::default(),
@@ -368,6 +393,23 @@ impl Node {
         {
             return Err(TreeError(
                 "centerbox needs exactly three non-popup children: start, center, end".into(),
+            ));
+        }
+        if self.max_lines == Some(0) {
+            return Err(TreeError(
+                "max_lines must be a positive whole number".into(),
+            ));
+        }
+        if self.kind != Kind::Text
+            && (self.max_lines.is_some() || self.text_overflow != TextOverflow::Clip)
+        {
+            return Err(TreeError(
+                "max_lines and overflow are available only on text widgets".into(),
+            ));
+        }
+        if self.text_overflow == TextOverflow::Ellipsis && self.max_lines != Some(1) {
+            return Err(TreeError(
+                "ellipsis currently requires max_lines = 1".into(),
             ));
         }
         for value in [
@@ -517,6 +559,33 @@ mod tests {
         node.style.width = None;
         node.style.opacity = f32::INFINITY;
         assert!(node.validate().is_err());
+    }
+
+    #[test]
+    fn validates_text_line_limits_and_ellipsis() {
+        let mut text = Node::new(NodeId(1), Kind::Text);
+        text.max_lines = Some(0);
+        assert_eq!(
+            text.validate().unwrap_err().to_string(),
+            "max_lines must be a positive whole number"
+        );
+
+        text.max_lines = Some(2);
+        text.text_overflow = TextOverflow::Ellipsis;
+        assert_eq!(
+            text.validate().unwrap_err().to_string(),
+            "ellipsis currently requires max_lines = 1"
+        );
+
+        text.max_lines = Some(1);
+        assert!(text.validate().is_ok());
+
+        let mut row = Node::new(NodeId(2), Kind::Row);
+        row.max_lines = Some(1);
+        assert_eq!(
+            row.validate().unwrap_err().to_string(),
+            "max_lines and overflow are available only on text widgets"
+        );
     }
 
     #[test]

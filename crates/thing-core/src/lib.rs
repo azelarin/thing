@@ -8,5 +8,5 @@ pub use color::{Color, ParseColorError};
 pub use geometry::{Point, Rect, Scale};
 pub use widget::{
     Image, Kind, Node, NodeId, PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins,
-    PanelProperties, PopupOptions, Slider, Style, TreeError,
+    PanelProperties, PopupOptions, Slider, Style, TextAlign, TextOverflow, TreeError,
 };

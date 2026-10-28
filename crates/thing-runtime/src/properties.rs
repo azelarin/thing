@@ -1,5 +1,7 @@
 use mlua::{Error, Result, Table, Value};
-use thing_core::{Kind, Node, PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins};
+use thing_core::{
+    Kind, Node, PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins, TextAlign, TextOverflow,
+};
 
 pub(crate) fn string(value: Value, name: &str) -> Result<String> {
     match value {
@@ -122,9 +124,45 @@ fn positive_dimension(value: Value, name: &str) -> Result<u32> {
         .ok_or_else(|| Error::runtime(format!("{name} must be a positive integer")))
 }
 
+fn max_lines(value: Value, name: &str) -> Result<Option<u32>> {
+    if value.is_nil() {
+        return Ok(None);
+    }
+    let value = number(value, name)?;
+    if value.fract() != 0.0 || !(1.0..=u32::MAX as f64).contains(&value) {
+        return Err(Error::runtime(format!(
+            "{name} must be a positive whole number"
+        )));
+    }
+    Ok(Some(value as u32))
+}
+
+fn text_align(value: Value, name: &str) -> Result<TextAlign> {
+    match string(value, name)?.as_str() {
+        "start" => Ok(TextAlign::Start),
+        "center" => Ok(TextAlign::Center),
+        "end" => Ok(TextAlign::End),
+        _ => Err(Error::runtime(format!(
+            "{name} must be \"start\", \"center\", or \"end\""
+        ))),
+    }
+}
+
+fn text_overflow(value: Value, name: &str) -> Result<TextOverflow> {
+    match string(value, name)?.as_str() {
+        "clip" => Ok(TextOverflow::Clip),
+        "ellipsis" => Ok(TextOverflow::Ellipsis),
+        _ => Err(Error::runtime(format!(
+            "{name} must be \"clip\" or \"ellipsis\""
+        ))),
+    }
+}
+
 pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
     match name {
         "text" if node.kind == Kind::Text => node.text = string(value, name)?,
+        "max_lines" if node.kind == Kind::Text => node.max_lines = max_lines(value, name)?,
+        "overflow" if node.kind == Kind::Text => node.text_overflow = text_overflow(value, name)?,
         "source" if node.kind == Kind::Image => node.image.source = optional_string(value, name)?,
         "icon" if node.kind == Kind::Image => node.image.icon = optional_string(value, name)?,
         "app_id" if node.kind == Kind::Image => node.image.app_id = optional_string(value, name)?,
@@ -182,6 +220,12 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "style.font_size" => node.style.font_size = number(value, name)? as f32,
         "style.font_weight" => node.style.font_weight = number(value, name)? as f32,
         "style.font_family" => node.style.font_family = string(value, name)?,
+        "style.text_align" if node.kind == Kind::Text => {
+            node.style.text_align = text_align(value, name)?
+        }
+        "style.tabular_digits" if node.kind == Kind::Text => {
+            node.style.tabular_digits = boolean(value, name)?
+        }
         "style.opacity" => node.style.opacity = number(value, name)? as f32,
         "style.background" => {
             node.style.background = string(value, name)?.parse().map_err(Error::external)?

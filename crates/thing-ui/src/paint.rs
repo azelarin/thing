@@ -152,7 +152,7 @@ impl<R: Renderer> Painter<R> {
                 self.canvas.stroke_path(&path, &focus);
             }
             match node.kind {
-                Kind::Text => self.draw_text(node, bounds)?,
+                Kind::Text => self.draw_text(node, bounds, clip)?,
                 Kind::Slider => self.draw_slider(node, bounds),
                 Kind::Image => self.draw_image(node, bounds, scale),
                 _ => {}
@@ -183,7 +183,16 @@ impl<R: Renderer> Painter<R> {
         Layout::compute_with_scroll(root, size, scroll, &mut self.text)
     }
 
-    fn draw_text(&mut self, node: &Node, bounds: Rect) -> Result<(), String> {
+    fn draw_text(&mut self, node: &Node, bounds: Rect, inherited_clip: Rect) -> Result<(), String> {
+        let clip = if node.max_lines.is_some() {
+            let Some(clip) = bounds.intersection(inherited_clip) else {
+                return Ok(());
+            };
+            clip
+        } else {
+            inherited_clip
+        };
+        self.canvas.scissor(clip.x, clip.y, clip.width, clip.height);
         let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
         let padding_y = node.style.padding_y.unwrap_or(node.style.padding);
         let layout = self
