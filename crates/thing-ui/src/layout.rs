@@ -43,7 +43,7 @@ impl ScrollState {
     }
 
     fn set(&mut self, id: NodeId, offset: f32) {
-        if offset > 0.0 {
+        if offset.is_finite() && offset > 0.0 {
             self.offsets.insert(id, offset);
         } else {
             self.offsets.remove(&id);
@@ -70,7 +70,17 @@ impl ScrollState {
 struct ScrollArea {
     id: NodeId,
     parent: Option<NodeId>,
+    viewport: Rect,
+    offset: f32,
     max_offset: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RevealRegion {
+    id: NodeId,
+    bounds: Rect,
+    enabled: bool,
+    scroll_parent: Option<NodeId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -92,6 +102,13 @@ struct Inherited {
     scroll_parent: Option<NodeId>,
 }
 
+#[derive(Clone, Copy)]
+struct RevealInherited {
+    origin: Point,
+    enabled: bool,
+    scroll_parent: Option<NodeId>,
+}
+
 /// resolved geometry for one surface. popup children have separate surfaces and
 /// do not participate in their parent's flex layout.
 #[derive(Debug, Default)]
@@ -99,6 +116,7 @@ pub struct Layout {
     placements: Vec<Placement>,
     pointer_regions: Vec<PointerRegion>,
     scroll_areas: Vec<ScrollArea>,
+    reveal_regions: Vec<RevealRegion>,
 }
 
 impl Layout {
@@ -195,6 +213,17 @@ impl Layout {
         let mut result = Self::default();
         let mut next_state = state.clone();
         next_state.retain_tree(root);
+        result.collect_reveal_regions(
+            root,
+            &tree,
+            &ids,
+            &mut next_state,
+            RevealInherited {
+                origin: Point { x: 0.0, y: 0.0 },
+                enabled: true,
+                scroll_parent: None,
+            },
+        )?;
         result.collect(
             root,
             &tree,
@@ -282,11 +311,139 @@ impl Layout {
         }
     }
 
+    /// make a visible, enabled widget vertically visible in every enclosing
+    /// scroll viewport, using the smallest movement at each level.
+    pub fn reveal_y(&self, id: NodeId, state: &mut ScrollState) -> bool {
+        let Some(region) = self
+            .reveal_regions
+            .iter()
+            .find(|region| region.id == id && region.enabled)
+        else {
+            return false;
+        };
+        if vertical_edges(region.bounds).is_none() {
+            return false;
+        }
+
+        let mut bounds = region.bounds;
+        let mut ancestor = region.scroll_parent;
+        while let Some(id) = ancestor {
+            let Some(area) = self.scroll_areas.iter().find(|area| area.id == id) else {
+                break;
+            };
+            bounds.y -= state.offset(area.id).clamp(0.0, area.max_offset) - area.offset;
+            ancestor = area.parent;
+        }
+        let mut parent = region.scroll_parent;
+        let mut changed = false;
+        while let Some(id) = parent {
+            let Some(area) = self.scroll_areas.iter().find(|area| area.id == id) else {
+                break;
+            };
+            let mut viewport = area.viewport;
+            let mut ancestor = area.parent;
+            while let Some(id) = ancestor {
+                let Some(parent) = self.scroll_areas.iter().find(|area| area.id == id) else {
+                    break;
+                };
+                viewport.y -= state.offset(parent.id).clamp(0.0, parent.max_offset) - parent.offset;
+                ancestor = parent.parent;
+            }
+            let current = state.offset(area.id).clamp(0.0, area.max_offset);
+            let delta = reveal_delta(bounds, viewport).unwrap_or(0.0);
+            let next = (current + delta).clamp(0.0, area.max_offset);
+            let applied = next - current;
+            if applied != 0.0 {
+                state.set(area.id, next);
+                bounds.y -= applied;
+                changed = true;
+            }
+            let Some(visible) = vertical_intersection(bounds, viewport) else {
+                break;
+            };
+            bounds = visible;
+            parent = area.parent;
+        }
+        changed
+    }
+
     fn pointer_region(&self, point: Point) -> Option<&PointerRegion> {
         self.pointer_regions
             .iter()
             .rev()
             .find(|region| region.bounds.contains(point) && region.clip.contains(point))
+    }
+
+    fn collect_reveal_regions(
+        &mut self,
+        node: &Node,
+        tree: &tf::TaffyTree<NodeId>,
+        ids: &BTreeMap<NodeId, tf::NodeId>,
+        state: &mut ScrollState,
+        inherited: RevealInherited,
+    ) -> Result<(), String> {
+        if !node.visible {
+            return Ok(());
+        }
+        let geometry = tree
+            .layout(ids[&node.id])
+            .map_err(|error| error.to_string())?;
+        let bounds = Rect {
+            x: inherited.origin.x + geometry.location.x,
+            y: inherited.origin.y + geometry.location.y,
+            width: geometry.size.width,
+            height: geometry.size.height,
+        };
+        let enabled = inherited.enabled && node.enabled;
+        self.reveal_regions.push(RevealRegion {
+            id: node.id,
+            bounds,
+            enabled,
+            scroll_parent: inherited.scroll_parent,
+        });
+
+        let mut child_origin = Point {
+            x: bounds.x,
+            y: bounds.y,
+        };
+        let mut child_scroll_parent = inherited.scroll_parent;
+        if node.kind == Kind::Scroll {
+            let max_offset = if geometry.scroll_height().is_finite() {
+                geometry.scroll_height().max(0.0)
+            } else {
+                0.0
+            };
+            let offset = state.offset(node.id).clamp(0.0, max_offset);
+            state.set(node.id, offset);
+            if enabled {
+                self.scroll_areas.push(ScrollArea {
+                    id: node.id,
+                    parent: inherited.scroll_parent,
+                    viewport: bounds,
+                    offset,
+                    max_offset,
+                });
+                child_scroll_parent = Some(node.id);
+            }
+            child_origin.y -= offset;
+        }
+
+        for child in &node.children {
+            if child.kind != Kind::Popup {
+                self.collect_reveal_regions(
+                    child,
+                    tree,
+                    ids,
+                    state,
+                    RevealInherited {
+                        origin: child_origin,
+                        enabled,
+                        scroll_parent: child_scroll_parent,
+                    },
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn collect(
@@ -365,13 +522,7 @@ impl Layout {
                 0.0
             };
             let offset = state.offset(node.id).clamp(0.0, max_offset);
-            state.set(node.id, offset);
             if enabled {
-                self.scroll_areas.push(ScrollArea {
-                    id: node.id,
-                    parent: scroll_parent,
-                    max_offset,
-                });
                 child_scroll_parent = Some(node.id);
             }
             child_origin.y -= offset;
@@ -397,6 +548,38 @@ impl Layout {
         }
         Ok(())
     }
+}
+
+fn vertical_edges(rect: Rect) -> Option<(f32, f32)> {
+    let bottom = rect.y + rect.height;
+    (rect.y.is_finite() && rect.height.is_finite() && rect.height > 0.0 && bottom.is_finite())
+        .then_some((rect.y, bottom))
+}
+
+fn reveal_delta(target: Rect, viewport: Rect) -> Option<f32> {
+    let (target_top, target_bottom) = vertical_edges(target)?;
+    let (viewport_top, viewport_bottom) = vertical_edges(viewport)?;
+    Some(
+        if target.height > viewport.height || target_top < viewport_top {
+            target_top - viewport_top
+        } else if target_bottom > viewport_bottom {
+            target_bottom - viewport_bottom
+        } else {
+            0.0
+        },
+    )
+}
+
+fn vertical_intersection(target: Rect, viewport: Rect) -> Option<Rect> {
+    let (target_top, target_bottom) = vertical_edges(target)?;
+    let (viewport_top, viewport_bottom) = vertical_edges(viewport)?;
+    let top = target_top.max(viewport_top);
+    let bottom = target_bottom.min(viewport_bottom);
+    (bottom > top).then_some(Rect {
+        y: top,
+        height: bottom - top,
+        ..target
+    })
 }
 
 fn build(
@@ -1233,6 +1416,186 @@ mod tests {
         assert!(layout.scroll_y(point, 40.0, &mut state));
         let layout = scrolled(&root, size, &mut state);
         assert_eq!(layout.hit_test(point), Some(NodeId(4)));
+    }
+
+    #[test]
+    fn reveal_uses_the_nearest_vertical_edge_and_is_idempotent() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut scroll = fixed(2, Kind::Scroll, 100.0, 40.0);
+        for id in 3..=5 {
+            scroll.children.push(fixed(id, Kind::Button, 100.0, 30.0));
+        }
+        root.children.push(scroll);
+        let size = Size {
+            width: 100.0,
+            height: 40.0,
+        };
+        let mut state = ScrollState::default();
+        let layout = scrolled(&root, size, &mut state);
+
+        assert!(layout.reveal_y(NodeId(5), &mut state));
+        assert_eq!(state.offset(NodeId(2)), 50.0);
+        assert!(!layout.reveal_y(NodeId(5), &mut state));
+        assert!(layout.reveal_y(NodeId(3), &mut state));
+        assert_eq!(state.offset(NodeId(2)), 0.0);
+
+        assert!(layout.reveal_y(NodeId(5), &mut state));
+        let layout = scrolled(&root, size, &mut state);
+        assert_eq!(layout.get(NodeId(5)).unwrap().bounds.y, 10.0);
+        assert!(!layout.reveal_y(NodeId(5), &mut state));
+
+        assert!(layout.reveal_y(NodeId(3), &mut state));
+        assert_eq!(state.offset(NodeId(2)), 0.0);
+        let layout = scrolled(&root, size, &mut state);
+        assert_eq!(layout.get(NodeId(3)).unwrap().bounds.y, 0.0);
+    }
+
+    #[test]
+    fn reveal_aligns_an_oversized_widget_to_the_viewport_start() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut scroll = fixed(2, Kind::Scroll, 100.0, 40.0);
+        scroll.children.push(fixed(3, Kind::Button, 100.0, 80.0));
+        root.children.push(scroll);
+        let size = Size {
+            width: 100.0,
+            height: 40.0,
+        };
+        let point = Point { x: 10.0, y: 10.0 };
+        let mut state = ScrollState::default();
+        let layout = scrolled(&root, size, &mut state);
+        assert!(layout.scroll_y(point, 25.0, &mut state));
+        let layout = scrolled(&root, size, &mut state);
+        assert_eq!(layout.get(NodeId(3)).unwrap().bounds.y, -25.0);
+
+        assert!(layout.reveal_y(NodeId(3), &mut state));
+        assert_eq!(state.offset(NodeId(2)), 0.0);
+        let layout = scrolled(&root, size, &mut state);
+        assert_eq!(layout.get(NodeId(3)).unwrap().bounds.y, 0.0);
+    }
+
+    #[test]
+    fn reveal_updates_every_nested_scroll_ancestor() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut outer = fixed(2, Kind::Scroll, 100.0, 100.0);
+        let mut page = fixed(3, Kind::Column, 100.0, 200.0);
+        page.children.push(fixed(4, Kind::Row, 100.0, 100.0));
+        let mut inner = fixed(5, Kind::Scroll, 100.0, 50.0);
+        inner.children.push(fixed(6, Kind::Button, 100.0, 50.0));
+        inner.children.push(fixed(7, Kind::Button, 100.0, 50.0));
+        page.children.push(inner);
+        outer.children.push(page);
+        root.children.push(outer);
+        let size = Size {
+            width: 100.0,
+            height: 100.0,
+        };
+        let mut state = ScrollState::default();
+        let layout = scrolled(&root, size, &mut state);
+
+        // the inner viewport starts entirely below the outer one, so the
+        // ordinary paint layout does not descend to this target yet.
+        assert!(layout.get(NodeId(7)).is_none());
+        assert!(layout.reveal_y(NodeId(7), &mut state));
+        assert_eq!(state.offset(NodeId(5)), 50.0);
+        assert_eq!(state.offset(NodeId(2)), 50.0);
+
+        let layout = scrolled(&root, size, &mut state);
+        let target = layout.get(NodeId(7)).unwrap();
+        assert_eq!(target.bounds.y, 50.0);
+        assert_eq!(target.bounds.intersection(target.clip), Some(target.bounds));
+        assert!(!layout.reveal_y(NodeId(7), &mut state));
+    }
+
+    #[test]
+    fn nested_reveal_exposes_only_the_inner_visible_slice() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut outer = fixed(2, Kind::Scroll, 100.0, 100.0);
+        let mut page = fixed(3, Kind::Column, 100.0, 180.0);
+        page.children.push(fixed(4, Kind::Row, 100.0, 100.0));
+        let mut inner = fixed(5, Kind::Scroll, 100.0, 40.0);
+        inner.children.push(fixed(6, Kind::Button, 100.0, 80.0));
+        page.children.push(inner);
+        page.children.push(fixed(7, Kind::Row, 100.0, 40.0));
+        outer.children.push(page);
+        root.children.push(outer);
+        let size = Size {
+            width: 100.0,
+            height: 100.0,
+        };
+        let mut state = ScrollState::default();
+        let layout = scrolled(&root, size, &mut state);
+
+        assert!(layout.reveal_y(NodeId(6), &mut state));
+        assert_eq!(state.offset(NodeId(5)), 0.0);
+        assert_eq!(state.offset(NodeId(2)), 40.0);
+
+        let layout = scrolled(&root, size, &mut state);
+        let target = layout.get(NodeId(6)).unwrap();
+        assert_eq!(target.bounds.y, 60.0);
+        assert_eq!(
+            target.bounds.intersection(target.clip).unwrap().height,
+            40.0
+        );
+    }
+
+    #[test]
+    fn repeated_reveal_uses_current_scroll_offsets() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut scroll = fixed(2, Kind::Scroll, 100.0, 40.0);
+        scroll.children.push(fixed(3, Kind::Row, 100.0, 60.0));
+        scroll.children.push(fixed(4, Kind::Button, 100.0, 10.0));
+        scroll.children.push(fixed(5, Kind::Row, 100.0, 10.0));
+        scroll.children.push(fixed(6, Kind::Button, 100.0, 10.0));
+        scroll.children.push(fixed(7, Kind::Row, 100.0, 100.0));
+        root.children.push(scroll);
+        let size = Size {
+            width: 100.0,
+            height: 40.0,
+        };
+        let mut state = ScrollState::default();
+        let layout = scrolled(&root, size, &mut state);
+
+        assert!(layout.reveal_y(NodeId(4), &mut state));
+        assert_eq!(state.offset(NodeId(2)), 30.0);
+        assert!(!layout.reveal_y(NodeId(4), &mut state));
+        assert_eq!(state.offset(NodeId(2)), 30.0);
+
+        assert!(layout.reveal_y(NodeId(6), &mut state));
+        assert_eq!(state.offset(NodeId(2)), 50.0);
+        assert!(!layout.reveal_y(NodeId(6), &mut state));
+        assert_eq!(state.offset(NodeId(2)), 50.0);
+    }
+
+    #[test]
+    fn reveal_ignores_unavailable_and_zero_height_targets() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        let mut scroll = fixed(2, Kind::Scroll, 100.0, 40.0);
+        scroll.children.push(fixed(3, Kind::Button, 100.0, 60.0));
+        let mut target = fixed(4, Kind::Button, 100.0, 20.0);
+        target.enabled = false;
+        scroll.children.push(target);
+        root.children.push(scroll);
+        let size = Size {
+            width: 100.0,
+            height: 40.0,
+        };
+        let mut state = ScrollState::default();
+        let layout = scrolled(&root, size, &mut state);
+        assert!(!layout.reveal_y(NodeId(4), &mut state));
+        assert_eq!(state.offset(NodeId(2)), 0.0);
+
+        root.children[0].children[1].enabled = true;
+        root.children[0].children[1].style.height = Some(0.0);
+        let layout = scrolled(&root, size, &mut state);
+        assert!(!layout.reveal_y(NodeId(4), &mut state));
+
+        root.children[0].children[1].style.height = Some(20.0);
+        root.children[0].children[1].visible = false;
+        let layout = scrolled(&root, size, &mut state);
+        assert!(!layout.reveal_y(NodeId(4), &mut state));
+
+        state.set(NodeId(2), f32::INFINITY);
+        assert_eq!(state.offset(NodeId(2)), 0.0);
     }
 
     #[test]
