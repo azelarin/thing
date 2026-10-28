@@ -58,7 +58,8 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] consistent keyboard repeat
 - [ ] text input
 - [x] vulkan rendering alongside opengl
-- [ ] drag and drop, animations, and custom shapes
+- [x] custom vector shapes
+- [ ] drag and drop and spring animations
 - [x] microphone controls
 - [x] per-application audio controls
 - [x] media metadata and playback controls

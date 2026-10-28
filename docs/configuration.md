@@ -205,8 +205,8 @@ a reactive `margins` property returns the complete margins table.
 ## widgets and children
 
 the current model has `panel`, `popup`, `row`, `centerbox`, `column`, `stack`,
-`scroll`, `text`, `image`, `button`, and `slider` constructors. pass properties in
-a table and children in a dense array:
+`scroll`, `text`, `image`, `path`, `button`, and `slider` constructors. pass
+properties in a table and children in a dense array:
 
 ```luau
 return ui.panel {
@@ -235,6 +235,7 @@ widget kind; unkeyed children match by position and kind.
 | --- | --- |
 | `text` | `text`: utf-8 string; optional `max_lines` and `overflow` |
 | `image` | one of `source`, `icon`, `app_id`; optional `icon_theme` and `fit` |
+| `path` | `data`, `view_box`; optional fit, fill, and stroke controls |
 | `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll`, `on_hover` |
 | `slider` | `min`, `max`, `value`, `step`, `on_change`, `on_hover` |
 | `range` | `children`, `min`, `max`, `value`, `step`, `inset`, `on_change`, `on_hover`, `on_pressed` |
@@ -412,6 +413,45 @@ limited to 4096 bytes and each output configuration may reference 10,000 distinc
 asset files. thing watches files registered by `ui.asset`; creating or changing one
 reloads the configuration and clears the image cache. other source paths are not
 watched.
+
+## vector paths
+
+`ui.path` draws svg path data without loading a complete svg document. this is
+useful for icons, indicators, separators, and decorative shapes that need to
+follow the rest of a luau theme.
+
+```luau
+ui.path {
+    data = 'M 12 2 L 22 20 H 2 Z',
+    view_box = { x = 0, y = 0, width = 24, height = 24 },
+    fill = '#89b4fa',
+    stroke = '#11111b',
+    stroke_width = 1.5,
+    stroke_join = 'round',
+    style = { width = 18, height = 18 },
+}
+```
+
+`data` accepts the standard `M`, `L`, `H`, `V`, `C`, `S`, `Q`, `T`, `A`, and `Z`
+commands, including their relative forms. `view_box` is required and supplies the
+path's intrinsic size when the style does not set one. its width and height must
+be positive.
+
+`fit` defaults to `contain`; `cover` fills and clips the content box, while `fill`
+allows different horizontal and vertical scales. `fill` defaults to
+`style.foreground`, and `fill_rule` accepts `nonzero` or `evenodd`. strokes are
+transparent by default. `stroke_cap` accepts `butt`, `round`, or `square`, and
+`stroke_join` accepts `miter`, `round`, or `bevel`. stroke width stays in logical
+pixels after the path is fitted, including with `fit = 'fill'`.
+
+padding defines the content box. `style.radius` clips the drawing within that
+box; the widget's background and border still use its complete bounds. a path is
+a visual leaf, so interaction belongs on a surrounding button or other control.
+
+path data is limited to 256 kib and 4,096 segments both before and after arcs and
+shorthand commands are normalized. coordinates and view-box edges must stay
+between -100,000 and 100,000. a rejected reactive update leaves the current tree
+in place.
 
 ## state and property functions
 

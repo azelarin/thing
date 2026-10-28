@@ -1,6 +1,6 @@
 use std::{collections::HashSet, error::Error, fmt};
 
-use crate::Color;
+use crate::{Color, vector::normalize_path};
 
 /// an identity scoped to one loaded configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -18,9 +18,177 @@ pub enum Kind {
     Scroll,
     Text,
     Image,
+    Path,
     Button,
     Slider,
     Range,
+}
+
+/// placement of vector content inside its content box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PathFit {
+    #[default]
+    Contain,
+    Cover,
+    Fill,
+}
+
+/// winding rule used to fill a vector path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PathFillRule {
+    #[default]
+    NonZero,
+    EvenOdd,
+}
+
+/// shape drawn at the open ends of a stroked path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PathStrokeCap {
+    #[default]
+    Butt,
+    Round,
+    Square,
+}
+
+/// shape drawn where two stroked segments meet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PathStrokeJoin {
+    #[default]
+    Miter,
+    Round,
+    Bevel,
+}
+
+/// source coordinates mapped into a path widget's content box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewBox {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl ViewBox {
+    pub fn new(x: f32, y: f32, width: f32, height: f32) -> Result<Self, TreeError> {
+        let view_box = Self {
+            x,
+            y,
+            width,
+            height,
+        };
+        view_box.validate()?;
+        Ok(view_box)
+    }
+
+    fn validate(self) -> Result<(), TreeError> {
+        let right = self.x + self.width;
+        let bottom = self.y + self.height;
+        if ![self.x, self.y, self.width, self.height, right, bottom]
+            .into_iter()
+            .all(f32::is_finite)
+            || self.width <= 0.0
+            || self.height <= 0.0
+            || [self.x, self.y, right, bottom]
+                .into_iter()
+                .any(|value| !(-100_000.0..=100_000.0).contains(&value))
+        {
+            return Err(TreeError(
+                "view_box must have positive dimensions and edges between -100,000 and 100,000"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// one normalized svg path command in absolute source coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VectorSegment {
+    MoveTo {
+        x: f32,
+        y: f32,
+    },
+    LineTo {
+        x: f32,
+        y: f32,
+    },
+    CurveTo {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        x: f32,
+        y: f32,
+    },
+    Quadratic {
+        x1: f32,
+        y1: f32,
+        x: f32,
+        y: f32,
+    },
+    Close,
+}
+
+/// resolved drawing properties for a `ui.path` widget.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorPath {
+    pub data: Option<String>,
+    pub segments: Vec<VectorSegment>,
+    pub view_box: Option<ViewBox>,
+    pub fit: PathFit,
+    pub fill: Option<Color>,
+    pub fill_rule: PathFillRule,
+    pub stroke: Color,
+    pub stroke_width: f32,
+    pub stroke_cap: PathStrokeCap,
+    pub stroke_join: PathStrokeJoin,
+}
+
+impl Default for VectorPath {
+    fn default() -> Self {
+        Self {
+            data: None,
+            segments: Vec::new(),
+            view_box: None,
+            fit: PathFit::Contain,
+            fill: None,
+            fill_rule: PathFillRule::NonZero,
+            stroke: Color::TRANSPARENT,
+            stroke_width: 1.0,
+            stroke_cap: PathStrokeCap::Butt,
+            stroke_join: PathStrokeJoin::Miter,
+        }
+    }
+}
+
+impl VectorPath {
+    pub fn set_data(&mut self, data: String) -> Result<(), TreeError> {
+        const MAX_BYTES: usize = 256 * 1024;
+
+        if data.len() > MAX_BYTES {
+            return Err(TreeError("path data exceeds 256 KiB".into()));
+        }
+
+        let segments = normalize_path(&data)?;
+        self.data = Some(data);
+        self.segments = segments;
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), TreeError> {
+        if self.data.is_none() || self.segments.is_empty() {
+            return Err(TreeError("path requires data".into()));
+        }
+        self.view_box
+            .ok_or_else(|| TreeError("path requires view_box".into()))?
+            .validate()?;
+        if !self.stroke_width.is_finite() || !(0.0..=100_000.0).contains(&self.stroke_width) {
+            return Err(TreeError(
+                "path stroke_width must be finite and between 0 and 100,000".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// the output edge that owns a panel surface.
@@ -293,7 +461,13 @@ impl Kind {
     fn is_range_visual(self) -> bool {
         matches!(
             self,
-            Self::Row | Self::CenterBox | Self::Column | Self::Stack | Self::Text | Self::Image
+            Self::Row
+                | Self::CenterBox
+                | Self::Column
+                | Self::Stack
+                | Self::Text
+                | Self::Image
+                | Self::Path
         )
     }
 }
@@ -541,6 +715,7 @@ pub struct Node {
     pub text_overflow: TextOverflow,
     pub image: Image,
     pub image_fit: ImageFit,
+    pub path: VectorPath,
     pub popup: PopupOptions,
     pub slider: Slider,
     pub range_inset: f32,
@@ -569,6 +744,7 @@ impl Node {
             text_overflow: TextOverflow::Clip,
             image: Image::default(),
             image_fit: ImageFit::Contain,
+            path: VectorPath::default(),
             popup: PopupOptions::default(),
             slider: Slider::default(),
             range_inset: 0.0,
@@ -809,6 +985,9 @@ impl Node {
         }
         if matches!(self.kind, Kind::Slider | Kind::Range) {
             self.slider.validate()?;
+        }
+        if self.kind == Kind::Path {
+            self.path.validate()?;
         }
         if self.kind == Kind::Range {
             if !self.range_inset.is_finite() || !(0.0..=100_000.0).contains(&self.range_inset) {
@@ -1163,12 +1342,94 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_complete_svg_path_syntax() {
+        let mut path = VectorPath::default();
+        path.set_data(
+            "M 0 0 h 10 v 10 l -10 0 z m 2 2 c 1 0 2 1 3 1 s 2 1 3 0 q 1 1 2 0 t 2 0 a 2 3 15 0 1 4 2"
+                .into(),
+        )
+        .unwrap();
+
+        assert!(path.segments.len() > 10);
+        assert!(
+            path.segments
+                .iter()
+                .any(|segment| matches!(segment, VectorSegment::CurveTo { .. }))
+        );
+        assert!(
+            path.segments
+                .iter()
+                .any(|segment| matches!(segment, VectorSegment::Quadratic { .. }))
+        );
+        assert!(path.segments.contains(&VectorSegment::Close));
+    }
+
+    #[test]
+    fn rejects_path_limits_without_replacing_valid_data() {
+        let mut path = VectorPath::default();
+        path.set_data("M 0 0 L 1 1".into()).unwrap();
+        let previous = path.clone();
+        assert!(path.set_data("M 0 0 L 100001 0".into()).is_err());
+        assert_eq!(path, previous);
+
+        let source = std::iter::once("M 0 0")
+            .chain(std::iter::repeat_n("a 1 1 0 1 1 1 0", 4095))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            path.set_data(source)
+                .unwrap_err()
+                .to_string()
+                .contains("normalized segments")
+        );
+
+        assert!(path.set_data("M 0 0 A -1 2 0 0 0 4 4".into()).is_err());
+    }
+
+    #[test]
+    fn coordinate_limits_apply_after_relative_commands_are_resolved() {
+        let mut path = VectorPath::default();
+        path.set_data("M 100000 0 l -100001 0".into()).unwrap();
+        assert_eq!(
+            path.segments.last(),
+            Some(&VectorSegment::LineTo { x: -1.0, y: 0.0 })
+        );
+
+        assert!(path.set_data("M 100000 0 l 1 0".into()).is_err());
+        assert!(path.set_data("M 0 0 A 100001 1 0 0 0 1 1".into()).is_err());
+    }
+
+    #[test]
+    fn path_requires_valid_data_and_view_box() {
+        let mut node = Node::new(NodeId(1), Kind::Path);
+        assert_eq!(
+            node.validate().unwrap_err().to_string(),
+            "path requires data"
+        );
+        node.path.set_data("M 0 0 L 10 10".into()).unwrap();
+        assert_eq!(
+            node.validate().unwrap_err().to_string(),
+            "path requires view_box"
+        );
+        node.path.view_box = Some(ViewBox::new(-10.0, -5.0, 20.0, 10.0).unwrap());
+        assert!(node.validate().is_ok());
+
+        assert!(ViewBox::new(99_999.0, 0.0, 2.0, 1.0).is_err());
+        node.path.stroke_width = f32::INFINITY;
+        assert!(node.validate().is_err());
+    }
+
+    #[test]
     fn ranges_accept_only_visual_descendants() {
         let mut range = Node::new(NodeId(1), Kind::Range);
         range.range_inset = 4.0;
         let mut row = Node::new(NodeId(2), Kind::Row);
         row.children.push(Node::new(NodeId(3), Kind::Text));
         row.children.push(Node::new(NodeId(4), Kind::Image));
+        let mut path = Node::new(NodeId(5), Kind::Path);
+        path.path.set_data("M 0 0 L 1 1".into()).unwrap();
+        path.path.view_box = Some(ViewBox::new(0.0, 0.0, 1.0, 1.0).unwrap());
+        row.children.push(path);
         range.children.push(row);
         assert!(range.validate().is_ok());
 

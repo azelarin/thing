@@ -1,8 +1,9 @@
 use mlua::{Error, Result, Table, Value};
 use thing_core::{
     CrossAlign, ImageFit, KeyboardMode, Kind, MainAlign, Node, PanelEdge, PanelInputRect,
-    PanelInputRegion, PanelMargins, PopupAlignment, PopupAnchor, PopupConstraints, PopupOffset,
-    SurfaceAnchors, SurfaceLayer, TextAlign, TextOverflow,
+    PanelInputRegion, PanelMargins, PathFillRule, PathFit, PathStrokeCap, PathStrokeJoin,
+    PopupAlignment, PopupAnchor, PopupConstraints, PopupOffset, SurfaceAnchors, SurfaceLayer,
+    TextAlign, TextOverflow, ViewBox,
 };
 
 pub(crate) fn string(value: Value, name: &str) -> Result<String> {
@@ -28,6 +29,89 @@ fn boolean(value: Value, name: &str) -> Result<bool> {
     match value {
         Value::Boolean(value) => Ok(value),
         _ => Err(Error::runtime(format!("{name} must be a boolean"))),
+    }
+}
+
+fn color(value: Value, name: &str) -> Result<thing_core::Color> {
+    string(value, name)?.parse().map_err(Error::external)
+}
+
+fn optional_color(value: Value, name: &str) -> Result<Option<thing_core::Color>> {
+    if value.is_nil() {
+        Ok(None)
+    } else {
+        color(value, name).map(Some)
+    }
+}
+
+fn path_view_box(value: Value) -> Result<ViewBox> {
+    let Value::Table(table) = value else {
+        return Err(Error::runtime("view_box must be a table"));
+    };
+    let mut x = None;
+    let mut y = None;
+    let mut width = None;
+    let mut height = None;
+    for pair in table.pairs::<String, Value>() {
+        let (name, value) = pair?;
+        let value = number(value, &format!("view_box.{name}"))? as f32;
+        match name.as_str() {
+            "x" => x = Some(value),
+            "y" => y = Some(value),
+            "width" => width = Some(value),
+            "height" => height = Some(value),
+            _ => {
+                return Err(Error::runtime(format!(
+                    "unknown view_box property {name:?}"
+                )));
+            }
+        }
+    }
+    ViewBox::new(
+        x.ok_or_else(|| Error::runtime("view_box.x is required"))?,
+        y.ok_or_else(|| Error::runtime("view_box.y is required"))?,
+        width.ok_or_else(|| Error::runtime("view_box.width is required"))?,
+        height.ok_or_else(|| Error::runtime("view_box.height is required"))?,
+    )
+    .map_err(Error::external)
+}
+
+fn path_fit(value: Value) -> Result<PathFit> {
+    match string(value, "fit")?.as_str() {
+        "contain" => Ok(PathFit::Contain),
+        "cover" => Ok(PathFit::Cover),
+        "fill" => Ok(PathFit::Fill),
+        _ => Err(Error::runtime("fit must be 'contain', 'cover', or 'fill'")),
+    }
+}
+
+fn path_fill_rule(value: Value) -> Result<PathFillRule> {
+    match string(value, "fill_rule")?.as_str() {
+        "nonzero" => Ok(PathFillRule::NonZero),
+        "evenodd" => Ok(PathFillRule::EvenOdd),
+        _ => Err(Error::runtime("fill_rule must be 'nonzero' or 'evenodd'")),
+    }
+}
+
+fn path_stroke_cap(value: Value) -> Result<PathStrokeCap> {
+    match string(value, "stroke_cap")?.as_str() {
+        "butt" => Ok(PathStrokeCap::Butt),
+        "round" => Ok(PathStrokeCap::Round),
+        "square" => Ok(PathStrokeCap::Square),
+        _ => Err(Error::runtime(
+            "stroke_cap must be 'butt', 'round', or 'square'",
+        )),
+    }
+}
+
+fn path_stroke_join(value: Value) -> Result<PathStrokeJoin> {
+    match string(value, "stroke_join")?.as_str() {
+        "miter" => Ok(PathStrokeJoin::Miter),
+        "round" => Ok(PathStrokeJoin::Round),
+        "bevel" => Ok(PathStrokeJoin::Bevel),
+        _ => Err(Error::runtime(
+            "stroke_join must be 'miter', 'round', or 'bevel'",
+        )),
     }
 }
 
@@ -398,6 +482,22 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "app_id" if node.kind == Kind::Image => node.image.app_id = optional_string(value, name)?,
         "icon_theme" if node.kind == Kind::Image => node.image.theme = string(value, name)?,
         "fit" if node.kind == Kind::Image => node.image_fit = image_fit(value, name)?,
+        "data" if node.kind == Kind::Path => node
+            .path
+            .set_data(string(value, name)?)
+            .map_err(Error::external)?,
+        "view_box" if node.kind == Kind::Path => node.path.view_box = Some(path_view_box(value)?),
+        "fit" if node.kind == Kind::Path => node.path.fit = path_fit(value)?,
+        "fill" if node.kind == Kind::Path => node.path.fill = optional_color(value, name)?,
+        "fill_rule" if node.kind == Kind::Path => node.path.fill_rule = path_fill_rule(value)?,
+        "stroke" if node.kind == Kind::Path => node.path.stroke = color(value, name)?,
+        "stroke_width" if node.kind == Kind::Path => {
+            node.path.stroke_width = number(value, name)? as f32
+        }
+        "stroke_cap" if node.kind == Kind::Path => node.path.stroke_cap = path_stroke_cap(value)?,
+        "stroke_join" if node.kind == Kind::Path => {
+            node.path.stroke_join = path_stroke_join(value)?
+        }
         "visible" => node.visible = boolean(value, name)?,
         "enabled" => node.enabled = boolean(value, name)?,
         "value" if matches!(node.kind, Kind::Slider | Kind::Range) => {
@@ -477,19 +577,11 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "style.wrap" => node.style.wrap = boolean(value, name)?,
         "style.radius" => node.style.radius = number(value, name)? as f32,
         "style.border_width" => node.style.border_width = number(value, name)? as f32,
-        "style.border_color" => {
-            node.style.border_color = string(value, name)?.parse().map_err(Error::external)?
-        }
-        "style.hover_overlay" => {
-            node.style.hover_overlay = string(value, name)?.parse().map_err(Error::external)?
-        }
-        "style.pressed_overlay" => {
-            node.style.pressed_overlay = string(value, name)?.parse().map_err(Error::external)?
-        }
+        "style.border_color" => node.style.border_color = color(value, name)?,
+        "style.hover_overlay" => node.style.hover_overlay = color(value, name)?,
+        "style.pressed_overlay" => node.style.pressed_overlay = color(value, name)?,
         "style.disabled_opacity" => node.style.disabled_opacity = number(value, name)? as f32,
-        "style.focus_ring_color" => {
-            node.style.focus_ring_color = string(value, name)?.parse().map_err(Error::external)?
-        }
+        "style.focus_ring_color" => node.style.focus_ring_color = color(value, name)?,
         "style.focus_ring_width" => node.style.focus_ring_width = number(value, name)? as f32,
         "style.font_size" => node.style.font_size = number(value, name)? as f32,
         "style.font_weight" => node.style.font_weight = number(value, name)? as f32,
@@ -501,12 +593,8 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
             node.style.tabular_digits = boolean(value, name)?
         }
         "style.opacity" => node.style.opacity = number(value, name)? as f32,
-        "style.background" => {
-            node.style.background = string(value, name)?.parse().map_err(Error::external)?
-        }
-        "style.foreground" => {
-            node.style.foreground = string(value, name)?.parse().map_err(Error::external)?
-        }
+        "style.background" => node.style.background = color(value, name)?,
+        "style.foreground" => node.style.foreground = color(value, name)?,
         _ => {
             return Err(Error::runtime(format!(
                 "unknown property {name:?} on {:?}",
