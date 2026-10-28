@@ -1,8 +1,10 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, mem::size_of};
 
 const MAX_ACTIVE: usize = 1_024;
 const MAX_ACTIONS: usize = 128;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
+const MAX_NOTIFICATION_RETAINED_BYTES: usize = 512 * 1024;
+const MAX_ACTIVE_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Urgency {
@@ -111,6 +113,7 @@ pub(crate) struct Notification {
     pub(crate) updated_at_ms: u64,
     pub(crate) expires_at_ms: Option<u64>,
     pub(crate) closed: Option<Closed>,
+    retained_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +145,7 @@ pub(crate) struct Model {
     timeout_policy: TimeoutPolicy,
     next_id: u32,
     next_key: u64,
+    retained_bytes: usize,
     active: Vec<Notification>,
 }
 
@@ -151,6 +155,7 @@ impl Model {
             timeout_policy,
             next_id: 1,
             next_key: 1,
+            retained_bytes: 0,
             active: Vec::new(),
         }
     }
@@ -165,7 +170,7 @@ impl Model {
         request: NotificationRequest,
         now_ms: u64,
     ) -> Result<Published, ModelError> {
-        validate_request(&request)?;
+        let retained_bytes = validate_request(&request)?;
         let urgency = Urgency::from_hint(request.hints.urgency);
         let effective_timeout_ms = effective_timeout(&request, urgency, self.timeout_policy)?;
         let expires_at_ms =
@@ -177,6 +182,12 @@ impl Model {
                 .iter()
                 .position(|notification| notification.id == replaces_id)
         {
+            let next_retained = self
+                .retained_bytes
+                .checked_sub(self.active[index].retained_bytes)
+                .and_then(|retained| retained.checked_add(retained_bytes))
+                .filter(|retained| *retained <= MAX_ACTIVE_RETAINED_BYTES)
+                .ok_or(ModelError::Capacity)?;
             let current = &mut self.active[index];
             current.revision = current.revision.saturating_add(1);
             current.request = request;
@@ -184,6 +195,8 @@ impl Model {
             current.effective_timeout_ms = effective_timeout_ms;
             current.updated_at_ms = now_ms;
             current.expires_at_ms = expires_at_ms;
+            current.retained_bytes = retained_bytes;
+            self.retained_bytes = next_retained;
             return Ok(Published {
                 id: current.id,
                 key: current.key,
@@ -191,7 +204,12 @@ impl Model {
             });
         }
 
-        if self.active.len() >= MAX_ACTIVE {
+        if self.active.len() >= MAX_ACTIVE
+            || self
+                .retained_bytes
+                .checked_add(retained_bytes)
+                .is_none_or(|retained| retained > MAX_ACTIVE_RETAINED_BYTES)
+        {
             return Err(ModelError::Capacity);
         }
         let id = if replaces_id == 0 {
@@ -203,6 +221,9 @@ impl Model {
             return Err(ModelError::Capacity);
         }
         let key = self.allocate_key()?;
+        if replaces_id != 0 {
+            self.reserve_id(replaces_id);
+        }
         self.active.insert(
             0,
             Notification {
@@ -216,8 +237,10 @@ impl Model {
                 updated_at_ms: now_ms,
                 expires_at_ms,
                 closed: None,
+                retained_bytes,
             },
         );
+        self.retained_bytes += retained_bytes;
         Ok(Published {
             id,
             key,
@@ -305,6 +328,7 @@ impl Model {
 
     fn close_at(&mut self, index: usize, reason: CloseReason, now_ms: u64) -> Notification {
         let mut notification = self.active.remove(index);
+        self.retained_bytes -= notification.retained_bytes;
         notification.closed = Some(Closed {
             reason,
             at_ms: now_ms,
@@ -331,6 +355,16 @@ impl Model {
         }
     }
 
+    fn reserve_id(&mut self, id: u32) {
+        if id == u32::MAX {
+            if self.next_id == u32::MAX {
+                self.next_id = 1;
+            }
+        } else if id >= self.next_id {
+            self.next_id = id + 1;
+        }
+    }
+
     fn allocate_key(&mut self) -> Result<u64, ModelError> {
         let key = self.next_key;
         self.next_key = self.next_key.checked_add(1).ok_or(ModelError::Capacity)?;
@@ -338,7 +372,7 @@ impl Model {
     }
 }
 
-fn validate_request(request: &NotificationRequest) -> Result<(), ModelError> {
+fn validate_request(request: &NotificationRequest) -> Result<usize, ModelError> {
     let text = [
         &request.app_name,
         &request.app_icon,
@@ -363,7 +397,39 @@ fn validate_request(request: &NotificationRequest) -> Result<(), ModelError> {
     }) {
         return Err(ModelError::InvalidRequest);
     }
-    Ok(())
+    let retained_bytes = request_retained_bytes(request).ok_or(ModelError::InvalidRequest)?;
+    if retained_bytes > MAX_NOTIFICATION_RETAINED_BYTES {
+        return Err(ModelError::InvalidRequest);
+    }
+    Ok(retained_bytes)
+}
+
+fn request_retained_bytes(request: &NotificationRequest) -> Option<usize> {
+    let text = [
+        &request.app_name,
+        &request.app_icon,
+        &request.summary,
+        &request.body,
+        &request.hints.category,
+        &request.hints.desktop_entry,
+        &request.hints.image_path,
+        &request.hints.sound_file,
+        &request.hints.sound_name,
+    ];
+    let mut retained = size_of::<Notification>().checked_add(
+        request
+            .actions
+            .capacity()
+            .checked_mul(size_of::<NotificationAction>())?,
+    )?;
+    for value in text {
+        retained = retained.checked_add(value.capacity())?;
+    }
+    for action in &request.actions {
+        retained = retained.checked_add(action.key.capacity())?;
+        retained = retained.checked_add(action.label.capacity())?;
+    }
+    Some(retained)
 }
 
 fn effective_timeout(
@@ -400,6 +466,31 @@ mod tests {
             expire_timeout_ms: -1,
             ..NotificationRequest::default()
         }
+    }
+
+    fn request_with_retained_bytes(target: usize) -> NotificationRequest {
+        let mut request = NotificationRequest::default();
+        let base = request_retained_bytes(&request).unwrap();
+        assert!(target >= base);
+        let mut remaining = target - base;
+        for field in [
+            &mut request.app_name,
+            &mut request.app_icon,
+            &mut request.summary,
+            &mut request.body,
+            &mut request.hints.category,
+            &mut request.hints.desktop_entry,
+            &mut request.hints.image_path,
+            &mut request.hints.sound_file,
+            &mut request.hints.sound_name,
+        ] {
+            let bytes = remaining.min(MAX_TEXT_BYTES);
+            *field = "x".repeat(bytes).into_boxed_str().into_string();
+            remaining -= bytes;
+        }
+        assert_eq!(remaining, 0);
+        assert_eq!(request_retained_bytes(&request), Some(target));
+        request
     }
 
     #[test]
@@ -511,5 +602,96 @@ mod tests {
         assert_eq!(published.id, 42);
         assert!(!published.replaced);
         assert_eq!(model.active()[0].id, 42);
+    }
+
+    #[test]
+    fn unknown_replacement_ids_advance_the_protocol_allocator() {
+        let mut model = Model::new(TimeoutPolicy::default());
+        let adopted = model.notify(1, request("adopted"), 0).unwrap();
+        model
+            .close_by_id(adopted.id, CloseReason::ClosedByCall, 1)
+            .unwrap();
+
+        let allocated = model.notify(0, request("allocated"), 2).unwrap();
+        assert_eq!(allocated.id, 2);
+
+        let mut wrapping = Model::new(TimeoutPolicy::default());
+        wrapping.next_id = u32::MAX;
+        let maximum = wrapping.notify(u32::MAX, request("maximum"), 3).unwrap();
+        wrapping
+            .close_by_id(maximum.id, CloseReason::ClosedByCall, 4)
+            .unwrap();
+        let wrapped = wrapping.notify(0, request("wrapped"), 5).unwrap();
+        assert_ne!(wrapped.id, maximum.id);
+        assert_eq!(wrapped.id, 1);
+
+        let mut below_maximum = Model::new(TimeoutPolicy::default());
+        below_maximum.next_id = 101;
+        let maximum = below_maximum
+            .notify(u32::MAX, request("maximum"), 6)
+            .unwrap();
+        below_maximum
+            .close_by_id(maximum.id, CloseReason::ClosedByCall, 7)
+            .unwrap();
+        let allocated = below_maximum.notify(0, request("next"), 8).unwrap();
+        assert_eq!(allocated.id, 101);
+    }
+
+    #[test]
+    fn request_and_active_retained_memory_are_bounded_atomically() {
+        let mut model = Model::new(TimeoutPolicy::default());
+        let oversized = request_with_retained_bytes(MAX_NOTIFICATION_RETAINED_BYTES + 1);
+        assert_eq!(
+            model.notify(0, oversized, 0),
+            Err(ModelError::InvalidRequest)
+        );
+        assert!(model.active().is_empty());
+        assert_eq!(model.retained_bytes, 0);
+
+        let original = model.notify(0, request("original"), 1).unwrap();
+        while model.retained_bytes + MAX_NOTIFICATION_RETAINED_BYTES <= MAX_ACTIVE_RETAINED_BYTES {
+            model
+                .notify(
+                    0,
+                    request_with_retained_bytes(MAX_NOTIFICATION_RETAINED_BYTES),
+                    2,
+                )
+                .unwrap();
+        }
+        let remaining = MAX_ACTIVE_RETAINED_BYTES - model.retained_bytes;
+        let smallest = request_retained_bytes(&request("sized")).unwrap();
+        if remaining >= smallest {
+            model
+                .notify(0, request_with_retained_bytes(remaining), 3)
+                .unwrap();
+        }
+        assert_eq!(model.retained_bytes, MAX_ACTIVE_RETAINED_BYTES);
+
+        let before = model
+            .active()
+            .iter()
+            .find(|notification| notification.id == original.id)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            model.notify(
+                original.id,
+                request_with_retained_bytes(MAX_NOTIFICATION_RETAINED_BYTES),
+                4,
+            ),
+            Err(ModelError::Capacity)
+        );
+        assert_eq!(model.retained_bytes, MAX_ACTIVE_RETAINED_BYTES);
+        assert_eq!(
+            model
+                .active()
+                .iter()
+                .find(|notification| notification.id == original.id),
+            Some(&before)
+        );
+        assert_eq!(
+            model.notify(0, request("one more"), 5),
+            Err(ModelError::Capacity)
+        );
     }
 }

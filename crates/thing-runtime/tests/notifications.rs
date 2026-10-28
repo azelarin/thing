@@ -209,6 +209,50 @@ fn malformed_notification_state_and_actions_are_rejected_atomically() {
     assert!(!runtime.refresh().unwrap());
     assert_eq!(runtime.root().children[0].text, "Valid");
 
+    let mut oversized = notification("2", 2, "Oversized");
+    oversized.app_name = "x".repeat(64 * 1024);
+    oversized.app_icon = "x".repeat(64 * 1024);
+    oversized.summary = "x".repeat(64 * 1024);
+    oversized.body = "x".repeat(64 * 1024);
+    oversized.category = "x".repeat(64 * 1024);
+    oversized.desktop_entry = "x".repeat(64 * 1024);
+    oversized.image_path = "x".repeat(64 * 1024);
+    oversized.actions[0].label = "x".repeat(64 * 1024);
+    oversized.actions.push(NotificationButton {
+        key: "second".into(),
+        label: "x".repeat(64 * 1024),
+    });
+    assert!(
+        runtime
+            .set_notifications(NotificationSnapshot {
+                owned: true,
+                error: String::new(),
+                active: vec![oversized],
+            })
+            .is_err()
+    );
+    assert!(!runtime.refresh().unwrap());
+    assert_eq!(runtime.root().children[0].text, "Valid");
+
+    let active = (1..=140)
+        .map(|id| {
+            let mut notification = notification(&id.to_string(), id, "Large");
+            notification.body = "x".repeat(60 * 1024);
+            notification
+        })
+        .collect();
+    assert!(
+        runtime
+            .set_notifications(NotificationSnapshot {
+                owned: true,
+                error: String::new(),
+                active,
+            })
+            .is_err()
+    );
+    assert!(!runtime.refresh().unwrap());
+    assert_eq!(runtime.root().children[0].text, "Valid");
+
     for argument in ["''", "'01'", "'0'", "'bad'", "7", "{}"] {
         let source = format!(
             "return ui.panel {{ children = {{ ui.button {{ on_click = function() services.notifications.dismiss({argument}) end }} }} }}"

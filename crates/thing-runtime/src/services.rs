@@ -5,6 +5,7 @@ use mlua::{Error, Lua, Result, Table, UserData, UserDataMethods, Value};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
+    mem::size_of,
     rc::Rc,
 };
 
@@ -1762,17 +1763,27 @@ fn invalid_media_text(value: &str, max: usize) -> bool {
 }
 
 const MAX_SAFE_LUA_INTEGER: u64 = (1_u64 << 53) - 1;
+const MAX_NOTIFICATION_RETAINED_BYTES: usize = 512 * 1024;
+const MAX_ACTIVE_NOTIFICATION_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 
 fn validate_notifications(notifications: &[Notification]) -> Result<()> {
     let mut keys = BTreeSet::new();
     let mut ids = BTreeSet::new();
+    let mut retained_bytes = 0_usize;
     let invalid = notifications.len() > 1_024
         || notifications.iter().any(|notification| {
             let valid_key = notification
                 .key
                 .parse::<u64>()
                 .is_ok_and(|key| key != 0 && key.to_string() == notification.key);
-            notification.id == 0
+            let record_bytes = notification_retained_bytes(notification);
+            let within_budget = record_bytes.is_some_and(|record_bytes| {
+                retained_bytes = retained_bytes.saturating_add(record_bytes);
+                record_bytes <= MAX_NOTIFICATION_RETAINED_BYTES
+                    && retained_bytes <= MAX_ACTIVE_NOTIFICATION_RETAINED_BYTES
+            });
+            !within_budget
+                || notification.id == 0
                 || notification.revision == 0
                 || notification.revision > MAX_SAFE_LUA_INTEGER
                 || !valid_key
@@ -1825,6 +1836,33 @@ fn validate_notifications(notifications: &[Notification]) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn notification_retained_bytes(notification: &Notification) -> Option<usize> {
+    let text = [
+        &notification.key,
+        &notification.app_name,
+        &notification.app_icon,
+        &notification.summary,
+        &notification.body,
+        &notification.category,
+        &notification.desktop_entry,
+        &notification.image_path,
+    ];
+    let mut retained = size_of::<Notification>().checked_add(
+        notification
+            .actions
+            .capacity()
+            .checked_mul(size_of::<NotificationButton>())?,
+    )?;
+    for value in text {
+        retained = retained.checked_add(value.capacity())?;
+    }
+    for action in &notification.actions {
+        retained = retained.checked_add(action.key.capacity())?;
+        retained = retained.checked_add(action.label.capacity())?;
+    }
+    Some(retained)
 }
 
 fn invalid_notification_text(value: &str) -> bool {
