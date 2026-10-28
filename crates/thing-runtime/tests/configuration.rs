@@ -538,6 +538,7 @@ fn parses_flex_layout_controls() {
         r#"
         return ui.panel { children = { ui.row {
             style = {
+                width_fraction = 0.5, height_fraction = 0.25,
                 min_width = 40, max_width = 240,
                 min_height = 20, max_height = 80,
                 grow = 1, shrink = 2, wrap = true,
@@ -550,6 +551,8 @@ fn parses_flex_layout_controls() {
     let runtime = Runtime::load(path).unwrap();
     let style = &runtime.root().unwrap().children[0].style;
 
+    assert_eq!(style.width_fraction, Some(0.5));
+    assert_eq!(style.height_fraction, Some(0.25));
     assert_eq!(style.min_width, Some(40.0));
     assert_eq!(style.max_width, Some(240.0));
     assert_eq!(style.min_height, Some(20.0));
@@ -605,10 +608,16 @@ fn rejects_invalid_flex_layout_options() {
         "return ui.panel { children = { ui.row { style = { justify = 'stretch' } } } }",
         "return ui.panel { children = { ui.row { style = { wrap = 1 } } } }",
         "return ui.panel { children = { ui.row { style = { shrink = -1 } } } }",
+        "return ui.panel { children = { ui.row { style = { width_fraction = -0.1 } } } }",
+        "return ui.panel { children = { ui.row { style = { height_fraction = 1.1 } } } }",
+        "return ui.panel { children = { ui.row { style = { width = 20, width_fraction = 0.5 } } } }",
+        "return ui.panel { children = { ui.row { style = { height = 20, height_fraction = 0.5 } } } }",
         "return ui.panel { children = { ui.row { style = { min_width = 20, max_width = 10 } } } }",
         "return ui.panel { children = { ui.scroll { style = { wrap = true } } } }",
         "return ui.panel { style = { max_width = 800 } }",
+        "return ui.panel { style = { width_fraction = 0.5 } }",
         "return ui.panel { children = { ui.button { children = { ui.popup { style = { min_width = 200 } } } } } }",
+        "return ui.panel { children = { ui.button { children = { ui.popup { style = { height_fraction = 0.5 } } } } } }",
         "return ui.panel { children = { ui.centerbox { style = { justify = 'center' }, children = { ui.row {}, ui.row {}, ui.row {} } } } }",
     ] {
         let (_directory, path) = fixture(source);

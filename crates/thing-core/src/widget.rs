@@ -294,6 +294,8 @@ impl Kind {
 pub struct Style {
     pub width: Option<f32>,
     pub height: Option<f32>,
+    pub width_fraction: Option<f32>,
+    pub height_fraction: Option<f32>,
     pub min_width: Option<f32>,
     pub max_width: Option<f32>,
     pub min_height: Option<f32>,
@@ -332,6 +334,8 @@ impl Default for Style {
         Self {
             width: None,
             height: None,
+            width_fraction: None,
+            height_fraction: None,
             min_width: None,
             max_width: None,
             min_height: None,
@@ -643,6 +647,13 @@ impl Node {
                 "min and max dimensions are not available on panel or popup surfaces".into(),
             ));
         }
+        if (self.kind == Kind::Popup || (depth == 0 && self.kind == Kind::Panel))
+            && (style.width_fraction.is_some() || style.height_fraction.is_some())
+        {
+            return Err(TreeError(
+                "fractional dimensions are not available on panel or popup surfaces".into(),
+            ));
+        }
         if [&self.image.source, &self.image.icon, &self.image.app_id]
             .iter()
             .filter(|v| v.is_some())
@@ -718,6 +729,25 @@ impl Node {
                     "style dimensions must be finite and between 0 and 100,000".into(),
                 ));
             }
+        }
+        if [style.width_fraction, style.height_fraction]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err(TreeError(
+                "width_fraction and height_fraction must be between 0 and 1".into(),
+            ));
+        }
+        if style.width.is_some() && style.width_fraction.is_some() {
+            return Err(TreeError(
+                "width and width_fraction cannot be used together".into(),
+            ));
+        }
+        if style.height.is_some() && style.height_fraction.is_some() {
+            return Err(TreeError(
+                "height and height_fraction cannot be used together".into(),
+            ));
         }
         if style
             .min_width
@@ -871,6 +901,9 @@ mod tests {
         node.style.width = Some(f32::NAN);
         assert!(node.validate().is_err());
         node.style.width = None;
+        node.style.width_fraction = Some(f32::NAN);
+        assert!(node.validate().is_err());
+        node.style.width_fraction = None;
         node.style.shrink = Some(f32::INFINITY);
         assert!(node.validate().is_err());
         node.style.shrink = None;

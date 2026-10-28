@@ -449,6 +449,8 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
                 Some(number(value, name)? as f32)
             }
         }
+        "style.width_fraction" => node.style.width_fraction = optional_number(value, name)?,
+        "style.height_fraction" => node.style.height_fraction = optional_number(value, name)?,
         "style.min_width" => node.style.min_width = optional_number(value, name)?,
         "style.max_width" => node.style.max_width = optional_number(value, name)?,
         "style.min_height" => node.style.min_height = optional_number(value, name)?,
