@@ -12,6 +12,23 @@ pub struct Interaction {
     pub hovered: Option<NodeId>,
     pub pressed: Option<NodeId>,
     pub focused: Option<NodeId>,
+    focus_visible: bool,
+}
+
+impl Interaction {
+    pub fn focus_from_pointer(&mut self, focused: Option<NodeId>) {
+        self.focused = focused;
+        self.focus_visible = false;
+    }
+
+    pub fn focus_from_keyboard(&mut self, focused: NodeId) {
+        self.focused = Some(focused);
+        self.focus_visible = true;
+    }
+
+    pub fn reveal_keyboard_focus(&mut self) {
+        self.focus_visible = self.focused.is_some();
+    }
 }
 
 /// an opengl es painter. the host must keep its context current during use and drop.
@@ -98,7 +115,7 @@ impl Painter {
                 self.canvas
                     .fill_path(&path, &Paint::color(Color::rgba(255, 255, 255, alpha)));
             }
-            if input.focused == Some(node.id) {
+            if input.focus_visible && input.focused == Some(node.id) {
                 let mut focus = Paint::color(Color::rgb(137, 180, 250));
                 focus.set_line_width(2.0);
                 self.canvas.stroke_path(&path, &focus);
@@ -203,4 +220,28 @@ impl Painter {
 fn color(value: thing_core::Color) -> Color {
     let [r, g, b, a] = value.0;
     Color::rgba(r, g, b, a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_indicator_follows_the_input_method() {
+        let mut interaction = Interaction::default();
+        interaction.focus_from_pointer(Some(NodeId(1)));
+        assert_eq!(interaction.focused, Some(NodeId(1)));
+        assert!(!interaction.focus_visible);
+
+        interaction.reveal_keyboard_focus();
+        assert!(interaction.focus_visible);
+
+        interaction.focus_from_pointer(Some(NodeId(2)));
+        assert_eq!(interaction.focused, Some(NodeId(2)));
+        assert!(!interaction.focus_visible);
+
+        interaction.focus_from_keyboard(NodeId(3));
+        assert_eq!(interaction.focused, Some(NodeId(3)));
+        assert!(interaction.focus_visible);
+    }
 }
