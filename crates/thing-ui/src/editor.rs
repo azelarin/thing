@@ -316,13 +316,14 @@ impl TextInputEditor {
     fn ensure_caret_visible(&mut self) {
         self.refresh();
         let text_width = self.layout().full_width();
-        let max_scroll = (text_width - self.viewport_width).max(0.0);
         let Some(caret) = self.editor.cursor_geometry(1.0) else {
+            let max_scroll = (text_width - self.viewport_width).max(0.0);
             self.scroll_x = self.scroll_x.clamp(0.0, max_scroll);
             return;
         };
         let x0 = caret.x0 as f32;
         let x1 = caret.x1 as f32;
+        let max_scroll = (text_width.max(x1) - self.viewport_width).max(0.0);
         if x0 < self.scroll_x {
             self.scroll_x = x0;
         } else if x1 > self.scroll_x + self.viewport_width {
@@ -338,9 +339,22 @@ mod tests {
     use thing_core::{Kind, NodeId};
 
     fn editor(value: &str) -> TextInputEditor {
+        editor_with_width(value, 160.0)
+    }
+
+    fn editor_with_width(value: &str, width: f32) -> TextInputEditor {
         let mut node = Node::new(NodeId(1), Kind::TextInput);
         node.text = value.into();
-        TextInputEditor::new(&node, 160.0)
+        TextInputEditor::new(&node, width)
+    }
+
+    fn assert_caret_visible(editor: &TextInputEditor, width: f32) {
+        let caret = editor.cursor_geometry().unwrap();
+        let offset = editor.text_offset_x();
+        let start = offset + caret.x0 as f32;
+        let end = offset + caret.x1 as f32;
+        assert!(start >= 0.0, "caret starts at {start} before the viewport");
+        assert!(end <= width, "caret ends at {end} after viewport {width}");
     }
 
     #[test]
@@ -404,6 +418,41 @@ mod tests {
         );
         editor.move_to_start(true);
         assert_eq!(editor.selection_range(), 0..editor.value().len());
+    }
+
+    #[test]
+    fn horizontal_scroll_keeps_ltr_caret_visible_at_both_ends() {
+        let mut editor = editor_with_width("a long value that needs horizontal scrolling", 40.0);
+        assert_caret_visible(&editor, 40.0);
+        editor.move_to_start(false);
+        assert_caret_visible(&editor, 40.0);
+        editor.move_to_end(false);
+        assert_caret_visible(&editor, 40.0);
+    }
+
+    #[test]
+    fn horizontal_scroll_keeps_rtl_caret_visible_at_both_ends() {
+        let mut editor = editor_with_width("אבגדה וזחטי כלמנס עפצקר שת", 40.0);
+        assert!(editor.layout().full_width() > 40.0);
+        assert_caret_visible(&editor, 40.0);
+        editor.move_to_start(false);
+        assert_caret_visible(&editor, 40.0);
+        editor.move_to_end(false);
+        assert_caret_visible(&editor, 40.0);
+    }
+
+    #[test]
+    fn short_values_keep_their_alignment_while_the_caret_moves() {
+        let mut editor = editor_with_width("short", 160.0);
+        assert!(editor.layout().full_width() < 160.0);
+        assert_eq!(editor.text_offset_x(), 0.0);
+        assert_caret_visible(&editor, 160.0);
+        editor.move_to_start(false);
+        assert_eq!(editor.text_offset_x(), 0.0);
+        assert_caret_visible(&editor, 160.0);
+        editor.move_to_end(false);
+        assert_eq!(editor.text_offset_x(), 0.0);
+        assert_caret_visible(&editor, 160.0);
     }
 
     #[test]
