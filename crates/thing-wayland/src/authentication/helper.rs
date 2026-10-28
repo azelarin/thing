@@ -3,7 +3,7 @@ use std::{
     fs, io,
     mem::MaybeUninit,
     os::{
-        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
         unix::fs::MetadataExt,
     },
     path::Path,
@@ -68,8 +68,7 @@ fn secure_policy_metadata(is_file: bool, uid: u32, mode: u32) -> bool {
 pub fn run() -> io::Result<()> {
     harden_secret_process()?;
     preflight_policy()?;
-    // SAFETY: the hidden entry point runs once and takes ownership of its open stdin.
-    let socket = unsafe { OwnedFd::from_raw_fd(libc::STDIN_FILENO) };
+    let socket = take_fd(libc::STDIN_FILENO)?;
     validate_socket(socket.as_fd())?;
     let id = receive_begin(socket.as_fd())?;
     let username = real_username()?;
@@ -146,18 +145,10 @@ impl<'a> PamConversation<'a> {
             self.failed = true;
         }
     }
-}
 
-impl ConversationHandler for PamConversation<'_> {
-    fn prompt_echo_on(&mut self, _prompt: &CStr) -> Result<CString, ErrorCode> {
-        self.failed = true;
-        Err(ErrorCode::CONV_ERR)
-    }
-
-    fn prompt_echo_off(&mut self, prompt: &CStr) -> Result<CString, ErrorCode> {
+    fn prompt_echo_off_inner(&mut self, prompt: &CStr) -> Result<CString, ErrorCode> {
         self.prompts = self.prompts.checked_add(1).ok_or(ErrorCode::CONV_ERR)?;
         if self.prompts > MAX_PROMPTS {
-            self.failed = true;
             return Err(ErrorCode::CONV_ERR);
         }
         let generation = self.prompts - 1;
@@ -181,6 +172,21 @@ impl ConversationHandler for PamConversation<'_> {
         drop(secret);
         Ok(response)
     }
+}
+
+impl ConversationHandler for PamConversation<'_> {
+    fn prompt_echo_on(&mut self, _prompt: &CStr) -> Result<CString, ErrorCode> {
+        self.failed = true;
+        Err(ErrorCode::CONV_ERR)
+    }
+
+    fn prompt_echo_off(&mut self, prompt: &CStr) -> Result<CString, ErrorCode> {
+        let result = self.prompt_echo_off_inner(prompt);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
 
     fn text_info(&mut self, message: &CStr) {
         self.send_text(message, false);
@@ -199,6 +205,17 @@ impl ConversationHandler for PamConversation<'_> {
         self.failed = true;
         Err(ErrorCode::CONV_ERR)
     }
+}
+
+fn take_fd(fd: RawFd) -> io::Result<OwnedFd> {
+    // Validate the inherited descriptor before constructing OwnedFd. The
+    // hidden helper is single-threaded, so it cannot be closed between calls.
+    // SAFETY: F_GETFD only inspects the descriptor number.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl proved fd is open and ownership is transferred once.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 fn receive_begin(socket: BorrowedFd<'_>) -> io::Result<AttemptId> {
@@ -371,6 +388,75 @@ mod tests {
             Err(ErrorCode::CONV_ERR)
         );
         assert!(conversation.failed);
+    }
+
+    #[test]
+    fn every_echo_off_error_latches_conversation_failure() {
+        let id = AttemptId {
+            lock: 1,
+            attempt: 1,
+        };
+        let prompt = c"password";
+
+        let (missing, _peer) = Socket::pair(Domain::UNIX, Type::SEQPACKET, None).unwrap();
+        let mut conversation = PamConversation::new(missing.as_fd(), id);
+        assert_eq!(
+            conversation.prompt_echo_off(prompt),
+            Err(ErrorCode::CONV_ERR)
+        );
+        assert!(conversation.failed);
+
+        let (overflow, _peer) = Socket::pair(Domain::UNIX, Type::SEQPACKET, None).unwrap();
+        let mut conversation = PamConversation::new(overflow.as_fd(), id);
+        conversation.prompts = u64::MAX;
+        assert_eq!(
+            conversation.prompt_echo_off(prompt),
+            Err(ErrorCode::CONV_ERR)
+        );
+        assert!(conversation.failed);
+
+        let (invalid, _peer) = Socket::pair(Domain::UNIX, Type::SEQPACKET, None).unwrap();
+        let mut conversation = PamConversation::new(invalid.as_fd(), id);
+        conversation.initial = Some(SecretBytes::copy_from(b"invalid\0secret").unwrap());
+        assert_eq!(
+            conversation.prompt_echo_off(prompt),
+            Err(ErrorCode::CONV_ERR)
+        );
+        assert!(conversation.failed);
+
+        let (closed, peer) = Socket::pair(Domain::UNIX, Type::SEQPACKET, None).unwrap();
+        let mut conversation = PamConversation::new(closed.as_fd(), id);
+        conversation.prompts = 1;
+        drop(peer);
+        assert_eq!(
+            conversation.prompt_echo_off(prompt),
+            Err(ErrorCode::CONV_ERR)
+        );
+        assert!(conversation.failed);
+
+        let (out_of_order, peer) = Socket::pair(Domain::UNIX, Type::SEQPACKET, None).unwrap();
+        let mut conversation = PamConversation::new(out_of_order.as_fd(), id);
+        conversation.prompts = 1;
+        protocol::send(
+            peer.as_fd(),
+            &Packet::Ready {
+                id: AttemptId {
+                    lock: 2,
+                    attempt: 2,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            conversation.prompt_echo_off(prompt),
+            Err(ErrorCode::CONV_ERR)
+        );
+        assert!(conversation.failed);
+    }
+
+    #[test]
+    fn taking_a_closed_descriptor_fails_before_assuming_ownership() {
+        assert_eq!(take_fd(-1).unwrap_err().raw_os_error(), Some(libc::EBADF));
     }
 
     #[test]

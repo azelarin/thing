@@ -25,6 +25,7 @@ impl ProcessContext {
     pub fn prepare() -> io::Result<Self> {
         normalize_sigchld()?;
         check_pidfd_support()?;
+        check_close_range_support()?;
         let mut mask = MaybeUninit::<libc::sigset_t>::uninit();
         // SAFETY: a null input set asks pthread_sigmask to initialize mask.
         let status =
@@ -74,6 +75,7 @@ impl ProcessContext {
                 if libc::getppid() != parent_pid {
                     libc::_exit(126);
                 }
+                mark_unrelated_fds_close_on_exec()?;
                 Ok(())
             });
         }
@@ -203,6 +205,43 @@ fn check_pidfd_support() -> io::Result<()> {
     Ok(())
 }
 
+fn check_close_range_support() -> io::Result<()> {
+    // Probe an empty practical range without changing any live descriptor.
+    // SAFETY: close_range accepts integer bounds and flags only.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            u32::MAX,
+            u32::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn mark_unrelated_fds_close_on_exec() -> io::Result<()> {
+    // stdin is the protocol socket and stdout/stderr are /dev/null. Mark every
+    // other descriptor close-on-exec, including descriptors inherited without
+    // CLOEXEC from the caller. The command's exec-error pipe remains usable
+    // until exec and closes with the rest on success.
+    // SAFETY: close_range accepts integer bounds and flags only.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3_u32,
+            u32::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
     // SAFETY: pidfd_open accepts a process id and zero flags.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -215,11 +254,16 @@ fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, os::fd::AsRawFd, process::Command};
+    use std::{
+        env,
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        process::Command,
+    };
 
     use super::*;
 
     const PROBE: &str = "THING_SIGCHLD_PROBE";
+    const FD_PROBE: &str = "THING_AUTH_FD_PROBE";
 
     #[test]
     fn normalizes_inherited_ignored_and_auto_reaped_children() {
@@ -270,5 +314,44 @@ mod tests {
             let flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFD) };
             assert_ne!(flags & libc::FD_CLOEXEC, 0);
         }
+    }
+
+    #[test]
+    fn execed_child_closes_deliberately_inheritable_descriptors() {
+        // SAFETY: F_DUPFD returns a new descriptor numbered at least three.
+        let raw = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD, 3) };
+        assert_ne!(raw, -1);
+        // SAFETY: F_DUPFD returned a new descriptor owned by this scope.
+        let inherited = unsafe { OwnedFd::from_raw_fd(raw) };
+        // Deliberately remove CLOEXEC to model a descriptor created elsewhere.
+        // SAFETY: inherited is live and F_SETFD accepts zero flags.
+        let status = unsafe { libc::fcntl(inherited.as_raw_fd(), libc::F_SETFD, 0) };
+        assert_ne!(status, -1);
+
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "authentication::process::tests::inherited_fd_probe",
+                "--nocapture",
+            ])
+            .env(FD_PROBE, inherited.as_raw_fd().to_string());
+        // SAFETY: the closure uses one async-signal-safe system call.
+        unsafe {
+            command.pre_exec(mark_unrelated_fds_close_on_exec);
+        }
+        let status = command.status().unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn inherited_fd_probe() {
+        let Some(raw) = env::var_os(FD_PROBE) else {
+            return;
+        };
+        let raw: libc::c_int = raw.to_string_lossy().parse().unwrap();
+        // SAFETY: F_GETFD only inspects the descriptor number.
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
     }
 }
