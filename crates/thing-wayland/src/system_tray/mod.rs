@@ -343,10 +343,12 @@ async fn session(
         }
     }
 
-    let host_names = request_host_names(&connection, &unique_name).await?;
-    let mut owned_host_names = WATCHER_PROTOCOLS.into_iter().collect::<BTreeSet<_>>();
+    let host_names = host_names(&unique_name);
+    let mut owned_host_names = BTreeSet::new();
     let mut active_host = None;
     if watcher_owned {
+        acquire_host_names(&connection, &host_names).await?;
+        owned_host_names.extend(WATCHER_PROTOCOLS);
         let mut registry = lock(&watcher_registry);
         for host_name in host_names.values() {
             registry.hosts.insert(
@@ -980,35 +982,62 @@ enum WatcherAcquisition {
 async fn acquire_watcher_names(connection: &Connection) -> Result<WatcherAcquisition, String> {
     let mut acquired = Vec::new();
     for protocol in WATCHER_PROTOCOLS {
-        match request_name_without_queue(connection, protocol.name).await? {
-            true => acquired.push(protocol.name),
-            false => {
-                for name in acquired.into_iter().rev() {
-                    connection
-                        .release_name(name)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                }
+        match request_name_without_queue(connection, protocol.name).await {
+            Ok(true) => acquired.push(protocol.name.to_owned()),
+            Ok(false) => {
+                release_names(connection, &acquired).await?;
                 return Ok(WatcherAcquisition::Declined);
+            }
+            Err(error) => {
+                if let Err(rollback) = release_names(connection, &acquired).await {
+                    return Err(format!("{error}; {rollback}"));
+                }
+                return Err(error);
             }
         }
     }
     Ok(WatcherAcquisition::Owned)
 }
 
-async fn request_host_names(
+fn host_names(unique_name: &str) -> BTreeMap<WatcherProtocol, String> {
+    WATCHER_PROTOCOLS
+        .into_iter()
+        .map(|protocol| (protocol, host_name(protocol, unique_name)))
+        .collect()
+}
+
+async fn acquire_host_names(
     connection: &Connection,
-    unique_name: &str,
-) -> Result<BTreeMap<WatcherProtocol, String>, String> {
-    let mut names = BTreeMap::new();
+    names: &BTreeMap<WatcherProtocol, String>,
+) -> Result<(), String> {
+    let mut acquired = Vec::new();
     for protocol in WATCHER_PROTOCOLS {
-        let name = host_name(protocol, unique_name);
-        if !request_name_without_queue(connection, &name).await? {
-            return Err("cannot acquire a unique status notifier host name".into());
+        let name = &names[&protocol];
+        match request_name_without_queue(connection, name).await {
+            Ok(true) => acquired.push(name.clone()),
+            Ok(false) => {
+                release_names(connection, &acquired).await?;
+                return Err("cannot acquire a unique status notifier host name".into());
+            }
+            Err(error) => {
+                if let Err(rollback) = release_names(connection, &acquired).await {
+                    return Err(format!("{error}; {rollback}"));
+                }
+                return Err(error);
+            }
         }
-        names.insert(protocol, name);
     }
-    Ok(names)
+    Ok(())
+}
+
+async fn release_names(connection: &Connection, names: &[String]) -> Result<(), String> {
+    for name in names.iter().rev() {
+        connection
+            .release_name(name.as_str())
+            .await
+            .map_err(|error| format!("failed to release partially acquired name: {error}"))?;
+    }
+    Ok(())
 }
 
 async fn request_name_without_queue(connection: &Connection, name: &str) -> Result<bool, String> {
@@ -1553,6 +1582,15 @@ mod tests {
         let empty = wait_for(&tray, |snapshot| snapshot.available);
         assert!(empty.watcher_owned);
         assert!(empty.items.is_empty());
+        let observer = async_io::block_on(
+            zbus::connection::Builder::address(address.as_str())
+                .unwrap()
+                .build(),
+        )
+        .unwrap();
+        let dbus = async_io::block_on(DBusProxy::new(&observer)).unwrap();
+        assert_eq!(bus_name_count(&dbus, KDE_HOST_PREFIX), 1);
+        assert_eq!(bus_name_count(&dbus, FREEDESKTOP_HOST_PREFIX), 1);
 
         let state = Arc::new(Mutex::new(FakeItemState::default()));
         let calls = Arc::new(FakeCalls::default());
@@ -1637,6 +1675,7 @@ mod tests {
         assert_ne!(replacement.items[0].id, first_id);
 
         drop(tray);
+        drop(observer);
         drop(item_connection);
         bus.stop();
     }
@@ -1764,6 +1803,8 @@ mod tests {
             async_io::block_on(get_name_owner(&dbus, KDE_WATCHER_NAME)).unwrap(),
             None
         );
+        assert_eq!(bus_name_count(&dbus, KDE_HOST_PREFIX), 0);
+        assert_eq!(bus_name_count(&dbus, FREEDESKTOP_HOST_PREFIX), 1);
 
         let kde_registry = Arc::new(Mutex::new(WatcherRegistry::default()));
         let kde_watcher = external_watcher(&address, KDE_PROTOCOL, kde_registry.clone());
@@ -1936,15 +1977,27 @@ mod tests {
         let tray = SystemTray::start_at(SystemTrayMode::Host, Some(address.clone()), ping).unwrap();
         thread::sleep(Duration::from_millis(150));
         assert!(!lock(&tray.shared).online);
+        let observer = async_io::block_on(
+            zbus::connection::Builder::address(address.as_str())
+                .unwrap()
+                .build(),
+        )
+        .unwrap();
+        let dbus = async_io::block_on(DBusProxy::new(&observer)).unwrap();
+        assert_eq!(bus_name_count(&dbus, KDE_HOST_PREFIX), 0);
+        assert_eq!(bus_name_count(&dbus, FREEDESKTOP_HOST_PREFIX), 0);
 
         let registry = Arc::new(Mutex::new(WatcherRegistry::default()));
         let watcher = external_watcher(&address, KDE_PROTOCOL, registry.clone());
         let snapshot = wait_for(&tray, |snapshot| snapshot.available);
         assert!(!snapshot.watcher_owned);
         wait_until(|| !lock(&registry).hosts.is_empty());
+        assert_eq!(bus_name_count(&dbus, KDE_HOST_PREFIX), 1);
+        assert_eq!(bus_name_count(&dbus, FREEDESKTOP_HOST_PREFIX), 0);
 
         drop(watcher);
         drop(tray);
+        drop(observer);
         bus.stop();
     }
 
@@ -2277,6 +2330,14 @@ mod tests {
             &(registration,),
         ))
         .unwrap();
+    }
+
+    fn bus_name_count(dbus: &DBusProxy<'_>, prefix: &str) -> usize {
+        async_io::block_on(dbus.list_names())
+            .unwrap()
+            .into_iter()
+            .filter(|name| name.as_str().starts_with(prefix))
+            .count()
     }
 
     fn wait_for(
