@@ -39,10 +39,18 @@ jobs:
         run: cargo fmt --all --check
       - name: run clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: run vulkan clippy
+        run: cargo clippy --locked --workspace --all-targets --features thing/vulkan -- -D warnings
       - name: run rust tests
         run: cargo test --locked --workspace
+      - name: run vulkan tests
+        run: cargo test --locked --workspace --features thing/vulkan
       - name: build documentation
         run: cargo doc --locked --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: build vulkan documentation
+        run: cargo doc --locked --workspace --no-deps --features thing/vulkan
         env:
           RUSTDOCFLAGS: -D warnings
       - name: run tool tests
