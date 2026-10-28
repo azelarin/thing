@@ -94,16 +94,36 @@ fn check_works_without_display_and_returns_distinct_error_codes() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("expected opengl or vulkan"));
 
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .arg("lock")
+        .args(["--renderer", "software"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected opengl or vulkan"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .arg("lock")
+        .arg("--notification-server")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option"));
+
     #[cfg(not(feature = "vulkan"))]
     {
-        let output = Command::new(env!("CARGO_BIN_EXE_thing"))
-            .arg("run")
-            .args(["--renderer", "vulkan"])
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&output.stderr).contains("--features vulkan"));
+        for command in ["run", "lock"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+                .arg(command)
+                .args(["--renderer", "vulkan"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("--features vulkan"));
+        }
     }
 }
 
