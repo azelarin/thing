@@ -51,7 +51,7 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] per-output configuration
 - [x] application launching
 - [x] panel sizing and input regions
-- [ ] popup positioning controls
+- [x] popup positioning controls
 - [x] hover popups
 - [x] scrolling containers
 - [ ] text input and consistent key repeat

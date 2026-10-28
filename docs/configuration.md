@@ -158,7 +158,7 @@ widget kind; unkeyed children match by position and kind.
 | `image` | one of `source`, `icon`, `app_id`; optional `icon_theme` |
 | `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll`, `on_hover` |
 | `slider` | `min`, `max`, `value`, `step`, `on_change`, `on_hover` |
-| `popup` | `visible`, `open_on_hover`, `open_on_click`, `open_delay`, `close_delay`, `on_hover`, `on_close` |
+| `popup` | `visible`, `open_on_hover`, `open_on_click`, `open_delay`, `close_delay`, `anchor`, `alignment`, `offset`, `constraints`, `on_hover`, `on_close` |
 | containers | `children`: array of widgets, or a function returning one |
 
 use a positive `max_lines` to limit a text widget. omitted lines are clipped by
@@ -507,8 +507,37 @@ return ui.panel {
 }
 ```
 
-the host anchors the popup to its nearest button ancestor and asks the compositor
-to constrain its position to the output.
+the host positions the popup from its nearest button ancestor. `anchor` chooses
+the side of that button: `'top'`, `'bottom'`, `'left'`, or `'right'`. its default,
+`'auto'`, opens away from the panel's output edge. `alignment` is physical: start
+and end mean left and right along a top or bottom anchor, and top and bottom along
+a left or right anchor. it defaults to `'end'`, preserving the original placement
+for a top panel.
+
+`offset = { x, y }` moves the result in surface-local logical pixels. both values
+default to zero and may range from -100,000 to 100,000. for example, this centers
+a popup below its button with an eight-pixel gap:
+
+```luau
+ui.popup {
+    alignment = 'center',
+    offset = { y = 8 },
+    style = { width = 240, height = 160 },
+}
+```
+
+the compositor keeps popups inside its own constraint boundary. by default it
+may flip the popup on either axis and slide it along the alignment axis. replace
+that behavior with a `constraints` table containing any of `flip_x`, `flip_y`,
+`slide_x`, and `slide_y`; omitted fields are false, and an empty table disables
+all adjustments. returning `nil` from a reactive `constraints` property restores
+the automatic choice. the protocol does not provide a separate inset from the
+constraint boundary.
+
+placement properties and popup dimensions may be reactive. an open popup moves
+after its trigger's layout changes, while a successful configuration reload
+continues to close it. compositors with xdg-shell version 2 or older apply a
+changed placement the next time the popup opens.
 
 for a popup that opens on hover, let the host manage the delay and the crossing
 between the button and popup surfaces:
