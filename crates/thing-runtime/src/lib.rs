@@ -172,6 +172,23 @@ struct UiIdentity {
     kind: Kind,
 }
 
+fn ui_target_identity_matches(current: &UiTarget, previous: &UiTarget) -> bool {
+    current.lineage.len() == previous.lineage.len()
+        && current
+            .lineage
+            .iter()
+            .zip(previous.lineage.iter())
+            .all(|(current, previous)| {
+                current.node == previous.node
+                    && current.kind == previous.kind
+                    && (current.source == previous.source
+                        || previous
+                            .key
+                            .as_ref()
+                            .is_some_and(|key| current.key.as_ref() == Some(key)))
+            })
+}
+
 #[derive(Default)]
 struct UiContext {
     action_start: Option<usize>,
@@ -343,7 +360,7 @@ impl Runtime {
             output,
         };
         runtime.surfaces = runtime.parse_surfaces(exported)?;
-        runtime.sync_ui_targets();
+        let _ = runtime.sync_ui_targets();
         Ok(runtime)
     }
 
@@ -508,20 +525,7 @@ impl Runtime {
         else {
             return false;
         };
-        current.lineage.len() == target.lineage.len()
-            && current
-                .lineage
-                .iter()
-                .zip(target.lineage.iter())
-                .all(|(current, previous)| {
-                    current.node == previous.node
-                        && current.kind == previous.kind
-                        && (current.source == previous.source
-                            || previous
-                                .key
-                                .as_ref()
-                                .is_some_and(|key| current.key.as_ref() == Some(key)))
-                })
+        ui_target_identity_matches(current, target)
     }
 
     pub fn ui_action_is_current(&self, action: &UiAction) -> bool {
@@ -1052,11 +1056,9 @@ impl Runtime {
         self.sources = sources;
         let changed = candidate != self.surfaces;
         self.surfaces = candidate;
-        if ui_structure_changed {
-            self.sync_ui_targets();
-        }
+        let ui_identity_changed = ui_structure_changed && self.sync_ui_targets();
         self.deferred.clear();
-        Ok(changed || self.has_active_transitions())
+        Ok(changed || ui_identity_changed || self.has_active_transitions())
     }
 
     /// advance active style animations to a monotonic point in time.
@@ -1179,7 +1181,7 @@ impl Runtime {
         self.ui.borrow_mut().actions.truncate(checkpoint.ui);
     }
 
-    fn sync_ui_targets(&self) {
+    fn sync_ui_targets(&self) -> bool {
         fn collect(
             node: &Node,
             sources: &BTreeMap<NodeId, u64>,
@@ -1213,7 +1215,15 @@ impl Runtime {
         for surface in &self.surfaces {
             collect(&surface.root, &self.sources, &mut Vec::new(), &mut targets);
         }
-        self.ui.borrow_mut().targets = targets;
+        let mut context = self.ui.borrow_mut();
+        let identity_changed = context.targets.values().any(|previous| {
+            self.sources
+                .get(&previous.node)
+                .and_then(|source| targets.get(source))
+                .is_none_or(|current| !ui_target_identity_matches(current, previous))
+        });
+        context.targets = targets;
+        identity_changed
     }
 
     fn evaluate_binding(&self, index: usize) -> Result<Value> {
@@ -1866,7 +1876,7 @@ mod ui_action_tests {
     fn stale_unkeyed_handles_do_not_target_positional_replacements() {
         let (_directory, mut runtime, target) = replacement_fixture("");
         let trigger = runtime.root().unwrap().children[0].id;
-        assert!(!runtime.dispatch(trigger, Event::Click).unwrap());
+        assert!(runtime.dispatch(trigger, Event::Click).unwrap());
         assert_eq!(runtime.root().unwrap().children[1].children[0].id, target);
         assert!(runtime.take_ui_actions().is_empty());
     }
@@ -1907,7 +1917,7 @@ mod ui_action_tests {
     fn replaced_ancestors_require_their_own_key_continuity() {
         let (_directory, mut runtime, target) = ancestor_replacement_fixture("");
         let trigger = runtime.root().unwrap().children[0].id;
-        assert!(!runtime.dispatch(trigger, Event::Click).unwrap());
+        assert!(runtime.dispatch(trigger, Event::Click).unwrap());
         assert_eq!(
             runtime.root().unwrap().children[1].children[0].children[0].id,
             target
