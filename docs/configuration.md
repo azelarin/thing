@@ -45,6 +45,36 @@ reports it in the terminal and keeps the previous configuration running.
 use `thing check ./panel.luau` to check a file without opening a panel. the
 sections below explain the rest of the api.
 
+## editor support
+
+thing includes a definition file for luau-lsp. write a copy beside your
+configuration, and repeat this after upgrading thing:
+
+```sh
+thing types > ./thing.d.luau
+```
+
+for the luau-lsp vscode extension, select the standard luau platform and add the
+file to your workspace settings:
+
+```json
+{
+    "luau-lsp.platform.type": "standard",
+    "luau-lsp.types.definitionFiles": {
+        "@thing": "thing.d.luau"
+    }
+}
+```
+
+other editors can start the server with
+`--platform=standard --definitions:@thing=/path/to/thing.d.luau`. the same
+options work with `luau-lsp analyze` for a command-line type check.
+
+the definitions cover widget properties, state, and service records, which
+provides completion and catches ordinary type mistakes. they cannot express
+every numeric limit, placement rule, or relationship between properties, so
+keep using `thing check` for thing's runtime validation.
+
 ## outputs
 
 thing runs a separate configuration for each connected output. all surfaces
@@ -459,6 +489,14 @@ in place.
 can hold a finite number, utf-8 string, boolean, or `nil`. it cannot hold a table;
 changing a table in place would bypass update tracking. a configuration can create
 at most 10,000 state values.
+
+the editor definitions infer a state's type from its initial value. when a state
+intentionally changes between scalar types, choose the union explicitly:
+
+```luau
+local status = ui.state<<number | string>>(0)
+status:set('ready')
+```
 
 use a function when a property should follow state:
 

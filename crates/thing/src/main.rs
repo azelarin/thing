@@ -2,7 +2,8 @@ use std::{env, ffi::OsStr, path::PathBuf, process::ExitCode};
 use thing_runtime::Runtime;
 use thing_wayland::{Renderer, RunOptions, SystemTrayMode};
 
-const HELP: &str = "thing — a programmable Wayland shell\n\nUsage:\n  thing run [--renderer <opengl|vulkan>] [--notification-server] [--system-tray <host|own-watcher>] <entry.luau>\n  thing check <entry.luau>\n\nCommands:\n  run    Open a panel on each Wayland output\n  check  Evaluate a configuration and validate its widget tree\n\nOptions:\n      --renderer             Select the graphics backend for run (default: opengl)\n      --notification-server  Provide the desktop notification service\n      --system-tray          Enable status notifier support in host or own-watcher mode\n  -h, --help                 Show this help\n  -V, --version              Show the version\n";
+const HELP: &str = "thing — a programmable Wayland shell\n\nUsage:\n  thing run [--renderer <opengl|vulkan>] [--notification-server] [--system-tray <host|own-watcher>] <entry.luau>\n  thing check <entry.luau>\n  thing types\n\nCommands:\n  run    Open a panel on each Wayland output\n  check  Evaluate a configuration and validate its widget tree\n  types  Write Luau editor definitions to standard output\n\nOptions:\n      --renderer             Select the graphics backend for run (default: opengl)\n      --notification-server  Provide the desktop notification service\n      --system-tray          Enable status notifier support in host or own-watcher mode\n  -h, --help                 Show this help\n  -V, --version              Show the version\n";
+const LUAU_TYPES: &str = include_str!("../types/thing.d.luau");
 
 fn main() -> ExitCode {
     match run() {
@@ -25,6 +26,21 @@ fn run() -> Result<(), (u8, String)> {
     }
     if command == "--version" || command == "-V" {
         println!("thing {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if command == "types" {
+        match args.next() {
+            None => print!("{LUAU_TYPES}"),
+            Some(argument) if argument == "--help" || argument == "-h" => {
+                print!("{HELP}");
+            }
+            Some(argument) => {
+                return Err((
+                    2,
+                    format!("types does not accept arguments (got {argument:?})"),
+                ));
+            }
+        }
         return Ok(());
     }
     if command != "check" && command != "run" {

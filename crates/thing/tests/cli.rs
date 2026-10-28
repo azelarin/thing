@@ -1,6 +1,26 @@
 use std::{fs, process::Command};
 
 #[test]
+fn types_writes_the_luau_definition_without_runtime_dependencies() {
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .arg("types")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, include_bytes!("../types/thing.d.luau"));
+    assert!(output.stderr.is_empty());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .args(["types", "unexpected"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not accept arguments"));
+}
+
+#[test]
 fn check_works_without_display_and_returns_distinct_error_codes() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("panel.luau");
