@@ -14,6 +14,22 @@ fn check_works_without_display_and_returns_distinct_error_codes() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
 
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/does/not/exist")
+        .arg("check")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .arg("check")
+        .arg("--notification-server")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+
     fs::write(&path, "return ui.panel { style = { width = -1 } }").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_thing"))
         .arg("check")

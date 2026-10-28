@@ -5,6 +5,7 @@ use mlua::{Error, Lua, Result, Table, UserData, UserDataMethods, Value};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
+    mem::size_of,
     rc::Rc,
 };
 
@@ -29,6 +30,13 @@ pub enum Action {
     Media {
         action: MediaAction,
         player: Option<String>,
+    },
+    DismissNotification {
+        key: u64,
+    },
+    InvokeNotification {
+        key: u64,
+        action: String,
     },
     Launch {
         argv: Vec<String>,
@@ -137,6 +145,98 @@ pub struct PowerDevice {
     pub icon_name: Option<String>,
     pub warning_level: String,
     pub battery_level: Option<String>,
+}
+
+/// an action advertised by a desktop notification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotificationButton {
+    pub key: String,
+    pub label: String,
+}
+
+/// the urgency supplied by a notification client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotificationUrgency {
+    Low,
+    Normal,
+    Critical,
+}
+
+impl NotificationUrgency {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Normal => "normal",
+            Self::Critical => "critical",
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::Normal => 1,
+            Self::Critical => 2,
+        }
+    }
+}
+
+/// one active notification, identified by an opaque ownership-lifetime key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notification {
+    /// pass this opaque key back to notification actions unchanged.
+    pub key: String,
+    /// the freedesktop protocol id, which may be reused after this record closes.
+    pub id: u32,
+    pub revision: u64,
+    pub app_name: String,
+    pub app_icon: String,
+    pub summary: String,
+    pub body: String,
+    pub actions: Vec<NotificationButton>,
+    pub urgency: NotificationUrgency,
+    pub raw_expire_timeout_ms: i32,
+    pub effective_timeout_ms: Option<u32>,
+    /// when the notification was first accepted, in server-relative milliseconds.
+    pub created_at_ms: u64,
+    /// when the notification was last replaced, in server-relative milliseconds.
+    pub updated_at_ms: u64,
+    /// a server-relative deadline, or none when the notification does not expire.
+    pub expires_at_ms: Option<u64>,
+    pub category: String,
+    pub desktop_entry: String,
+    pub image_path: String,
+    pub resident: bool,
+    pub transient: bool,
+    pub action_icons: bool,
+}
+
+/// one confirmed generation of notification-server state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NotificationSnapshot {
+    pub owned: bool,
+    pub error: String,
+    pub active: Vec<Notification>,
+}
+
+impl NotificationSnapshot {
+    fn values(&self) -> [(&'static str, Scalar); 2] {
+        [
+            ("notifications.owned", Scalar::Boolean(self.owned)),
+            ("notifications.error", Scalar::String(self.error.clone())),
+        ]
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (name, value) in self.values() {
+            validate_service(name, &value)?;
+        }
+        if !self.owned && !self.active.is_empty() {
+            return Err(Error::runtime(
+                "notification records require notification-server ownership",
+            ));
+        }
+        validate_notifications(&self.active)
+    }
 }
 
 impl AudioSnapshot {
@@ -311,6 +411,7 @@ pub struct ServiceSnapshot {
     pub(crate) media_players: Vec<MediaPlayer>,
     pub(crate) power_display: Option<PowerDevice>,
     pub(crate) power_devices: Vec<PowerDevice>,
+    pub(crate) notifications: Vec<Notification>,
     pub(crate) niri: NiriState,
 }
 
@@ -370,6 +471,15 @@ impl ServiceSnapshot {
         Ok(())
     }
 
+    pub fn set_notifications(&mut self, notifications: NotificationSnapshot) -> Result<()> {
+        notifications.validate()?;
+        for (name, value) in notifications.values() {
+            self.values.insert(name.into(), value);
+        }
+        self.notifications = notifications.active;
+        Ok(())
+    }
+
     pub fn set_niri(&mut self, state: NiriState) -> Result<()> {
         state.validate()?;
         self.niri = state;
@@ -387,6 +497,62 @@ struct MediaPlayerList {
     tracker: Rc<RefCell<Tracker>>,
     revision: usize,
     players: Rc<RefCell<Vec<MediaPlayer>>>,
+}
+
+struct NotificationList {
+    tracker: Rc<RefCell<Tracker>>,
+    revision: usize,
+    notifications: Rc<RefCell<Vec<Notification>>>,
+}
+
+impl UserData for NotificationList {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |lua, this, ()| {
+            this.tracker.borrow_mut().read(this.revision);
+            let list = lua.create_table()?;
+            for (index, notification) in this.notifications.borrow().iter().enumerate() {
+                let actions = lua.create_table()?;
+                for (action_index, action) in notification.actions.iter().enumerate() {
+                    let item = lua.create_table()?;
+                    item.set("key", action.key.as_str())?;
+                    item.set("label", action.label.as_str())?;
+                    item.set_readonly(true);
+                    actions.raw_set(action_index + 1, item)?;
+                }
+                actions.set_readonly(true);
+
+                let item = lua.create_table()?;
+                item.set("key", notification.key.as_str())?;
+                item.set("id", notification.id)?;
+                item.set("revision", notification.revision as f64)?;
+                item.set("app_name", notification.app_name.as_str())?;
+                item.set("app_icon", notification.app_icon.as_str())?;
+                item.set("summary", notification.summary.as_str())?;
+                item.set("body", notification.body.as_str())?;
+                item.set("actions", actions)?;
+                item.set("urgency", notification.urgency.name())?;
+                item.set("urgency_code", notification.urgency.code())?;
+                item.set("raw_expire_timeout_ms", notification.raw_expire_timeout_ms)?;
+                item.set("effective_timeout_ms", notification.effective_timeout_ms)?;
+                item.set("created_at_ms", notification.created_at_ms as f64)?;
+                item.set("updated_at_ms", notification.updated_at_ms as f64)?;
+                item.set(
+                    "expires_at_ms",
+                    notification.expires_at_ms.map(|v| v as f64),
+                )?;
+                item.set("category", notification.category.as_str())?;
+                item.set("desktop_entry", notification.desktop_entry.as_str())?;
+                item.set("image_path", notification.image_path.as_str())?;
+                item.set("resident", notification.resident)?;
+                item.set("transient", notification.transient)?;
+                item.set("action_icons", notification.action_icons)?;
+                item.set_readonly(true);
+                list.raw_set(index + 1, item)?;
+            }
+            list.set_readonly(true);
+            Ok(list)
+        });
+    }
 }
 
 impl UserData for MediaPlayerList {
@@ -576,6 +742,8 @@ pub(crate) struct Services {
     power_display_revision: usize,
     power_devices: Rc<RefCell<Vec<PowerDevice>>>,
     power_devices_revision: usize,
+    notifications: Rc<RefCell<Vec<Notification>>>,
+    notifications_revision: usize,
     niri: NiriData,
 }
 
@@ -588,6 +756,7 @@ impl Services {
         let media_players_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let power_display_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let power_devices_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
+        let notifications_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let niri = lua.create_table()?;
         let niri_data = NiriData::install(&niri, tracker.clone())?;
         let mut result = Self {
@@ -609,12 +778,15 @@ impl Services {
             power_display_revision,
             power_devices: Rc::default(),
             power_devices_revision,
+            notifications: Rc::default(),
+            notifications_revision,
             niri: niri_data,
         };
         let services = lua.create_table()?;
         let audio = lua.create_table()?;
         let clock = lua.create_table()?;
         let media = lua.create_table()?;
+        let notifications = lua.create_table()?;
         let output = lua.create_table()?;
         let power = lua.create_table()?;
         audio.set(
@@ -673,6 +845,14 @@ impl Services {
                 devices: result.power_devices.clone(),
             },
         )?;
+        notifications.set(
+            "active",
+            NotificationList {
+                tracker: result.tracker.clone(),
+                revision: notifications_revision,
+                notifications: result.notifications.clone(),
+            },
+        )?;
         for (name, value) in [
             ("audio.available", Scalar::Boolean(false)),
             ("audio.volume", Scalar::Number(0.0)),
@@ -701,6 +881,8 @@ impl Services {
             ("power.available", Scalar::Boolean(false)),
             ("power.on_battery", Scalar::Boolean(false)),
             ("power.error", Scalar::String(String::new())),
+            ("notifications.owned", Scalar::Boolean(false)),
+            ("notifications.error", Scalar::String(String::new())),
             ("niri.available", Scalar::Boolean(false)),
             ("niri.error", Scalar::String(String::new())),
             ("output.available", Scalar::Boolean(false)),
@@ -723,6 +905,7 @@ impl Services {
                 "audio" => audio.set(property, signal)?,
                 "clock" => clock.set(property, signal)?,
                 "media" => media.set(property, signal)?,
+                "notifications" => notifications.set(property, signal)?,
                 "niri" => niri.set(property, signal)?,
                 "output" => output.set(property, signal)?,
                 "power" => power.set(property, signal)?,
@@ -842,6 +1025,30 @@ impl Services {
         }
         media.set_readonly(true);
         power.set_readonly(true);
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        notifications.set(
+            "dismiss",
+            lua.create_function(move |_, key: Value| {
+                let key = notification_key(key)?;
+                enqueue(&actions, &allowed, Action::DismissNotification { key })
+            })?,
+        )?;
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        notifications.set(
+            "invoke",
+            lua.create_function(move |_, (key, action): (Value, String)| {
+                let key = notification_key(key)?;
+                validate_notification_action_key(&action)?;
+                enqueue(
+                    &actions,
+                    &allowed,
+                    Action::InvokeNotification { key, action },
+                )
+            })?,
+        )?;
+        notifications.set_readonly(true);
         for (name, action) in [
             (
                 "focus_workspace",
@@ -875,6 +1082,7 @@ impl Services {
         services.set("audio", audio)?;
         services.set("clock", clock)?;
         services.set("media", media)?;
+        services.set("notifications", notifications)?;
         services.set("niri", niri)?;
         services.set("output", output)?;
         services.set("power", power)?;
@@ -1095,6 +1303,30 @@ impl Services {
         Ok(())
     }
 
+    pub fn set_notifications(&self, notifications: NotificationSnapshot) -> Result<()> {
+        notifications.validate()?;
+        let records_changed = *self.notifications.borrow() != notifications.active;
+        let mut records = self.notifications.borrow_mut();
+        let mut tracker = self.tracker.borrow_mut();
+        let mut updates = notifications
+            .values()
+            .into_iter()
+            .map(|(name, value)| (self.signals[name], value))
+            .collect::<Vec<_>>();
+        if records_changed {
+            let revision = tracker.read(self.notifications_revision);
+            updates.push((
+                self.notifications_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            ));
+        }
+        tracker.write_batch(updates)?;
+        if records_changed {
+            *records = notifications.active;
+        }
+        Ok(())
+    }
+
     pub fn set_power_devices(
         &self,
         display: Option<PowerDevice>,
@@ -1132,6 +1364,20 @@ impl Services {
         Ok(())
     }
 
+    pub fn set_notification_records(&self, notifications: Vec<Notification>) -> Result<()> {
+        validate_notifications(&notifications)?;
+        if *self.notifications.borrow() != notifications {
+            *self.notifications.borrow_mut() = notifications;
+            let mut tracker = self.tracker.borrow_mut();
+            let revision = tracker.read(self.notifications_revision);
+            tracker.write(
+                self.notifications_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> ServiceSnapshot {
         let mut tracker = self.tracker.borrow_mut();
         let values = self
@@ -1149,6 +1395,7 @@ impl Services {
             media_players: self.media_players.borrow().clone(),
             power_display: self.power_display.borrow().clone(),
             power_devices: self.power_devices.borrow().clone(),
+            notifications: self.notifications.borrow().clone(),
             niri: self.niri.snapshot(),
         }
     }
@@ -1274,6 +1521,30 @@ fn media_player_id(value: Value) -> Result<Option<String>> {
     Ok(Some(value.to_owned()))
 }
 
+fn notification_key(value: Value) -> Result<u64> {
+    let Value::String(value) = value else {
+        return Err(Error::runtime("notification key must be a string"));
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| Error::runtime("notification key must be valid utf-8"))?;
+    let key = value
+        .parse::<u64>()
+        .map_err(|_| Error::runtime("invalid notification key"))?;
+    if key == 0 || value != key.to_string() {
+        return Err(Error::runtime("invalid notification key"));
+    }
+    Ok(key)
+}
+
+fn validate_notification_action_key(value: &str) -> Result<()> {
+    if value.is_empty() || invalid_notification_text(value) {
+        Err(Error::runtime("invalid notification action key"))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_service(name: &str, value: &Scalar) -> Result<()> {
     let valid = match (name, value) {
         (
@@ -1289,6 +1560,7 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "media.can_stop"
             | "power.available"
             | "power.on_battery"
+            | "notifications.owned"
             | "niri.available",
             Scalar::Boolean(_),
         ) => true,
@@ -1308,6 +1580,7 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "media.desktop_entry"
             | "media.error"
             | "power.error"
+            | "notifications.error"
             | "niri.error",
             Scalar::String(value),
         ) => value.len() <= 4096 && !value.contains('\0'),
@@ -1487,6 +1760,113 @@ fn valid_power_text(value: &str, max: usize) -> bool {
 
 fn invalid_media_text(value: &str, max: usize) -> bool {
     value.len() > max || value.contains('\0')
+}
+
+const MAX_SAFE_LUA_INTEGER: u64 = (1_u64 << 53) - 1;
+const MAX_NOTIFICATION_RETAINED_BYTES: usize = 512 * 1024;
+const MAX_ACTIVE_NOTIFICATION_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+
+fn validate_notifications(notifications: &[Notification]) -> Result<()> {
+    let mut keys = BTreeSet::new();
+    let mut ids = BTreeSet::new();
+    let mut retained_bytes = 0_usize;
+    let invalid = notifications.len() > 1_024
+        || notifications.iter().any(|notification| {
+            let valid_key = notification
+                .key
+                .parse::<u64>()
+                .is_ok_and(|key| key != 0 && key.to_string() == notification.key);
+            let record_bytes = notification_retained_bytes(notification);
+            let within_budget = record_bytes.is_some_and(|record_bytes| {
+                retained_bytes = retained_bytes.saturating_add(record_bytes);
+                record_bytes <= MAX_NOTIFICATION_RETAINED_BYTES
+                    && retained_bytes <= MAX_ACTIVE_NOTIFICATION_RETAINED_BYTES
+            });
+            !within_budget
+                || notification.id == 0
+                || notification.revision == 0
+                || notification.revision > MAX_SAFE_LUA_INTEGER
+                || !valid_key
+                || !keys.insert(notification.key.as_str())
+                || !ids.insert(notification.id)
+                || notification.actions.len() > 128
+                || notification.raw_expire_timeout_ms < -1
+                || notification.updated_at_ms < notification.created_at_ms
+                || notification.created_at_ms > MAX_SAFE_LUA_INTEGER
+                || notification.updated_at_ms > MAX_SAFE_LUA_INTEGER
+                || notification
+                    .expires_at_ms
+                    .is_some_and(|deadline| deadline > MAX_SAFE_LUA_INTEGER)
+                || match (
+                    notification.effective_timeout_ms,
+                    notification.expires_at_ms,
+                ) {
+                    (None, None) => false,
+                    (Some(timeout), Some(deadline)) => {
+                        timeout == 0
+                            || deadline
+                                != notification
+                                    .updated_at_ms
+                                    .saturating_add(u64::from(timeout))
+                    }
+                    _ => true,
+                }
+                || [
+                    &notification.app_name,
+                    &notification.app_icon,
+                    &notification.summary,
+                    &notification.body,
+                    &notification.category,
+                    &notification.desktop_entry,
+                    &notification.image_path,
+                ]
+                .into_iter()
+                .any(|value| invalid_notification_text(value))
+                || {
+                    let mut action_keys = BTreeSet::new();
+                    notification.actions.iter().any(|action| {
+                        validate_notification_action_key(&action.key).is_err()
+                            || invalid_notification_text(&action.label)
+                            || !action_keys.insert(action.key.as_str())
+                    })
+                }
+        });
+    if invalid {
+        Err(Error::runtime("invalid notification list"))
+    } else {
+        Ok(())
+    }
+}
+
+fn notification_retained_bytes(notification: &Notification) -> Option<usize> {
+    let text = [
+        &notification.key,
+        &notification.app_name,
+        &notification.app_icon,
+        &notification.summary,
+        &notification.body,
+        &notification.category,
+        &notification.desktop_entry,
+        &notification.image_path,
+    ];
+    let mut retained = size_of::<Notification>().checked_add(
+        notification
+            .actions
+            .capacity()
+            .checked_mul(size_of::<NotificationButton>())?,
+    )?;
+    for value in text {
+        retained = retained.checked_add(value.capacity())?;
+    }
+    for action in &notification.actions {
+        retained = retained.checked_add(action.key.capacity())?;
+        retained = retained.checked_add(action.label.capacity())?;
+    }
+    Some(retained)
+}
+
+fn invalid_notification_text(value: &str) -> bool {
+    value.len() > 64 * 1024 || value.contains('\0')
 }
 
 fn enqueue(actions: &RefCell<Vec<Action>>, allowed: &Cell<bool>, action: Action) -> Result<()> {

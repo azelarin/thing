@@ -68,13 +68,14 @@ use wayland_protocols::{
 use xkbcommon::xkb;
 
 use crate::{
-    Renderer,
+    Renderer, RunOptions,
     audio::Audio,
     configuration::Configurations,
     hover::{Command as HoverCommand, HoverKey, HoverStates, HoverTarget},
     launch::{self, LaunchRequest, Launcher, PendingLaunches},
     media::Media,
     niri::Niri,
+    notifications::Server as NotificationServer,
     panel::{self, Geometry, ResolvedInputRegion},
     popup::{self, Position as PopupPosition},
     power::Power,
@@ -86,6 +87,17 @@ use crate::{
 /// configuration, or a compositor frame callback arrives; unchanged surfaces do
 /// not request frames.
 pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
+    run_with_options(
+        entry,
+        RunOptions {
+            renderer,
+            ..RunOptions::default()
+        },
+    )
+}
+
+pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String> {
+    let renderer = options.renderer;
     if renderer == Renderer::Vulkan && !cfg!(feature = "vulkan") {
         return Err(
             "vulkan support is not included in this build; rebuild with --features vulkan".into(),
@@ -149,6 +161,14 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
     let power = Power::start(power_ping).map_err(|e| format!("cannot start power worker: {e}"))?;
     let (niri_ping, niri_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let niri = Niri::start(niri_ping).map_err(|e| format!("cannot start niri worker: {e}"))?;
+    let (notifications, notification_source) = if options.notification_server {
+        let (ping, source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
+        let server = NotificationServer::start(ping)
+            .map_err(|e| format!("cannot start notification server: {e}"))?;
+        (Some(server), Some(source))
+    } else {
+        (None, None)
+    };
     let mut event_loop: EventLoop<'static, App> =
         EventLoop::try_new().map_err(|error| error.to_string())?;
     let loop_handle = event_loop.handle();
@@ -163,6 +183,7 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
         media,
         power,
         niri,
+        notifications,
         launcher,
         pending_launches: PendingLaunches::new(),
         surfaces: Vec::new(),
@@ -233,6 +254,12 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
         .handle()
         .insert_source(power_source, |_, _, app| app.update_power())
         .map_err(|e| e.to_string())?;
+    if let Some(source) = notification_source {
+        event_loop
+            .handle()
+            .insert_source(source, |_, _, app| app.update_notifications())
+            .map_err(|e| e.to_string())?;
+    }
     WaylandSource::new(connection.clone(), queue)
         .insert(event_loop.handle())
         .map_err(|error| error.to_string())?;
@@ -574,6 +601,7 @@ struct App {
     media: Media,
     power: Power,
     niri: Niri,
+    notifications: Option<NotificationServer>,
     launcher: Launcher,
     pending_launches: PendingLaunches<XdgActivationTokenV1>,
     watch: Rc<Watch>,
@@ -674,6 +702,19 @@ impl App {
             return;
         };
         if let Err(error) = self.configurations.set_power(snapshot) {
+            eprintln!("thing: {error}");
+        }
+        self.refresh();
+    }
+    fn update_notifications(&mut self) {
+        let Some(snapshot) = self
+            .notifications
+            .as_ref()
+            .and_then(NotificationServer::take_snapshot)
+        else {
+            return;
+        };
+        if let Err(error) = self.configurations.set_notifications(snapshot) {
             eprintln!("thing: {error}");
         }
         self.refresh();
@@ -1411,6 +1452,18 @@ impl App {
                     self.request_launch(LaunchRequest { argv, cwd }, origin.as_ref());
                     Ok(())
                 }
+                Action::DismissNotification { key } => self
+                    .notifications
+                    .as_ref()
+                    .ok_or("notification server is disabled")
+                    .and_then(|server| server.dismiss(key))
+                    .map_err(str::to_owned),
+                Action::InvokeNotification { key, action } => self
+                    .notifications
+                    .as_ref()
+                    .ok_or("notification server is disabled")
+                    .and_then(|server| server.invoke(key, action))
+                    .map_err(str::to_owned),
                 action @ (Action::SetVolume(_)
                 | Action::SetMuted(_)
                 | Action::SetDefaultSink(_)
