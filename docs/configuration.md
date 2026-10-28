@@ -398,5 +398,5 @@ to constrain its position to the output.
 the host supports one grabbed popup at a time. an input event is required to open
 it. outside clicks and escape dismiss it and call `on_close`. tab/shift+tab move
 focus; return/space activate a focused button. slider arrows adjust by `step`
-(or 1% of the range when step is zero); home/end reach the endpoints. holding a
-key does not yet repeat the action.
+(or 1% of the range when step is zero); home/end reach the endpoints. key repeat
+currently depends on the compositor; thing does not generate repeated presses.
