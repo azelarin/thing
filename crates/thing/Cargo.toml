@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+vulkan = ["thing-wayland/vulkan"]
+
 [dependencies]
 thing-runtime = { path = "../thing-runtime" }
 thing-wayland = { path = "../thing-wayland" }

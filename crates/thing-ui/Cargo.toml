@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+wgpu = ["femtovg/wgpu"]
+
 [dependencies]
 thing-core = { path = "../thing-core" }
 taffy = { version = "0.15.1", default-features = false, features = ["std", "taffy_tree", "flexbox", "content_size"] }

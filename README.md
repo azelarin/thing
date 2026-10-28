@@ -10,7 +10,7 @@ the project is in early development, and the api is still changing.
 to build thing, you'll need rust 1.88 or newer, a c/c++ compiler, and pkg-config.
 you'll also need the development packages for these system libraries:
 
-- wayland and egl, for displaying panels and setting up graphics rendering
+- wayland and egl, for displaying panels with the default opengl es renderer
 - xkbcommon, for keyboard input
 - fontconfig, for finding installed fonts
 - pulseaudio, for reading and controlling audio devices
@@ -28,6 +28,17 @@ from the repository directory, install thing with cargo:
 cargo install --locked --path crates/thing
 ```
 
+vulkan support is available as an optional build feature. it uses the system's
+vulkan driver through wgpu, while keeping opengl es as the default renderer:
+
+```sh
+cargo install --locked --path crates/thing --features vulkan
+thing run --renderer vulkan path/to/panel.luau
+```
+
+renderer selection is explicit. if vulkan initialization fails, thing reports
+the error instead of silently switching to opengl.
+
 the [configuration guide](docs/configuration.md) walks through creating your
 first panel, then covers widgets, state, styling, and services. if you'd like to
 work on the framework, see [contributing](CONTRIBUTING.md).
@@ -42,7 +53,7 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] hover popups
 - [x] scrolling containers
 - [ ] text input and consistent key repeat
-- [ ] vulkan rendering alongside opengl
+- [x] vulkan rendering alongside opengl
 - [ ] drag and drop, animations, and custom shapes
 - [x] microphone controls
 - [ ] per-application audio controls
