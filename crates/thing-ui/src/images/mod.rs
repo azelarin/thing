@@ -10,7 +10,7 @@ use std::{
     thread,
 };
 
-use femtovg::{Canvas, ImageFlags, ImageId, ImageSource, renderer::Renderer, rgb::FromSlice};
+use skia_safe::{AlphaType, ColorType, Data, Image as SkiaImage, ImageInfo, images as skia_images};
 use thing_core::{Image, ImageFit, Rect};
 
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -53,10 +53,46 @@ struct Shared {
     changed: Condvar,
 }
 
+fn start_worker(wake: impl Fn() + Send + 'static) -> Result<Arc<Shared>, String> {
+    let shared = Arc::new(Shared::default());
+    let worker = shared.clone();
+    thread::Builder::new()
+        .name("thing-images".into())
+        .spawn(move || {
+            let mut icons = icons::Icons::default();
+            loop {
+                let key = {
+                    let mut inbox = lock(&worker.inbox);
+                    while !inbox.stop && (inbox.result.is_some() || inbox.requests.is_empty()) {
+                        inbox = worker
+                            .changed
+                            .wait(inbox)
+                            .unwrap_or_else(|e| e.into_inner());
+                    }
+                    if inbox.stop {
+                        break;
+                    }
+                    inbox.requests.pop_front().expect("waited for a request")
+                };
+                let result = decode(&key, &mut icons);
+                {
+                    let mut inbox = lock(&worker.inbox);
+                    if inbox.stop {
+                        break;
+                    }
+                    inbox.result = Some((key, result));
+                }
+                wake();
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(shared)
+}
+
 enum State {
     Pending,
     Ready {
-        id: ImageId,
+        image: SkiaImage,
         width: u32,
         height: u32,
     },
@@ -69,7 +105,7 @@ struct Entry {
 }
 
 struct Retired {
-    id: ImageId,
+    image: SkiaImage,
     bytes: usize,
 }
 
@@ -84,40 +120,8 @@ pub(super) struct Images {
 
 impl Images {
     pub fn new(wake: impl Fn() + Send + 'static) -> Result<Self, String> {
-        let shared = Arc::new(Shared::default());
-        let worker = shared.clone();
-        thread::Builder::new()
-            .name("thing-images".into())
-            .spawn(move || {
-                let mut icons = icons::Icons::default();
-                loop {
-                    let key = {
-                        let mut inbox = lock(&worker.inbox);
-                        while !inbox.stop && (inbox.result.is_some() || inbox.requests.is_empty()) {
-                            inbox = worker
-                                .changed
-                                .wait(inbox)
-                                .unwrap_or_else(|e| e.into_inner());
-                        }
-                        if inbox.stop {
-                            break;
-                        }
-                        inbox.requests.pop_front().expect("waited for a request")
-                    };
-                    let result = decode(&key, &mut icons);
-                    {
-                        let mut inbox = lock(&worker.inbox);
-                        if inbox.stop {
-                            break;
-                        }
-                        inbox.result = Some((key, result));
-                    }
-                    wake();
-                }
-            })
-            .map_err(|e| e.to_string())?;
         Ok(Self {
-            shared,
+            shared: start_worker(wake)?,
             cache: BTreeMap::new(),
             retired: Vec::new(),
             bytes: 0,
@@ -126,7 +130,7 @@ impl Images {
         })
     }
 
-    pub fn collect<R: Renderer>(&mut self, canvas: &mut Canvas<R>) {
+    pub fn collect(&mut self) {
         let result = lock(&self.shared.inbox).result.take();
         let Some((key, result)) = result else {
             return;
@@ -136,33 +140,38 @@ impl Images {
             return;
         }
         let state = match result.and_then(|pixels| {
-            while self.resident_bytes().saturating_add(pixels.rgba.len()) > CACHE_BYTES {
+            let bytes = pixels.rgba.len();
+            while self.resident_bytes().saturating_add(bytes) > CACHE_BYTES {
                 if !self.evict(Some(&key)) {
-                    return Err("image exceeds GPU cache budget".into());
+                    return Err("image exceeds decoded image cache budget".into());
                 }
-                // collect runs before this frame records drawing commands, so
-                // images evicted here can be released immediately.
-                self.release(canvas);
+                self.release();
             }
-            let source = ImageSource::Rgba(femtovg::imgref::Img::new(
-                pixels.rgba.as_rgba(),
-                pixels.width as usize,
-                pixels.height as usize,
-            ));
-            let flags = if pixels.premultiplied {
-                ImageFlags::PREMULTIPLIED
+            let width = pixels.width;
+            let height = pixels.height;
+            let alpha = if pixels.premultiplied {
+                AlphaType::Premul
             } else {
-                ImageFlags::empty()
+                AlphaType::Unpremul
             };
-            let id = canvas
-                .create_image(source, flags)
-                .map_err(|e| e.to_string())?;
-            self.bytes += pixels.rgba.len();
+            let info = ImageInfo::new(
+                (width as i32, height as i32),
+                ColorType::RGBA8888,
+                alpha,
+                None,
+            );
+            let image = skia_images::raster_from_data(
+                &info,
+                Data::new_copy(&pixels.rgba),
+                width as usize * 4,
+            )
+            .ok_or("Skia rejected decoded image pixels")?;
+            self.bytes += bytes;
             debug_assert!(self.resident_bytes() <= CACHE_BYTES);
             Ok(State::Ready {
-                id,
-                width: pixels.width,
-                height: pixels.height,
+                image,
+                width,
+                height,
             })
         }) {
             Ok(state) => state,
@@ -182,7 +191,7 @@ impl Images {
         fit: ImageFit,
         bounds: Rect,
         scale: f32,
-    ) -> Option<(ImageId, u32, u32)> {
+    ) -> Option<(SkiaImage, u32, u32)> {
         if image.source.is_none()
             && image.memory.is_none()
             && image.icon.is_none()
@@ -197,8 +206,12 @@ impl Images {
         self.tick = self.tick.saturating_add(1);
         if let Some(entry) = self.cache.get_mut(&key) {
             entry.touched = self.tick;
-            return match entry.state {
-                State::Ready { id, width, height } => Some((id, width, height)),
+            return match &entry.state {
+                State::Ready {
+                    image,
+                    width,
+                    height,
+                } => Some((image.clone(), *width, *height)),
                 _ => None,
             };
         }
@@ -233,12 +246,14 @@ impl Images {
             return false;
         };
         if let Some(entry) = self.cache.remove(&key)
-            && let State::Ready { id, width, height } = entry.state
+            && let State::Ready {
+                image,
+                width,
+                height,
+            } = entry.state
         {
-            // queued draw commands may still refer to this image. the painter
-            // deletes it after submitting the frame.
             let bytes = width as usize * height as usize * 4;
-            self.retired.push(Retired { id, bytes });
+            self.retired.push(Retired { image, bytes });
             self.bytes -= bytes;
             self.retired_bytes += bytes;
         }
@@ -246,12 +261,19 @@ impl Images {
         true
     }
 
-    pub fn release<R: Renderer>(&mut self, canvas: &mut Canvas<R>) {
+    pub fn release(&mut self) {
         for retired in self.retired.drain(..) {
-            canvas.delete_image(retired.id);
             self.retired_bytes -= retired.bytes;
+            drop(retired.image);
         }
         debug_assert_eq!(self.retired_bytes, 0);
+    }
+
+    pub fn clear(&mut self) {
+        self.cache.clear();
+        self.retired.clear();
+        self.bytes = 0;
+        self.retired_bytes = 0;
     }
 
     fn resident_bytes(&self) -> usize {
@@ -565,7 +587,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use femtovg::{PixelFormat, renderer::Void};
     use thing_core::{ImageCandidate, ImagePixmap, ImageSource};
 
     #[test]
@@ -603,48 +624,94 @@ mod tests {
     }
 
     #[test]
-    fn eviction_keeps_retired_bytes_resident_until_release() {
-        let mut canvas = Canvas::new(Void).unwrap();
-        let id = canvas
-            .create_image_empty(2, 2, PixelFormat::Rgba8, ImageFlags::empty())
-            .unwrap();
+    fn replacing_images_discards_previous_configuration_work() {
         let key = Key {
             image: Image::default(),
             fit: ImageFit::Contain,
-            width: 2,
-            height: 2,
+            width: 1,
+            height: 1,
             cover_aspect_bits: None,
         };
-        let mut cache = BTreeMap::new();
-        cache.insert(
-            key,
-            Entry {
-                state: State::Ready {
-                    id,
-                    width: 2,
-                    height: 2,
-                },
-                touched: 0,
-            },
-        );
-        let mut images = Images {
-            shared: Arc::new(Shared::default()),
-            cache,
+        let shared = Arc::new(Shared::default());
+        {
+            let mut inbox = lock(&shared.inbox);
+            inbox.requests.push_back(key.clone());
+            inbox.result = Some((
+                key,
+                Ok(Pixels {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![0; 4],
+                    premultiplied: true,
+                }),
+            ));
+        }
+        let images = Images {
+            shared: shared.clone(),
+            cache: BTreeMap::new(),
             retired: Vec::new(),
-            bytes: 16,
+            bytes: 0,
             retired_bytes: 0,
             tick: 0,
         };
 
+        drop(images);
+
+        let inbox = lock(&shared.inbox);
+        assert!(inbox.stop);
+        assert!(inbox.requests.is_empty());
+        assert!(inbox.result.is_none());
+    }
+
+    #[test]
+    fn images_accept_memory_sources_and_defer_retired_pixels() {
+        let pixmap = ImagePixmap::new(2, 1, vec![10, 20, 30, 128, 40, 50, 60, 255]).unwrap();
+        let candidate = ImageCandidate::new(None, vec![pixmap]).unwrap();
+        let image = Image {
+            memory: Some(ImageSource::new("tray1-image2".into(), vec![candidate]).unwrap()),
+            ..Image::default()
+        };
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 2.0,
+            height: 1.0,
+        };
+        let key = request_key(&image, ImageFit::Fill, bounds, 1.0);
+        let decoded = decode(&key, &mut icons::Icons::default()).unwrap();
+        let shared = Arc::new(Shared::default());
+        lock(&shared.inbox).result = Some((key.clone(), Ok(decoded)));
+        let mut cache = BTreeMap::new();
+        cache.insert(
+            key,
+            Entry {
+                state: State::Pending,
+                touched: 0,
+            },
+        );
+        let mut images = Images {
+            shared,
+            cache,
+            retired: Vec::new(),
+            bytes: 0,
+            retired_bytes: 0,
+            tick: 0,
+        };
+
+        images.collect();
+        let (raster, width, height) = images
+            .get(&image, ImageFit::Fill, bounds, 1.0)
+            .expect("the decoded in-memory image should be ready");
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(raster.alpha_type(), AlphaType::Unpremul);
+        assert_eq!(raster.peek_pixels().unwrap().get_color((0, 0)).a(), 128);
+        assert_eq!(images.resident_bytes(), 8);
+
         assert!(images.evict(None));
         assert_eq!(images.bytes, 0);
-        assert_eq!(images.retired_bytes, 16);
-        assert_eq!(images.resident_bytes(), 16);
-        assert!(canvas.image_info(id).is_ok());
-
-        images.release(&mut canvas);
+        assert_eq!(images.retired_bytes, 8);
+        images.release();
         assert_eq!(images.resident_bytes(), 0);
-        assert!(canvas.image_info(id).is_err());
     }
 
     #[test]
