@@ -680,15 +680,15 @@ fn apply(
             return true;
         }
         Action::SetVolume(value) if value.is_finite() && (0.0..=1.0).contains(&value) => {
-            if let Some(sink) = state.sinks.get(&state.default_sink) {
-                if let Some(volume) = scaled_volume(&sink.volume, value) {
-                    context.introspect().set_sink_volume_by_name(
-                        &state.default_sink,
-                        &volume,
-                        Some(Box::new(completed)),
-                    );
-                    return true;
-                }
+            if let Some(sink) = state.sinks.get(&state.default_sink)
+                && let Some(volume) = scaled_volume(&sink.volume, value)
+            {
+                context.introspect().set_sink_volume_by_name(
+                    &state.default_sink,
+                    &volume,
+                    Some(Box::new(completed)),
+                );
+                return true;
             }
         }
         Action::SetMuted(muted) if state.sinks.contains_key(&state.default_sink) => {
@@ -706,18 +706,17 @@ fn apply(
                 .streams
                 .get(&id)
                 .filter(|stream| stream.state.volume_writable)
+                && let Some(channels) = scaled_volume(&stream.channels, volume)
             {
-                if let Some(channels) = scaled_volume(&stream.channels, volume) {
-                    // pulse controls a stream by its numeric index. the opaque
-                    // id rejects retired snapshots, but the protocol cannot
-                    // make this request conditional on the stream generation.
-                    context.introspect().set_sink_input_volume(
-                        stream.index,
-                        &channels,
-                        Some(Box::new(completed)),
-                    );
-                    return true;
-                }
+                // pulse controls a stream by its numeric index. the opaque
+                // id rejects retired snapshots, but the protocol cannot
+                // make this request conditional on the stream generation.
+                context.introspect().set_sink_input_volume(
+                    stream.index,
+                    &channels,
+                    Some(Box::new(completed)),
+                );
+                return true;
             }
         }
         Action::SetStreamMuted { id, muted } => {
@@ -735,15 +734,15 @@ fn apply(
             return true;
         }
         Action::SetSourceVolume(value) if value.is_finite() && (0.0..=1.0).contains(&value) => {
-            if let Some(source) = state.sources.get(&state.default_source) {
-                if let Some(volume) = scaled_volume(&source.volume, value) {
-                    context.introspect().set_source_volume_by_name(
-                        &state.default_source,
-                        &volume,
-                        Some(Box::new(completed)),
-                    );
-                    return true;
-                }
+            if let Some(source) = state.sources.get(&state.default_source)
+                && let Some(volume) = scaled_volume(&source.volume, value)
+            {
+                context.introspect().set_source_volume_by_name(
+                    &state.default_source,
+                    &volume,
+                    Some(Box::new(completed)),
+                );
+                return true;
             }
         }
         Action::SetSourceMuted(muted) if state.sources.contains_key(&state.default_source) => {
