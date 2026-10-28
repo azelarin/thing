@@ -469,7 +469,8 @@ put layout and paint values in `style`. dimensions use logical pixels.
 
 | property | default |
 | --- | --- |
-| `width`, `height` | unspecified |
+| `width`, `height` | unspecified; logical pixels |
+| `width_fraction`, `height_fraction` | unspecified; a fraction from `0` to `1` of the parent's content size |
 | `min_width`, `max_width`, `min_height`, `max_height` | unspecified |
 | `padding`, `gap`, `grow`, `radius` | `0` |
 | `shrink` | unspecified; `1` for scroll and `0` elsewhere |
@@ -520,10 +521,14 @@ explicit positive `shrink` may reduce an item below its intrinsic content size;
 set a min dimension when it needs a floor. min and max dimensions also clamp an
 explicit size and the result of `grow`.
 
-min and max dimensions are for widgets inside a surface. they are rejected on a
-root panel or popup because wayland surfaces are either given an exact size or
-filled by the compositor. use `width` and `height` for the surface, then put the
-constraint on an inner container.
+`width_fraction` and `height_fraction` make a widget responsive to its parent.
+they cannot be combined with `width` or `height` on the same axis. pixel min and
+max dimensions still clamp the result.
+
+min, max, and fractional dimensions are for widgets inside a surface. they are
+rejected on a root panel or popup because wayland surfaces are either given an
+exact size or filled by the compositor. use `width` and `height` for the surface,
+then put the responsive or constrained dimension on an inner container.
 
 set an overlay color to transparent or the focus ring width to `0` to remove that
 part of the built-in interaction appearance. for example, this keeps only a thin

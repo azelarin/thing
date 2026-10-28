@@ -434,12 +434,22 @@ fn build(
             Position::Relative
         },
         size: tf::Size {
-            width: style
-                .width
-                .map_or(tf::Dimension::auto(), tf::Dimension::length),
-            height: style
-                .height
-                .map_or(tf::Dimension::auto(), tf::Dimension::length),
+            width: style.width.map_or_else(
+                || {
+                    style
+                        .width_fraction
+                        .map_or(tf::Dimension::auto(), tf::Dimension::percent)
+                },
+                tf::Dimension::length,
+            ),
+            height: style.height.map_or_else(
+                || {
+                    style
+                        .height_fraction
+                        .map_or(tf::Dimension::auto(), tf::Dimension::percent)
+                },
+                tf::Dimension::length,
+            ),
         },
         min_size: tf::Size {
             width: min_width.map_or(
@@ -906,6 +916,29 @@ mod tests {
         assert_eq!(layout.hit_test(Point { x: 0.0, y: 20.0 }), Some(NodeId(2)));
         assert_eq!(layout.hit_test(Point { x: -1.0, y: 20.0 }), None);
         assert_eq!(layout.hit_test(Point { x: 101.0, y: 20.0 }), None);
+    }
+
+    #[test]
+    fn fractional_dimensions_follow_the_parent_and_respect_pixel_minimums() {
+        let mut root = Node::new(NodeId(1), Kind::Row);
+        let mut child = Node::new(NodeId(2), Kind::Row);
+        child.style.width_fraction = Some(0.62);
+        child.style.height_fraction = Some(0.5);
+        child.style.min_width = Some(16.0);
+        root.children.push(child);
+        let size = Size {
+            width: 240.0,
+            height: 80.0,
+        };
+
+        let layout = Layout::compute(&root, size, &mut FixedText).unwrap();
+        let bounds = layout.get(NodeId(2)).unwrap().bounds;
+        assert!((bounds.width - 148.8).abs() < 0.001, "{bounds:?}");
+        assert_eq!(bounds.height, 40.0);
+
+        root.children[0].style.width_fraction = Some(0.0);
+        let layout = Layout::compute(&root, size, &mut FixedText).unwrap();
+        assert_eq!(layout.get(NodeId(2)).unwrap().bounds.width, 16.0);
     }
 
     #[test]
