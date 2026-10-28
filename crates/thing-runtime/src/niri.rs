@@ -49,7 +49,7 @@ pub struct NiriState {
 }
 
 impl NiriState {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let valid_text = |text: &Option<String>| {
             text.as_ref()
                 .is_none_or(|s| s.len() <= 65536 && !s.contains('\0'))

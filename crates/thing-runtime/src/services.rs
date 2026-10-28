@@ -1,3 +1,4 @@
+use crate::OutputContext;
 use crate::niri::{NiriAction, NiriData, NiriState, parse_id};
 use crate::state::{Scalar, Signal, Tracker};
 use mlua::{Error, Lua, Result, UserData, UserDataMethods, Value};
@@ -23,11 +24,32 @@ pub struct AudioDevice {
     pub description: String,
 }
 
-#[derive(Default)]
-pub(crate) struct Snapshot {
-    pub values: Vec<(String, Scalar)>,
-    pub devices: Vec<AudioDevice>,
-    pub niri: NiriState,
+/// desktop service values used when loading a runtime.
+#[derive(Clone, Debug, Default)]
+pub struct ServiceSnapshot {
+    pub(crate) values: BTreeMap<String, Scalar>,
+    pub(crate) devices: Vec<AudioDevice>,
+    pub(crate) niri: NiriState,
+}
+
+impl ServiceSnapshot {
+    pub fn set_service(&mut self, name: &str, value: Scalar) -> Result<()> {
+        validate_service(name, &value)?;
+        self.values.insert(name.to_owned(), value);
+        Ok(())
+    }
+
+    pub fn set_audio_devices(&mut self, devices: Vec<AudioDevice>) -> Result<()> {
+        validate_devices(&devices)?;
+        self.devices = devices;
+        Ok(())
+    }
+
+    pub fn set_niri(&mut self, state: NiriState) -> Result<()> {
+        state.validate()?;
+        self.niri = state;
+        Ok(())
+    }
 }
 
 struct DeviceList {
@@ -81,6 +103,7 @@ impl Services {
         let services = lua.create_table()?;
         let audio = lua.create_table()?;
         let clock = lua.create_table()?;
+        let output = lua.create_table()?;
         audio.set(
             "devices",
             DeviceList {
@@ -99,6 +122,11 @@ impl Services {
             ("clock.date", Scalar::String(String::new())),
             ("niri.available", Scalar::Boolean(false)),
             ("niri.error", Scalar::String(String::new())),
+            ("output.available", Scalar::Boolean(false)),
+            ("output.name", Scalar::String(String::new())),
+            ("output.width", Scalar::Number(0.0)),
+            ("output.height", Scalar::Number(0.0)),
+            ("output.scale", Scalar::Number(1.0)),
         ] {
             let id = result.tracker.borrow_mut().insert(value)?;
             result.signals.insert(name.into(), id);
@@ -110,12 +138,12 @@ impl Services {
             let (service, property) = name
                 .split_once('.')
                 .ok_or_else(|| Error::runtime("invalid service name"))?;
-            if service == "audio" {
-                audio.set(property, signal)?;
-            } else if service == "clock" {
-                clock.set(property, signal)?;
-            } else {
-                niri.set(property, signal)?;
+            match service {
+                "audio" => audio.set(property, signal)?,
+                "clock" => clock.set(property, signal)?,
+                "niri" => niri.set(property, signal)?,
+                "output" => output.set(property, signal)?,
+                _ => return Err(Error::runtime("invalid service name")),
             }
         }
         let actions = result.actions.clone();
@@ -173,9 +201,11 @@ impl Services {
         }
         niri.set_readonly(true);
         clock.set_readonly(true);
+        output.set_readonly(true);
         services.set("audio", audio)?;
         services.set("clock", clock)?;
         services.set("niri", niri)?;
+        services.set("output", output)?;
         services.set_readonly(true);
         lua.globals().set("services", services)?;
         Ok(result)
@@ -193,40 +223,18 @@ impl Services {
         self.actions.borrow_mut().truncate(count);
     }
     pub fn set(&self, name: &str, value: Scalar) -> Result<()> {
+        if name.starts_with("output.") {
+            return Err(Error::runtime("output properties must be updated together"));
+        }
         let id = self
             .signals
             .get(name)
             .ok_or_else(|| Error::runtime(format!("unknown service property {name}")))?;
-        let valid = match (name, &value) {
-            ("audio.available" | "audio.muted" | "niri.available", Scalar::Boolean(_)) => true,
-            ("audio.volume", Scalar::Number(v)) => v.is_finite() && *v >= 0.0,
-            (
-                "audio.device" | "audio.error" | "clock.time" | "clock.date" | "niri.error",
-                Scalar::String(v),
-            ) => v.len() <= 4096 && !v.contains('\0'),
-            _ => false,
-        };
-        if !valid {
-            return Err(Error::runtime(format!(
-                "invalid value for service property {name}"
-            )));
-        }
+        validate_service(name, &value)?;
         self.tracker.borrow_mut().write(*id, value)
     }
     pub fn set_devices(&self, devices: Vec<AudioDevice>) -> Result<()> {
-        let mut names = BTreeSet::new();
-        if devices.len() > 512
-            || devices.iter().any(|device| {
-                device.name.is_empty()
-                    || device.name.len() > 4096
-                    || device.name.contains('\0')
-                    || device.description.len() > 4096
-                    || device.description.contains('\0')
-                    || !names.insert(device.name.as_str())
-            })
-        {
-            return Err(Error::runtime("invalid audio device list"));
-        }
+        validate_devices(&devices)?;
         if *self.devices.borrow() != devices {
             *self.devices.borrow_mut() = devices;
             let mut tracker = self.tracker.borrow_mut();
@@ -239,22 +247,79 @@ impl Services {
         Ok(())
     }
 
-    pub fn snapshot(&self) -> Snapshot {
+    pub fn snapshot(&self) -> ServiceSnapshot {
         let mut tracker = self.tracker.borrow_mut();
         let values = self
             .signals
             .iter()
+            .filter(|(name, _)| !name.starts_with("output."))
             .map(|(name, id)| (name.clone(), tracker.read(*id)))
             .collect();
-        Snapshot {
+        ServiceSnapshot {
             values,
             devices: self.devices.borrow().clone(),
             niri: self.niri.snapshot(),
         }
     }
 
+    pub fn set_output(&self, output: &OutputContext) -> Result<()> {
+        output.validate()?;
+        let name = output.name.clone().unwrap_or_default();
+        let values = [
+            ("output.available", Scalar::Boolean(true)),
+            ("output.name", Scalar::String(name)),
+            ("output.width", Scalar::Number(f64::from(output.width))),
+            ("output.height", Scalar::Number(f64::from(output.height))),
+            (
+                "output.scale",
+                Scalar::Number(f64::from(output.scale.factor())),
+            ),
+        ];
+        let updates = values
+            .into_iter()
+            .map(|(name, value)| (self.signals[name], value));
+        self.tracker.borrow_mut().write_batch(updates)
+    }
+
     pub fn set_niri(&self, state: NiriState) -> Result<()> {
         self.niri.set(state)
+    }
+}
+
+fn validate_service(name: &str, value: &Scalar) -> Result<()> {
+    let valid = match (name, value) {
+        ("audio.available" | "audio.muted" | "niri.available", Scalar::Boolean(_)) => true,
+        ("audio.volume", Scalar::Number(value)) => value.is_finite() && *value >= 0.0,
+        (
+            "audio.device" | "audio.error" | "clock.time" | "clock.date" | "niri.error",
+            Scalar::String(value),
+        ) => value.len() <= 4096 && !value.contains('\0'),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::runtime(format!(
+            "invalid value for service property {name}"
+        )))
+    }
+}
+
+fn validate_devices(devices: &[AudioDevice]) -> Result<()> {
+    let mut names = BTreeSet::new();
+    let invalid = devices.len() > 512
+        || devices.iter().any(|device| {
+            device.name.is_empty()
+                || device.name.len() > 4096
+                || device.name.contains('\0')
+                || device.description.len() > 4096
+                || device.description.contains('\0')
+                || !names.insert(device.name.as_str())
+        });
+    if invalid {
+        Err(Error::runtime("invalid audio device list"))
+    } else {
+        Ok(())
     }
 }
 

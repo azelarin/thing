@@ -10,7 +10,7 @@ mod reconcile;
 mod services;
 mod state;
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
-pub use services::{Action, AudioDevice};
+pub use services::{Action, AudioDevice, ServiceSnapshot};
 
 use mlua::{Error, Function, Lua, Result, Table, Value, VmState};
 pub use state::Scalar;
@@ -22,7 +22,31 @@ use std::{
     rc::Rc,
     time::{Duration, Instant},
 };
-use thing_core::{Kind, Node, NodeId};
+use thing_core::{Kind, Node, NodeId, Scale};
+
+/// the wayland output for one runtime, measured in logical pixels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutputContext {
+    pub name: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub scale: Scale,
+}
+
+impl OutputContext {
+    fn validate(&self) -> Result<()> {
+        if self.width == 0
+            || self.height == 0
+            || self
+                .name
+                .as_ref()
+                .is_some_and(|name| name.len() > 4096 || name.contains('\0'))
+        {
+            return Err(Error::runtime("invalid output context"));
+        }
+        Ok(())
+    }
+}
 
 /// limits apply to each load, event callback, and batch of reactive updates.
 #[derive(Clone, Copy, Debug)]
@@ -85,6 +109,7 @@ pub struct Runtime {
     limits: Limits,
     modules: modules::Modules,
     services: services::Services,
+    output: Option<OutputContext>,
 }
 
 impl Runtime {
@@ -94,13 +119,29 @@ impl Runtime {
     }
 
     pub fn load_with_limits(path: impl AsRef<Path>, limits: Limits) -> Result<Self> {
-        Self::load_with_services(path.as_ref(), limits, services::Snapshot::default())
+        Self::load_with_services(path.as_ref(), limits, ServiceSnapshot::default(), None)
+    }
+
+    /// load an entry file for one output with current desktop service values.
+    pub fn load_for_output(
+        path: impl AsRef<Path>,
+        output: OutputContext,
+        services: &ServiceSnapshot,
+    ) -> Result<Self> {
+        output.validate()?;
+        Self::load_with_services(
+            path.as_ref(),
+            Limits::default(),
+            services.clone(),
+            Some(output),
+        )
     }
 
     fn load_with_services(
         path: &Path,
         limits: Limits,
-        snapshot: services::Snapshot,
+        snapshot: ServiceSnapshot,
+        output: Option<OutputContext>,
     ) -> Result<Self> {
         if limits.memory_bytes == 0 || limits.execution_time.is_zero() {
             return Err(Error::runtime("runtime limits must be positive"));
@@ -123,6 +164,9 @@ impl Runtime {
         }
         services.set_devices(snapshot.devices)?;
         services.set_niri(snapshot.niri)?;
+        if let Some(output) = &output {
+            services.set_output(output)?;
+        }
         install_ui(&lua, tracker.clone())?;
         lua.sandbox(true)?;
         let modules = modules::Modules::default();
@@ -141,6 +185,7 @@ impl Runtime {
             limits,
             modules,
             services,
+            output,
         };
         runtime.root = runtime.parse_node(exported, 0, &mut BTreeSet::new())?;
         if runtime.root.kind != Kind::Panel {
@@ -178,6 +223,13 @@ impl Runtime {
     /// replaces workspace and window lists. call [`Self::refresh`] to update widgets.
     pub fn set_niri(&mut self, state: NiriState) -> Result<()> {
         self.services.set_niri(state)
+    }
+
+    /// replace all output properties together. call [`Self::refresh`] afterward.
+    pub fn set_output(&mut self, output: OutputContext) -> Result<()> {
+        self.services.set_output(&output)?;
+        self.output = Some(output);
+        Ok(())
     }
 
     /// takes the service actions queued by event handlers.
@@ -310,14 +362,19 @@ impl Runtime {
         Ok(changed)
     }
 
-    /// reloads the configuration.
-    ///
-    /// loading or validation errors leave the current configuration unchanged.
-    /// a successful reload resets local state.
+    /// load a replacement without changing the current runtime.
+    pub fn load_replacement(&self, path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_services(
+            path.as_ref(),
+            self.limits,
+            self.services.snapshot(),
+            self.output.clone(),
+        )
+    }
+
+    /// reload the configuration, preserving it if loading or validation fails.
     pub fn reload(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let candidate =
-            Self::load_with_services(path.as_ref(), self.limits, self.services.snapshot())?;
-        *self = candidate;
+        *self = self.load_replacement(path)?;
         Ok(())
     }
 
