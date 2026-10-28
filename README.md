@@ -7,12 +7,13 @@ the project is in early development, and the api is still changing.
 
 ## installation
 
-to build thing, you'll need rust 1.88 or newer, a c/c++ compiler, and pkg-config.
-you'll also need the development packages for these system libraries:
+to build thing, you'll need rust 1.88 or newer, a c/c++ compiler, curl, and
+pkg-config. you'll also need the development packages for these system
+libraries:
 
-- wayland and egl, for displaying panels with the default opengl es renderer
+- wayland, egl, and opengl es, for displaying panels with the default renderer
 - xkbcommon, for keyboard input
-- fontconfig, for finding installed fonts
+- fontconfig and freetype, for finding and drawing installed fonts
 - pulseaudio, for reading and controlling audio devices
 
 if you use pipewire, its pulseaudio-compatible server handles the audio
@@ -28,8 +29,15 @@ from the repository directory, install thing with cargo:
 cargo install --locked --path crates/thing
 ```
 
-vulkan support is available as an optional build feature. it uses the system's
-vulkan driver through wgpu, while keeping opengl es as the default renderer:
+the first build downloads an official prebuilt skia archive when one is
+available for your platform and selected features. if there isn't a matching
+archive, rust-skia builds skia locally; that fallback also needs clang,
+libclang, python 3, git, and ninja, and takes considerably longer. offline
+builds can point `SKIA_BINARIES_URL` at a previously downloaded archive using
+a `file://` url.
+
+vulkan support is available as an optional build feature. it uses skia with
+your system's vulkan driver, while keeping opengl es as the default renderer:
 
 ```sh
 cargo install --locked --path crates/thing --features vulkan
@@ -73,3 +81,8 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 ## license
 
 [mit](LICENSE-MIT) or [apache-2.0](LICENSE-APACHE).
+
+the renderer includes [skia](LICENSE-SKIA) and
+[rust-skia](LICENSE-RUST-SKIA) under their respective licenses. notices for
+the third-party code bundled with skia are in
+[third-party notices](THIRD_PARTY_NOTICES).

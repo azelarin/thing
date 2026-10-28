@@ -17,9 +17,9 @@ mod panel;
 mod popup;
 mod power;
 mod render;
-mod system_tray;
 #[cfg(feature = "vulkan")]
-mod vulkan;
+mod skia_vulkan;
+mod system_tray;
 mod watch;
 pub use host::{run, run_with_options};
 pub use system_tray::{SystemTray, SystemTrayMode};

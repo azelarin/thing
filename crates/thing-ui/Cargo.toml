@@ -7,17 +7,19 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-wgpu = ["femtovg/wgpu"]
+ci-no-skia-compile = ["skia-safe/no-compile"]
+vulkan = ["skia-safe/vulkan"]
 
 [dependencies]
 thing-core = { path = "../thing-core" }
 taffy = { version = "0.15.1", default-features = false, features = ["std", "taffy_tree", "flexbox", "content_size"] }
-femtovg = { version = "0.28.0", default-features = false, features = ["swash"] }
 parley = "0.6.0"
 unicode-segmentation = "1.13.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 resvg = { version = "0.47", default-features = false }
 freedesktop-icons = "0.4"
+skia-safe = { version = "=0.156.0", default-features = false, features = ["binary-cache", "ganesh", "gl", "jpeg", "pdf"] }
+skrifa = { version = "0.37.0", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

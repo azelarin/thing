@@ -8,9 +8,7 @@ use wayland_client::{Connection, protocol::wl_surface::WlSurface};
 use crate::{Renderer, egl};
 
 #[cfg(feature = "vulkan")]
-use crate::vulkan;
-#[cfg(feature = "vulkan")]
-use thing_ui::WGPURenderer;
+use crate::skia_vulkan as vulkan;
 
 pub enum FrameResult {
     Presented {
@@ -32,7 +30,7 @@ enum Backend {
     #[cfg(feature = "vulkan")]
     Vulkan {
         graphics: vulkan::Graphics,
-        painter: Option<Box<Painter<WGPURenderer>>>,
+        painter: Option<Box<Painter>>,
     },
 }
 
@@ -60,7 +58,7 @@ impl Render {
             Renderer::OpenGl => {
                 let _ = gpu_wake;
                 let graphics = egl::Graphics::new(connection)?;
-                let painter = Painter::new(graphics.renderer()?, wake)?;
+                let painter = graphics.painter(wake)?;
                 Ok(Self {
                     backend: Backend::OpenGl {
                         graphics,
@@ -72,8 +70,8 @@ impl Render {
                 #[cfg(feature = "vulkan")]
                 {
                     let probe = probe.ok_or("vulkan initialization needs a Wayland surface")?;
-                    let graphics = vulkan::Graphics::new(connection, probe, gpu_wake)?;
-                    let painter = Painter::new(graphics.renderer(), wake)?;
+                    let (graphics, context) = vulkan::Graphics::new(connection, probe, gpu_wake)?;
+                    let painter = Painter::new_vulkan(context, wake)?;
                     Ok(Self {
                         backend: Backend::Vulkan {
                             graphics,
@@ -95,12 +93,18 @@ impl Render {
         match &mut self.backend {
             Backend::OpenGl { graphics, painter } => {
                 graphics.park()?;
-                *painter = Some(Box::new(Painter::new(graphics.renderer()?, wake)?));
+                painter
+                    .as_deref_mut()
+                    .ok_or("OpenGL painter is unavailable")?
+                    .reset(wake)?;
             }
             #[cfg(feature = "vulkan")]
             Backend::Vulkan { graphics, painter } => {
-                graphics.check_error()?;
-                *painter = Some(Box::new(Painter::new(graphics.renderer(), wake)?));
+                graphics.wait_idle()?;
+                painter
+                    .as_deref_mut()
+                    .ok_or("vulkan painter is unavailable")?
+                    .reset(wake)?;
             }
         }
         Ok(())
@@ -155,7 +159,7 @@ impl Render {
                 painter
                     .as_deref_mut()
                     .ok_or("OpenGL painter is unavailable")?
-                    .paint_to_output(frame, (), |_| {})?;
+                    .paint(frame, graphics.framebuffer())?;
                 before_present();
                 window.present()?;
                 Ok(FrameResult::Presented { redraw: false })
@@ -175,11 +179,19 @@ impl Render {
         }
     }
 
-    pub fn park(&self) -> Result<(), String> {
-        match &self.backend {
+    pub fn park(&mut self) -> Result<(), String> {
+        match &mut self.backend {
             Backend::OpenGl { graphics, .. } => graphics.park(),
             #[cfg(feature = "vulkan")]
-            Backend::Vulkan { graphics, .. } => graphics.check_error(),
+            Backend::Vulkan { graphics, painter } => {
+                graphics.wait_idle()?;
+                painter
+                    .as_deref_mut()
+                    .ok_or("vulkan painter is unavailable")?
+                    .context_mut()
+                    .free_gpu_resources();
+                Ok(())
+            }
         }
     }
 
@@ -193,14 +205,26 @@ impl Render {
 
     pub fn prepare_drop(&mut self) {
         match &mut self.backend {
-            Backend::OpenGl { graphics, painter } => {
-                let _ = graphics.park();
-                painter.take();
-            }
+            Backend::OpenGl { graphics, painter } => prepare_open_gl_drop(graphics, painter),
             #[cfg(feature = "vulkan")]
-            Backend::Vulkan { painter, .. } => {
+            Backend::Vulkan { graphics, painter } => {
+                if painter.is_some()
+                    && graphics.wait_idle().is_err()
+                    && let Some(painter) = painter.as_deref_mut()
+                {
+                    painter.abandon();
+                }
                 painter.take();
             }
         }
     }
+}
+
+fn prepare_open_gl_drop(graphics: &egl::Graphics, painter: &mut Option<Box<Painter>>) {
+    if graphics.park().is_err()
+        && let Some(painter) = painter.as_deref_mut()
+    {
+        painter.abandon();
+    }
+    drop(painter.take());
 }

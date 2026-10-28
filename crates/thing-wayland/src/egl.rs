@@ -1,5 +1,6 @@
 //! egl ownership boundary. every graphics object stays on the event-loop thread.
 
+use std::cell::Cell;
 use std::{
     ffi::{c_char, c_int, c_uint, c_void},
     ptr,
@@ -22,6 +23,7 @@ const BLUE_SIZE: c_int = 0x3022;
 const ALPHA_SIZE: c_int = 0x3021;
 const STENCIL_SIZE: c_int = 0x3026;
 const CONTEXT_CLIENT_VERSION: c_int = 0x3098;
+const FRAMEBUFFER_BINDING: c_uint = 0x8CA6;
 const WIDTH: c_int = 0x3057;
 const HEIGHT: c_int = 0x3056;
 
@@ -61,6 +63,11 @@ unsafe extern "C" {
     fn eglGetProcAddress(name: *const c_char) -> *const c_void;
 }
 
+#[link(name = "GLESv2")]
+unsafe extern "C" {
+    fn glGetIntegerv(name: c_uint, value: *mut c_int);
+}
+
 #[link(name = "wayland-egl")]
 unsafe extern "C" {
     fn wl_egl_window_create(surface: Handle, width: c_int, height: c_int) -> Handle;
@@ -89,6 +96,7 @@ pub struct Graphics {
     context: Handle,
     // a 1×1 surface keeps cleanup valid even after the last window disappears.
     parking: Handle,
+    framebuffer: Cell<u32>,
 }
 
 pub struct Window {
@@ -163,18 +171,24 @@ impl Graphics {
                 config,
                 context,
                 parking,
+                framebuffer: Cell::new(0),
             };
             result.park()?;
+            result.framebuffer.set(current_framebuffer()?);
             Ok(result)
         }
     }
 
-    pub fn renderer(&self) -> Result<thing_ui::OpenGl, String> {
+    pub fn painter(&self, wake: impl Fn() + Send + 'static) -> Result<thing_ui::Painter, String> {
         self.park()?;
-        // SAFETY: park made our live opengl es context current on this thread.
-        // egl provides the matching function pointers, valid for its lifetime.
-        unsafe { thing_ui::OpenGl::new_from_function_cstr(|name| eglGetProcAddress(name.as_ptr())) }
-            .map_err(|error| error.to_string())
+        thing_ui::Painter::new_gl(
+            |name| {
+                // SAFETY: park made the live OpenGL ES context current. EGL
+                // owns these function pointers for the lifetime of this display.
+                unsafe { eglGetProcAddress(name.as_ptr()) }
+            },
+            wake,
+        )
     }
 
     pub fn window(&self, surface: &WlSurface, width: u32, height: u32) -> Result<Window, String> {
@@ -226,6 +240,10 @@ impl Graphics {
         Ok(())
     }
 
+    pub fn framebuffer(&self) -> u32 {
+        self.framebuffer.get()
+    }
+
     pub fn park(&self) -> Result<(), String> {
         // SAFETY: the parking surface and context are owned by this object.
         if unsafe { eglMakeCurrent(self.display.raw, self.parking, self.parking, self.context) }
@@ -235,6 +253,16 @@ impl Graphics {
         }
         Ok(())
     }
+}
+
+fn current_framebuffer() -> Result<u32, String> {
+    let mut framebuffer = 0;
+    // SAFETY: Graphics::new made its live OpenGL ES context current on the
+    // parking surface before this one-time external-state query.
+    unsafe {
+        glGetIntegerv(FRAMEBUFFER_BINDING, &mut framebuffer);
+    }
+    u32::try_from(framebuffer).map_err(|_| "OpenGL returned a negative framebuffer id".into())
 }
 
 impl Window {
