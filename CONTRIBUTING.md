@@ -13,6 +13,9 @@ compositor, graphics driver, and output scale.
 feature requests are welcome too. describe what you're trying to build and where
 the current api gets in your way.
 
+assign yourself to an issue when you start working on it. include `closes #123`
+in the fix's pull request description so the issue closes when it merges.
+
 ## pull requests
 
 work on a branch and open a draft while the change is in progress. use
