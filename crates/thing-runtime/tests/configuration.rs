@@ -1,7 +1,9 @@
 use std::{fs, path::PathBuf, time::Duration};
 use tempfile::TempDir;
 use thing_core::{Kind, TextAlign, TextOverflow};
-use thing_runtime::{Action, AudioDevice, AudioSnapshot, Event, Limits, Runtime, Scalar};
+use thing_runtime::{
+    Action, AudioDevice, AudioSnapshot, AudioStream, Event, Limits, Runtime, Scalar,
+};
 
 fn fixture(source: &str) -> (TempDir, PathBuf) {
     let directory = tempfile::tempdir().unwrap();
@@ -781,4 +783,95 @@ fn microphone_state_is_reactive_preserved_and_controllable() {
         runtime.root().children[0].text,
         "true:1.25:true:microphone:Microphone"
     );
+}
+
+#[test]
+fn playback_streams_are_reactive_preserved_and_controllable() {
+    let (_directory, path) = fixture(
+        r#"
+        local audio = services.audio
+        return ui.panel { children = {
+            ui.text { text = function()
+                local streams = audio.streams:get()
+                if #streams == 0 then return 'none' end
+                local stream = streams[1]
+                return `{stream.id}:{stream.application}:{stream.app_id}:{stream.name}:{stream.icon}:{stream.volume}:{stream.muted}:{stream.volume_writable}`
+            end },
+            ui.button { on_click = function()
+                local stream = audio.streams:get()[1]
+                audio.set_stream_volume(stream.id, 0.7)
+            end },
+            ui.button { on_click = function()
+                local stream = audio.streams:get()[1]
+                audio.set_stream_muted(stream.id, not stream.muted)
+            end },
+            ui.button { on_click = function() audio.set_stream_volume('stream-1', 1.1) end },
+            ui.button { on_click = function() audio.set_stream_muted('', true) end },
+            ui.button { on_click = function() audio.streams:get()[1].name = 'changed' end },
+        } }
+        "#,
+    );
+    let stream = AudioStream {
+        id: "stream-1".into(),
+        application: "Firefox".into(),
+        app_id: "firefox".into(),
+        name: "Music".into(),
+        icon: "firefox".into(),
+        volume: 1.25,
+        muted: true,
+        volume_writable: true,
+    };
+    let mut runtime = Runtime::load(&path).unwrap();
+    runtime
+        .set_audio(AudioSnapshot {
+            streams: vec![stream.clone()],
+            ..AudioSnapshot::default()
+        })
+        .unwrap();
+    assert!(runtime.refresh().unwrap());
+    assert_eq!(
+        runtime.root().children[0].text,
+        "stream-1:Firefox:firefox:Music:firefox:1.25:true:true"
+    );
+
+    runtime
+        .dispatch(runtime.root().children[1].id, Event::Click)
+        .unwrap();
+    runtime
+        .dispatch(runtime.root().children[2].id, Event::Click)
+        .unwrap();
+    for index in 3..=5 {
+        assert!(
+            runtime
+                .dispatch(runtime.root().children[index].id, Event::Click)
+                .is_err()
+        );
+    }
+    assert_eq!(
+        runtime.take_actions(),
+        vec![
+            Action::SetStreamVolume {
+                id: "stream-1".into(),
+                volume: 0.7,
+            },
+            Action::SetStreamMuted {
+                id: "stream-1".into(),
+                muted: false,
+            },
+        ]
+    );
+
+    runtime.reload(&path).unwrap();
+    assert_eq!(
+        runtime.root().children[0].text,
+        "stream-1:Firefox:firefox:Music:firefox:1.25:true:true"
+    );
+    runtime
+        .set_audio(AudioSnapshot {
+            streams: Vec::new(),
+            ..AudioSnapshot::default()
+        })
+        .unwrap();
+    assert!(runtime.refresh().unwrap());
+    assert_eq!(runtime.root().children[0].text, "none");
 }
