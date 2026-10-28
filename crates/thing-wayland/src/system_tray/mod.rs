@@ -790,7 +790,7 @@ fn normalize_pixmaps(pixmaps: Vec<Pixmap>) -> Vec<QueriedPixmap> {
             continue;
         }
         let mut rgba = Vec::with_capacity(argb.len());
-        for pixel in argb.chunks_exact(4) {
+        for pixel in argb.as_chunks::<4>().0 {
             rgba.extend_from_slice(&[pixel[1], pixel[2], pixel[3], pixel[0]]);
         }
         normalized.push(QueriedPixmap {
