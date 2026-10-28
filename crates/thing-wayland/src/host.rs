@@ -2768,10 +2768,10 @@ impl App {
                 return None;
             }
         };
-        if !outcome.active {
-            if let Some(capture) = self.pointer_capture.take() {
-                self.clear_pressed_for_capture(&capture);
-            }
+        if !outcome.active
+            && let Some(capture) = self.pointer_capture.take()
+        {
+            self.clear_pressed_for_capture(&capture);
         }
         let result = (outcome.handled, outcome.active);
         self.finish_dispatch(output, consumer, Ok(outcome.dispatch), origin)
