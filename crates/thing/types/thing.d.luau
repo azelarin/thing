@@ -14,6 +14,7 @@ export type ThingReadonlyArray<T> = { T }
 export type ThingReactive<T> = T | (() -> T)
 
 declare extern type ThingWidget with end
+declare extern type ThingImageSource with end
 declare extern type ThingNumberTransition with end
 declare extern type ThingColorTransition with end
 
@@ -92,6 +93,7 @@ export type ThingPopupConstraints = {
 type ThingAnimatedNumber = number | (() -> number) | ThingNumberTransition
 type ThingAnimatedOptionalNumber = number | (() -> number?) | ThingNumberTransition
 type ThingAnimatedColor = string | (() -> string) | ThingColorTransition
+type ThingImageSourceValue = string | ThingImageSource
 
 export type ThingStyle = {
     width: ThingAnimatedOptionalNumber?,
@@ -208,7 +210,7 @@ export type ThingImageProperties = {
     visible: ThingReactive<boolean>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
-    source: ThingReactive<string?>?,
+    source: ThingReactive<ThingImageSourceValue?>?,
     icon: ThingReactive<string?>?,
     app_id: ThingReactive<string?>?,
     icon_theme: ThingReactive<string>?,
@@ -388,6 +390,7 @@ declare extern type ThingSystemTrayItem with
     read category: string
     read title: string
     read status: string
+    read icon: ThingImageSource?
     read icon_name: string
     read attention_icon_name: string
     read overlay_icon_name: string
