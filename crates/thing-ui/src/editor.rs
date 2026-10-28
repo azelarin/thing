@@ -280,15 +280,27 @@ impl TextInputEditor {
     pub fn text_offset_x(&self) -> f32 {
         let layout = self.layout();
         let width = layout.full_width();
-        if width > self.viewport_width {
-            return -self.scroll_x;
+        let mut offset = if width > self.viewport_width {
+            -self.scroll_x
+        } else {
+            let rtl = layout.is_rtl();
+            match (self.style.align, rtl) {
+                (TextAlign::Start, true) | (TextAlign::End, false) => self.viewport_width - width,
+                (TextAlign::Center, _) => (self.viewport_width - width) / 2.0,
+                _ => 0.0,
+            }
+        };
+        let Some(caret) = self.cursor_geometry() else {
+            return offset;
+        };
+        let start = offset + caret.x0 as f32;
+        let end = offset + caret.x1 as f32;
+        if start < 0.0 {
+            offset -= start;
+        } else if end > self.viewport_width {
+            offset -= end - self.viewport_width;
         }
-        let rtl = layout.is_rtl();
-        match (self.style.align, rtl) {
-            (TextAlign::Start, true) | (TextAlign::End, false) => self.viewport_width - width,
-            (TextAlign::Center, _) => (self.viewport_width - width) / 2.0,
-            _ => 0.0,
-        }
+        offset
     }
 
     fn apply_style(&mut self, style: &EditorStyle) {
@@ -343,8 +355,17 @@ mod tests {
     }
 
     fn editor_with_width(value: &str, width: f32) -> TextInputEditor {
+        editor_with_width_and_align(value, width, TextAlign::Start)
+    }
+
+    fn editor_with_width_and_align(
+        value: &str,
+        width: f32,
+        text_align: TextAlign,
+    ) -> TextInputEditor {
         let mut node = Node::new(NodeId(1), Kind::TextInput);
         node.text = value.into();
+        node.style.text_align = text_align;
         TextInputEditor::new(&node, width)
     }
 
@@ -452,6 +473,37 @@ mod tests {
         assert_caret_visible(&editor, 160.0);
         editor.move_to_end(false);
         assert_eq!(editor.text_offset_x(), 0.0);
+        assert_caret_visible(&editor, 160.0);
+    }
+
+    #[test]
+    fn exact_fit_keeps_the_end_caret_inside_start_alignment() {
+        let mut node = Node::new(NodeId(1), Kind::TextInput);
+        node.text = "exact fit".into();
+        let mut editor = TextInputEditor::new(&node, 160.0);
+        let width = editor.layout().full_width();
+        editor.prepare(&node, width);
+
+        assert_caret_visible(&editor, width);
+    }
+
+    #[test]
+    fn short_end_aligned_ltr_keeps_the_caret_visible() {
+        let mut editor = editor_with_width_and_align("short", 160.0, TextAlign::End);
+        assert_caret_visible(&editor, 160.0);
+        editor.move_to_start(false);
+        assert_caret_visible(&editor, 160.0);
+        editor.move_to_end(true);
+        assert_caret_visible(&editor, 160.0);
+    }
+
+    #[test]
+    fn short_start_aligned_rtl_keeps_the_caret_visible() {
+        let mut editor = editor_with_width("אבג", 160.0);
+        assert_caret_visible(&editor, 160.0);
+        editor.move_to_start(false);
+        assert_caret_visible(&editor, 160.0);
+        editor.move_to_end(true);
         assert_caret_visible(&editor, 160.0);
     }
 
