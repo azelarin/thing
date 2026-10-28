@@ -2,7 +2,34 @@ use std::{collections::BTreeMap, env, fs, io::Read, path::PathBuf};
 
 #[derive(Default)]
 pub(super) struct Icons {
-    applications: Option<BTreeMap<String, String>>,
+    applications: Option<Applications>,
+}
+
+#[derive(Default)]
+struct Applications {
+    filenames: BTreeMap<String, String>,
+    classes: BTreeMap<String, String>,
+}
+
+impl Applications {
+    fn insert(&mut self, filename: Option<&str>, icon: String, class: Option<String>) {
+        if let Some(filename) = filename {
+            self.filenames
+                .entry(filename.to_lowercase())
+                .or_insert_with(|| icon.clone());
+        }
+        if let Some(class) = class {
+            self.classes.entry(class.to_lowercase()).or_insert(icon);
+        }
+    }
+
+    fn find(&self, app_id: &str) -> Option<&str> {
+        let app_id = app_id.to_lowercase();
+        self.filenames
+            .get(&app_id)
+            .or_else(|| self.classes.get(&app_id))
+            .map(String::as_str)
+    }
 }
 
 impl Icons {
@@ -12,10 +39,7 @@ impl Icons {
         }
         let name = if let Some(app) = &image.app_id {
             let applications = self.applications.get_or_insert_with(index_applications);
-            applications
-                .get(&app.to_lowercase())
-                .map(String::as_str)
-                .unwrap_or(app)
+            applications.find(app).unwrap_or(app)
         } else if let Some(icon) = &image.icon {
             icon
         } else {
@@ -44,7 +68,7 @@ impl Icons {
     }
 }
 
-fn index_applications() -> BTreeMap<String, String> {
+fn index_applications() -> Applications {
     let mut roots = Vec::new();
     if let Some(home) = env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -61,7 +85,7 @@ fn index_applications() -> BTreeMap<String, String> {
         )
         .filter(|p| p.is_absolute()),
     );
-    let mut entries = BTreeMap::new();
+    let mut entries = Applications::default();
     let mut examined = 0;
     for root in roots {
         let base = root.join("applications");
@@ -101,14 +125,7 @@ fn index_applications() -> BTreeMap<String, String> {
                 let Some(icon) = icon else {
                     continue;
                 };
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    entries
-                        .entry(stem.to_lowercase())
-                        .or_insert_with(|| icon.clone());
-                }
-                if let Some(class) = class {
-                    entries.entry(class.to_lowercase()).or_insert(icon);
-                }
+                entries.insert(path.file_stem().and_then(|s| s.to_str()), icon, class);
             }
         }
     }
@@ -139,6 +156,8 @@ fn desktop_icon(text: &str) -> (Option<String>, Option<String>) {
 
 #[cfg(test)]
 mod tests {
+    use super::Applications;
+
     #[test]
     fn desktop_action_icons_do_not_override_the_application_icon() {
         assert_eq!(
@@ -147,5 +166,16 @@ mod tests {
             ),
             (Some("terminal".into()), Some("Term".into()))
         );
+    }
+
+    #[test]
+    fn desktop_filenames_take_priority_over_class_aliases() {
+        let mut applications = Applications::default();
+        applications.insert(Some("a"), "wrong-icon".into(), Some("target".into()));
+        applications.insert(Some("target"), "right-icon".into(), None);
+        assert_eq!(applications.find("TARGET"), Some("right-icon"));
+
+        applications.insert(Some("target"), "lower-priority-icon".into(), None);
+        assert_eq!(applications.find("target"), Some("right-icon"));
     }
 }
