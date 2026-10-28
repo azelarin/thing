@@ -858,7 +858,7 @@ impl App {
                 } else {
                     current.map_or(0, |n| (n + 1) % order.len())
                 };
-                surface.input.focused = Some(order[next]);
+                surface.input.focus_from_keyboard(order[next]);
                 surface.dirty = true;
             }
             return;
@@ -877,6 +877,8 @@ impl App {
         if node.kind == Kind::Button
             && (event.keysym == Keysym::Return || event.keysym == Keysym::space)
         {
+            self.surfaces[index].input.reveal_keyboard_focus();
+            self.surfaces[index].dirty = true;
             let event_surface = self.surfaces[index].role.surface().clone();
             self.dispatch(output, id, Event::Click);
             if let Some(index) = self.index(&event_surface) {
@@ -896,6 +898,8 @@ impl App {
                 Keysym::End => slider.max,
                 _ => return,
             };
+            self.surfaces[index].input.reveal_keyboard_focus();
+            self.surfaces[index].dirty = true;
             self.dispatch(
                 output,
                 id,
@@ -1307,7 +1311,7 @@ impl PointerHandler for App {
                     surface.input.pressed = hit;
                     surface.pressed_button = Some(button);
                     surface.press_serial = Some(serial);
-                    surface.input.focused = hit;
+                    surface.input.focus_from_pointer(hit);
                     surface.dirty = true;
                     if button == 0x110
                         && let Some(id) = hit
