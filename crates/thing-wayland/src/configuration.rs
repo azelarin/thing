@@ -2,8 +2,8 @@ use std::{collections::BTreeSet, path::PathBuf, time::Instant};
 
 use thing_core::{Node, NodeId};
 use thing_runtime::{
-    Action, AudioSnapshot, Event, MediaSnapshot, NiriState, OutputContext, Runtime, Scalar,
-    ServiceSnapshot, SurfaceKey, SurfaceTree,
+    Action, AudioSnapshot, Event, MediaSnapshot, NiriState, OutputContext, PowerSnapshot, Runtime,
+    Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree,
 };
 use thing_ui::Layout;
 
@@ -195,6 +195,21 @@ impl<K: Clone + Eq> Configurations<K> {
         Ok(())
     }
 
+    pub(crate) fn set_power(&mut self, power: PowerSnapshot) -> Result<(), String> {
+        let mut services = self.services.clone();
+        services
+            .set_power(power.clone())
+            .map_err(|error| error.to_string())?;
+        for instance in &mut self.instances {
+            instance
+                .runtime
+                .set_power(power.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        self.services = services;
+        Ok(())
+    }
+
     pub(crate) fn set_niri(&mut self, state: NiriState) -> Result<(), String> {
         self.services
             .set_niri(state.clone())
@@ -335,7 +350,7 @@ mod tests {
 
     use tempfile::tempdir;
     use thing_core::{KeyboardMode, Kind, Scale};
-    use thing_runtime::{AudioDevice, AudioSource, AudioStream, MediaPlayer};
+    use thing_runtime::{AudioDevice, AudioSource, AudioStream, MediaPlayer, PowerDevice};
     use thing_ui::{Layout, Measurer, Size};
 
     use super::*;
@@ -357,6 +372,33 @@ mod tests {
             node.children.iter().find_map(find)
         }
         find(configurations.root(&key).unwrap()).unwrap()
+    }
+
+    fn power_device(path: &str) -> PowerDevice {
+        PowerDevice {
+            id: path.into(),
+            kind: "battery".into(),
+            state: "discharging".into(),
+            power_supply: true,
+            present: Some(true),
+            online: None,
+            percentage: Some(42.0),
+            time_to_empty: Some(3600),
+            time_to_full: None,
+            energy: Some(21.0),
+            energy_empty: Some(0.0),
+            energy_full: Some(50.0),
+            energy_full_design: Some(55.0),
+            energy_rate: Some(8.0),
+            capacity: Some(90.0),
+            native_path: Some("BAT0".into()),
+            vendor: None,
+            model: Some("battery".into()),
+            serial: None,
+            icon_name: Some("battery-good-symbolic".into()),
+            warning_level: "none".into(),
+            battery_level: None,
+        }
     }
 
     struct FixedText;
@@ -944,6 +986,54 @@ mod tests {
         assert!(configurations.refresh().is_empty());
         assert_eq!(text(&configurations, 1), "Track:Artist:true:1:p1");
         assert_eq!(text(&configurations, 2), "Track:Artist:true:1:p1");
+    }
+
+    #[test]
+    fn power_updates_reach_existing_and_later_outputs_together() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            return ui.panel { children = { ui.text { text = function()
+                local display = services.power.display:get() or { percentage = 0 }
+                local devices = services.power.devices:get()
+                local first = devices[1] or { state = 'none' }
+                return `{services.power.available:get()}:{services.power.on_battery:get()}:{display.percentage}:{#devices}:{first.state}`
+            end } } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        configurations
+            .set_power(PowerSnapshot {
+                available: true,
+                on_battery: true,
+                display: Some(power_device(
+                    "/org/freedesktop/UPower/devices/DisplayDevice",
+                )),
+                devices: vec![power_device("/org/freedesktop/UPower/devices/battery_BAT0")],
+                error: String::new(),
+            })
+            .unwrap();
+        assert_eq!(configurations.refresh(), vec![1]);
+        assert_eq!(text(&configurations, 1), "true:true:42:1:discharging");
+
+        configurations.add(2, output("DP-2", 2560)).unwrap();
+        assert_eq!(text(&configurations, 2), "true:true:42:1:discharging");
+        assert!(
+            configurations
+                .set_power(PowerSnapshot {
+                    on_battery: true,
+                    ..PowerSnapshot::default()
+                })
+                .is_err()
+        );
+        assert!(configurations.refresh().is_empty());
+        for key in [1, 2] {
+            assert_eq!(text(&configurations, key), "true:true:42:1:discharging");
+        }
     }
 
     #[test]

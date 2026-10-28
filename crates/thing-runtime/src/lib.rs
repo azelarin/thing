@@ -13,7 +13,7 @@ mod transition;
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
 pub use services::{
     Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, MediaAction, MediaPlayer,
-    MediaSnapshot, ServiceSnapshot,
+    MediaSnapshot, PowerDevice, PowerSnapshot, ServiceSnapshot,
 };
 
 use mlua::{Error, Function, Lua, Result, Table, Value, VmState};
@@ -189,6 +189,7 @@ impl Runtime {
         services.set_all_sources(snapshot.all_sources)?;
         services.set_streams(snapshot.streams)?;
         services.set_media_players(snapshot.media_players)?;
+        services.set_power_devices(snapshot.power_display, snapshot.power_devices)?;
         services.set_niri(snapshot.niri)?;
         if let Some(output) = &output {
             services.set_output(output)?;
@@ -268,6 +269,11 @@ impl Runtime {
     /// replaces selected media player state in one update. call [`Self::refresh`] afterward.
     pub fn set_media(&mut self, media: MediaSnapshot) -> Result<()> {
         self.services.set_media(media)
+    }
+
+    /// replaces read-only power state in one update. call [`Self::refresh`] afterward.
+    pub fn set_power(&mut self, power: PowerSnapshot) -> Result<()> {
+        self.services.set_power(power)
     }
 
     /// replaces workspace and window lists. call [`Self::refresh`] to update widgets.
