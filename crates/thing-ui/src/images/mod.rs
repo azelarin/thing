@@ -183,7 +183,11 @@ impl Images {
         bounds: Rect,
         scale: f32,
     ) -> Option<(ImageId, u32, u32)> {
-        if image.source.is_none() && image.icon.is_none() && image.app_id.is_none() {
+        if image.source.is_none()
+            && image.memory.is_none()
+            && image.icon.is_none()
+            && image.app_id.is_none()
+        {
             return None;
         }
         if bounds.width <= 0.0 || bounds.height <= 0.0 {
@@ -291,11 +295,37 @@ impl Drop for Images {
 }
 
 fn decode(key: &Key, icons: &mut icons::Icons) -> Result<Pixels, String> {
-    let path = icons.find(
-        &key.image,
-        key.width.max(key.height).min(u16::MAX as u32) as u16,
-    )?;
-    let file = std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let requested = key.width.max(key.height).min(u16::MAX as u32) as u16;
+    if let Some(path) = key.image.source.as_deref() {
+        return decode_path(std::path::Path::new(path), key);
+    }
+    let mut last_error = None;
+    if let Some(source) = &key.image.memory {
+        for candidate in source.candidates() {
+            if let Some(name) = candidate.icon() {
+                match icons::Icons::find_name(name, &key.image.theme, requested)
+                    .and_then(|path| decode_path(&path, key))
+                {
+                    Ok(pixels) => return Ok(pixels),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            if let Some(pixmap) = select_pixmap(candidate.pixmaps(), key.width, key.height) {
+                return decode_pixmap(pixmap, key);
+            }
+        }
+    }
+    match icons
+        .find(&key.image, requested)
+        .and_then(|path| decode_path(&path, key))
+    {
+        Ok(pixels) => Ok(pixels),
+        Err(error) => Err(last_error.unwrap_or(error)),
+    }
+}
+
+fn decode_path(path: &std::path::Path, key: &Key) -> Result<Pixels, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !file.metadata().map_err(|e| e.to_string())?.is_file() {
         return Err("image source is not a regular file".into());
     }
@@ -310,6 +340,34 @@ fn decode(key: &Key, icons: &mut icons::Icons) -> Result<Pixels, String> {
         &bytes,
         path.extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("svg")),
+        key.width,
+        key.height,
+        key.fit,
+        key.viewport_aspect(),
+    )
+}
+
+fn select_pixmap(
+    pixmaps: &[thing_core::ImagePixmap],
+    width: u32,
+    height: u32,
+) -> Option<&thing_core::ImagePixmap> {
+    pixmaps
+        .iter()
+        .filter(|pixmap| pixmap.width() >= width && pixmap.height() >= height)
+        .min_by_key(|pixmap| u64::from(pixmap.width()) * u64::from(pixmap.height()))
+        .or_else(|| {
+            pixmaps
+                .iter()
+                .max_by_key(|pixmap| u64::from(pixmap.width()) * u64::from(pixmap.height()))
+        })
+}
+
+fn decode_pixmap(pixmap: &thing_core::ImagePixmap, key: &Key) -> Result<Pixels, String> {
+    let image = image::RgbaImage::from_raw(pixmap.width(), pixmap.height(), pixmap.rgba().to_vec())
+        .ok_or("invalid in-memory image dimensions")?;
+    resize_raster(
+        image::DynamicImage::ImageRgba8(image),
         key.width,
         key.height,
         key.fit,
@@ -398,27 +456,37 @@ fn decode_bytes_with_aspect(
         limits.max_alloc = Some(CACHE_BYTES as u64);
         reader.limits(limits);
         let decoded = reader.decode().map_err(|e| e.to_string())?;
-        let image = match fit {
-            ImageFit::Contain => decoded.thumbnail(width, height).into_rgba8(),
-            ImageFit::Cover => {
-                let (x, y, crop_width, crop_height) =
-                    cover_crop(decoded.width(), decoded.height(), viewport_aspect);
-                decoded
-                    .crop_imm(x, y, crop_width, crop_height)
-                    .resize_exact(width, height, image::imageops::FilterType::Triangle)
-                    .into_rgba8()
-            }
-            ImageFit::Fill => decoded
-                .resize_exact(width, height, image::imageops::FilterType::Triangle)
-                .into_rgba8(),
-        };
-        Ok(Pixels {
-            width: image.width(),
-            height: image.height(),
-            rgba: image.into_raw(),
-            premultiplied: false,
-        })
+        resize_raster(decoded, width, height, fit, viewport_aspect)
     }
+}
+
+fn resize_raster(
+    decoded: image::DynamicImage,
+    width: u32,
+    height: u32,
+    fit: ImageFit,
+    viewport_aspect: f64,
+) -> Result<Pixels, String> {
+    let image = match fit {
+        ImageFit::Contain => decoded.thumbnail(width, height).into_rgba8(),
+        ImageFit::Cover => {
+            let (x, y, crop_width, crop_height) =
+                cover_crop(decoded.width(), decoded.height(), viewport_aspect);
+            decoded
+                .crop_imm(x, y, crop_width, crop_height)
+                .resize_exact(width, height, image::imageops::FilterType::Triangle)
+                .into_rgba8()
+        }
+        ImageFit::Fill => decoded
+            .resize_exact(width, height, image::imageops::FilterType::Triangle)
+            .into_rgba8(),
+    };
+    Ok(Pixels {
+        width: image.width(),
+        height: image.height(),
+        rgba: image.into_raw(),
+        premultiplied: false,
+    })
 }
 
 fn svg_cover_transform(
@@ -498,6 +566,41 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use femtovg::{PixelFormat, renderer::Void};
+    use thing_core::{ImageCandidate, ImagePixmap, ImageSource};
+
+    #[test]
+    fn memory_sources_fall_back_from_names_and_choose_a_suitable_resolution() {
+        let attention = ImageCandidate::new(
+            Some("thing-missing-attention-icon-9d52f20f".into()),
+            Vec::new(),
+        )
+        .unwrap();
+        let normal = ImageCandidate::new(
+            Some("thing-missing-normal-icon-9d52f20f".into()),
+            vec![
+                ImagePixmap::new(16, 16, vec![255; 16 * 16 * 4]).unwrap(),
+                ImagePixmap::new(32, 32, [10, 20, 30, 128].repeat(32 * 32)).unwrap(),
+            ],
+        )
+        .unwrap();
+        let image = Image {
+            memory: Some(ImageSource::new("tray1-image1".into(), vec![attention, normal]).unwrap()),
+            theme: "Adwaita".into(),
+            ..Image::default()
+        };
+        let key = Key {
+            image,
+            fit: ImageFit::Fill,
+            width: 24,
+            height: 24,
+            cover_aspect_bits: None,
+        };
+
+        let pixels = decode(&key, &mut icons::Icons::default()).unwrap();
+        assert_eq!((pixels.width, pixels.height), (24, 24));
+        assert_eq!(&pixels.rgba[..4], &[10, 20, 30, 128]);
+        assert!(!pixels.premultiplied);
+    }
 
     #[test]
     fn eviction_keeps_retired_bytes_resident_until_release() {

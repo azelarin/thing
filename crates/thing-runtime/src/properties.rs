@@ -1,11 +1,12 @@
 use mlua::{Error, Result, Table, Value};
 use thing_core::{
-    Color, CrossAlign, ImageFit, KeyboardMode, Kind, MainAlign, Node, PanelEdge, PanelInputRect,
-    PanelInputRegion, PanelMargins, PathFillRule, PathFit, PathStrokeCap, PathStrokeJoin,
-    PopupAlignment, PopupAnchor, PopupConstraints, PopupOffset, SurfaceAnchors, SurfaceLayer,
-    TextAlign, TextOverflow, ViewBox,
+    Color, CrossAlign, ImageFit, ImageSource, KeyboardMode, Kind, MainAlign, Node, PanelEdge,
+    PanelInputRect, PanelInputRegion, PanelMargins, PathFillRule, PathFit, PathStrokeCap,
+    PathStrokeJoin, PopupAlignment, PopupAnchor, PopupConstraints, PopupOffset, SurfaceAnchors,
+    SurfaceLayer, TextAlign, TextOverflow, ViewBox,
 };
 
+use crate::services::ImageHandle;
 use crate::transition::Resolved;
 
 pub(crate) fn string(value: Value, name: &str) -> Result<String> {
@@ -486,7 +487,11 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "text" if node.kind == Kind::Text => node.text = string(value, name)?,
         "max_lines" if node.kind == Kind::Text => node.max_lines = max_lines(value, name)?,
         "overflow" if node.kind == Kind::Text => node.text_overflow = text_overflow(value, name)?,
-        "source" if node.kind == Kind::Image => node.image.source = optional_string(value, name)?,
+        "source" if node.kind == Kind::Image => {
+            let (source, memory) = image_source(value, name)?;
+            node.image.source = source;
+            node.image.memory = memory;
+        }
         "icon" if node.kind == Kind::Image => node.image.icon = optional_string(value, name)?,
         "app_id" if node.kind == Kind::Image => node.image.app_id = optional_string(value, name)?,
         "icon_theme" if node.kind == Kind::Image => node.image.theme = string(value, name)?,
@@ -644,5 +649,19 @@ fn optional_string(value: Value, name: &str) -> Result<Option<String>> {
         Ok(None)
     } else {
         string(value, name).map(Some)
+    }
+}
+
+fn image_source(value: Value, name: &str) -> Result<(Option<String>, Option<ImageSource>)> {
+    match value {
+        Value::Nil => Ok((None, None)),
+        Value::String(value) => Ok((Some(value.to_str()?.to_owned()), None)),
+        Value::UserData(value) => value
+            .borrow::<ImageHandle>()
+            .map(|source| (None, Some(source.0.clone())))
+            .map_err(|_| Error::runtime(format!("{name} must be a string, image source, or nil"))),
+        _ => Err(Error::runtime(format!(
+            "{name} must be a string, image source, or nil"
+        ))),
     }
 }

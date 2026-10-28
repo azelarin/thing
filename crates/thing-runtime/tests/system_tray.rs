@@ -1,5 +1,6 @@
 use std::fs;
 
+use thing_core::{ImageCandidate, ImagePixmap, ImageSource};
 use thing_runtime::{Action, Event, Runtime, SystemTrayAction, SystemTrayItem, SystemTraySnapshot};
 
 fn runtime(source: &str) -> (tempfile::TempDir, Runtime) {
@@ -17,6 +18,7 @@ fn item(id: &str) -> SystemTrayItem {
         category: "Communications".into(),
         title: "Chat".into(),
         status: "NeedsAttention".into(),
+        icon: Some(image_source(id, 10)),
         icon_name: "chat".into(),
         attention_icon_name: "chat-attention".into(),
         overlay_icon_name: "chat-unread".into(),
@@ -30,6 +32,20 @@ fn item(id: &str) -> SystemTrayItem {
         has_overlay_icon_pixmap: true,
         has_tooltip_icon_pixmap: false,
     }
+}
+
+fn image_source(id: &str, red: u8) -> ImageSource {
+    ImageSource::new(
+        format!("{id}-image{red}"),
+        vec![
+            ImageCandidate::new(
+                Some("chat-attention".into()),
+                vec![ImagePixmap::new(1, 1, vec![red, 20, 30, 255]).unwrap()],
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
 }
 
 #[test]
@@ -77,6 +93,17 @@ fn system_tray_state_is_reactive_and_replaced_together() {
         "true|true||1|tray1|chat|Communications|Chat|NeedsAttention|chat|chat-attention|chat-unread|dialog-information|new message|one unread conversation|false|true|true|false|true|false"
     );
 
+    let oversized_icon = ImageSource::new(
+        "tray2-image1".into(),
+        vec![
+            ImageCandidate::new(
+                None,
+                vec![ImagePixmap::new(257, 257, vec![0; 257 * 257 * 4]).unwrap()],
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
     for invalid in [
         SystemTraySnapshot {
             available: false,
@@ -96,6 +123,14 @@ fn system_tray_state_is_reactive_and_replaced_together() {
             }],
             ..SystemTraySnapshot::default()
         },
+        SystemTraySnapshot {
+            available: true,
+            items: vec![SystemTrayItem {
+                icon: Some(oversized_icon),
+                ..item("tray2")
+            }],
+            ..SystemTraySnapshot::default()
+        },
     ] {
         assert!(runtime.set_system_tray(invalid).is_err());
     }
@@ -107,6 +142,7 @@ fn system_tray_records_and_lists_are_read_only() {
     for mutation in [
         "services.system_tray.items:get()[1].title = 'changed'",
         "services.system_tray.items:get()[1] = {}",
+        "services.system_tray.items:get()[1].icon.value = 'changed'",
     ] {
         let source = format!(
             r#"
@@ -131,6 +167,99 @@ fn system_tray_records_and_lists_are_read_only() {
         );
         assert!(runtime.take_actions().is_empty());
     }
+}
+
+#[test]
+fn system_tray_image_sources_are_opaque_and_reactive() {
+    let (_directory, mut instance) = runtime(
+        r#"
+        return ui.panel { children = { ui.image {
+            source = function()
+                local items = services.system_tray.items:get()
+                return if #items == 0 then nil else items[1].icon
+            end,
+        } } }
+        "#,
+    );
+    instance
+        .set_system_tray(SystemTraySnapshot {
+            available: true,
+            items: vec![item("tray1")],
+            ..SystemTraySnapshot::default()
+        })
+        .unwrap();
+    assert!(instance.refresh().unwrap());
+    assert_eq!(
+        instance.root().unwrap().children[0]
+            .image
+            .memory
+            .as_ref()
+            .unwrap()
+            .id(),
+        "tray1-image10"
+    );
+
+    let mut changed = item("tray1");
+    changed.icon = Some(image_source("tray1", 40));
+    instance
+        .set_system_tray(SystemTraySnapshot {
+            available: true,
+            items: vec![changed],
+            ..SystemTraySnapshot::default()
+        })
+        .unwrap();
+    assert!(instance.refresh().unwrap());
+    assert_eq!(
+        instance.root().unwrap().children[0]
+            .image
+            .memory
+            .as_ref()
+            .unwrap()
+            .id(),
+        "tray1-image40"
+    );
+
+    let invalid = tempfile::tempdir().unwrap();
+    let path = invalid.path().join("invalid.luau");
+    fs::write(
+        &path,
+        "return ui.panel { children = { ui.image { source = services.system_tray.items } } }",
+    )
+    .unwrap();
+    let error = Runtime::load(path).err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("source must be a string, image source, or nil")
+    );
+
+    let (_directory, mut conflicting) = runtime(
+        r#"
+        return ui.panel { children = { ui.image {
+            icon = "fallback",
+            source = function()
+                local items = services.system_tray.items:get()
+                return if #items == 0 then nil else items[1].icon
+            end,
+        } } }
+        "#,
+    );
+    conflicting
+        .set_system_tray(SystemTraySnapshot {
+            available: true,
+            items: vec![item("tray1")],
+            ..SystemTraySnapshot::default()
+        })
+        .unwrap();
+    let error = conflicting.refresh().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("image accepts only one of a file source, image handle, icon, or app_id")
+    );
+    let image = &conflicting.root().unwrap().children[0].image;
+    assert_eq!(image.icon.as_deref(), Some("fallback"));
+    assert!(image.memory.is_none());
 }
 
 #[test]

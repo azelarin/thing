@@ -29,7 +29,7 @@ use zbus::{
     zvariant::{OwnedObjectPath, OwnedValue},
 };
 
-use model::{Endpoint, Lifetime, Model, QueriedItem, Target};
+use model::{Endpoint, Lifetime, Model, QueriedIcon, QueriedItem, QueriedPixmap, Target};
 
 const WATCHER_PATH: &str = "/StatusNotifierWatcher";
 const KDE_WATCHER_NAME: &str = "org.kde.StatusNotifierWatcher";
@@ -51,6 +51,9 @@ const MAX_SIGNAL_BYTES: usize = 8 * 1024;
 const MAX_PROPERTY_BYTES: usize = 512 * 1024;
 const MAX_PIXMAPS: usize = 32;
 const MAX_PIXMAP_BYTES: usize = 256 * 1024;
+const MAX_PIXMAP_SIDE: u32 = 4096;
+const MAX_ITEM_IMAGE_BYTES: usize = 512 * 1024;
+const MAX_TOTAL_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const METHOD_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -119,10 +122,10 @@ struct Shared {
 
 /// a status notifier worker for discovery, metadata, and item actions.
 ///
-/// snapshots retain icon names and report whether bounded pixmaps exist, but do
-/// not retain their pixel data. dbusmenu layouts and legacy xembed items are not
-/// handled here. action coordinates are `(0, 0)` because wayland clients do not
-/// have global screen coordinates.
+/// snapshots retain bounded normal and attention icons. dbusmenu layouts,
+/// pixmap animation, overlays, and legacy xembed items are not handled here.
+/// action coordinates are `(0, 0)` because wayland clients do not have global
+/// screen coordinates.
 pub struct SystemTray {
     shared: Arc<Mutex<Shared>>,
     wake: UnixStream,
@@ -558,7 +561,7 @@ async fn session(
             Input::Query(result) => {
                 running.remove(&result.request.lifetime.id);
                 if let Ok(queried) = result.result
-                    && model.update(&result.request.lifetime, queried)
+                    && model.update(&result.request.lifetime, queried, MAX_TOTAL_IMAGE_BYTES)?
                 {
                     publish(update_shared(
                         shared,
@@ -691,15 +694,26 @@ async fn query_item(connection: &Connection, lifetime: &Lifetime) -> Result<Quer
         {
             Ok(mut values) => {
                 let tooltip = take::<Tooltip>(&mut values, "ToolTip").unwrap_or_default();
-                let icon_pixmaps =
+                let raw_icon_pixmaps =
                     take::<Vec<Pixmap>>(&mut values, "IconPixmap").unwrap_or_default();
-                let attention_pixmaps =
+                let raw_attention_pixmaps =
                     take::<Vec<Pixmap>>(&mut values, "AttentionIconPixmap").unwrap_or_default();
                 let overlay_pixmaps =
                     take::<Vec<Pixmap>>(&mut values, "OverlayIconPixmap").unwrap_or_default();
                 let menu = take::<OwnedObjectPath>(&mut values, "Menu")
                     .map(|path| path.to_string())
                     .unwrap_or_default();
+                let icon_name = take_string(&mut values, "IconName", 4096);
+                let attention_icon_name = take_string(&mut values, "AttentionIconName", 4096);
+                let mut icon = QueriedIcon {
+                    name: icon_name.clone(),
+                    pixmaps: normalize_pixmaps(raw_icon_pixmaps),
+                };
+                let mut attention_icon = QueriedIcon {
+                    name: attention_icon_name.clone(),
+                    pixmaps: normalize_pixmaps(raw_attention_pixmaps),
+                };
+                enforce_item_image_budget(&mut icon, &mut attention_icon);
                 return Ok(QueriedItem {
                     item: SystemTrayItem {
                         id: lifetime.id.clone(),
@@ -707,19 +721,22 @@ async fn query_item(connection: &Connection, lifetime: &Lifetime) -> Result<Quer
                         category: take_string(&mut values, "Category", 4096),
                         title: take_string(&mut values, "Title", 4096),
                         status: take_string(&mut values, "Status", 4096),
-                        icon_name: take_string(&mut values, "IconName", 4096),
-                        attention_icon_name: take_string(&mut values, "AttentionIconName", 4096),
+                        icon: None,
+                        icon_name,
+                        attention_icon_name,
                         overlay_icon_name: take_string(&mut values, "OverlayIconName", 4096),
                         tooltip_icon_name: sanitize(tooltip.0, 4096),
                         tooltip_title: sanitize(tooltip.2, 4096),
                         tooltip_text: sanitize(tooltip.3, 16 * 1024),
                         item_is_menu: take::<bool>(&mut values, "ItemIsMenu").unwrap_or(false),
                         has_menu: !menu.is_empty() && menu != "/" && menu != "/NO_DBUSMENU",
-                        has_icon_pixmap: valid_pixmaps(&icon_pixmaps),
-                        has_attention_icon_pixmap: valid_pixmaps(&attention_pixmaps),
+                        has_icon_pixmap: !icon.pixmaps.is_empty(),
+                        has_attention_icon_pixmap: !attention_icon.pixmaps.is_empty(),
                         has_overlay_icon_pixmap: valid_pixmaps(&overlay_pixmaps),
                         has_tooltip_icon_pixmap: valid_pixmaps(&tooltip.1),
                     },
+                    icon,
+                    attention_icon,
                     interface: interface.into(),
                 });
             }
@@ -735,17 +752,65 @@ type Tooltip = (String, Vec<Pixmap>, String, String);
 fn valid_pixmaps(pixmaps: &[Pixmap]) -> bool {
     !pixmaps.is_empty()
         && pixmaps.len() <= MAX_PIXMAPS
-        && pixmaps.iter().all(|(width, height, bytes)| {
-            if *width <= 0 || *height <= 0 {
-                return false;
-            }
-            let expected = usize::try_from(*width)
-                .ok()
-                .zip(usize::try_from(*height).ok())
-                .and_then(|(width, height)| width.checked_mul(height))
-                .and_then(|pixels| pixels.checked_mul(4));
-            expected.is_some_and(|expected| expected == bytes.len() && expected <= MAX_PIXMAP_BYTES)
-        })
+        && pixmaps.iter().all(valid_pixmap)
+        && pixmaps
+            .iter()
+            .try_fold(0_usize, |total, (_, _, bytes)| {
+                total.checked_add(bytes.len())
+            })
+            .is_some_and(|total| total <= MAX_ITEM_IMAGE_BYTES)
+}
+
+fn valid_pixmap((width, height, bytes): &Pixmap) -> bool {
+    let dimensions = u32::try_from(*width).ok().zip(u32::try_from(*height).ok());
+    let Some((width, height)) = dimensions else {
+        return false;
+    };
+    if width == 0 || height == 0 || width > MAX_PIXMAP_SIDE || height > MAX_PIXMAP_SIDE {
+        return false;
+    }
+    let expected = usize::try_from(width)
+        .ok()
+        .zip(usize::try_from(height).ok())
+        .and_then(|(width, height)| width.checked_mul(height))
+        .and_then(|pixels| pixels.checked_mul(4));
+    expected.is_some_and(|expected| expected == bytes.len() && expected <= MAX_PIXMAP_BYTES)
+}
+
+fn normalize_pixmaps(pixmaps: Vec<Pixmap>) -> Vec<QueriedPixmap> {
+    if !valid_pixmaps(&pixmaps) {
+        return Vec::new();
+    }
+    let mut sizes = BTreeSet::new();
+    let mut normalized = Vec::new();
+    for (width, height, argb) in pixmaps {
+        let width = width as u32;
+        let height = height as u32;
+        if !sizes.insert((width, height)) {
+            continue;
+        }
+        let mut rgba = Vec::with_capacity(argb.len());
+        for pixel in argb.as_chunks::<4>().0 {
+            rgba.extend_from_slice(&[pixel[1], pixel[2], pixel[3], pixel[0]]);
+        }
+        normalized.push(QueriedPixmap {
+            width,
+            height,
+            rgba,
+        });
+    }
+    normalized
+}
+
+fn enforce_item_image_budget(icon: &mut QueriedIcon, attention_icon: &mut QueriedIcon) {
+    if icon
+        .retained_bytes()
+        .checked_add(attention_icon.retained_bytes())
+        .is_none_or(|bytes| bytes > MAX_ITEM_IMAGE_BYTES)
+    {
+        icon.pixmaps.clear();
+        attention_icon.pixmaps.clear();
+    }
 }
 
 async fn get_all(
@@ -1537,7 +1602,50 @@ mod tests {
         assert!(!valid_pixmaps(&[(0, 0, Vec::new())]));
         assert!(!valid_pixmaps(&[(2, 2, vec![0; 15])]));
         assert!(!valid_pixmaps(&[(257, 257, vec![0; 257 * 257 * 4])]));
+        assert!(!valid_pixmaps(&[(4097, 1, vec![0; 4097 * 4])]));
         assert!(!valid_pixmaps(&vec![(1, 1, vec![0; 4]); MAX_PIXMAPS + 1]));
+        assert!(!valid_pixmaps(&vec![(128, 128, vec![0; 128 * 128 * 4]); 9]));
+    }
+
+    #[test]
+    fn pixmaps_are_deduplicated_and_converted_from_network_argb_to_rgba() {
+        let pixmaps = normalize_pixmaps(vec![
+            (1, 1, vec![128, 10, 20, 30]),
+            (1, 1, vec![255, 40, 50, 60]),
+            (2, 1, vec![64, 1, 2, 3, 255, 4, 5, 6]),
+        ]);
+        assert_eq!(pixmaps.len(), 2);
+        assert_eq!(pixmaps[0].rgba, vec![10, 20, 30, 128]);
+        assert_eq!(pixmaps[1].rgba, vec![1, 2, 3, 64, 4, 5, 6, 255]);
+    }
+
+    #[test]
+    fn normal_and_attention_pixmaps_share_one_item_budget() {
+        let large_pixmap = || QueriedPixmap {
+            width: 256,
+            height: 256,
+            rgba: vec![0; 256 * 256 * 4],
+        };
+        let mut icon = QueriedIcon {
+            name: "normal".into(),
+            pixmaps: vec![large_pixmap()],
+        };
+        let mut attention = QueriedIcon {
+            name: "attention".into(),
+            pixmaps: vec![
+                large_pixmap(),
+                QueriedPixmap {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![0; 4],
+                },
+            ],
+        };
+        enforce_item_image_budget(&mut icon, &mut attention);
+        assert!(icon.pixmaps.is_empty());
+        assert!(attention.pixmaps.is_empty());
+        assert_eq!(icon.name, "normal");
+        assert_eq!(attention.name, "attention");
     }
 
     #[test]
@@ -1618,6 +1726,25 @@ mod tests {
         assert!(!snapshot.items[0].has_attention_icon_pixmap);
         assert!(snapshot.items[0].has_overlay_icon_pixmap);
         assert!(snapshot.items[0].has_tooltip_icon_pixmap);
+        let icon = snapshot.items[0].icon.as_ref().unwrap();
+        let first_icon_id = icon.id().to_owned();
+        assert_eq!(icon.candidates().len(), 2);
+        assert_eq!(icon.candidates()[0].icon(), Some("thing-item-attention"));
+        assert!(icon.candidates()[0].pixmaps().is_empty());
+        assert_eq!(icon.candidates()[1].icon(), Some("thing-item"));
+        assert_eq!(icon.candidates()[1].pixmaps()[0].rgba(), &[1, 2, 3, 255]);
+
+        state.lock().unwrap().icon_red = 9;
+        emit_item_signal(&item_connection, "NewIcon", &());
+        let icon_updated = wait_for(&tray, |snapshot| {
+            snapshot.items.first().is_some_and(|item| {
+                item.icon
+                    .as_ref()
+                    .is_some_and(|icon| icon.candidates()[1].pixmaps()[0].rgba() == [9, 2, 3, 255])
+            })
+        });
+        let updated_icon_id = icon_updated.items[0].icon.as_ref().unwrap().id().to_owned();
+        assert_ne!(updated_icon_id, first_icon_id);
 
         tray.send(SystemTrayAction::Activate, &first_id).unwrap();
         tray.send(SystemTrayAction::SecondaryActivate, &first_id)
@@ -1639,6 +1766,10 @@ mod tests {
                 .is_some_and(|item| item.title == "updated title")
         });
         assert_eq!(updated.items[0].id, first_id);
+        assert_eq!(
+            updated.items[0].icon.as_ref().unwrap().id(),
+            updated_icon_id
+        );
 
         let unrelated_name = "org.example.ThingUnrelatedName";
         async_io::block_on(
@@ -1673,6 +1804,10 @@ mod tests {
         register_item(&item_connection, KDE_PROTOCOL, ITEM_NAME);
         let replacement = wait_for(&tray, |snapshot| snapshot.items.len() == 1);
         assert_ne!(replacement.items[0].id, first_id);
+        assert_ne!(
+            replacement.items[0].icon.as_ref().unwrap().id(),
+            updated_icon_id
+        );
 
         drop(tray);
         drop(observer);
@@ -2042,12 +2177,14 @@ mod tests {
 
     struct FakeItemState {
         title: String,
+        icon_red: u8,
     }
 
     impl Default for FakeItemState {
         fn default() -> Self {
             Self {
                 title: "first title".into(),
+                icon_red: 1,
             }
         }
     }
@@ -2193,7 +2330,7 @@ mod tests {
 
         #[zbus(property)]
         fn icon_pixmap(&self) -> Vec<Pixmap> {
-            vec![(1, 1, vec![255, 1, 2, 3])]
+            vec![(1, 1, vec![255, lock(&self.state).icon_red, 2, 3])]
         }
 
         #[zbus(property)]
