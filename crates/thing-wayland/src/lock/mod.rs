@@ -37,8 +37,8 @@ use smithay_client_toolkit::{
 use thing_core::NodeId;
 use thing_core::{Kind, Node, Scale};
 use thing_runtime::{
-    AuthenticationSnapshot, AuthenticationState, OutputContext, Scalar, ServiceSnapshot,
-    SurfaceKey, SurfaceTree,
+    AuthenticationSnapshot, AuthenticationState, KeyInput, OutputContext, Runtime, Scalar,
+    ServiceSnapshot, SurfaceKey, SurfaceTree,
 };
 use thing_ui::{Interaction, PaintFrame, ScrollState, SecretInputEditor, Size};
 use wayland_client::{
@@ -64,7 +64,8 @@ use crate::{
     configuration::Configurations,
     focus::{ScopedUiTarget, SurfaceLayouts},
     keyboard::{
-        RepeatSession, RepeatTimerAction, TextKeyAction, repeat_action_is_current, text_key_action,
+        RepeatSession, RepeatTimerAction, RootKeyDispatch, TextKeyAction, repeat_action_is_current,
+        root_key_input, text_key_action,
     },
     output::output_context,
     render::{FrameResult, Render, Window},
@@ -82,6 +83,13 @@ enum SecretKeyRoute {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecretFocusRoute {
+    Public,
+    Edit,
+    Guarded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SecretSubmitRoute {
     Start,
     Respond(AttemptId, u64),
@@ -89,6 +97,16 @@ enum SecretSubmitRoute {
 
 fn secret_key_route(event: &KeyEvent, modifiers: Modifiers, direct: bool) -> SecretKeyRoute {
     text_key_action(event, modifiers, direct).map_or(SecretKeyRoute::Consume, SecretKeyRoute::Apply)
+}
+
+fn secret_focus_route(guarded: bool, live_secret: bool) -> SecretFocusRoute {
+    if live_secret {
+        SecretFocusRoute::Edit
+    } else if guarded {
+        SecretFocusRoute::Guarded
+    } else {
+        SecretFocusRoute::Public
+    }
 }
 
 fn secret_submit_route(
@@ -304,6 +322,13 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
     app.result.clone()
 }
 
+/// validate one lock configuration without connecting to Wayland or PAM.
+pub fn check(entry: &Path) -> Result<usize, String> {
+    let runtime = Runtime::load_lock(entry).map_err(|error| error.to_string())?;
+    validate_lock_surfaces(runtime.surfaces())?;
+    Ok(runtime.files().len())
+}
+
 struct Surface {
     window: Option<Window>,
     role: SessionLockSurface,
@@ -316,7 +341,7 @@ struct Surface {
     scroll: ScrollState,
     input: Interaction,
     focus_target: Option<ScopedUiTarget>,
-    secret_focused: bool,
+    secret_guarded: bool,
     secret_input: Option<ActiveSecretInput>,
     autofocus_pending: bool,
     configured: bool,
@@ -460,7 +485,7 @@ impl App {
             scroll: ScrollState::default(),
             input: Interaction::default(),
             focus_target: None,
-            secret_focused: false,
+            secret_guarded: false,
             secret_input: None,
             autofocus_pending: true,
             configured: false,
@@ -513,7 +538,6 @@ impl App {
             surface.scroll = ScrollState::default();
             surface.input = Interaction::default();
             surface.focus_target = None;
-            surface.secret_focused = false;
             surface.secret_input = None;
             surface.autofocus_pending = true;
             surface.dirty = true;
@@ -673,7 +697,6 @@ impl App {
         }
         let surface = &mut self.surfaces[index];
         surface.focus_target = None;
-        surface.secret_focused = false;
         surface.secret_input = None;
         surface.input.focus_from_pointer(None);
         surface.dirty = true;
@@ -699,7 +722,7 @@ impl App {
         }
         let surface = &mut self.surfaces[index];
         surface.focus_target = Some(target.clone());
-        surface.secret_focused = secret.is_some();
+        surface.secret_guarded = secret.is_some();
         surface.input.focus_from_keyboard(id);
         if let Some((node, width)) = secret {
             match surface.secret_input.as_mut() {
@@ -909,40 +932,106 @@ impl App {
         if let Some(repeats) = self.secret_input_key(index, &event, direct) {
             return repeats;
         }
+        let event_surface = self.surfaces[index].role.wl_surface().clone();
+        match self.dispatch_root_key(index, root_key_input(&event, self.modifiers, !direct)) {
+            RootKeyDispatch::Handled => return true,
+            RootKeyDispatch::Failed => return false,
+            RootKeyDispatch::Missing | RootKeyDispatch::Unhandled => {}
+        }
+        let Some(index) = self.index(&event_surface) else {
+            return false;
+        };
         if direct && matches!(event.keysym, Keysym::Tab | Keysym::ISO_Left_Tab) {
-            let order: Vec<_> = self.surfaces[index]
-                .layouts
-                .input()
-                .map(|layout| layout.focus_order().collect())
-                .unwrap_or_default();
-            if !order.is_empty() {
-                let current = self.surfaces[index]
-                    .input
-                    .focused
-                    .and_then(|id| order.iter().position(|candidate| *candidate == id));
-                let next = if self.modifiers.shift {
-                    current.map_or(order.len() - 1, |n| (n + order.len() - 1) % order.len())
-                } else {
-                    current.map_or(0, |n| (n + 1) % order.len())
-                };
-                if let Some(target) = self.surfaces[index].layouts.presented_target(order[next]) {
-                    self.focus_from_keyboard(index, target);
-                }
-            }
+            self.focus_next(index);
         }
         false
     }
 
+    fn dispatch_root_key(&mut self, index: usize, input: KeyInput) -> RootKeyDispatch {
+        let output = self.surfaces[index].output.clone();
+        let Some(root) = self
+            .configurations
+            .surface_root(&output, &SurfaceKey::Default)
+            .map(|root| root.id)
+        else {
+            eprintln!("thing: lock output has no configuration root");
+            return RootKeyDispatch::Failed;
+        };
+        let result =
+            self.configurations
+                .dispatch_key_checked(&output, root, input, validate_lock_surfaces);
+        self.update_watch();
+        let outcome = match result {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => return RootKeyDispatch::Missing,
+            Err(error) => {
+                eprintln!("thing: {error}");
+                self.reconcile_surface_focus(index);
+                return RootKeyDispatch::Failed;
+            }
+        };
+        let handled = outcome.handled;
+        if outcome.dispatch.changed {
+            self.surfaces[index].dirty = true;
+        }
+        if !outcome.dispatch.actions.is_empty() || !outcome.dispatch.ui_actions.is_empty() {
+            eprintln!("thing: actions are unavailable in lock key handlers");
+            self.reconcile_surface_focus(index);
+            return RootKeyDispatch::Failed;
+        }
+        self.reconcile_surface_focus(index);
+        if handled {
+            RootKeyDispatch::Handled
+        } else {
+            RootKeyDispatch::Unhandled
+        }
+    }
+
+    fn focus_next(&mut self, index: usize) {
+        let order: Vec<_> = self.surfaces[index]
+            .layouts
+            .input()
+            .map(|layout| layout.focus_order().collect())
+            .unwrap_or_default();
+        if order.is_empty() {
+            return;
+        }
+        let current = self.surfaces[index]
+            .input
+            .focused
+            .and_then(|id| order.iter().position(|candidate| *candidate == id));
+        let next = if self.modifiers.shift {
+            current.map_or(order.len() - 1, |n| (n + order.len() - 1) % order.len())
+        } else {
+            current.map_or(0, |n| (n + 1) % order.len())
+        };
+        if let Some(target) = self.surfaces[index].layouts.presented_target(order[next]) {
+            self.focus_from_keyboard(index, target);
+        }
+    }
+
     fn secret_input_key(&mut self, index: usize, event: &KeyEvent, direct: bool) -> Option<bool> {
-        let target = self.surfaces.get(index)?.focus_target.clone()?;
-        let was_secret = self.surfaces[index].secret_focused;
-        let Some((node, width)) = self.secret_node_and_width(index, &target) else {
-            if was_secret {
-                self.clear_surface_focus(index);
+        let surface = self.surfaces.get(index)?;
+        let guarded = surface.secret_guarded;
+        let target = surface.focus_target.clone();
+        let secret = target
+            .as_ref()
+            .and_then(|target| self.secret_node_and_width(index, target));
+        match secret_focus_route(guarded, secret.is_some()) {
+            SecretFocusRoute::Public => return None,
+            SecretFocusRoute::Guarded => {
+                if target.is_some() {
+                    self.clear_surface_focus(index);
+                }
+                if direct && matches!(event.keysym, Keysym::Tab | Keysym::ISO_Left_Tab) {
+                    self.focus_next(index);
+                }
                 return Some(false);
             }
-            return None;
-        };
+            SecretFocusRoute::Edit => {}
+        }
+        let target = target.expect("a live secret focus has a target");
+        let (node, width) = secret.expect("a live secret focus has an editor node");
         if self.surfaces[index]
             .secret_input
             .as_ref()
@@ -1127,7 +1216,6 @@ impl App {
             {
                 repeat_invalidated |= keyboard_surface.as_ref() == Some(surface.role.wl_surface());
                 surface.focus_target = None;
-                surface.secret_focused = false;
                 surface.secret_input = None;
                 surface.input.focus_from_pointer(None);
             }
@@ -1783,6 +1871,31 @@ mod tests {
             secret_key_route(&key(Keysym::Tab, None), Modifiers::default(), true),
             SecretKeyRoute::Consume
         );
+    }
+
+    #[test]
+    fn secret_guard_outlives_editor_reload_and_visibility_changes() {
+        fn dispatch_public(route: SecretFocusRoute, calls: &mut usize) {
+            if route == SecretFocusRoute::Public {
+                *calls += 1;
+            }
+        }
+
+        let mut public_calls = 0;
+        let focused = secret_focus_route(true, true);
+        let after_reload = secret_focus_route(true, false);
+        let after_hide = secret_focus_route(true, false);
+        assert_eq!(focused, SecretFocusRoute::Edit);
+        assert_eq!(after_reload, SecretFocusRoute::Guarded);
+        assert_eq!(after_hide, SecretFocusRoute::Guarded);
+        for route in [focused, after_reload, after_hide] {
+            dispatch_public(route, &mut public_calls);
+        }
+        assert_eq!(public_calls, 0);
+
+        let non_secret_focus = secret_focus_route(false, false);
+        dispatch_public(non_secret_focus, &mut public_calls);
+        assert_eq!(public_calls, 1);
     }
 
     #[test]

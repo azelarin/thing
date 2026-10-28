@@ -1036,12 +1036,12 @@ impl Runtime {
         self.dispatch_inner_checked(id, event, None, &validate)
     }
 
-    /// run a panel or popup keyboard handler.
+    /// run a surface-root keyboard handler.
     pub fn dispatch_key(&mut self, id: NodeId, input: KeyInput) -> Result<Option<KeyDispatch>> {
         self.dispatch_key_checked(id, input, |_| Ok(()))
     }
 
-    /// run a panel or popup keyboard handler and validate its candidate trees.
+    /// run a surface-root keyboard handler and validate its candidate trees.
     pub fn dispatch_key_checked(
         &mut self,
         id: NodeId,
@@ -1862,7 +1862,8 @@ impl Runtime {
                         || (key == "on_submit" && kind != Kind::TextInput)
                         || (key == "on_hover" && kind != Kind::Popup && !kind.is_interactive())
                         || (key == "on_close" && kind != Kind::Popup)
-                        || (key == "on_key" && !matches!(kind, Kind::Panel | Kind::Popup))
+                        || (key == "on_key"
+                            && !matches!(kind, Kind::Panel | Kind::Popup | Kind::Lock))
                         || (key == "on_pointer"
                             && !matches!(kind, Kind::Button | Kind::PointerArea))
                     {

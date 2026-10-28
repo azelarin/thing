@@ -128,6 +128,49 @@ fn check_works_without_display_and_returns_distinct_error_codes() {
 }
 
 #[test]
+fn lock_check_uses_the_lock_loader_without_desktop_services() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("lock.luau");
+    fs::write(
+        &path,
+        "return ui.lock { children = { ui.secret_input { autofocus = true } } }",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/does/not/exist")
+        .args(["check", "--lock"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("valid (1 file(s))"));
+    assert!(output.stderr.is_empty());
+
+    fs::write(&path, "return ui.lock {}").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/does/not/exist")
+        .args(["check", "--lock"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("exactly one secret_input"));
+
+    fs::write(&path, "return ui.panel {}").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .args(["check", "--lock"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ui.lock"));
+}
+
+#[test]
 fn check_resolves_assets_without_using_the_process_working_directory() {
     let root = tempfile::tempdir().unwrap();
     let configuration = root.path().join("configuration");

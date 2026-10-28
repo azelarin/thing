@@ -1,7 +1,16 @@
 use std::time::Duration;
 
 use smithay_client_toolkit::seat::keyboard::{KeyEvent, Modifiers, RepeatInfo};
-use xkbcommon::xkb::Keysym;
+use thing_runtime::KeyInput;
+use xkbcommon::xkb::{self, Keysym};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootKeyDispatch {
+    Missing,
+    Unhandled,
+    Handled,
+    Failed,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TextKeyAction {
@@ -190,6 +199,22 @@ pub(crate) fn text_key_action(
             character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
         }))
     .then(|| TextKeyAction::Insert(text.clone()))
+}
+
+pub(crate) fn root_key_input(event: &KeyEvent, modifiers: Modifiers, repeated: bool) -> KeyInput {
+    let mut key = xkb::keysym_get_name(event.keysym);
+    if key.is_empty() {
+        key = format!("0x{:08x}", event.keysym.raw());
+    }
+    KeyInput {
+        key,
+        text: event.utf8.clone().filter(|text| !text.is_empty()),
+        shift: modifiers.shift,
+        ctrl: modifiers.ctrl,
+        alt: modifiers.alt,
+        logo: modifiers.logo,
+        repeated,
+    }
 }
 
 pub(crate) fn repeat_action_is_current<T: PartialEq>(

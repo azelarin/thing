@@ -1,6 +1,11 @@
 --!strict
 
 return ui.lock {
+    on_key = function(event)
+        local _key: string = event.key
+        local _text: string? = event.text
+        return false
+    end,
     children = {
         ui.column {
             children = {

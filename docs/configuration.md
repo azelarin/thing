@@ -45,6 +45,32 @@ reports it in the terminal and keeps the previous configuration running.
 use `thing check ./panel.luau` to check a file without opening a panel. the
 sections below explain the rest of the api.
 
+## lock screens
+
+a lock configuration returns one `ui.lock` root and contains exactly one
+`ui.secret_input`. the host owns that field's contents: luau can set its
+placeholder and style, but cannot read the entered text or receive it through
+an event callback. enter submits the current text to the authentication helper.
+
+validate a lock configuration before trying it on the desktop:
+
+```sh
+thing check --lock ./lock.luau
+```
+
+this uses the lock loader and its stricter surface rules without connecting to
+wayland or PAM. `thing lock ./lock.luau` requests a real compositor lock, so it
+also requires `ext-session-lock-v1` and a root-owned `/etc/pam.d/thing` policy.
+thing never falls back to another PAM service. authentication currently calls
+`pam_authenticate` only; it does not open a PAM session or run account and
+credential management stages.
+
+`services.authentication` is read-only. `state` is one of `idle`,
+`authenticating`, `waiting`, `rejected`, or `unavailable`; `prompt` contains a
+bounded follow-up prompt while waiting, and `message` contains bounded status
+text. these values let the configuration present feedback, but they do not
+provide an unlock operation.
+
 ## editor support
 
 thing includes a definition file for luau-lsp. write a copy beside your
@@ -267,6 +293,7 @@ widget kind; unkeyed children match by position and kind.
 | --- | --- |
 | `text` | `text`: utf-8 string; optional `max_lines` and `overflow` |
 | `text_input` | controlled `value` and `on_change`; optional `placeholder` and `on_submit` |
+| `secret_input` | host-owned lock input; optional `placeholder`; never exposes its value or a submit callback |
 | `image` | one of `source`, `icon`, `app_id`; optional `icon_theme` and `fit` |
 | `path` | `data`, `view_box`; optional fit, fill, and stroke controls |
 | `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll`, `on_hover`, `on_pointer` |
@@ -1585,9 +1612,10 @@ false cancels a pending open and closes the popup. one button can own one
 automatic popup. `on_close` runs when the popup is dismissed, but not when an
 open hover popup is recreated in grabbed mode.
 
-buttons, sliders, ranges, and text inputs accept `autofocus = true`. one widget
-per panel or popup may use it. thing applies autofocus when that surface first
-receives keyboard focus; an earlier pointer or explicit focus choice wins.
+buttons, sliders, ranges, text inputs, and secret inputs accept
+`autofocus = true`. one widget per panel, popup, or lock surface may use it.
+thing applies autofocus when that surface first receives keyboard focus; an
+earlier pointer or explicit focus choice wins.
 
 event handlers can move focus or reveal a row after updating state:
 
@@ -1622,8 +1650,9 @@ disabling, or removing the focused widget clears focus and text input state. a
 successful configuration reload starts a new focus lifetime and can apply its
 autofocus choice, while a failed reload leaves the current one alone.
 
-panels and popups may handle keys while their surface has keyboard focus. the
-callback runs before the built-in text, control, tab, and escape behavior:
+panels, popups, and lock surfaces may handle keys while their surface has
+keyboard focus. the callback runs before the built-in text, control, tab, and
+escape behavior:
 
 ```luau
 local result = ui.button { key = 'first-result' }
@@ -1647,6 +1676,13 @@ that fallback. when the keymap marks a key repeatable, repetition continues
 while either the callback consumes it or the built-in behavior repeats it. the
 callback runs first for each repeat with `repeated = true`; key releases are not
 exposed.
+
+a lock surface is the exception while `secret_input` owns focus. the host
+consumes every press before `on_key`, including repeats and modifier shortcuts,
+so entered characters never reach luau. if reload or a reactive update hides
+the field, that guard remains until the host establishes a non-secret focus.
+lock key handlers may update local state and consume a key; desktop and local ui
+actions are not available from this callback.
 
 the event is a read-only record. `key` is the case-sensitive XKB keysym name,
 such as `Down`, `Return`, `Escape`, or `a`; an unnamed symbol uses an eight-digit

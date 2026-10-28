@@ -116,7 +116,8 @@ use crate::{
         Done as InputMethodDone, InputMethod, TextState as InputMethodTextState,
     },
     keyboard::{
-        RepeatSession, RepeatTimerAction, TextKeyAction, repeat_action_is_current, text_key_action,
+        RepeatSession, RepeatTimerAction, RootKeyDispatch, TextKeyAction, repeat_action_is_current,
+        root_key_input, text_key_action,
     },
     launch::{self, LaunchRequest, Launcher, PendingLaunches},
     managed_process::{
@@ -688,14 +689,6 @@ const MAX_PENDING_UI_ACTIONS: usize = 4096;
 enum WidgetKeyAction {
     Activate,
     Slider(SliderKeyAction),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RootKeyDispatch {
-    Missing,
-    Unhandled,
-    Handled,
-    Failed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4562,22 +4555,6 @@ impl App {
             }
         }
         action.repeats()
-    }
-}
-
-fn root_key_input(event: &KeyEvent, modifiers: Modifiers, repeated: bool) -> KeyInput {
-    let mut key = xkb::keysym_get_name(event.keysym);
-    if key.is_empty() {
-        key = format!("0x{:08x}", event.keysym.raw());
-    }
-    KeyInput {
-        key,
-        text: event.utf8.clone().filter(|text| !text.is_empty()),
-        shift: modifiers.shift,
-        ctrl: modifiers.ctrl,
-        alt: modifiers.alt,
-        logo: modifiers.logo,
-        repeated,
     }
 }
 

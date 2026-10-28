@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf};
 
 use tempfile::TempDir;
 use thing_core::Kind;
-use thing_runtime::{Runtime, SurfaceKey};
+use thing_runtime::{KeyInput, Runtime, SurfaceKey};
 
 fn fixture(source: &str) -> (TempDir, PathBuf) {
     let directory = tempfile::tempdir().unwrap();
@@ -106,4 +106,47 @@ fn lock_reload_preserves_the_configuration_mode() {
     let (_panel_directory, panel) = fixture("return ui.panel {}");
     assert!(runtime.reload(panel).is_err());
     assert_eq!(runtime.root().unwrap().kind, Kind::Lock);
+}
+
+#[test]
+fn lock_root_key_handlers_receive_non_secret_input() {
+    let (_directory, lock) = fixture(
+        r#"
+        local count = ui.state(0)
+        return ui.lock {
+            on_key = function(event)
+                assert(event.key == 'F1')
+                assert(event.text == nil)
+                assert(event.ctrl and not event.repeated)
+                count:set(count:get() + 1)
+                return true
+            end,
+            children = {
+                ui.secret_input {},
+                ui.text { text = function() return tostring(count:get()) end },
+            },
+        }
+        "#,
+    );
+    let mut runtime = Runtime::load_lock(lock).unwrap();
+    let root = runtime.root().unwrap().id;
+    let result = runtime
+        .dispatch_key(
+            root,
+            KeyInput {
+                key: "F1".into(),
+                text: None,
+                shift: false,
+                ctrl: true,
+                alt: false,
+                logo: false,
+                repeated: false,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+    assert!(result.handled);
+    assert!(result.changed);
+    assert_eq!(runtime.root().unwrap().children[1].text, "1");
 }

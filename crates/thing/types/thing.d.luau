@@ -300,6 +300,7 @@ export type ThingLockProperties = {
     visible: ThingReactive<boolean>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
+    on_key: ((event: ThingKeyEvent) -> boolean)?,
     children: ThingChildren?,
 }
 

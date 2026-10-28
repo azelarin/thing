@@ -30,7 +30,7 @@ mod system_tray;
 mod text_data;
 mod watch;
 pub use host::{run, run_with_options};
-pub use lock::run as run_lock;
+pub use lock::{check as check_lock, run as run_lock};
 pub use system_tray::{SystemTray, SystemTrayMode};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
