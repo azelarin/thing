@@ -219,6 +219,16 @@ export type ThingTextInputStyle = {
 
 export type ThingChildren = { ThingWidget } | (() -> { ThingWidget })
 
+declare extern type ThingKeyEvent with
+    read key: string
+    read text: string?
+    read shift: boolean
+    read ctrl: boolean
+    read alt: boolean
+    read logo: boolean
+    read repeated: boolean
+end
+
 export type ThingPanelProperties = {
     key: string?,
     visible: ThingReactive<boolean>?,
@@ -232,6 +242,7 @@ export type ThingPanelProperties = {
     margins: ThingReactive<ThingMargins>?,
     exclusive_zone: ThingReactive<number?>?,
     input_region: ThingReactive<ThingInputRegion?>?,
+    on_key: ((event: ThingKeyEvent) -> boolean)?,
     children: ThingChildren?,
 }
 
@@ -353,6 +364,7 @@ export type ThingPopupProperties = {
     alignment: ThingReactive<ThingPopupAlignment>?,
     offset: ThingReactive<ThingPopupOffset?>?,
     constraints: ThingReactive<ThingPopupConstraints?>?,
+    on_key: ((event: ThingKeyEvent) -> boolean)?,
     on_hover: ((inside: boolean) -> ())?,
     on_close: (() -> ())?,
 }

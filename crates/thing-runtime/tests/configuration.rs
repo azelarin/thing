@@ -5,7 +5,8 @@ use thing_core::{
     PathStrokeCap, PathStrokeJoin, TextAlign, TextOverflow, VectorSegment,
 };
 use thing_runtime::{
-    Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, Event, Limits, Runtime, Scalar,
+    Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, Event, KeyInput, Limits, Runtime,
+    Scalar, UiAction,
 };
 
 fn fixture(source: &str) -> (TempDir, PathBuf) {
@@ -13,6 +14,136 @@ fn fixture(source: &str) -> (TempDir, PathBuf) {
     let path = directory.path().join("panel.luau");
     fs::write(&path, source).unwrap();
     (directory, path)
+}
+
+fn key_input(key: &str, text: Option<&str>, repeated: bool) -> KeyInput {
+    KeyInput {
+        key: key.into(),
+        text: text.map(str::to_owned),
+        shift: true,
+        ctrl: false,
+        alt: true,
+        logo: false,
+        repeated,
+    }
+}
+
+#[test]
+fn root_key_handlers_receive_layout_text_modifiers_and_repeat_state() {
+    let (_directory, path) = fixture(
+        r#"
+        local count = ui.state(0)
+        local target = ui.button { key = 'target' }
+        return ui.panel {
+            on_key = function(event)
+                assert(event.key == 'Down')
+                assert(event.text == 'é')
+                assert(event.shift and not event.ctrl and event.alt and not event.logo)
+                count:set(count:get() + 1)
+                ui.focus(target)
+                return event.repeated
+            end,
+            children = {
+                target,
+                ui.text { text = function() return tostring(count:get()) end },
+            },
+        }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let root = runtime.root().unwrap().id;
+
+    let initial = runtime
+        .dispatch_key(root, key_input("Down", Some("é"), false))
+        .unwrap()
+        .unwrap();
+    assert!(!initial.handled);
+    assert!(initial.changed);
+    assert!(matches!(
+        runtime.take_ui_actions().as_slice(),
+        [UiAction::Focus(_)]
+    ));
+
+    let repeated = runtime
+        .dispatch_key(root, key_input("Down", Some("é"), true))
+        .unwrap()
+        .unwrap();
+    assert!(repeated.handled);
+    assert!(repeated.changed);
+    assert_eq!(runtime.root().unwrap().children[1].text, "2");
+}
+
+#[test]
+fn popup_key_handlers_are_surface_local_and_event_records_are_read_only() {
+    let (_directory, path) = fixture(
+        r#"
+        return ui.panel { children = { ui.button { children = { ui.popup {
+            on_key = function(event)
+                event.key = 'Return'
+                return true
+            end,
+        } } } } }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let popup = runtime.root().unwrap().children[0].children[0].id;
+
+    assert!(
+        runtime
+            .dispatch_key(popup, key_input("Escape", None, false))
+            .is_err()
+    );
+    assert!(runtime.take_actions().is_empty());
+    assert!(runtime.take_ui_actions().is_empty());
+}
+
+#[test]
+fn key_handler_errors_discard_actions_and_missing_handlers_are_distinct() {
+    let (_directory, path) = fixture(
+        r#"
+        local target = ui.button { key = 'target' }
+        return ui.panel {
+            on_key = function()
+                services.launch({ 'true' })
+                ui.focus(target)
+                return 'handled'
+            end,
+            children = { target },
+        }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let root = runtime.root().unwrap().id;
+
+    assert!(
+        runtime
+            .dispatch_key(root, key_input("a", Some("a"), false))
+            .is_err()
+    );
+    assert!(runtime.take_actions().is_empty());
+    assert!(runtime.take_ui_actions().is_empty());
+
+    let (_directory, path) = fixture("return ui.panel {}");
+    let mut runtime = Runtime::load(path).unwrap();
+    let root = runtime.root().unwrap().id;
+    assert_eq!(
+        runtime
+            .dispatch_key(root, key_input("a", Some("a"), false))
+            .unwrap(),
+        None,
+    );
+}
+
+#[test]
+fn on_key_is_available_only_on_panel_and_popup_roots() {
+    for source in [
+        "return ui.panel { on_key = true }",
+        "return ui.panel { children = { ui.row { on_key = function() return true end } } }",
+        "return ui.panel { children = { ui.button { on_key = function() return true end } } }",
+    ] {
+        let (_directory, path) = fixture(source);
+        assert!(Runtime::load(path).is_err(), "accepted {source}");
+    }
 }
 
 #[test]

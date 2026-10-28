@@ -104,6 +104,25 @@ pub enum Event {
     Close,
 }
 
+/// one keyboard press delivered to a panel or popup handler.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyInput {
+    pub key: String,
+    pub text: Option<String>,
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub logo: bool,
+    pub repeated: bool,
+}
+
+/// result of a root keyboard handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyDispatch {
+    pub handled: bool,
+    pub changed: bool,
+}
+
 const MAX_UI_ACTIONS_PER_HANDLER: usize = 1024;
 
 /// one widget identity captured by a local ui action.
@@ -554,6 +573,64 @@ impl Runtime {
         validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<bool> {
         self.dispatch_inner_checked(id, event, None, &validate)
+    }
+
+    /// run a panel or popup keyboard handler.
+    pub fn dispatch_key(&mut self, id: NodeId, input: KeyInput) -> Result<Option<KeyDispatch>> {
+        self.dispatch_key_checked(id, input, |_| Ok(()))
+    }
+
+    /// run a panel or popup keyboard handler and validate its candidate trees.
+    pub fn dispatch_key_checked(
+        &mut self,
+        id: NodeId,
+        input: KeyInput,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<Option<KeyDispatch>> {
+        if !self.is_available(id) {
+            return Ok(None);
+        }
+        let Some(handler) = self.handlers.get(&(id, "on_key")).cloned() else {
+            return Ok(None);
+        };
+        self.begin_call();
+        let event = self.lua.create_table()?;
+        event.set("key", input.key.as_str())?;
+        if let Some(text) = input.text.as_deref() {
+            event.set("text", text)?;
+        }
+        event.set("shift", input.shift)?;
+        event.set("ctrl", input.ctrl)?;
+        event.set("alt", input.alt)?;
+        event.set("logo", input.logo)?;
+        event.set("repeated", input.repeated)?;
+        event.set_readonly(true);
+        let checkpoint = self.action_checkpoint();
+        self.allow_actions(true);
+        let result = handler.call::<Value>(event).and_then(|value| {
+            let Value::Boolean(handled) = value else {
+                return Err(Error::runtime("on_key must return a boolean"));
+            };
+            Ok(handled)
+        });
+        self.allow_actions(false);
+        let now = Instant::now();
+        let result = result.and_then(|handled| {
+            self.refresh_at_checked(now, &validate)
+                .map(|changed| KeyDispatch { handled, changed })
+        });
+        if result.is_err() {
+            self.truncate_actions(checkpoint);
+        }
+        let mut result = result?;
+        match self.cancel_unavailable_presses_checked(now, &validate) {
+            Ok(cleaned) => result.changed |= cleaned,
+            Err(error) => {
+                self.truncate_actions(checkpoint);
+                return Err(error);
+            }
+        }
+        Ok(Some(result))
     }
 
     #[cfg(test)]
@@ -1230,7 +1307,7 @@ impl Runtime {
                     node.autofocus = value;
                 }
                 "on_click" | "on_middle_click" | "on_secondary_click" | "on_scroll"
-                | "on_change" | "on_pressed" | "on_submit" | "on_hover" | "on_close" => {
+                | "on_change" | "on_pressed" | "on_submit" | "on_hover" | "on_close" | "on_key" => {
                     if (matches!(
                         key.as_str(),
                         "on_click" | "on_middle_click" | "on_secondary_click" | "on_scroll"
@@ -1241,6 +1318,7 @@ impl Runtime {
                         || (key == "on_submit" && kind != Kind::TextInput)
                         || (key == "on_hover" && kind != Kind::Popup && !kind.is_interactive())
                         || (key == "on_close" && kind != Kind::Popup)
+                        || (key == "on_key" && !matches!(kind, Kind::Panel | Kind::Popup))
                     {
                         return Err(Error::runtime(format!(
                             "{key} is not supported on {kind:?}"
@@ -1258,7 +1336,8 @@ impl Runtime {
                         "on_pressed" => "on_pressed",
                         "on_submit" => "on_submit",
                         "on_hover" => "on_hover",
-                        _ => "on_close",
+                        "on_close" => "on_close",
+                        _ => "on_key",
                     };
                     self.handlers.insert((node.id, name), function);
                 }

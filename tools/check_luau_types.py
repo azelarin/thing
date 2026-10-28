@@ -81,6 +81,13 @@ CASES = (
             "Expected this to be 'ThingWidget', but got 'boolean'",
         ),
     ),
+    Case(
+        "invalid-key-events.luau",
+        (
+            "Expected this to be 'string', but got 'boolean'",
+            "Expected this to be 'boolean', but got 'string'",
+        ),
+    ),
 )
 
 

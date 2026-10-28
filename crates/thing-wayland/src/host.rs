@@ -43,7 +43,7 @@ use thing_core::{
     SurfaceLayer,
 };
 use thing_runtime::{
-    Action, Event, OutputContext, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree,
+    Action, Event, KeyInput, OutputContext, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree,
     SystemTrayAction, SystemTrayMenuAction, UiAction, UiTarget,
 };
 use thing_ui::{
@@ -92,7 +92,7 @@ use crate::{
     Renderer, RunOptions, SystemTray,
     audio::Audio,
     clipboard::{Clipboard, OfferData as ClipboardOfferData, SourceData as ClipboardSourceData},
-    configuration::Configurations,
+    configuration::{Configurations, DispatchOutcome},
     hover::{Command as HoverCommand, HoverKey, HoverStates, HoverTarget},
     input_method::{
         ChangeCause as InputMethodChangeCause, CursorRectangle as InputMethodCursorRectangle,
@@ -568,6 +568,14 @@ const MAX_PENDING_UI_ACTIONS: usize = 4096;
 enum WidgetKeyAction {
     Activate,
     Slider(SliderKeyAction),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootKeyDispatch {
+    Missing,
+    Unhandled,
+    Handled,
+    Failed,
 }
 
 impl WidgetKeyAction {
@@ -1971,6 +1979,16 @@ impl App {
             .dispatch_checked(&output, id, event, |surfaces| {
                 validate_surface_capabilities(surfaces, layer_shell_version)
             });
+        self.finish_dispatch(output, consumer, result, origin);
+    }
+
+    fn finish_dispatch(
+        &mut self,
+        output: wl_output::WlOutput,
+        consumer: Option<String>,
+        result: Result<DispatchOutcome, String>,
+        origin: Option<InputOrigin>,
+    ) -> bool {
         self.update_watch();
         let outcome = match result {
             Ok(result) => result,
@@ -1980,7 +1998,7 @@ impl App {
                 // published, so reconcile whichever snapshot remains.
                 self.invalidate_output(&output);
                 self.reconcile_published_configuration();
-                return;
+                return false;
             }
         };
         // a successful handler can remove its own popup. request activation
@@ -2049,6 +2067,7 @@ impl App {
             self.invalidate_output(&output);
         }
         self.reconcile_published_configuration();
+        true
     }
 
     fn queue_ui_actions(
@@ -3759,8 +3778,67 @@ impl App {
         }
     }
 
+    fn dispatch_root_key(
+        &mut self,
+        surface: usize,
+        input: KeyInput,
+        origin: Option<InputOrigin>,
+    ) -> RootKeyDispatch {
+        let output = self.surfaces[surface].output.clone();
+        let root = self.surfaces[surface].root;
+        let consumer = self.configurations.consumer(&output).map(str::to_owned);
+        let layer_shell_version = self.layer_shell_version;
+        let result = self
+            .configurations
+            .dispatch_key_checked(&output, root, input, |surfaces| {
+                validate_surface_capabilities(surfaces, layer_shell_version)
+            });
+        let outcome = match result {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => return RootKeyDispatch::Missing,
+            Err(error) => {
+                self.finish_dispatch(output, consumer, Err(error), origin);
+                return RootKeyDispatch::Failed;
+            }
+        };
+        let handled = outcome.handled;
+        if !self.finish_dispatch(output, consumer, Ok(outcome.dispatch), origin) {
+            return RootKeyDispatch::Failed;
+        }
+        if handled {
+            RootKeyDispatch::Handled
+        } else {
+            RootKeyDispatch::Unhandled
+        }
+    }
+
     fn key(&mut self, event: KeyEvent, serial: u32, direct: bool, qh: &QueueHandle<Self>) -> bool {
         let Some(index) = self.keyboard_surface.as_ref().and_then(|wl| self.index(wl)) else {
+            return false;
+        };
+        let event_surface = self.surfaces[index].role.surface().clone();
+        let origin = direct_input_serial(direct, serial)
+            .and_then(|serial| self.input_origin(event_surface.clone(), serial));
+        let root_dispatch = self.dispatch_root_key(
+            index,
+            root_key_input(&event, self.modifiers, !direct),
+            origin,
+        );
+        if direct
+            && matches!(
+                root_dispatch,
+                RootKeyDispatch::Unhandled | RootKeyDispatch::Handled
+            )
+            && let Some(index) = self.index(&event_surface)
+        {
+            self.sync_popup(index, serial, None, qh);
+        }
+        match root_dispatch {
+            RootKeyDispatch::Handled => return true,
+            RootKeyDispatch::Failed => return false,
+            RootKeyDispatch::Missing | RootKeyDispatch::Unhandled => {}
+        }
+        let Some(index) = self.index(&event_surface) else {
             return false;
         };
         if direct && event.keysym == Keysym::Escape {
@@ -3824,7 +3902,6 @@ impl App {
         else {
             return false;
         };
-        let event_surface = self.surfaces[index].role.surface().clone();
         let origin = direct_input_serial(direct, serial)
             .and_then(|serial| self.input_origin(event_surface.clone(), serial));
         if node.kind == Kind::TextInput {
@@ -3875,6 +3952,22 @@ impl App {
             }
         }
         action.repeats()
+    }
+}
+
+fn root_key_input(event: &KeyEvent, modifiers: Modifiers, repeated: bool) -> KeyInput {
+    let mut key = xkb::keysym_get_name(event.keysym);
+    if key.is_empty() {
+        key = format!("0x{:08x}", event.keysym.raw());
+    }
+    KeyInput {
+        key,
+        text: event.utf8.clone().filter(|text| !text.is_empty()),
+        shift: modifiers.shift,
+        ctrl: modifiers.ctrl,
+        alt: modifiers.alt,
+        logo: modifiers.logo,
+        repeated,
     }
 }
 
@@ -5239,7 +5332,7 @@ mod input_tests {
         keyboard_leave_matches, paint_interaction, prepare_text_input_submit,
         reconcile_controlled_text_edit, repeat_action_is_current,
         reset_active_text_input_generation, retain_non_focus_actions, reveal_text_input_focus,
-        scroll_distance, surface_action_route, text_key_action, widget_key_action,
+        root_key_input, scroll_distance, surface_action_route, text_key_action, widget_key_action,
     };
 
     struct FixedMeasurer;
@@ -5573,6 +5666,35 @@ mod input_tests {
         assert_eq!(widget_key_action(Kind::Button, Keysym::Return, false), None);
         assert_eq!(widget_key_action(Kind::Button, Keysym::space, false), None);
         assert!(!WidgetKeyAction::Activate.repeats());
+    }
+
+    #[test]
+    fn root_key_records_use_xkb_names_text_modifiers_and_repeat_origin() {
+        let mut event = key_event(108, Keysym::Down);
+        event.utf8 = Some("é".into());
+        let modifiers = Modifiers {
+            shift: true,
+            ctrl: true,
+            alt: false,
+            logo: true,
+            ..Modifiers::default()
+        };
+
+        let input = root_key_input(&event, modifiers, true);
+
+        assert_eq!(input.key, "Down");
+        assert_eq!(input.text.as_deref(), Some("é"));
+        assert!(input.shift);
+        assert!(input.ctrl);
+        assert!(!input.alt);
+        assert!(input.logo);
+        assert!(input.repeated);
+
+        event.utf8 = Some(String::new());
+        assert_eq!(root_key_input(&event, modifiers, false).text, None);
+
+        event.keysym = Keysym::new(0xdead_beef);
+        assert_eq!(root_key_input(&event, modifiers, false).key, "0xdeadbeef");
     }
 
     #[test]

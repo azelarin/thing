@@ -6,7 +6,7 @@ use std::{
 
 use thing_core::{Node, NodeId};
 use thing_runtime::{
-    Action, AudioSnapshot, ClipboardSnapshot, Event, MediaSnapshot, NiriState,
+    Action, AudioSnapshot, ClipboardSnapshot, Event, KeyInput, MediaSnapshot, NiriState,
     NotificationSnapshot, OutputContext, PowerSnapshot, Runtime, Scalar, ServiceSnapshot,
     SurfaceKey, SurfaceTree, SystemTraySnapshot, UiAction, UiTarget,
 };
@@ -32,6 +32,12 @@ pub(crate) struct DispatchOutcome {
     pub(crate) changed: bool,
     pub(crate) actions: Vec<Action>,
     pub(crate) ui_actions: Vec<UiAction>,
+}
+
+#[derive(Debug)]
+pub(crate) struct KeyHandlerOutcome {
+    pub(crate) handled: bool,
+    pub(crate) dispatch: DispatchOutcome,
 }
 
 impl<K: Clone + Eq> Configurations<K> {
@@ -443,6 +449,32 @@ impl<K: Clone + Eq> Configurations<K> {
             actions: runtime.take_actions(),
             ui_actions: runtime.take_ui_actions(),
         })
+    }
+
+    pub(crate) fn dispatch_key_checked(
+        &mut self,
+        key: &K,
+        id: NodeId,
+        input: KeyInput,
+        validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
+    ) -> Result<Option<KeyHandlerOutcome>, String> {
+        let Some(runtime) = self.runtime_mut(key) else {
+            return Ok(None);
+        };
+        let Some(result) = runtime
+            .dispatch_key_checked(id, input, validate)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(KeyHandlerOutcome {
+            handled: result.handled,
+            dispatch: DispatchOutcome {
+                changed: result.changed,
+                actions: runtime.take_actions(),
+                ui_actions: runtime.take_ui_actions(),
+            },
+        }))
     }
 
     #[cfg(test)]
