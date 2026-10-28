@@ -1,6 +1,6 @@
 use thing_core::{Node, NodeId};
 
-use crate::{Layout, TextInputEditor};
+use crate::{Layout, SecretInputEditor, TextInputEditor};
 
 /// transient input state belongs to the host, not to the widget snapshot.
 #[derive(Clone, Copy, Debug, Default)]
@@ -47,6 +47,7 @@ pub struct PaintFrame<'a> {
     pub scale: f32,
     pub input: Interaction,
     pub text_input: Option<&'a mut TextInputEditor>,
+    pub secret_input: Option<&'a mut SecretInputEditor>,
 }
 
 #[cfg(test)]

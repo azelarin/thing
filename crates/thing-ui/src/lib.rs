@@ -4,6 +4,7 @@ mod editor;
 mod frame;
 mod images;
 mod layout;
+mod secret;
 mod skia;
 mod text;
 pub use editor::{
@@ -12,5 +13,6 @@ pub use editor::{
 };
 pub use frame::{Interaction, PaintFrame};
 pub use layout::{Layout, Measurer, Placement, ScrollState, Size};
+pub use secret::{MAX_SECRET_BYTES, SecretBytes, SecretInputEditor};
 pub use skia::Painter;
 pub use text::TextSystem;

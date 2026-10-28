@@ -28,6 +28,7 @@ class Case:
 
 CASES = (
     Case("valid.luau"),
+    Case("valid-lock.luau"),
     Case(
         "invalid-text-input.luau",
         ("missing field 'value'", "missing field 'on_change'"),
@@ -62,6 +63,14 @@ CASES = (
             "Property 'x' is not compatible.",
             "Property 'width' is not compatible.",
             "Expected this to be 'ThingInputRectangle', but got 'boolean'",
+        ),
+    ),
+    Case(
+        "invalid-secret-input.luau",
+        (
+            "Cannot add property 'value' to table 'ThingSecretInputProperties'",
+            "Cannot add property 'on_change' to table 'ThingSecretInputProperties'",
+            "Cannot add property 'on_submit' to table 'ThingSecretInputProperties'",
         ),
     ),
     Case(

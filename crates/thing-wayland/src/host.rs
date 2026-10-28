@@ -2208,6 +2208,7 @@ impl App {
                     scale: surface.scale.factor(),
                     input,
                     text_input,
+                    secret_input: None,
                 },
                 || {
                     if let Some(viewport) = &viewport {

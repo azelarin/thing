@@ -1,6 +1,7 @@
 //! wayland host for the thing runtime.
 
 mod audio;
+pub mod authentication;
 mod clipboard;
 mod clock;
 mod configuration;

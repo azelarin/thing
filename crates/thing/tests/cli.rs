@@ -1,5 +1,17 @@
 use std::{fs, process::Command};
 
+use thing_wayland::authentication::HELPER_SENTINEL;
+
+#[test]
+fn authentication_helper_entry_point_is_not_an_extensible_public_command() {
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .args([HELPER_SENTINEL, "unexpected"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not accept arguments"));
+}
+
 #[test]
 fn types_writes_the_luau_definition_without_runtime_dependencies() {
     let output = Command::new(env!("CARGO_BIN_EXE_thing"))

@@ -10,6 +10,7 @@ pub struct NodeId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Panel,
+    Lock,
     Popup,
     Row,
     CenterBox,
@@ -18,6 +19,7 @@ pub enum Kind {
     Scroll,
     Text,
     TextInput,
+    SecretInput,
     Image,
     Path,
     Button,
@@ -445,6 +447,7 @@ impl Kind {
         matches!(
             self,
             Self::Panel
+                | Self::Lock
                 | Self::Popup
                 | Self::Row
                 | Self::CenterBox
@@ -460,7 +463,7 @@ impl Kind {
     pub fn is_interactive(self) -> bool {
         matches!(
             self,
-            Self::Button | Self::Slider | Self::Range | Self::TextInput
+            Self::Button | Self::Slider | Self::Range | Self::TextInput | Self::SecretInput
         )
     }
 
@@ -747,6 +750,7 @@ struct ValidationScope {
     allow_external_anchor: bool,
     allow_automatic_popup_anchor: bool,
     inside_range: bool,
+    lock_root: bool,
 }
 
 impl Node {
@@ -778,34 +782,33 @@ impl Node {
 
     /// validates widget properties, sibling keys, and tree depth and size limits.
     pub fn validate(&self) -> Result<(), TreeError> {
-        self.validate_inner(
-            0,
-            &mut HashSet::new(),
-            None,
-            &mut HashSet::new(),
-            ValidationScope {
-                allow_external_anchor: false,
-                allow_automatic_popup_anchor: self.allows_automatic_popup_anchor(),
-                inside_range: false,
-            },
-        )?;
-        self.validate_autofocus_surfaces()
+        self.validate_root(false)
     }
 
     /// validates a tree rendered as one surface. an automatic popup root may
     /// inherit its button anchor from the parent surface.
     pub fn validate_surface(&self) -> Result<(), TreeError> {
+        self.validate_root(true)
+    }
+
+    fn validate_root(&self, allow_external_anchor: bool) -> Result<(), TreeError> {
         self.validate_inner(
             0,
             &mut HashSet::new(),
             None,
             &mut HashSet::new(),
             ValidationScope {
-                allow_external_anchor: true,
+                allow_external_anchor,
                 allow_automatic_popup_anchor: self.allows_automatic_popup_anchor(),
                 inside_range: false,
+                lock_root: self.kind == Kind::Lock,
             },
         )?;
+        if self.kind == Kind::Lock && self.count_kind(Kind::SecretInput) > 1 {
+            return Err(TreeError(
+                "a lock configuration can contain only one secret_input".into(),
+            ));
+        }
         self.validate_autofocus_surfaces()
     }
 
@@ -841,6 +844,21 @@ impl Node {
                 "range children must be visual widgets, found {:?}",
                 self.kind
             )));
+        }
+        if depth > 0 && self.kind == Kind::Lock {
+            return Err(TreeError(
+                "lock is valid only as the root of a lock configuration".into(),
+            ));
+        }
+        if scope.lock_root && self.kind == Kind::Popup {
+            return Err(TreeError(
+                "popups are not available in a lock configuration".into(),
+            ));
+        }
+        if self.kind == Kind::SecretInput && !scope.lock_root {
+            return Err(TreeError(
+                "secret_input is available only in a lock configuration".into(),
+            ));
         }
         if depth > 0 && self.panel != PanelProperties::default() {
             return Err(TreeError(
@@ -878,7 +896,8 @@ impl Node {
             return Err(TreeError("pointer_area requires an event handler".into()));
         }
         let style = &self.style;
-        if (self.kind == Kind::Popup || (depth == 0 && self.kind == Kind::Panel))
+        if (self.kind == Kind::Popup
+            || (depth == 0 && matches!(self.kind, Kind::Panel | Kind::Lock)))
             && [
                 style.min_width,
                 style.max_width,
@@ -889,14 +908,15 @@ impl Node {
             .any(|value| value.is_some())
         {
             return Err(TreeError(
-                "min and max dimensions are not available on panel or popup surfaces".into(),
+                "min and max dimensions are not available on root or popup surfaces".into(),
             ));
         }
-        if (self.kind == Kind::Popup || (depth == 0 && self.kind == Kind::Panel))
+        if (self.kind == Kind::Popup
+            || (depth == 0 && matches!(self.kind, Kind::Panel | Kind::Lock)))
             && (style.width_fraction.is_some() || style.height_fraction.is_some())
         {
             return Err(TreeError(
-                "fractional dimensions are not available on panel or popup surfaces".into(),
+                "fractional dimensions are not available on root or popup surfaces".into(),
             ));
         }
         if [
@@ -930,6 +950,7 @@ impl Node {
             && !matches!(
                 self.kind,
                 Kind::Panel
+                    | Kind::Lock
                     | Kind::Popup
                     | Kind::Row
                     | Kind::Column
@@ -938,7 +959,7 @@ impl Node {
             )
         {
             return Err(TreeError(
-                "wrap is available only on panel, popup, row, column, button, and pointer_area containers"
+                "wrap is available only on root, popup, row, column, button, and pointer_area containers"
                     .into(),
             ));
         }
@@ -959,9 +980,15 @@ impl Node {
                 "ellipsis currently requires max_lines = 1".into(),
             ));
         }
-        if self.kind == Kind::TextInput {
+        if matches!(self.kind, Kind::TextInput | Kind::SecretInput) {
             validate_single_line(&self.text, "text input value")?;
             validate_single_line(&self.placeholder, "text input placeholder")?;
+        }
+        if self.kind == Kind::SecretInput && !self.text.is_empty() {
+            return Err(TreeError(
+                "secret_input values are owned by the host and cannot appear in widget state"
+                    .into(),
+            ));
         }
         for value in [
             style.width,
@@ -1138,6 +1165,15 @@ impl Node {
         } else {
             self.children.iter().find_map(|child| child.find(id))
         }
+    }
+
+    fn count_kind(&self, kind: Kind) -> usize {
+        usize::from(self.kind == kind)
+            + self
+                .children
+                .iter()
+                .map(|child| child.count_kind(kind))
+                .sum::<usize>()
     }
 
     pub fn find_mut(&mut self, id: NodeId) -> Option<&mut Self> {
@@ -1548,6 +1584,46 @@ mod tests {
     }
 
     #[test]
+    fn secret_inputs_are_confined_to_one_lock_root() {
+        let secret = Node::new(NodeId(2), Kind::SecretInput);
+        assert_eq!(
+            secret.validate().unwrap_err().to_string(),
+            "secret_input is available only in a lock configuration"
+        );
+
+        let mut lock = Node::new(NodeId(1), Kind::Lock);
+        lock.children.push(secret);
+        assert!(lock.validate().is_ok());
+
+        lock.children.push(Node::new(NodeId(3), Kind::SecretInput));
+        assert_eq!(
+            lock.validate().unwrap_err().to_string(),
+            "a lock configuration can contain only one secret_input"
+        );
+    }
+
+    #[test]
+    fn lock_trees_reject_public_secret_state_and_popups() {
+        let mut lock = Node::new(NodeId(1), Kind::Lock);
+        let mut secret = Node::new(NodeId(2), Kind::SecretInput);
+        secret.text = "not allowed".into();
+        lock.children.push(secret);
+        assert!(
+            lock.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("owned by the host")
+        );
+
+        lock.children.clear();
+        lock.children.push(Node::new(NodeId(3), Kind::Popup));
+        assert_eq!(
+            lock.validate().unwrap_err().to_string(),
+            "popups are not available in a lock configuration"
+        );
+    }
+
+    #[test]
     fn surface_validation_accepts_only_the_root_popup_external_anchor() {
         let mut popup = Node::new(NodeId(1), Kind::Popup);
         popup.popup.open_on_hover = true;
@@ -1772,11 +1848,13 @@ mod tests {
 
         for kind in [
             Kind::Panel,
+            Kind::Lock,
             Kind::Popup,
             Kind::Scroll,
             Kind::Button,
             Kind::Slider,
             Kind::Range,
+            Kind::SecretInput,
         ] {
             let mut candidate = range.clone();
             candidate.children[0]

@@ -176,7 +176,7 @@ impl Layout {
                                 height: 24.0,
                             },
                             Kind::Text => measurer.measure(node, max_width),
-                            Kind::TextInput => Size {
+                            Kind::TextInput | Kind::SecretInput => Size {
                                 width: 160.0,
                                 height: measurer
                                     .measure(node, None)

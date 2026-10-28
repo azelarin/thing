@@ -323,6 +323,12 @@ struct ActivePointer {
     handled: bool,
 }
 
+#[derive(Clone, Copy)]
+enum ConfigurationMode {
+    Shell,
+    Lock,
+}
+
 struct Children {
     nodes: Vec<Node>,
     bindings: BTreeMap<usize, Binding>,
@@ -350,6 +356,7 @@ pub struct Runtime {
     services: services::Services,
     ui: Rc<RefCell<UiContext>>,
     output: Option<OutputContext>,
+    mode: ConfigurationMode,
 }
 
 impl Runtime {
@@ -359,7 +366,24 @@ impl Runtime {
     }
 
     pub fn load_with_limits(path: impl AsRef<Path>, limits: Limits) -> Result<Self> {
-        Self::load_with_services(path.as_ref(), limits, ServiceSnapshot::default(), None)
+        Self::load_with_services(
+            path.as_ref(),
+            limits,
+            ServiceSnapshot::default(),
+            None,
+            ConfigurationMode::Shell,
+        )
+    }
+
+    /// load one session-lock surface without connecting to wayland.
+    pub fn load_lock(path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_services(
+            path.as_ref(),
+            Limits::default(),
+            ServiceSnapshot::default(),
+            None,
+            ConfigurationMode::Lock,
+        )
     }
 
     /// load an entry file for one output with current desktop service values.
@@ -374,6 +398,23 @@ impl Runtime {
             Limits::default(),
             services.clone(),
             Some(output),
+            ConfigurationMode::Shell,
+        )
+    }
+
+    /// load one session-lock surface for an output with current service values.
+    pub fn load_lock_for_output(
+        path: impl AsRef<Path>,
+        output: OutputContext,
+        services: &ServiceSnapshot,
+    ) -> Result<Self> {
+        output.validate()?;
+        Self::load_with_services(
+            path.as_ref(),
+            Limits::default(),
+            services.clone(),
+            Some(output),
+            ConfigurationMode::Lock,
         )
     }
 
@@ -382,6 +423,7 @@ impl Runtime {
         limits: Limits,
         snapshot: ServiceSnapshot,
         output: Option<OutputContext>,
+        mode: ConfigurationMode,
     ) -> Result<Self> {
         if limits.memory_bytes == 0 || limits.execution_time.is_zero() {
             return Err(Error::runtime("runtime limits must be positive"));
@@ -441,6 +483,7 @@ impl Runtime {
             services,
             ui,
             output,
+            mode,
         };
         runtime.surfaces = runtime.parse_surfaces(exported)?;
         let _ = runtime.sync_ui_targets();
@@ -1576,7 +1619,13 @@ impl Runtime {
     pub fn load_replacement(&self, path: impl AsRef<Path>) -> Result<Self> {
         let mut services = self.services.snapshot();
         services.set_managed_processes(ManagedProcessSnapshot::default())?;
-        Self::load_with_services(path.as_ref(), self.limits, services, self.output.clone())
+        Self::load_with_services(
+            path.as_ref(),
+            self.limits,
+            services,
+            self.output.clone(),
+            self.mode,
+        )
     }
 
     /// reload the configuration, preserving it if loading or validation fails.
@@ -1662,11 +1711,19 @@ impl Runtime {
 
     fn parse_surfaces(&mut self, exported: Value) -> Result<Vec<SurfaceTree>> {
         let Value::Table(table) = exported else {
-            return Err(Error::runtime(
-                "the entry file must return ui.panel { ... } or a dense panel array",
-            ));
+            return Err(Error::runtime(match self.mode {
+                ConfigurationMode::Shell => {
+                    "the entry file must return ui.panel { ... } or a dense panel array"
+                }
+                ConfigurationMode::Lock => "the lock entry file must return ui.lock { ... }",
+            }));
         };
         let single = !table.raw_get::<Value>("_kind")?.is_nil();
+        if matches!(self.mode, ConfigurationMode::Lock) && !single {
+            return Err(Error::runtime(
+                "the lock entry file must return exactly one ui.lock { ... }",
+            ));
+        }
         let roots = if single {
             vec![table]
         } else {
@@ -1676,16 +1733,37 @@ impl Runtime {
         let mut seen_keys = BTreeSet::new();
         let mut surfaces = Vec::with_capacity(roots.len());
         for table in roots {
-            let key = surface_key(&table, !single)?;
+            if matches!(self.mode, ConfigurationMode::Lock)
+                && (!table.raw_get::<Value>("key")?.is_nil()
+                    || !table.raw_get::<Value>("namespace")?.is_nil())
+            {
+                return Err(Error::runtime(
+                    "lock surfaces do not accept key or namespace",
+                ));
+            }
+            let key = if matches!(self.mode, ConfigurationMode::Lock) {
+                SurfaceKey::Default
+            } else {
+                surface_key(&table, !single)?
+            };
             if !seen_keys.insert(key.clone()) {
                 return Err(Error::runtime(format!("duplicate surface key {key:?}")));
             }
-            let namespace = surface_namespace(&table, &key)?;
+            let namespace = if matches!(self.mode, ConfigurationMode::Lock) {
+                "thing-lock".into()
+            } else {
+                surface_namespace(&table, &key)?
+            };
             let root = self.parse_node(Value::Table(table), 0, &mut seen_widgets)?;
-            if root.kind != Kind::Panel {
-                return Err(Error::runtime(
-                    "every surface root must be ui.panel { ... }",
-                ));
+            let expected = match self.mode {
+                ConfigurationMode::Shell => Kind::Panel,
+                ConfigurationMode::Lock => Kind::Lock,
+            };
+            if root.kind != expected {
+                return Err(Error::runtime(match self.mode {
+                    ConfigurationMode::Shell => "every surface root must be ui.panel { ... }",
+                    ConfigurationMode::Lock => "the lock surface root must be ui.lock { ... }",
+                }));
             }
             root.validate().map_err(Error::external)?;
             surfaces.push(SurfaceTree {
@@ -1730,6 +1808,7 @@ impl Runtime {
             ));
         }
         if depth == 0
+            && kind == Kind::Panel
             && !table.raw_get::<Value>("edge")?.is_nil()
             && !table.raw_get::<Value>("anchors")?.is_nil()
         {
@@ -2092,6 +2171,7 @@ fn is_available(node: &Node, id: NodeId) -> bool {
 fn kind(name: &str) -> Result<Kind> {
     match name {
         "panel" => Ok(Kind::Panel),
+        "lock" => Ok(Kind::Lock),
         "popup" => Ok(Kind::Popup),
         "row" => Ok(Kind::Row),
         "centerbox" => Ok(Kind::CenterBox),
@@ -2100,6 +2180,7 @@ fn kind(name: &str) -> Result<Kind> {
         "scroll" => Ok(Kind::Scroll),
         "text" => Ok(Kind::Text),
         "text_input" => Ok(Kind::TextInput),
+        "secret_input" => Ok(Kind::SecretInput),
         "image" => Ok(Kind::Image),
         "path" => Ok(Kind::Path),
         "button" => Ok(Kind::Button),
@@ -2116,6 +2197,7 @@ fn install_ui(lua: &Lua, tracker: Rc<RefCell<Tracker>>) -> Result<Rc<RefCell<UiC
     let next_id = Rc::new(Cell::new(1_u64));
     for name in [
         "panel",
+        "lock",
         "popup",
         "row",
         "centerbox",
@@ -2124,6 +2206,7 @@ fn install_ui(lua: &Lua, tracker: Rc<RefCell<Tracker>>) -> Result<Rc<RefCell<UiC
         "scroll",
         "text",
         "text_input",
+        "secret_input",
         "image",
         "path",
         "button",

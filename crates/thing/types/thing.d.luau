@@ -296,6 +296,13 @@ export type ThingPanelProperties = {
     children: ThingChildren?,
 }
 
+export type ThingLockProperties = {
+    visible: ThingReactive<boolean>?,
+    enabled: ThingReactive<boolean>?,
+    style: ThingStyle?,
+    children: ThingChildren?,
+}
+
 export type ThingContainerProperties = {
     key: string?,
     visible: ThingReactive<boolean>?,
@@ -325,6 +332,14 @@ export type ThingTextInputProperties = {
     on_change: (value: string) -> (),
     on_submit: ((value: string) -> ())?,
     on_hover: ((inside: boolean) -> ())?,
+}
+
+export type ThingSecretInputProperties = {
+    key: string?,
+    visible: ThingReactive<boolean>?,
+    enabled: ThingReactive<boolean>?,
+    style: ThingTextInputStyle?,
+    placeholder: ThingReactive<string>?,
 }
 
 export type ThingImageProperties = {
@@ -748,6 +763,7 @@ end
 
 declare ui: {
     panel: (properties: ThingPanelProperties) -> ThingWidget,
+    lock: (properties: ThingLockProperties) -> ThingWidget,
     popup: (properties: ThingPopupProperties) -> ThingWidget,
     row: (properties: ThingContainerProperties) -> ThingWidget,
     centerbox: (properties: ThingContainerProperties) -> ThingWidget,
@@ -756,6 +772,7 @@ declare ui: {
     scroll: (properties: ThingContainerProperties) -> ThingWidget,
     text: (properties: ThingTextProperties) -> ThingWidget,
     text_input: (properties: ThingTextInputProperties) -> ThingWidget,
+    secret_input: (properties: ThingSecretInputProperties) -> ThingWidget,
     image: (properties: ThingImageProperties) -> ThingWidget,
     path: (properties: ThingPathProperties) -> ThingWidget,
     button: (properties: ThingButtonProperties) -> ThingWidget,
