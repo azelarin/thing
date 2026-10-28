@@ -80,6 +80,7 @@ struct RevealRegion {
     id: NodeId,
     bounds: Rect,
     enabled: bool,
+    focusable: bool,
     scroll_parent: Option<NodeId>,
 }
 
@@ -261,10 +262,10 @@ impl Layout {
     }
 
     pub fn focus_order(&self) -> impl Iterator<Item = NodeId> + '_ {
-        self.placements
+        self.reveal_regions
             .iter()
-            .filter(|p| p.interactive && p.bounds.intersection(p.clip).is_some())
-            .map(|p| p.id)
+            .filter(|region| region.focusable)
+            .map(|region| region.id)
     }
 
     /// the nearest interactive widget on the topmost painted branch at `point`.
@@ -399,6 +400,13 @@ impl Layout {
             id: node.id,
             bounds,
             enabled,
+            focusable: enabled
+                && node.kind.is_interactive()
+                && [bounds.x, bounds.y, bounds.width, bounds.height]
+                    .into_iter()
+                    .all(f32::is_finite)
+                && bounds.width > 0.0
+                && bounds.height > 0.0,
             scroll_parent: inherited.scroll_parent,
         });
 
@@ -1495,6 +1503,7 @@ mod tests {
         // the inner viewport starts entirely below the outer one, so the
         // ordinary paint layout does not descend to this target yet.
         assert!(layout.get(NodeId(7)).is_none());
+        assert!(layout.focus_order().any(|id| id == NodeId(7)));
         assert!(layout.reveal_y(NodeId(7), &mut state));
         assert_eq!(state.offset(NodeId(5)), 50.0);
         assert_eq!(state.offset(NodeId(2)), 50.0);
@@ -1582,17 +1591,20 @@ mod tests {
         let mut state = ScrollState::default();
         let layout = scrolled(&root, size, &mut state);
         assert!(!layout.reveal_y(NodeId(4), &mut state));
+        assert_eq!(layout.focus_order().collect::<Vec<_>>(), vec![NodeId(3)]);
         assert_eq!(state.offset(NodeId(2)), 0.0);
 
         root.children[0].children[1].enabled = true;
         root.children[0].children[1].style.height = Some(0.0);
         let layout = scrolled(&root, size, &mut state);
         assert!(!layout.reveal_y(NodeId(4), &mut state));
+        assert_eq!(layout.focus_order().collect::<Vec<_>>(), vec![NodeId(3)]);
 
         root.children[0].children[1].style.height = Some(20.0);
         root.children[0].children[1].visible = false;
         let layout = scrolled(&root, size, &mut state);
         assert!(!layout.reveal_y(NodeId(4), &mut state));
+        assert_eq!(layout.focus_order().collect::<Vec<_>>(), vec![NodeId(3)]);
 
         state.set(NodeId(2), f32::INFINITY);
         assert_eq!(state.offset(NodeId(2)), 0.0);

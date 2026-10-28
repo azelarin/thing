@@ -104,6 +104,89 @@ pub enum Event {
     Close,
 }
 
+const MAX_UI_ACTIONS_PER_HANDLER: usize = 1024;
+
+/// one widget identity captured by a local ui action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UiTarget {
+    node: NodeId,
+    source: u64,
+    lineage: Vec<UiIdentity>,
+}
+
+impl UiTarget {
+    pub fn node(&self) -> NodeId {
+        self.node
+    }
+}
+
+/// host-local actions produced by a successful event handler.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UiAction {
+    Focus(UiTarget),
+    Reveal(UiTarget),
+}
+
+impl UiAction {
+    pub fn target(&self) -> &UiTarget {
+        match self {
+            Self::Focus(target) | Self::Reveal(target) => target,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UiIdentity {
+    node: NodeId,
+    source: u64,
+    key: Option<Rc<str>>,
+    kind: Kind,
+}
+
+#[derive(Default)]
+struct UiContext {
+    action_start: Option<usize>,
+    targets: BTreeMap<u64, UiTarget>,
+    actions: Vec<UiAction>,
+}
+
+impl UiContext {
+    fn queue(&mut self, source: u64, focus: bool) -> Result<()> {
+        let Some(action_start) = self.action_start else {
+            return Err(Error::runtime(
+                "ui actions are available only inside event handlers",
+            ));
+        };
+        if self.actions.len().saturating_sub(action_start) >= MAX_UI_ACTIONS_PER_HANDLER {
+            return Err(Error::runtime("too many ui actions in one handler"));
+        }
+        let target =
+            self.targets.get(&source).cloned().ok_or_else(|| {
+                Error::runtime("ui action target is not in the current widget tree")
+            })?;
+        if focus
+            && !target
+                .lineage
+                .last()
+                .is_some_and(|identity| identity.kind.is_interactive())
+        {
+            return Err(Error::runtime("ui.focus target must be interactive"));
+        }
+        self.actions.push(if focus {
+            UiAction::Focus(target)
+        } else {
+            UiAction::Reveal(target)
+        });
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ActionCheckpoint {
+    services: usize,
+    ui: usize,
+}
+
 struct Binding {
     node: NodeId,
     property: String,
@@ -137,6 +220,7 @@ pub struct Runtime {
     limits: Limits,
     modules: modules::Modules,
     services: services::Services,
+    ui: Rc<RefCell<UiContext>>,
     output: Option<OutputContext>,
 }
 
@@ -202,7 +286,7 @@ impl Runtime {
         if let Some(output) = &output {
             services.set_output(output)?;
         }
-        install_ui(&lua, tracker.clone())?;
+        let ui = install_ui(&lua, tracker.clone())?;
         lua.sandbox(true)?;
         let modules = modules::Modules::default();
         let exported = modules.load(&lua, path)?;
@@ -222,9 +306,11 @@ impl Runtime {
             limits,
             modules,
             services,
+            ui,
             output,
         };
         runtime.surfaces = runtime.parse_surfaces(exported)?;
+        runtime.sync_ui_targets();
         Ok(runtime)
     }
 
@@ -317,6 +403,119 @@ impl Runtime {
         self.services.take_actions()
     }
 
+    /// takes local ui actions queued by the last successful event handler.
+    pub fn take_ui_actions(&mut self) -> Vec<UiAction> {
+        let actions = std::mem::take(&mut self.ui.borrow_mut().actions);
+        let last_focus = actions
+            .iter()
+            .rposition(|action| matches!(action, UiAction::Focus(_)));
+        actions
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, action)| {
+                if matches!(action, UiAction::Focus(_)) && Some(index) != last_focus {
+                    return None;
+                }
+                self.ui_action_is_current(&action).then_some(action)
+            })
+            .collect()
+    }
+
+    pub fn ui_target(&self, id: NodeId) -> Option<UiTarget> {
+        self.is_available(id)
+            .then(|| {
+                self.ui
+                    .borrow()
+                    .targets
+                    .values()
+                    .find(|target| target.node == id)
+                    .cloned()
+            })
+            .flatten()
+    }
+
+    pub fn focus_target(&self, id: NodeId) -> Option<UiTarget> {
+        self.find(id)
+            .is_some_and(|node| node.kind.is_interactive())
+            .then(|| self.ui_target(id))
+            .flatten()
+    }
+
+    pub fn ui_target_is_current(&self, target: &UiTarget) -> bool {
+        if !self.is_available(target.node) {
+            return false;
+        }
+        let context = self.ui.borrow();
+        let Some(current) = context
+            .targets
+            .values()
+            .find(|current| current.node == target.node)
+        else {
+            return false;
+        };
+        current.lineage.len() == target.lineage.len()
+            && current
+                .lineage
+                .iter()
+                .zip(&target.lineage)
+                .all(|(current, previous)| {
+                    current.node == previous.node
+                        && current.kind == previous.kind
+                        && (current.source == previous.source
+                            || previous
+                                .key
+                                .as_ref()
+                                .is_some_and(|key| current.key.as_ref() == Some(key)))
+                })
+    }
+
+    pub fn ui_action_is_current(&self, action: &UiAction) -> bool {
+        let target = action.target();
+        self.ui_target_is_current(target)
+            && (!matches!(action, UiAction::Focus(_))
+                || self
+                    .find(target.node)
+                    .is_some_and(|node| node.kind.is_interactive()))
+    }
+
+    pub fn autofocus_target(&self, surface_root: NodeId) -> Option<UiTarget> {
+        fn find(node: &Node) -> Option<NodeId> {
+            if node.autofocus {
+                return Some(node.id);
+            }
+            node.children
+                .iter()
+                .filter(|child| child.kind != Kind::Popup)
+                .find_map(find)
+        }
+
+        let root = self.find(surface_root)?;
+        find(root).and_then(|id| self.focus_target(id))
+    }
+
+    pub fn rendered_surface_root(&self, id: NodeId) -> Option<NodeId> {
+        fn find(node: &Node, id: NodeId, surface_root: NodeId) -> Option<NodeId> {
+            if node.id == id {
+                return Some(surface_root);
+            }
+            node.children.iter().find_map(|child| {
+                find(
+                    child,
+                    id,
+                    if child.kind == Kind::Popup {
+                        child.id
+                    } else {
+                        surface_root
+                    },
+                )
+            })
+        }
+
+        self.surfaces
+            .iter()
+            .find_map(|surface| find(&surface.root, id, surface.root.id))
+    }
+
     /// whether an available widget has an explicit scroll handler.
     pub fn has_scroll_handler(&self, id: NodeId) -> bool {
         self.is_available(id) && self.handlers.contains_key(&(id, "on_scroll"))
@@ -387,8 +586,8 @@ impl Runtime {
             return Ok(false);
         };
         self.begin_call();
-        let checkpoint = self.services.action_count();
-        self.services.allow_actions(true);
+        let checkpoint = self.action_checkpoint();
+        self.allow_actions(true);
         let result = match event {
             Event::Click | Event::MiddleClick | Event::SecondaryClick | Event::Close => {
                 handler.call::<()>(())
@@ -399,7 +598,7 @@ impl Runtime {
             Event::Hover(inside) => handler.call::<()>(inside),
             Event::Pressed(_) => unreachable!("press events are handled above"),
         };
-        self.services.allow_actions(false);
+        self.allow_actions(false);
         let now = now.unwrap_or_else(Instant::now);
         let result = result.and_then(|()| self.refresh_at_checked(now, validate));
         let result = match result {
@@ -410,9 +609,9 @@ impl Runtime {
             {
                 self.ended_hovers.insert(id);
                 self.begin_call();
-                self.services.allow_actions(true);
+                self.allow_actions(true);
                 let cleanup = handler.call::<()>(false);
-                self.services.allow_actions(false);
+                self.allow_actions(false);
                 cleanup
                     .and_then(|()| self.refresh_at_checked(now, validate))
                     .map(|cleanup_changed| changed || cleanup_changed)
@@ -420,13 +619,13 @@ impl Runtime {
             result => result,
         };
         if result.is_err() {
-            self.services.truncate_actions(checkpoint);
+            self.truncate_actions(checkpoint);
         }
         let changed = result?;
         match self.cancel_unavailable_presses_checked(now, validate) {
             Ok(cleaned) => Ok(changed || cleaned),
             Err(error) => {
-                self.services.truncate_actions(checkpoint);
+                self.truncate_actions(checkpoint);
                 Err(error)
             }
         }
@@ -445,12 +644,12 @@ impl Runtime {
             return Ok(false);
         }
         let handler = self.handlers.get(&(id, "on_pressed")).cloned();
-        let checkpoint = self.services.action_count();
+        let checkpoint = self.action_checkpoint();
         let result = if let Some(handler) = &handler {
             self.begin_call();
-            self.services.allow_actions(true);
+            self.allow_actions(true);
             let result = handler.call::<()>(true);
-            self.services.allow_actions(false);
+            self.allow_actions(false);
             result.and_then(|()| self.refresh_at_checked(now, validate))
         } else {
             Ok(false)
@@ -460,11 +659,11 @@ impl Runtime {
             Err(error) => {
                 if let Some(handler) = handler {
                     self.begin_call();
-                    self.services.allow_actions(true);
+                    self.allow_actions(true);
                     let cleanup = handler.call::<()>(false);
-                    self.services.allow_actions(false);
+                    self.allow_actions(false);
                     let cleanup = cleanup.and_then(|()| self.refresh_at_checked(now, validate));
-                    self.services.truncate_actions(checkpoint);
+                    self.truncate_actions(checkpoint);
                     return match cleanup {
                         Ok(_) => Err(error),
                         Err(cleanup) => Err(Error::runtime(format!(
@@ -472,7 +671,7 @@ impl Runtime {
                         ))),
                     };
                 }
-                self.services.truncate_actions(checkpoint);
+                self.truncate_actions(checkpoint);
                 return Err(error);
             }
         };
@@ -480,7 +679,7 @@ impl Runtime {
         match self.cancel_unavailable_presses_checked(now, validate) {
             Ok(cleaned) => Ok(changed || cleaned),
             Err(error) => {
-                self.services.truncate_actions(checkpoint);
+                self.truncate_actions(checkpoint);
                 Err(error)
             }
         }
@@ -498,14 +697,14 @@ impl Runtime {
         let Some(handler) = handler else {
             return Ok(false);
         };
-        let checkpoint = self.services.action_count();
+        let checkpoint = self.action_checkpoint();
         self.begin_call();
-        self.services.allow_actions(true);
+        self.allow_actions(true);
         let result = handler.call::<()>(false);
-        self.services.allow_actions(false);
+        self.allow_actions(false);
         let result = result.and_then(|()| self.refresh_at_checked(now, validate));
         if result.is_err() {
-            self.services.truncate_actions(checkpoint);
+            self.truncate_actions(checkpoint);
         }
         result
     }
@@ -570,6 +769,7 @@ impl Runtime {
         let mut handlers = Handlers::new();
         let mut sources = self.sources.clone();
         let mut staged_transitions = BTreeMap::new();
+        let mut ui_structure_changed = false;
         let result = (|| {
             for index in dirty {
                 if retired.contains(&index) {
@@ -580,6 +780,7 @@ impl Runtime {
                 let id = binding.node;
                 let property = binding.property.clone();
                 if property == "children" {
+                    ui_structure_changed = true;
                     let (surface, depth) = candidate
                         .iter()
                         .enumerate()
@@ -738,6 +939,9 @@ impl Runtime {
         self.sources = sources;
         let changed = candidate != self.surfaces;
         self.surfaces = candidate;
+        if ui_structure_changed {
+            self.sync_ui_targets();
+        }
         self.deferred.clear();
         Ok(changed || self.has_active_transitions())
     }
@@ -847,6 +1051,61 @@ impl Runtime {
             .set(Instant::now() + self.limits.execution_time);
     }
 
+    fn action_checkpoint(&self) -> ActionCheckpoint {
+        ActionCheckpoint {
+            services: self.services.action_count(),
+            ui: self.ui.borrow().actions.len(),
+        }
+    }
+
+    fn allow_actions(&self, allowed: bool) {
+        self.services.allow_actions(allowed);
+        let mut ui = self.ui.borrow_mut();
+        ui.action_start = allowed.then_some(ui.actions.len());
+    }
+
+    fn truncate_actions(&self, checkpoint: ActionCheckpoint) {
+        self.services.truncate_actions(checkpoint.services);
+        self.ui.borrow_mut().actions.truncate(checkpoint.ui);
+    }
+
+    fn sync_ui_targets(&self) {
+        fn collect(
+            node: &Node,
+            sources: &BTreeMap<NodeId, u64>,
+            lineage: &mut Vec<UiIdentity>,
+            targets: &mut BTreeMap<u64, UiTarget>,
+        ) {
+            let Some(source) = sources.get(&node.id).copied() else {
+                return;
+            };
+            lineage.push(UiIdentity {
+                node: node.id,
+                source,
+                key: node.key.as_deref().map(Rc::from),
+                kind: node.kind,
+            });
+            targets.insert(
+                source,
+                UiTarget {
+                    node: node.id,
+                    source,
+                    lineage: lineage.clone(),
+                },
+            );
+            for child in &node.children {
+                collect(child, sources, lineage, targets);
+            }
+            lineage.pop();
+        }
+
+        let mut targets = BTreeMap::new();
+        for surface in &self.surfaces {
+            collect(&surface.root, &self.sources, &mut Vec::new(), &mut targets);
+        }
+        self.ui.borrow_mut().targets = targets;
+    }
+
     fn evaluate_binding(&self, index: usize) -> Result<Value> {
         self.tracker.borrow_mut().begin(index);
         let result = self.bindings[&index].function.call::<Value>(());
@@ -944,6 +1203,12 @@ impl Runtime {
                     )));
                 }
                 "key" => node.key = Some(properties::string(value, "key")?),
+                "autofocus" => {
+                    let Value::Boolean(value) = value else {
+                        return Err(Error::runtime("autofocus must be a static boolean"));
+                    };
+                    node.autofocus = value;
+                }
                 "on_click" | "on_middle_click" | "on_secondary_click" | "on_scroll"
                 | "on_change" | "on_pressed" | "on_submit" | "on_hover" | "on_close" => {
                     if (matches!(
@@ -1218,8 +1483,9 @@ fn kind(name: &str) -> Result<Kind> {
     }
 }
 
-fn install_ui(lua: &Lua, tracker: Rc<RefCell<Tracker>>) -> Result<()> {
+fn install_ui(lua: &Lua, tracker: Rc<RefCell<Tracker>>) -> Result<Rc<RefCell<UiContext>>> {
     let ui = lua.create_table()?;
+    let context = Rc::new(RefCell::new(UiContext::default()));
     let next_id = Rc::new(Cell::new(1_u64));
     for name in [
         "panel",
@@ -1281,8 +1547,343 @@ fn install_ui(lua: &Lua, tracker: Rc<RefCell<Tracker>>) -> Result<()> {
             transition::Descriptor::spring(function, options)
         })?,
     )?;
+    for (name, focus) in [("focus", true), ("reveal", false)] {
+        let context = context.clone();
+        ui.set(
+            name,
+            lua.create_function(move |_, widget: Table| {
+                let source = widget
+                    .raw_get::<u64>("_id")
+                    .map_err(|_| Error::runtime("ui action target must be a widget"))?;
+                context.borrow_mut().queue(source, focus)
+            })?,
+        )?;
+    }
     ui.set_readonly(true);
-    lua.globals().set("ui", ui)
+    lua.globals().set("ui", ui)?;
+    Ok(context)
+}
+
+#[cfg(test)]
+mod ui_action_tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn load(source: &str) -> (TempDir, Runtime) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("panel.luau");
+        fs::write(path, source).unwrap();
+        let runtime = Runtime::load(directory.path().join("panel.luau")).unwrap();
+        (directory, runtime)
+    }
+
+    #[test]
+    fn ui_action_limit_applies_to_each_handler() {
+        let source = 1;
+        let identity = UiIdentity {
+            node: NodeId(1),
+            source,
+            key: None,
+            kind: Kind::Button,
+        };
+        let mut context = UiContext::default();
+        context.targets.insert(
+            source,
+            UiTarget {
+                node: identity.node,
+                source,
+                lineage: vec![identity],
+            },
+        );
+
+        context.action_start = Some(0);
+        for _ in 0..MAX_UI_ACTIONS_PER_HANDLER {
+            context.queue(source, false).unwrap();
+        }
+        assert!(context.queue(source, false).is_err());
+
+        context.action_start = Some(context.actions.len());
+        assert!(context.queue(source, false).is_ok());
+    }
+
+    #[test]
+    fn ui_actions_require_handlers_and_focusable_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("panel.luau");
+        fs::write(
+            &path,
+            "local target = ui.button {}; ui.focus(target); return ui.panel {}",
+        )
+        .unwrap();
+        assert!(
+            Runtime::load(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("only inside event handlers")
+        );
+
+        let (_directory, mut runtime) = load(
+            r#"
+            local target = ui.text {}
+            return ui.panel { children = {
+                ui.button { on_click = function() ui.focus(target) end },
+                target,
+            } }
+            "#,
+        );
+        let trigger = runtime.root().unwrap().children[0].id;
+        assert!(
+            runtime
+                .dispatch(trigger, Event::Click)
+                .unwrap_err()
+                .to_string()
+                .contains("must be interactive")
+        );
+        assert!(runtime.take_ui_actions().is_empty());
+    }
+
+    #[test]
+    fn successful_handlers_publish_reveal_and_only_the_last_focus() {
+        let (_directory, mut runtime) = load(
+            r#"
+            local first = ui.button { key = 'first' }
+            local second = ui.text_input {
+                key = 'second',
+                value = '',
+                on_change = function() end,
+            }
+            return ui.panel { children = {
+                ui.button { on_click = function()
+                    ui.focus(first)
+                    ui.reveal(first)
+                    ui.focus(second)
+                end },
+                first,
+                second,
+            } }
+            "#,
+        );
+        let root = runtime.root().unwrap();
+        let trigger = root.children[0].id;
+        let first = root.children[1].id;
+        let second = root.children[2].id;
+
+        assert!(!runtime.dispatch(trigger, Event::Click).unwrap());
+        let actions = runtime.take_ui_actions();
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(&actions[0], UiAction::Reveal(target) if target.node() == first));
+        assert!(matches!(&actions[1], UiAction::Focus(target) if target.node() == second));
+    }
+
+    #[test]
+    fn rejected_refreshes_discard_local_actions() {
+        let (_directory, mut runtime) = load(
+            r#"
+            local invalid = ui.state(false)
+            local target = ui.button {}
+            return ui.panel { children = {
+                ui.button { on_click = function()
+                    ui.focus(target)
+                    invalid:set(true)
+                end },
+                target,
+                ui.text { text = function()
+                    return invalid:get() and 42 or 'valid'
+                end },
+            } }
+            "#,
+        );
+        let trigger = runtime.root().unwrap().children[0].id;
+        assert!(runtime.dispatch(trigger, Event::Click).is_err());
+        assert!(runtime.take_ui_actions().is_empty());
+        assert_eq!(runtime.root().unwrap().children[2].text, "valid");
+    }
+
+    #[test]
+    fn property_only_refreshes_check_target_availability_live() {
+        let (_directory, mut runtime) = load(
+            r#"
+            local enabled = ui.state(true)
+            local target = ui.button {
+                enabled = function() return enabled:get() end,
+            }
+            return ui.panel { children = {
+                ui.button { on_click = function()
+                    ui.focus(target)
+                    enabled:set(false)
+                end },
+                target,
+            } }
+            "#,
+        );
+        let trigger = runtime.root().unwrap().children[0].id;
+
+        assert!(runtime.dispatch(trigger, Event::Click).unwrap());
+        assert!(runtime.take_ui_actions().is_empty());
+    }
+
+    fn replacement_fixture(key: &str) -> (TempDir, Runtime, NodeId) {
+        let source = format!(
+            r#"
+            local replace = ui.state(false)
+            local target = nil
+            local list = ui.column {{ children = function()
+                local changed = replace:get()
+                target = ui.button {{ {key} }}
+                return {{ target }}
+            end }}
+            return ui.panel {{ children = {{
+                ui.button {{ on_click = function()
+                    ui.focus(target)
+                    replace:set(true)
+                end }},
+                list,
+            }} }}
+            "#,
+        );
+        let (directory, runtime) = load(&source);
+        let target = runtime.root().unwrap().children[1].children[0].id;
+        (directory, runtime, target)
+    }
+
+    #[test]
+    fn stale_unkeyed_handles_do_not_target_positional_replacements() {
+        let (_directory, mut runtime, target) = replacement_fixture("");
+        let trigger = runtime.root().unwrap().children[0].id;
+        assert!(!runtime.dispatch(trigger, Event::Click).unwrap());
+        assert_eq!(runtime.root().unwrap().children[1].children[0].id, target);
+        assert!(runtime.take_ui_actions().is_empty());
+    }
+
+    #[test]
+    fn keyed_replacements_preserve_queued_target_identity() {
+        let (_directory, mut runtime, target) = replacement_fixture("key = 'row',");
+        let trigger = runtime.root().unwrap().children[0].id;
+        assert!(!runtime.dispatch(trigger, Event::Click).unwrap());
+        let actions = runtime.take_ui_actions();
+        assert!(matches!(actions.as_slice(), [UiAction::Focus(action)] if action.node() == target));
+    }
+
+    fn ancestor_replacement_fixture(key: &str) -> (TempDir, Runtime, NodeId) {
+        let source = format!(
+            r#"
+            local replace = ui.state(false)
+            local target = ui.button {{ key = 'target' }}
+            local list = ui.column {{ children = function()
+                local changed = replace:get()
+                return {{ ui.row {{ {key} children = {{ target }} }} }}
+            end }}
+            return ui.panel {{ children = {{
+                ui.button {{ on_click = function()
+                    ui.focus(target)
+                    replace:set(true)
+                end }},
+                list,
+            }} }}
+            "#,
+        );
+        let (directory, runtime) = load(&source);
+        let target = runtime.root().unwrap().children[1].children[0].children[0].id;
+        (directory, runtime, target)
+    }
+
+    #[test]
+    fn replaced_ancestors_require_their_own_key_continuity() {
+        let (_directory, mut runtime, target) = ancestor_replacement_fixture("");
+        let trigger = runtime.root().unwrap().children[0].id;
+        assert!(!runtime.dispatch(trigger, Event::Click).unwrap());
+        assert_eq!(
+            runtime.root().unwrap().children[1].children[0].children[0].id,
+            target
+        );
+        assert!(runtime.take_ui_actions().is_empty());
+
+        let (_directory, mut runtime, target) = ancestor_replacement_fixture("key = 'branch',");
+        let trigger = runtime.root().unwrap().children[0].id;
+        assert!(!runtime.dispatch(trigger, Event::Click).unwrap());
+        assert!(matches!(
+            runtime.take_ui_actions().as_slice(),
+            [UiAction::Focus(action)] if action.node() == target
+        ));
+    }
+
+    #[test]
+    fn removed_targets_discard_queued_actions() {
+        let (_directory, mut runtime) = load(
+            r#"
+            local shown = ui.state(true)
+            local target = nil
+            local list = ui.column { children = function()
+                if not shown:get() then return {} end
+                target = ui.button { key = 'row' }
+                return { target }
+            end }
+            return ui.panel { children = {
+                ui.button { on_click = function()
+                    ui.focus(target)
+                    shown:set(false)
+                end },
+                list,
+            } }
+            "#,
+        );
+        let trigger = runtime.root().unwrap().children[0].id;
+        assert!(runtime.dispatch(trigger, Event::Click).unwrap());
+        assert!(runtime.take_ui_actions().is_empty());
+    }
+
+    #[test]
+    fn autofocus_and_surface_roots_stop_at_popup_boundaries() {
+        let (_directory, runtime) = load(
+            r#"
+            local panel_target = ui.button { autofocus = true }
+            local popup_target = ui.text_input {
+                autofocus = true,
+                value = '',
+                on_change = function() end,
+            }
+            local popup = ui.popup { children = { popup_target } }
+            return ui.panel { children = { panel_target, popup } }
+            "#,
+        );
+        let root = runtime.root().unwrap();
+        let panel_target = root.children[0].id;
+        let popup = root.children[1].id;
+        let popup_target = root.children[1].children[0].id;
+
+        assert_eq!(
+            runtime.autofocus_target(root.id).unwrap().node(),
+            panel_target
+        );
+        assert_eq!(
+            runtime.autofocus_target(popup).unwrap().node(),
+            popup_target
+        );
+        assert_eq!(runtime.rendered_surface_root(panel_target), Some(root.id));
+        assert_eq!(runtime.rendered_surface_root(popup_target), Some(popup));
+    }
+
+    #[test]
+    fn autofocus_is_static() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("panel.luau");
+        fs::write(
+            &path,
+            "return ui.panel { children = { ui.button { autofocus = function() return true end } } }",
+        )
+        .unwrap();
+        assert!(
+            Runtime::load(path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("static boolean")
+        );
+    }
 }
 
 #[cfg(test)]

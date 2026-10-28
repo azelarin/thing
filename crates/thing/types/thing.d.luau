@@ -255,6 +255,7 @@ export type ThingTextProperties = {
 
 export type ThingTextInputProperties = {
     key: string?,
+    autofocus: boolean?,
     visible: ThingReactive<boolean>?,
     enabled: ThingReactive<boolean>?,
     style: ThingTextInputStyle?,
@@ -295,6 +296,7 @@ export type ThingPathProperties = {
 
 export type ThingButtonProperties = {
     key: string?,
+    autofocus: boolean?,
     visible: ThingReactive<boolean>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
@@ -308,6 +310,7 @@ export type ThingButtonProperties = {
 
 export type ThingSliderProperties = {
     key: string?,
+    autofocus: boolean?,
     visible: ThingReactive<boolean>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
@@ -321,6 +324,7 @@ export type ThingSliderProperties = {
 
 export type ThingRangeProperties = {
     key: string?,
+    autofocus: boolean?,
     visible: ThingReactive<boolean>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
@@ -651,6 +655,8 @@ declare ui: {
     button: (properties: ThingButtonProperties) -> ThingWidget,
     slider: (properties: ThingSliderProperties) -> ThingWidget,
     range: (properties: ThingRangeProperties) -> ThingWidget,
+    focus: (widget: ThingWidget) -> (),
+    reveal: (widget: ThingWidget) -> (),
     state: <T>(initial: T & ThingStateValue) -> ThingState<T>,
     transition: (
         ((value: () -> number, options: ThingTransitionOptions) -> ThingNumberTransition)

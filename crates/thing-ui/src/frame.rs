@@ -26,6 +26,10 @@ impl Interaction {
         self.focus_visible = self.focused.is_some();
     }
 
+    pub fn hide_keyboard_focus(&mut self) {
+        self.focus_visible = false;
+    }
+
     pub fn keyboard_focused(&self) -> Option<NodeId> {
         if self.focus_visible {
             self.focused
@@ -66,5 +70,9 @@ mod tests {
         interaction.focus_from_keyboard(NodeId(3));
         assert_eq!(interaction.focused, Some(NodeId(3)));
         assert!(interaction.focus_visible);
+
+        interaction.hide_keyboard_focus();
+        assert_eq!(interaction.focused, Some(NodeId(3)));
+        assert!(!interaction.focus_visible);
     }
 }

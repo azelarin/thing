@@ -4,7 +4,7 @@ use thing_core::{Node, NodeId};
 use thing_runtime::{
     Action, AudioSnapshot, ClipboardSnapshot, Event, MediaSnapshot, NiriState,
     NotificationSnapshot, OutputContext, PowerSnapshot, Runtime, Scalar, ServiceSnapshot,
-    SurfaceKey, SurfaceTree, SystemTraySnapshot,
+    SurfaceKey, SurfaceTree, SystemTraySnapshot, UiAction, UiTarget,
 };
 use thing_ui::Layout;
 
@@ -21,6 +21,13 @@ pub(crate) struct Configurations<K> {
     services: ServiceSnapshot,
     instances: Vec<Instance<K>>,
     next_consumer: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct DispatchOutcome {
+    pub(crate) changed: bool,
+    pub(crate) actions: Vec<Action>,
+    pub(crate) ui_actions: Vec<UiAction>,
 }
 
 impl<K: Clone + Eq> Configurations<K> {
@@ -95,6 +102,23 @@ impl<K: Clone + Eq> Configurations<K> {
     pub(crate) fn has_active_press(&self, key: &K, id: NodeId) -> bool {
         self.runtime(key)
             .is_some_and(|runtime| runtime.has_active_press(id))
+    }
+
+    pub(crate) fn focus_target(&self, key: &K, id: NodeId) -> Option<UiTarget> {
+        self.runtime(key)?.focus_target(id)
+    }
+
+    pub(crate) fn autofocus_target(&self, key: &K, root: NodeId) -> Option<UiTarget> {
+        self.runtime(key)?.autofocus_target(root)
+    }
+
+    pub(crate) fn ui_target_is_current(&self, key: &K, target: &UiTarget) -> bool {
+        self.runtime(key)
+            .is_some_and(|runtime| runtime.ui_target_is_current(target))
+    }
+
+    pub(crate) fn rendered_surface_root(&self, key: &K, id: NodeId) -> Option<NodeId> {
+        self.runtime(key)?.rendered_surface_root(id)
     }
 
     pub(crate) fn active_press_is_available(&self, key: &K, id: NodeId) -> bool {
@@ -342,7 +366,7 @@ impl<K: Clone + Eq> Configurations<K> {
         key: &K,
         id: NodeId,
         event: Event,
-    ) -> Result<(bool, Vec<Action>), String> {
+    ) -> Result<DispatchOutcome, String> {
         self.dispatch_checked(key, id, event, |_| Ok(()))
     }
 
@@ -352,14 +376,22 @@ impl<K: Clone + Eq> Configurations<K> {
         id: NodeId,
         event: Event,
         validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
-    ) -> Result<(bool, Vec<Action>), String> {
+    ) -> Result<DispatchOutcome, String> {
         let Some(runtime) = self.runtime_mut(key) else {
-            return Ok((false, Vec::new()));
+            return Ok(DispatchOutcome {
+                changed: false,
+                actions: Vec::new(),
+                ui_actions: Vec::new(),
+            });
         };
         let changed = runtime
             .dispatch_checked(id, event, validate)
             .map_err(|error| error.to_string())?;
-        Ok((changed, runtime.take_actions()))
+        Ok(DispatchOutcome {
+            changed,
+            actions: runtime.take_actions(),
+            ui_actions: runtime.take_ui_actions(),
+        })
     }
 
     #[cfg(test)]
@@ -587,9 +619,106 @@ mod tests {
         assert_eq!(text(&configurations, 2), "DP-2:2560:0");
 
         let button = configurations.root(&1).unwrap().children[0].id;
-        assert!(configurations.dispatch(&1, button, Event::Click).unwrap().0);
+        assert!(
+            configurations
+                .dispatch(&1, button, Event::Click)
+                .unwrap()
+                .changed
+        );
         assert_eq!(text(&configurations, 1), "DP-1:1920:1");
         assert_eq!(text(&configurations, 2), "DP-2:2560:0");
+    }
+
+    #[test]
+    fn local_ui_actions_keep_runtime_and_reload_identity_separate() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        let source = r#"
+            local target = ui.button { key = 'target', autofocus = true }
+            return ui.panel { children = {
+                ui.button { on_click = function()
+                    ui.reveal(target)
+                    ui.focus(target)
+                end },
+                target,
+            } }
+            "#;
+        fs::write(&entry, source).unwrap();
+        let mut configurations = Configurations::new(entry.clone(), ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        let root = configurations.root(&1).unwrap();
+        let root_id = root.id;
+        let trigger = root.children[0].id;
+        let target_id = root.children[1].id;
+        let consumer = configurations.consumer(&1).unwrap().to_owned();
+
+        let outcome = configurations.dispatch(&1, trigger, Event::Click).unwrap();
+        assert!(!outcome.changed);
+        assert!(outcome.actions.is_empty());
+        assert!(matches!(
+            outcome.ui_actions.as_slice(),
+            [UiAction::Reveal(reveal), UiAction::Focus(focus)]
+                if reveal.node() == target_id && focus.node() == target_id
+        ));
+        let target = outcome.ui_actions[1].target().clone();
+        assert!(configurations.ui_target_is_current(&1, &target));
+        assert_eq!(
+            configurations.rendered_surface_root(&1, target_id),
+            Some(root_id)
+        );
+        assert_eq!(
+            configurations.autofocus_target(&1, root_id).unwrap().node(),
+            target_id
+        );
+
+        fs::write(
+            &entry,
+            "return ui.panel { children = { ui.text { text = 42 } } }",
+        )
+        .unwrap();
+        assert!(
+            configurations
+                .reload_for(vec![(1, output("DP-1", 1920))])
+                .is_err()
+        );
+        assert_eq!(configurations.consumer(&1), Some(consumer.as_str()));
+        assert!(configurations.ui_target_is_current(&1, &target));
+
+        fs::write(&entry, source).unwrap();
+        configurations
+            .reload_for(vec![(1, output("DP-1", 1920))])
+            .unwrap();
+        assert_ne!(configurations.consumer(&1), Some(consumer.as_str()));
+    }
+
+    #[test]
+    fn output_refresh_invalidates_an_unkeyed_focus_target() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            local target = nil
+            local list = ui.column { children = function()
+                local width = services.output.width:get()
+                target = ui.button {}
+                return { target }
+            end }
+            return ui.panel { children = { list } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        let target_id = configurations.root(&1).unwrap().children[0].children[0].id;
+        let target = configurations.focus_target(&1, target_id).unwrap();
+
+        assert!(!configurations.set_output(&1, output("DP-1", 2560)).unwrap());
+        assert_eq!(
+            configurations.root(&1).unwrap().children[0].children[0].id,
+            target_id
+        );
+        assert!(!configurations.ui_target_is_current(&1, &target));
     }
 
     #[test]
@@ -615,7 +744,12 @@ mod tests {
         let first = configurations.root(&1).unwrap().children[0].id;
         let second = configurations.root(&2).unwrap().children[0].id;
 
-        assert!(configurations.dispatch(&1, first, Event::Click).unwrap().0);
+        assert!(
+            configurations
+                .dispatch(&1, first, Event::Click)
+                .unwrap()
+                .changed
+        );
         assert!(configurations.runtime(&1).unwrap().is_animating(first));
         assert!(!configurations.runtime(&2).unwrap().is_animating(second));
         let layout = Layout::compute(
