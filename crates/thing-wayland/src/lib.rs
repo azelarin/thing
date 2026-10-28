@@ -20,6 +20,7 @@ mod render;
 #[cfg(feature = "vulkan")]
 mod skia_vulkan;
 mod system_tray;
+mod text_data;
 mod watch;
 pub use host::{run, run_with_options};
 pub use system_tray::{SystemTray, SystemTrayMode};
