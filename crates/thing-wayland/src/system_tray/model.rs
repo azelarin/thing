@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use thing_core::{ImageCandidate, ImagePixmap, ImageSource};
-use thing_runtime::{SystemTrayItem, SystemTraySnapshot};
+use thing_runtime::{SystemTrayItem, SystemTrayMenu, SystemTraySnapshot};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Endpoint {
@@ -34,6 +34,7 @@ pub(super) struct Target {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct QueriedItem {
     pub item: SystemTrayItem,
+    pub menu_path: Option<String>,
     pub icon: QueriedIcon,
     pub attention_icon: QueriedIcon,
     pub interface: String,
@@ -114,6 +115,7 @@ impl StoredIcon {
 struct StoredItem {
     serial: u64,
     item: SystemTrayItem,
+    menu_path: Option<String>,
     interface: String,
     icon: StoredIcon,
     attention_icon: StoredIcon,
@@ -247,6 +249,7 @@ impl Model {
         let value = StoredItem {
             serial: lifetime.serial,
             item: queried.item,
+            menu_path: queried.menu_path,
             interface: queried.interface,
             icon,
             attention_icon,
@@ -254,6 +257,7 @@ impl Model {
         let changed = previous.as_ref().is_none_or(|previous| {
             previous.serial != value.serial
                 || previous.item != value.item
+                || previous.menu_path != value.menu_path
                 || previous.interface != value.interface
         });
         self.retained_image_bytes = self
@@ -328,7 +332,29 @@ impl Model {
             .collect()
     }
 
+    pub fn menu_registrations(&self) -> Vec<(Lifetime, String)> {
+        self.items
+            .iter()
+            .filter_map(|(endpoint, item)| {
+                let lifetime = self.lifetimes.get(endpoint)?;
+                let path = item.menu_path.as_ref()?;
+                Some((lifetime.clone(), path.clone()))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub fn projection(&self, available: bool, watcher_owned: bool, error: String) -> Projection {
+        self.projection_with(available, watcher_owned, error, |_| None)
+    }
+
+    pub fn projection_with(
+        &self,
+        available: bool,
+        watcher_owned: bool,
+        error: String,
+        mut menu: impl FnMut(&str) -> Option<Arc<SystemTrayMenu>>,
+    ) -> Projection {
         let mut values = self.items.values().collect::<Vec<_>>();
         values.sort_by_key(|item| item.serial);
         let mut items = Vec::with_capacity(values.len());
@@ -351,7 +377,9 @@ impl Model {
                     interface: stored.interface.clone(),
                 },
             );
-            items.push(item.clone());
+            let mut item = item.clone();
+            item.menu = menu(&item.id);
+            items.push(item);
         }
         Projection {
             snapshot: SystemTraySnapshot {
@@ -611,11 +639,13 @@ mod tests {
                 tooltip_text: String::new(),
                 item_is_menu: false,
                 has_menu: false,
+                menu: None,
                 has_icon_pixmap: false,
                 has_attention_icon_pixmap: false,
                 has_overlay_icon_pixmap: false,
                 has_tooltip_icon_pixmap: false,
             },
+            menu_path: None,
             icon: QueriedIcon::default(),
             attention_icon: QueriedIcon::default(),
             interface: "org.kde.StatusNotifierItem".into(),

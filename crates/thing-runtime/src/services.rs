@@ -7,6 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     mem::size_of,
     rc::Rc,
+    sync::Arc,
 };
 use thing_core::ImageSource;
 
@@ -71,6 +72,14 @@ pub enum SystemTrayAction {
     ContextMenu,
 }
 
+/// an action requested from one current DBusMenu branch lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemTrayMenuAction {
+    Open,
+    Close,
+    Activate,
+}
+
 const MAX_LAUNCH_ARGUMENTS: usize = 256;
 const MAX_LAUNCH_ARGUMENT_BYTES: usize = 4096;
 const MAX_LAUNCH_BYTES: usize = 64 * 1024;
@@ -79,6 +88,12 @@ const MAX_TRAY_PIXMAP_SIDE: u32 = 4096;
 const MAX_TRAY_PIXMAP_BYTES: usize = 256 * 1024;
 const MAX_TRAY_ITEM_IMAGE_BYTES: usize = 512 * 1024;
 const MAX_TRAY_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TRAY_MENU_CHILDREN: usize = 64;
+const MAX_TRAY_MENU_DEPTH: usize = 16;
+const MAX_TRAY_MENU_NODES: usize = 256;
+const MAX_TRAY_MENU_TOTAL_NODES: usize = 2048;
+const MAX_TRAY_MENU_BYTES: usize = 512 * 1024;
+const MAX_TRAY_MENU_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 
 /// an audio device identified by its stable server name.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,10 +175,42 @@ pub struct SystemTrayItem {
     pub tooltip_text: String,
     pub item_is_menu: bool,
     pub has_menu: bool,
+    pub menu: Option<Arc<SystemTrayMenu>>,
     pub has_icon_pixmap: bool,
     pub has_attention_icon_pixmap: bool,
     pub has_overlay_icon_pixmap: bool,
     pub has_tooltip_icon_pixmap: bool,
+}
+
+/// one immutable projection of a DBusMenu root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemTrayMenu {
+    pub id: String,
+    pub loaded: bool,
+    pub loading: bool,
+    pub error: String,
+    pub children: Vec<SystemTrayMenuItem>,
+}
+
+/// one immutable DBusMenu item and its lazily loaded children.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemTrayMenuItem {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub access_key: Option<String>,
+    pub enabled: bool,
+    pub visible: bool,
+    pub icon_name: String,
+    pub shortcut: Vec<Vec<String>>,
+    pub toggle_type: String,
+    pub toggle_state: i32,
+    pub disposition: String,
+    pub has_submenu: bool,
+    pub loaded: bool,
+    pub loading: bool,
+    pub error: String,
+    pub children: Vec<SystemTrayMenuItem>,
 }
 
 #[derive(Clone)]
@@ -2009,17 +2056,33 @@ fn validate_media_players(players: &[MediaPlayer]) -> Result<()> {
 fn validate_system_tray_items(items: &[SystemTrayItem]) -> Result<()> {
     let mut ids = BTreeSet::new();
     let mut image_bytes = 0_usize;
+    let mut menu_ids = BTreeSet::new();
+    let mut menu_nodes = 0_usize;
+    let mut menu_bytes = 0_usize;
     let invalid = items.len() > 128
         || items.iter().any(|item| {
             let source_bytes = item.icon.as_ref().and_then(validate_system_tray_image);
             let valid_source = item.icon.is_none() || source_bytes.is_some();
             image_bytes = image_bytes.saturating_add(source_bytes.unwrap_or(0));
+            let menu_size = item
+                .menu
+                .as_ref()
+                .and_then(|menu| validate_system_tray_menu(menu, &mut menu_ids));
+            let valid_menu = item.has_menu == item.menu.is_some()
+                && (item.menu.is_none() || menu_size.is_some());
+            if let Some((nodes, bytes)) = menu_size {
+                menu_nodes = menu_nodes.saturating_add(nodes);
+                menu_bytes = menu_bytes.saturating_add(bytes);
+            }
             item.id.is_empty()
                 || item.id.len() > 128
                 || item.id.contains('\0')
                 || !ids.insert(item.id.as_str())
                 || !valid_source
+                || !valid_menu
                 || image_bytes > MAX_TRAY_IMAGE_BYTES
+                || menu_nodes > MAX_TRAY_MENU_TOTAL_NODES
+                || menu_bytes > MAX_TRAY_MENU_TOTAL_BYTES
                 || invalid_system_tray_text(&item.protocol_item_id, 4096)
                 || invalid_system_tray_text(&item.category, 4096)
                 || invalid_system_tray_text(&item.title, 4096)
@@ -2036,6 +2099,103 @@ fn validate_system_tray_items(items: &[SystemTrayItem]) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn validate_system_tray_menu(
+    menu: &SystemTrayMenu,
+    ids: &mut BTreeSet<String>,
+) -> Option<(usize, usize)> {
+    if menu.id.is_empty()
+        || menu.id.len() > 128
+        || menu.id.contains('\0')
+        || !ids.insert(menu.id.clone())
+        || invalid_system_tray_text(&menu.error, 4096)
+        || !menu.loaded && !menu.children.is_empty()
+        || menu.children.len() > MAX_TRAY_MENU_CHILDREN
+    {
+        return None;
+    }
+    let mut nodes = 1_usize;
+    let mut bytes = size_of::<SystemTrayMenu>()
+        .checked_add(menu.id.capacity())?
+        .checked_add(menu.error.capacity())?
+        .checked_add(
+            menu.children
+                .capacity()
+                .checked_mul(size_of::<SystemTrayMenuItem>())?,
+        )?;
+    for child in &menu.children {
+        let (child_nodes, child_bytes) = validate_system_tray_menu_item(child, ids, 1)?;
+        nodes = nodes.checked_add(child_nodes)?;
+        bytes = bytes.checked_add(child_bytes)?;
+    }
+    (nodes <= MAX_TRAY_MENU_NODES && bytes <= MAX_TRAY_MENU_BYTES).then_some((nodes, bytes))
+}
+
+fn validate_system_tray_menu_item(
+    item: &SystemTrayMenuItem,
+    ids: &mut BTreeSet<String>,
+    depth: usize,
+) -> Option<(usize, usize)> {
+    if depth > MAX_TRAY_MENU_DEPTH
+        || item.id.is_empty()
+        || item.id.len() > 128
+        || item.id.contains('\0')
+        || !ids.insert(item.id.clone())
+        || invalid_system_tray_text(&item.kind, 4096)
+        || invalid_system_tray_text(&item.label, 4096)
+        || item
+            .access_key
+            .as_ref()
+            .is_some_and(|key| key.chars().count() != 1 || invalid_system_tray_text(key, 8))
+        || invalid_system_tray_text(&item.icon_name, 4096)
+        || invalid_system_tray_text(&item.toggle_type, 4096)
+        || invalid_system_tray_text(&item.disposition, 4096)
+        || invalid_system_tray_text(&item.error, 4096)
+        || item.shortcut.len() > 8
+        || item.shortcut.iter().any(|chord| {
+            chord.len() > 8 || chord.iter().any(|part| invalid_system_tray_text(part, 64))
+        })
+        || item.children.len() > MAX_TRAY_MENU_CHILDREN
+        || !item.loaded && !item.children.is_empty()
+        || !item.has_submenu && (item.loaded || item.loading || !item.children.is_empty())
+    {
+        return None;
+    }
+    let shortcut_bytes = item.shortcut.iter().try_fold(
+        item.shortcut
+            .capacity()
+            .checked_mul(size_of::<Vec<String>>())?,
+        |total, chord| {
+            chord.iter().try_fold(
+                total.checked_add(chord.capacity().checked_mul(size_of::<String>())?)?,
+                |total, part| total.checked_add(part.capacity()),
+            )
+        },
+    )?;
+    let mut nodes = 1_usize;
+    let mut bytes = item
+        .id
+        .capacity()
+        .checked_add(item.kind.capacity())?
+        .checked_add(item.label.capacity())?
+        .checked_add(item.access_key.as_ref().map_or(0, String::capacity))?
+        .checked_add(item.icon_name.capacity())?
+        .checked_add(item.toggle_type.capacity())?
+        .checked_add(item.disposition.capacity())?
+        .checked_add(item.error.capacity())?
+        .checked_add(shortcut_bytes)?
+        .checked_add(
+            item.children
+                .capacity()
+                .checked_mul(size_of::<SystemTrayMenuItem>())?,
+        )?;
+    for child in &item.children {
+        let (child_nodes, child_bytes) = validate_system_tray_menu_item(child, ids, depth + 1)?;
+        nodes = nodes.checked_add(child_nodes)?;
+        bytes = bytes.checked_add(child_bytes)?;
+    }
+    Some((nodes, bytes))
 }
 
 fn validate_system_tray_image(source: &ImageSource) -> Option<usize> {

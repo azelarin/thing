@@ -1,7 +1,9 @@
 use std::fs;
 
 use thing_core::{ImageCandidate, ImagePixmap, ImageSource};
-use thing_runtime::{Action, Event, Runtime, SystemTrayAction, SystemTrayItem, SystemTraySnapshot};
+use thing_runtime::{
+    Action, Event, Runtime, SystemTrayAction, SystemTrayItem, SystemTrayMenu, SystemTraySnapshot,
+};
 
 fn runtime(source: &str) -> (tempfile::TempDir, Runtime) {
     let directory = tempfile::tempdir().unwrap();
@@ -27,6 +29,13 @@ fn item(id: &str) -> SystemTrayItem {
         tooltip_text: "one unread conversation".into(),
         item_is_menu: false,
         has_menu: true,
+        menu: Some(SystemTrayMenu {
+            id: format!("{id}-menu"),
+            loaded: false,
+            loading: false,
+            error: String::new(),
+            children: Vec::new(),
+        }),
         has_icon_pixmap: true,
         has_attention_icon_pixmap: false,
         has_overlay_icon_pixmap: true,
