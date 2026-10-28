@@ -769,6 +769,7 @@ impl Runtime {
         let mut handlers = Handlers::new();
         let mut sources = self.sources.clone();
         let mut staged_transitions = BTreeMap::new();
+        let mut ui_structure_changed = false;
         let result = (|| {
             for index in dirty {
                 if retired.contains(&index) {
@@ -779,6 +780,7 @@ impl Runtime {
                 let id = binding.node;
                 let property = binding.property.clone();
                 if property == "children" {
+                    ui_structure_changed = true;
                     let (surface, depth) = candidate
                         .iter()
                         .enumerate()
@@ -937,7 +939,9 @@ impl Runtime {
         self.sources = sources;
         let changed = candidate != self.surfaces;
         self.surfaces = candidate;
-        self.sync_ui_targets();
+        if ui_structure_changed {
+            self.sync_ui_targets();
+        }
         self.deferred.clear();
         Ok(changed || self.has_active_transitions())
     }
@@ -1697,6 +1701,29 @@ mod ui_action_tests {
         assert!(runtime.dispatch(trigger, Event::Click).is_err());
         assert!(runtime.take_ui_actions().is_empty());
         assert_eq!(runtime.root().unwrap().children[2].text, "valid");
+    }
+
+    #[test]
+    fn property_only_refreshes_check_target_availability_live() {
+        let (_directory, mut runtime) = load(
+            r#"
+            local enabled = ui.state(true)
+            local target = ui.button {
+                enabled = function() return enabled:get() end,
+            }
+            return ui.panel { children = {
+                ui.button { on_click = function()
+                    ui.focus(target)
+                    enabled:set(false)
+                end },
+                target,
+            } }
+            "#,
+        );
+        let trigger = runtime.root().unwrap().children[0].id;
+
+        assert!(runtime.dispatch(trigger, Event::Click).unwrap());
+        assert!(runtime.take_ui_actions().is_empty());
     }
 
     fn replacement_fixture(key: &str) -> (TempDir, Runtime, NodeId) {
