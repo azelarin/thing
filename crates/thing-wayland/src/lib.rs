@@ -10,6 +10,8 @@ mod host;
 mod hover;
 mod input_method;
 mod launch;
+#[cfg(test)]
+mod managed_process;
 mod media;
 mod niri;
 mod notifications;
