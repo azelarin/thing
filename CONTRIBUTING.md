@@ -3,6 +3,10 @@
 keep changes focused. describe the resulting behavior and how you checked it.
 use [conventional commits](https://www.conventionalcommits.org/).
 
+work on a branch and open a draft pull request while the change is in progress.
+mark it ready after review and the relevant checks pass. squash-merge completed
+pull requests and delete their branches.
+
 ## checks
 
 ```sh
