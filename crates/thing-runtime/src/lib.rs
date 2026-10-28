@@ -12,13 +12,13 @@ mod state;
 mod transition;
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
 pub use services::{
-    Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, ClipboardSnapshot,
-    ManagedProcessAction, ManagedProcessCommand, ManagedProcessDefinition,
-    ManagedProcessShutdownSignal, ManagedProcessSnapshot, ManagedProcessState,
-    ManagedProcessStatus, MediaAction, MediaPlayer, MediaSnapshot, Notification,
-    NotificationButton, NotificationSnapshot, NotificationUrgency, PowerDevice, PowerSnapshot,
-    ServiceSnapshot, SystemTrayAction, SystemTrayItem, SystemTrayMenu, SystemTrayMenuAction,
-    SystemTrayMenuItem, SystemTraySnapshot,
+    Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, AuthenticationSnapshot,
+    AuthenticationState, ClipboardSnapshot, ManagedProcessAction, ManagedProcessCommand,
+    ManagedProcessDefinition, ManagedProcessShutdownSignal, ManagedProcessSnapshot,
+    ManagedProcessState, ManagedProcessStatus, MediaAction, MediaPlayer, MediaSnapshot,
+    Notification, NotificationButton, NotificationSnapshot, NotificationUrgency, PowerDevice,
+    PowerSnapshot, ServiceSnapshot, SystemTrayAction, SystemTrayItem, SystemTrayMenu,
+    SystemTrayMenuAction, SystemTrayMenuItem, SystemTraySnapshot,
 };
 
 use mlua::{Error, Function, Lua, Result, Table, Value, VmState};
@@ -570,6 +570,11 @@ impl Runtime {
     /// replaces clipboard state in one update. call [`Self::refresh`] afterward.
     pub fn set_clipboard(&mut self, clipboard: ClipboardSnapshot) -> Result<()> {
         self.services.set_clipboard(clipboard)
+    }
+
+    /// replaces read-only lock authentication state. call [`Self::refresh`] afterward.
+    pub fn set_authentication(&mut self, authentication: AuthenticationSnapshot) -> Result<()> {
+        self.services.set_authentication(authentication)
     }
 
     /// replaces workspace and window lists. call [`Self::refresh`] to update widgets.

@@ -5,6 +5,15 @@ return ui.lock {
         ui.column {
             children = {
                 ui.text { text = "locked" },
+                ui.text {
+                    text = function()
+                        local state: ThingAuthenticationState =
+                            services.authentication.state:get()
+                        return if state == "waiting"
+                            then services.authentication.prompt:get()
+                            else services.authentication.message:get()
+                    end,
+                },
                 ui.secret_input {
                     placeholder = "password",
                     on_hover = function(inside)

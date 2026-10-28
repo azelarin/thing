@@ -441,6 +441,68 @@ pub struct ClipboardSnapshot {
     pub error: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AuthenticationState {
+    Idle,
+    Authenticating,
+    Waiting,
+    Rejected,
+    #[default]
+    Unavailable,
+}
+
+impl AuthenticationState {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Authenticating => "authenticating",
+            Self::Waiting => "waiting",
+            Self::Rejected => "rejected",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// read-only authentication state shared by every lock surface.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuthenticationSnapshot {
+    pub available: bool,
+    pub state: AuthenticationState,
+    pub prompt: String,
+    pub message: String,
+}
+
+impl AuthenticationSnapshot {
+    fn values(&self) -> [(&'static str, Scalar); 4] {
+        [
+            ("authentication.available", Scalar::Boolean(self.available)),
+            (
+                "authentication.state",
+                Scalar::String(self.state.name().into()),
+            ),
+            ("authentication.prompt", Scalar::String(self.prompt.clone())),
+            (
+                "authentication.message",
+                Scalar::String(self.message.clone()),
+            ),
+        ]
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.available == (self.state == AuthenticationState::Unavailable)
+            || (self.state != AuthenticationState::Waiting && !self.prompt.is_empty())
+            || !valid_authentication_text(&self.prompt)
+            || !valid_authentication_text(&self.message)
+        {
+            return Err(Error::runtime("inconsistent authentication snapshot"));
+        }
+        for (name, value) in self.values() {
+            validate_service(name, &value)?;
+        }
+        Ok(())
+    }
+}
+
 impl ClipboardSnapshot {
     fn values(&self) -> [(&'static str, Scalar); 4] {
         [
@@ -793,6 +855,14 @@ impl ServiceSnapshot {
         ManagedProcessSnapshot {
             states: self.managed_processes.clone(),
         }
+    }
+
+    pub fn set_authentication(&mut self, authentication: AuthenticationSnapshot) -> Result<()> {
+        authentication.validate()?;
+        for (name, value) in authentication.values() {
+            self.values.insert(name.into(), value);
+        }
+        Ok(())
     }
 
     pub fn set_niri(&mut self, state: NiriState) -> Result<()> {
@@ -1227,6 +1297,7 @@ impl Services {
         };
         let services = lua.create_table()?;
         let audio = lua.create_table()?;
+        let authentication = lua.create_table()?;
         let clipboard = lua.create_table()?;
         let clock = lua.create_table()?;
         let media = lua.create_table()?;
@@ -1316,6 +1387,10 @@ impl Services {
             ("audio.source_muted", Scalar::Boolean(false)),
             ("audio.source_device", Scalar::String(String::new())),
             ("audio.error", Scalar::String(String::new())),
+            ("authentication.available", Scalar::Boolean(false)),
+            ("authentication.state", Scalar::String("unavailable".into())),
+            ("authentication.prompt", Scalar::String(String::new())),
+            ("authentication.message", Scalar::String(String::new())),
             ("clipboard.available", Scalar::Boolean(false)),
             ("clipboard.text", Scalar::Nil),
             ("clipboard.loading", Scalar::Boolean(false)),
@@ -1363,6 +1438,7 @@ impl Services {
                 .ok_or_else(|| Error::runtime("invalid service name"))?;
             match service {
                 "audio" => audio.set(property, signal)?,
+                "authentication" => authentication.set(property, signal)?,
                 "clipboard" => clipboard.set(property, signal)?,
                 "clock" => clock.set(property, signal)?,
                 "media" => media.set(property, signal)?,
@@ -1469,6 +1545,7 @@ impl Services {
             })?,
         )?;
         audio.set_readonly(true);
+        authentication.set_readonly(true);
         let actions = result.actions.clone();
         let allowed = result.allowed.clone();
         clipboard.set(
@@ -1637,6 +1714,7 @@ impl Services {
             })?,
         )?;
         services.set("audio", audio)?;
+        services.set("authentication", authentication)?;
         services.set("clipboard", clipboard)?;
         services.set("clock", clock)?;
         services.set("media", media)?;
@@ -1946,6 +2024,15 @@ impl Services {
     pub fn set_clipboard(&self, clipboard: ClipboardSnapshot) -> Result<()> {
         clipboard.validate()?;
         let updates = clipboard
+            .values()
+            .into_iter()
+            .map(|(name, value)| (self.signals[name], value));
+        self.tracker.borrow_mut().write_batch(updates)
+    }
+
+    pub fn set_authentication(&self, authentication: AuthenticationSnapshot) -> Result<()> {
+        authentication.validate()?;
+        let updates = authentication
             .values()
             .into_iter()
             .map(|(name, value)| (self.signals[name], value));
@@ -2584,6 +2671,11 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "niri.error",
             Scalar::String(value),
         ) => value.len() <= 4096 && !value.contains('\0'),
+        (
+            "authentication.state" | "authentication.prompt" | "authentication.message",
+            Scalar::String(value),
+        ) => valid_authentication_text(value),
+        ("authentication.available", Scalar::Boolean(_)) => true,
         ("media.art_url", Scalar::String(value)) => {
             value.len() <= 16 * 1024 && !value.contains('\0')
         }
@@ -2598,6 +2690,15 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             "invalid value for service property {name}"
         )))
     }
+}
+
+fn valid_authentication_text(value: &str) -> bool {
+    value.len() <= 1024
+        && !value.chars().any(|character| {
+            character == '\0'
+                || character.is_control()
+                || matches!(character, '\u{2028}' | '\u{2029}')
+        })
 }
 
 fn validate_devices(devices: &[AudioDevice]) -> Result<()> {
@@ -3446,6 +3547,54 @@ mod tests {
         };
         assert!(services.set_audio(invalid).is_err());
         assert_eq!(services.snapshot(), before);
+    }
+
+    #[test]
+    fn authentication_snapshot_is_read_only_and_atomic() {
+        let lua = Lua::new();
+        let tracker = Rc::new(RefCell::new(Tracker::default()));
+        let services = Services::install(&lua, tracker).unwrap();
+
+        assert_eq!(
+            lua.load("return services.authentication.state:get()")
+                .eval::<String>()
+                .unwrap(),
+            "unavailable"
+        );
+        services
+            .set_authentication(AuthenticationSnapshot {
+                available: true,
+                state: AuthenticationState::Waiting,
+                prompt: "verification code".into(),
+                message: "additional authentication is required".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            lua.load(
+                "return services.authentication.available:get(), services.authentication.state:get(), services.authentication.prompt:get()",
+            )
+            .eval::<(bool, String, String)>()
+            .unwrap(),
+            (true, "waiting".into(), "verification code".into())
+        );
+
+        let before = services.snapshot();
+        assert!(
+            services
+                .set_authentication(AuthenticationSnapshot {
+                    available: true,
+                    state: AuthenticationState::Idle,
+                    prompt: "unexpected".into(),
+                    message: String::new(),
+                })
+                .is_err()
+        );
+        assert_eq!(services.snapshot(), before);
+        assert!(
+            lua.load("services.authentication.state = 'idle'")
+                .exec()
+                .is_err()
+        );
     }
 
     #[test]

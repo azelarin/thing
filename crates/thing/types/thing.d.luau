@@ -634,6 +634,16 @@ declare extern type ThingAudioService with
     read set_default_source: (name: string) -> ()
 end
 
+export type ThingAuthenticationState =
+    "idle" | "authenticating" | "waiting" | "rejected" | "unavailable"
+
+declare extern type ThingAuthenticationService with
+    read available: ThingSignal<boolean>
+    read state: ThingSignal<ThingAuthenticationState>
+    read prompt: ThingSignal<string>
+    read message: ThingSignal<string>
+end
+
 declare extern type ThingClipboardService with
     read available: ThingSignal<boolean>
     read text: ThingSignal<string?>
@@ -746,6 +756,7 @@ end
 
 declare extern type ThingServices with
     read audio: ThingAudioService
+    read authentication: ThingAuthenticationService
     read clipboard: ThingClipboardService
     read clock: ThingClockService
     read media: ThingMediaService
