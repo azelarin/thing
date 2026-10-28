@@ -161,6 +161,30 @@ mod tests {
     }
 
     #[test]
+    fn painted_reserved_and_interactive_heights_are_independent() {
+        let mut root = panel();
+        root.style.height = Some(52.0);
+        root.panel.exclusive_zone = Some(36);
+        root.panel.input_region = PanelInputRegion::Rectangle(PanelInputRect {
+            height: Some(36),
+            ..PanelInputRect::default()
+        });
+
+        let geometry = geometry(&root, Some((1920, 52)));
+        assert_eq!(geometry.requested_size, (0, 52));
+        assert_eq!(geometry.exclusive_zone, 36);
+        assert_eq!(
+            input_region(root.panel.input_region, (1920, 52)),
+            ResolvedInputRegion::Region(Some(InputRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 36,
+            }))
+        );
+    }
+
+    #[test]
     fn side_geometry_swaps_fill_and_thickness_axes() {
         let mut root = panel();
         root.style.width = Some(48.0);
@@ -196,6 +220,9 @@ mod tests {
             ..PanelProperties::default()
         };
         assert_eq!(geometry(&root, None).exclusive_zone, 0);
+
+        root.panel.margins.bottom = i32::MAX;
+        assert_eq!(geometry(&root, None).exclusive_zone, i32::MAX);
     }
 
     #[test]

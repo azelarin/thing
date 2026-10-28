@@ -7,7 +7,6 @@ mod egl;
 mod host;
 mod hover;
 mod niri;
-#[cfg(test)]
 mod panel;
 mod render;
 #[cfg(feature = "vulkan")]
