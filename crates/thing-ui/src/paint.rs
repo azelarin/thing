@@ -7,10 +7,10 @@ use femtovg::{
 use parley::PositionedLayoutItem;
 use thing_core::{
     HorizontalRange, ImageFit, Kind, Node, NodeId, PathFillRule, PathFit, PathStrokeCap,
-    PathStrokeJoin, Rect, VectorSegment, ViewBox,
+    PathStrokeJoin, Rect, TextAlign, VectorSegment, ViewBox,
 };
 
-use crate::{Layout, ScrollState, Size, TextSystem};
+use crate::{Layout, ScrollState, Size, TextInputEditor, TextSystem};
 
 /// transient input state belongs to the host, not to the widget snapshot.
 #[derive(Clone, Copy, Debug, Default)]
@@ -52,6 +52,7 @@ pub struct PaintFrame<'a> {
     pub physical: (u32, u32),
     pub scale: f32,
     pub input: Interaction,
+    pub text_input: Option<&'a mut TextInputEditor>,
 }
 
 /// renders a widget tree through femtovg.
@@ -95,6 +96,7 @@ impl<R: Renderer> Painter<R> {
             physical,
             scale,
             input,
+            mut text_input,
         } = frame;
         self.canvas.set_size(physical.0, physical.1, scale);
         self.images.collect(&mut self.canvas);
@@ -148,6 +150,14 @@ impl<R: Renderer> Painter<R> {
             }
             match node.kind {
                 Kind::Text => self.draw_text(node, bounds, clip)?,
+                Kind::TextInput => self.draw_text_input(
+                    node,
+                    bounds,
+                    clip,
+                    (input.focused == Some(node.id))
+                        .then_some(text_input.as_deref_mut())
+                        .flatten(),
+                )?,
                 Kind::Slider => self.draw_slider(node, bounds),
                 Kind::Image => self.draw_image(node, bounds, scale),
                 Kind::Path => self.draw_path(node, bounds)?,
@@ -194,38 +204,114 @@ impl<R: Renderer> Painter<R> {
         let layout = self
             .text
             .layout(node, Some((bounds.width - 2.0 * padding_x).max(0.0)));
-        for line in layout.lines() {
-            for item in line.items() {
-                let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
-                    continue;
-                };
-                let run = glyph_run.run();
-                let font = run.font();
-                let key = (font.data.id(), font.index);
-                let id = match self.fonts.get(&key) {
-                    Some(id) => *id,
-                    None => {
-                        let id = self
-                            .text_context
-                            .add_shared_font_with_index(font.data.clone(), font.index)
-                            .map_err(|e| e.to_string())?;
-                        self.fonts.insert(key, id);
-                        id
-                    }
-                };
-                let mut paint = Paint::color(color(node.style.foreground));
-                paint.set_font_size(run.font_size());
-                let glyphs = glyph_run.positioned_glyphs().map(|glyph| PositionedGlyph {
-                    x: bounds.x + padding_x + glyph.x,
-                    y: bounds.y + padding_y + glyph.y,
-                    glyph_id: glyph.id as u16,
-                });
+        draw_layout(
+            &mut self.canvas,
+            &mut self.text_context,
+            &mut self.fonts,
+            layout,
+            bounds.x + padding_x,
+            bounds.y + padding_y,
+            node.style.foreground,
+        )
+    }
+
+    fn draw_text_input(
+        &mut self,
+        node: &Node,
+        bounds: Rect,
+        inherited_clip: Rect,
+        active: Option<&mut TextInputEditor>,
+    ) -> Result<(), String> {
+        let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
+        let padding_y = node.style.padding_y.unwrap_or(node.style.padding);
+        let content = Rect {
+            x: bounds.x + padding_x,
+            y: bounds.y + padding_y,
+            width: (bounds.width - 2.0 * padding_x).max(0.0),
+            height: (bounds.height - 2.0 * padding_y).max(0.0),
+        };
+        let Some(clip) = content.intersection(inherited_clip) else {
+            return Ok(());
+        };
+        self.canvas.scissor(clip.x, clip.y, clip.width, clip.height);
+
+        if let Some(editor) = active {
+            editor.prepare(node, content.width);
+            let layout = editor.layout();
+            let offset_x = editor.text_offset_x();
+            let offset_y = ((content.height - layout.height()) / 2.0).max(0.0);
+            for (selection, _) in editor.selection_geometry() {
+                let mut path = Path::new();
+                path.rect(
+                    content.x + offset_x + selection.x0 as f32,
+                    content.y + offset_y + selection.y0 as f32,
+                    (selection.x1 - selection.x0).max(0.0) as f32,
+                    (selection.y1 - selection.y0).max(0.0) as f32,
+                );
                 self.canvas
-                    .fill_glyph_run(id, run.normalized_coords(), glyphs, &paint)
-                    .map_err(|e| e.to_string())?;
+                    .fill_path(&path, &Paint::color(color(node.style.selection_color)));
             }
+            if node.text.is_empty() && !node.placeholder.is_empty() {
+                self.draw_text_input_value(node, content, &node.placeholder, true)?;
+            } else {
+                draw_layout(
+                    &mut self.canvas,
+                    &mut self.text_context,
+                    &mut self.fonts,
+                    layout,
+                    content.x + offset_x,
+                    content.y + offset_y,
+                    node.style.foreground,
+                )?;
+            }
+            if let Some(caret) = editor.cursor_geometry() {
+                let mut path = Path::new();
+                path.rect(
+                    content.x + offset_x + caret.x0 as f32,
+                    content.y + offset_y + caret.y0 as f32,
+                    1.0,
+                    (caret.y1 - caret.y0).max(0.0) as f32,
+                );
+                self.canvas
+                    .fill_path(&path, &Paint::color(color(node.style.caret_color)));
+            }
+            return Ok(());
         }
-        Ok(())
+
+        let (value, placeholder) = if node.text.is_empty() {
+            (node.placeholder.as_str(), true)
+        } else {
+            (node.text.as_str(), false)
+        };
+        self.draw_text_input_value(node, content, value, placeholder)
+    }
+
+    fn draw_text_input_value(
+        &mut self,
+        node: &Node,
+        content: Rect,
+        value: &str,
+        placeholder: bool,
+    ) -> Result<(), String> {
+        let mut display = node.clone();
+        display.text = value.to_owned();
+        let layout = self.text.layout(&display, None);
+        let x = content.x + text_alignment_offset(layout, content.width, node.style.text_align);
+        let y = content.y + ((content.height - layout.height()) / 2.0).max(0.0);
+        let color = if placeholder {
+            node.style.placeholder_color
+        } else {
+            node.style.foreground
+        };
+        draw_layout(
+            &mut self.canvas,
+            &mut self.text_context,
+            &mut self.fonts,
+            layout,
+            x,
+            y,
+            color,
+        )
     }
 
     fn draw_slider(&mut self, node: &Node, bounds: Rect) {
@@ -442,6 +528,58 @@ fn path_range_error() -> String {
     "path coordinates exceed renderer limits after fitting".into()
 }
 
+fn draw_layout<R: Renderer>(
+    canvas: &mut Canvas<R>,
+    text_context: &mut TextContext,
+    fonts: &mut BTreeMap<(u64, u32), FontId>,
+    layout: &parley::Layout<()>,
+    x: f32,
+    y: f32,
+    foreground: thing_core::Color,
+) -> Result<(), String> {
+    for line in layout.lines() {
+        for item in line.items() {
+            let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                continue;
+            };
+            let run = glyph_run.run();
+            let font = run.font();
+            let key = (font.data.id(), font.index);
+            let id = match fonts.get(&key) {
+                Some(id) => *id,
+                None => {
+                    let id = text_context
+                        .add_shared_font_with_index(font.data.clone(), font.index)
+                        .map_err(|error| error.to_string())?;
+                    fonts.insert(key, id);
+                    id
+                }
+            };
+            let mut paint = Paint::color(color(foreground));
+            paint.set_font_size(run.font_size());
+            let glyphs = glyph_run.positioned_glyphs().map(|glyph| PositionedGlyph {
+                x: x + glyph.x,
+                y: y + glyph.y,
+                glyph_id: glyph.id as u16,
+            });
+            canvas
+                .fill_glyph_run(id, run.normalized_coords(), glyphs, &paint)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn text_alignment_offset(layout: &parley::Layout<()>, width: f32, align: TextAlign) -> f32 {
+    let content = layout.full_width();
+    let rtl = layout.is_rtl();
+    match (align, rtl) {
+        (TextAlign::Start, true) | (TextAlign::End, false) => width - content,
+        (TextAlign::Center, _) => (width - content) / 2.0,
+        _ => 0.0,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ImageGeometry {
     paint: Rect,
@@ -503,6 +641,7 @@ impl Painter<OpenGl> {
                 physical,
                 scale,
                 input,
+                text_input: None,
             },
             (),
             |_| {},

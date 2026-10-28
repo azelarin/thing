@@ -155,6 +155,14 @@ impl Layout {
                                 height: 24.0,
                             },
                             Kind::Text => measurer.measure(node, max_width),
+                            Kind::TextInput => Size {
+                                width: 160.0,
+                                height: measurer
+                                    .measure(node, None)
+                                    .height
+                                    .max(node.style.font_size * 1.2)
+                                    .max(24.0),
+                            },
                             Kind::Image => Size {
                                 width: 32.0,
                                 height: 32.0,
@@ -757,6 +765,34 @@ mod tests {
         .unwrap();
         assert_eq!(layout.get(NodeId(2)).unwrap().bounds.width, 46.0);
         assert_eq!(layout.get(NodeId(2)).unwrap().bounds.height, 26.0);
+    }
+
+    #[test]
+    fn text_inputs_have_stable_intrinsics_and_join_focus_order() {
+        let mut root = Node::new(NodeId(1), Kind::Row);
+        root.children.push(Node::new(NodeId(2), Kind::TextInput));
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 300.0,
+                height: 40.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+
+        let input = layout.get(NodeId(2)).unwrap();
+        assert_eq!(input.bounds.width, 160.0);
+        assert_eq!(input.bounds.height, 24.0);
+        assert!(input.interactive);
+        assert_eq!(
+            layout.hit_test(Point {
+                x: input.bounds.x + input.bounds.width / 2.0,
+                y: input.bounds.y + input.bounds.height / 2.0,
+            }),
+            Some(NodeId(2))
+        );
+        assert_eq!(layout.focus_order().collect::<Vec<_>>(), vec![NodeId(2)]);
     }
 
     #[test]
