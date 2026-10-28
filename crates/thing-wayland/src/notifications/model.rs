@@ -26,6 +26,7 @@ impl Urgency {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CriticalTimeout {
     Never,
+    #[allow(dead_code)]
     HonorRequest,
 }
 
@@ -150,11 +151,16 @@ pub(crate) struct Model {
 }
 
 impl Model {
+    #[cfg(test)]
     pub(crate) fn new(timeout_policy: TimeoutPolicy) -> Self {
+        Self::with_next_key(timeout_policy, 1)
+    }
+
+    pub(crate) fn with_next_key(timeout_policy: TimeoutPolicy, next_key: u64) -> Self {
         Self {
             timeout_policy,
             next_id: 1,
-            next_key: 1,
+            next_key: next_key.max(1),
             retained_bytes: 0,
             active: Vec::new(),
         }
@@ -162,6 +168,17 @@ impl Model {
 
     pub(crate) fn active(&self) -> &[Notification] {
         &self.active
+    }
+
+    pub(crate) fn next_key(&self) -> u64 {
+        self.next_key
+    }
+
+    pub(crate) fn next_expiry_ms(&self) -> Option<u64> {
+        self.active
+            .iter()
+            .filter_map(|notification| notification.expires_at_ms)
+            .min()
     }
 
     pub(crate) fn notify(

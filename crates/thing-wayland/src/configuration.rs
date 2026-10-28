@@ -2,8 +2,8 @@ use std::{collections::BTreeSet, path::PathBuf, time::Instant};
 
 use thing_core::{Node, NodeId};
 use thing_runtime::{
-    Action, AudioSnapshot, Event, MediaSnapshot, NiriState, OutputContext, PowerSnapshot, Runtime,
-    Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree,
+    Action, AudioSnapshot, Event, MediaSnapshot, NiriState, NotificationSnapshot, OutputContext,
+    PowerSnapshot, Runtime, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree,
 };
 use thing_ui::Layout;
 
@@ -210,6 +210,24 @@ impl<K: Clone + Eq> Configurations<K> {
         Ok(())
     }
 
+    pub(crate) fn set_notifications(
+        &mut self,
+        notifications: NotificationSnapshot,
+    ) -> Result<(), String> {
+        let mut services = self.services.clone();
+        services
+            .set_notifications(notifications.clone())
+            .map_err(|error| error.to_string())?;
+        for instance in &mut self.instances {
+            instance
+                .runtime
+                .set_notifications(notifications.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        self.services = services;
+        Ok(())
+    }
+
     pub(crate) fn set_niri(&mut self, state: NiriState) -> Result<(), String> {
         self.services
             .set_niri(state.clone())
@@ -350,7 +368,10 @@ mod tests {
 
     use tempfile::tempdir;
     use thing_core::{KeyboardMode, Kind, Scale};
-    use thing_runtime::{AudioDevice, AudioSource, AudioStream, MediaPlayer, PowerDevice};
+    use thing_runtime::{
+        AudioDevice, AudioSource, AudioStream, MediaPlayer, Notification, NotificationButton,
+        NotificationUrgency, PowerDevice,
+    };
     use thing_ui::{Layout, Measurer, Size};
 
     use super::*;
@@ -1034,6 +1055,76 @@ mod tests {
         for key in [1, 2] {
             assert_eq!(text(&configurations, key), "true:true:42:1:discharging");
         }
+    }
+
+    #[test]
+    fn notification_updates_reach_existing_and_later_outputs_together() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            return ui.panel { children = { ui.text { text = function()
+                local active = services.notifications.active:get()
+                if #active == 0 then
+                    return `{services.notifications.owned:get()}:{services.notifications.error:get()}:0`
+                end
+                return `{services.notifications.owned:get()}:{services.notifications.error:get()}:{#active}:{active[1].key}:{active[1].summary}:{active[1].actions[1].label}`
+            end } } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        let notification = Notification {
+            key: "1".into(),
+            id: 7,
+            revision: 1,
+            app_name: "Test".into(),
+            app_icon: "test".into(),
+            summary: "Saved".into(),
+            body: "The file was saved".into(),
+            actions: vec![NotificationButton {
+                key: "open".into(),
+                label: "Open".into(),
+            }],
+            urgency: NotificationUrgency::Normal,
+            raw_expire_timeout_ms: 0,
+            effective_timeout_ms: None,
+            created_at_ms: 10,
+            updated_at_ms: 10,
+            expires_at_ms: None,
+            category: String::new(),
+            desktop_entry: "test".into(),
+            image_path: String::new(),
+            resident: false,
+            transient: false,
+            action_icons: false,
+        };
+        configurations
+            .set_notifications(NotificationSnapshot {
+                owned: true,
+                error: String::new(),
+                active: vec![notification.clone()],
+            })
+            .unwrap();
+        assert_eq!(configurations.refresh(), vec![1]);
+        assert_eq!(text(&configurations, 1), "true::1:1:Saved:Open");
+
+        configurations.add(2, output("DP-2", 2560)).unwrap();
+        assert_eq!(text(&configurations, 2), "true::1:1:Saved:Open");
+        assert!(
+            configurations
+                .set_notifications(NotificationSnapshot {
+                    owned: false,
+                    error: "disconnected".into(),
+                    active: vec![notification],
+                })
+                .is_err()
+        );
+        assert!(configurations.refresh().is_empty());
+        assert_eq!(text(&configurations, 1), "true::1:1:Saved:Open");
+        assert_eq!(text(&configurations, 2), "true::1:1:Saved:Open");
     }
 
     #[test]

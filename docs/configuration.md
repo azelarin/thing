@@ -826,6 +826,77 @@ UPower defines zero time estimates as unknown, so those become `nil`.
 the service follows devices appearing and disappearing, replaces its state when
 UPower restarts, and does not provide power-management actions.
 
+## notifications
+
+thing can provide the standard desktop notification service. it is opt-in so it
+doesn't unexpectedly replace the notification daemon you already use:
+
+```sh
+thing run --notification-server ./panel.luau
+```
+
+if another process owns `org.freedesktop.Notifications`, thing leaves it alone
+and reports the conflict through `services.notifications.error`. it will not try
+to take ownership later in the same run, even if that process exits. restart
+thing when you want it to try again.
+
+`services.notifications.owned:get()` says whether thing currently owns the
+service. `active:get()` returns an immutable array ordered with the newest
+notification lifetime first. each record contains:
+
+| field | meaning |
+| --- | --- |
+| `key` | opaque string for this notification lifetime |
+| `id` | freedesktop protocol id; useful for display, not as a widget key |
+| `revision` | starts at 1 and increases when a client replaces the notification |
+| `app_name`, `app_icon`, `summary`, `body` | content supplied by the client |
+| `actions` | immutable `{ key, label }` records advertised by the client |
+| `urgency`, `urgency_code` | `low`, `normal`, or `critical`, and its numeric code |
+| `raw_expire_timeout_ms` | timeout from the client; `-1` means the server default |
+| `effective_timeout_ms`, `expires_at_ms` | resolved timeout and server-relative deadline, or `nil` |
+| `created_at_ms`, `updated_at_ms` | server-relative times for the first and latest revision |
+| `category`, `desktop_entry`, `image_path` | optional application metadata |
+| `resident`, `transient`, `action_icons` | standard notification behavior hints |
+
+use the opaque `key` unchanged as the widget key and when sending an action:
+
+```luau
+local notifications = services.notifications
+
+ui.column {
+    children = function()
+        local rows = {}
+        for _, notification in notifications.active:get() do
+            table.insert(rows, ui.button {
+                key = notification.key,
+                on_click = function()
+                    notifications.dismiss(notification.key)
+                end,
+                children = {
+                    ui.text { text = notification.summary },
+                    ui.text { text = notification.body },
+                },
+            })
+        end
+        return rows
+    end,
+}
+```
+
+`invoke(key, action_key)` activates one of the record's actions. non-resident
+notifications close after an action; resident notifications stay active. both
+`dismiss` and `invoke` are event-handler actions and reject stale keys.
+
+a timeout of zero never expires. the default timeout is five seconds, while
+critical notifications remain until they are closed. thing does not retain
+notification history. the accepted active record payload is limited to 512 kib
+per record and 8 mib in total. the service reconnects after a session-bus
+failure, discards queued actions from the old connection, and never reuses an
+opaque key during the same run.
+
+without `--notification-server`, the service remains unowned and empty.
+`thing check` never connects to the session bus.
+
 ## popups and input
 
 place a popup under its trigger button and bind `visible` to local state. change

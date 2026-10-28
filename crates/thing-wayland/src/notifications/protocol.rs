@@ -1,10 +1,10 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use zbus::{Connection, fdo, object_server::SignalEmitter, zvariant::OwnedValue};
+use zbus::{Connection, fdo, message::Header, object_server::SignalEmitter, zvariant::OwnedValue};
 
 use super::model::{
     CloseReason, Model, ModelError, Notification, NotificationAction, NotificationHints,
@@ -13,10 +13,17 @@ use super::model::{
 
 pub(crate) const BUS_NAME: &str = "org.freedesktop.Notifications";
 pub(crate) const OBJECT_PATH: &str = "/org/freedesktop/Notifications";
+const MAX_QUEUED_MESSAGES: usize = 4;
+const MAX_NOTIFY_BODY_BYTES: u32 = 1024 * 1024;
+const MAX_HINTS: usize = 64;
+const MAX_RAW_ACTIONS: usize = 256;
+
+pub(crate) type ChangeHook = Arc<dyn Fn(Vec<Notification>) + Send + Sync>;
 
 struct State {
     model: Mutex<Model>,
     started: Instant,
+    changed: ChangeHook,
 }
 
 /// the freedesktop notification interface without host event-loop policy.
@@ -26,17 +33,33 @@ pub(crate) struct Notifications {
 }
 
 impl Notifications {
-    pub(crate) fn new(timeout_policy: TimeoutPolicy) -> Self {
+    pub(crate) fn with_state(
+        timeout_policy: TimeoutPolicy,
+        next_key: u64,
+        changed: ChangeHook,
+    ) -> Self {
         Self {
             state: Arc::new(State {
-                model: Mutex::new(Model::new(timeout_policy)),
+                model: Mutex::new(Model::with_next_key(timeout_policy, next_key)),
                 started: Instant::now(),
+                changed,
             }),
         }
     }
 
     pub(crate) fn active(&self) -> Vec<Notification> {
         lock(&self.state.model).active().to_vec()
+    }
+
+    pub(crate) fn next_key(&self) -> u64 {
+        lock(&self.state.model).next_key()
+    }
+
+    pub(crate) fn next_expiry(&self) -> Option<Duration> {
+        let now = self.now_ms();
+        lock(&self.state.model)
+            .next_expiry_ms()
+            .map(|deadline| Duration::from_millis(deadline.saturating_sub(now)))
     }
 
     pub(crate) async fn dismiss(
@@ -47,6 +70,7 @@ impl Notifications {
         let notification = lock(&self.state.model)
             .dismiss(key, self.now_ms())
             .map_err(model_message)?;
+        self.publish();
         Self::notification_closed(emitter, notification.id, CloseReason::Dismissed.code())
             .await
             .map_err(|error| error.to_string())
@@ -61,6 +85,7 @@ impl Notifications {
         let invoked = lock(&self.state.model)
             .invoke(key, action_key, self.now_ms())
             .map_err(model_message)?;
+        self.publish();
         Self::action_invoked(emitter, invoked.id, &invoked.action_key)
             .await
             .map_err(|error| error.to_string())?;
@@ -74,6 +99,9 @@ impl Notifications {
 
     pub(crate) async fn expire(&self, emitter: &SignalEmitter<'_>) -> Result<usize, String> {
         let expired = lock(&self.state.model).expire(self.now_ms());
+        if !expired.is_empty() {
+            self.publish();
+        }
         for notification in &expired {
             Self::notification_closed(emitter, notification.id, CloseReason::Expired.code())
                 .await
@@ -90,6 +118,10 @@ impl Notifications {
             .try_into()
             .unwrap_or(u64::MAX)
     }
+
+    fn publish(&self) {
+        (self.state.changed)(self.active());
+    }
 }
 
 #[zbus::interface(name = "org.freedesktop.Notifications")]
@@ -98,8 +130,10 @@ impl Notifications {
         vec!["actions".into(), "body".into()]
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn notify(
         &self,
+        #[zbus(header)] header: Header<'_>,
         app_name: String,
         replaces_id: u32,
         app_icon: String,
@@ -109,6 +143,19 @@ impl Notifications {
         hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
     ) -> fdo::Result<u32> {
+        // zbus has already received and deserialized the message when this runs.
+        // this rejects oversized requests before they enter retained state; the
+        // transport's separate 128 MiB message limit remains the allocation bound.
+        if header.primary().body_len() > MAX_NOTIFY_BODY_BYTES {
+            return Err(fdo::Error::LimitsExceeded(
+                "notification request body is too large".into(),
+            ));
+        }
+        if hints.len() > MAX_HINTS {
+            return Err(fdo::Error::LimitsExceeded(
+                "notification request has too many hints".into(),
+            ));
+        }
         let actions = parse_actions(actions)?;
         let hints = parse_hints(&hints);
         let request = NotificationRequest {
@@ -120,10 +167,12 @@ impl Notifications {
             hints,
             expire_timeout_ms: expire_timeout,
         };
-        lock(&self.state.model)
+        let id = lock(&self.state.model)
             .notify(replaces_id, request, self.now_ms())
             .map(|published| published.id)
-            .map_err(model_error)
+            .map_err(model_error)?;
+        self.publish();
+        Ok(id)
     }
 
     async fn close_notification(
@@ -137,6 +186,7 @@ impl Notifications {
                 ModelError::UnknownNotification => fdo::Error::Failed(String::new()),
                 error => model_error(error),
             })?;
+        self.publish();
         Self::notification_closed(&emitter, notification.id, CloseReason::ClosedByCall.code())
             .await?;
         Ok(())
@@ -174,12 +224,27 @@ impl Notifications {
     ) -> zbus::Result<()>;
 }
 
+#[cfg(test)]
 pub(crate) async fn serve(
     address: &str,
     timeout_policy: TimeoutPolicy,
 ) -> zbus::Result<(Connection, Notifications)> {
-    let notifications = Notifications::new(timeout_policy);
-    let connection = zbus::connection::Builder::address(address)?
+    serve_with(Some(address), timeout_policy, 1, Arc::new(|_| {})).await
+}
+
+pub(crate) async fn serve_with(
+    address: Option<&str>,
+    timeout_policy: TimeoutPolicy,
+    next_key: u64,
+    changed: ChangeHook,
+) -> zbus::Result<(Connection, Notifications)> {
+    let notifications = Notifications::with_state(timeout_policy, next_key, changed);
+    let builder = match address {
+        Some(address) => zbus::connection::Builder::address(address),
+        None => zbus::connection::Builder::session(),
+    }?;
+    let connection = builder
+        .max_queued(MAX_QUEUED_MESSAGES)
         .serve_at(OBJECT_PATH, notifications.clone())?
         .name(BUS_NAME)?
         .allow_name_replacements(false)
@@ -190,6 +255,11 @@ pub(crate) async fn serve(
 }
 
 fn parse_actions(actions: Vec<String>) -> fdo::Result<Vec<NotificationAction>> {
+    if actions.len() > MAX_RAW_ACTIONS {
+        return Err(fdo::Error::LimitsExceeded(
+            "notification request has too many actions".into(),
+        ));
+    }
     if actions.len() % 2 != 0 {
         return Err(fdo::Error::InvalidArgs(
             "notification actions must be key/label pairs".into(),
@@ -291,6 +361,8 @@ fn lock(model: &Mutex<Model>) -> MutexGuard<'_, Model> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::too_many_arguments)]
+
     use std::{
         io::{BufRead, BufReader},
         process::{Child, Command as ProcessCommand, Stdio},
@@ -608,6 +680,51 @@ mod tests {
                     .await
                     .is_err()
             );
+            assert!(
+                proxy
+                    .notify(
+                        "test",
+                        0,
+                        "",
+                        "too many actions",
+                        "",
+                        (0..=MAX_RAW_ACTIONS)
+                            .map(|index| index.to_string())
+                            .collect(),
+                        HashMap::new(),
+                        0,
+                    )
+                    .await
+                    .is_err()
+            );
+            let hints = (0..=MAX_HINTS)
+                .map(|index| (format!("hint-{index}"), owned(Value::from(index as u32))))
+                .collect();
+            assert!(
+                proxy
+                    .notify("test", 0, "", "too many hints", "", Vec::new(), hints, 0,)
+                    .await
+                    .is_err()
+            );
+            let oversized = "x".repeat(MAX_NOTIFY_BODY_BYTES as usize);
+            let error = proxy
+                .notify(
+                    "test",
+                    0,
+                    "",
+                    "oversized body",
+                    &oversized,
+                    Vec::new(),
+                    HashMap::new(),
+                    0,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                zbus::Error::MethodError(name, _, _)
+                    if name.as_str() == "org.freedesktop.DBus.Error.LimitsExceeded"
+            ));
             assert!(server.active().is_empty());
         });
         bus.stop();

@@ -98,7 +98,7 @@ fn notification_state_is_reactive_and_records_are_immutable() {
         .unwrap();
     assert!(runtime.refresh().unwrap());
     assert_eq!(
-        runtime.root().children[0].text,
+        runtime.root().unwrap().children[0].text,
         "true||1|9007199254740993|7|1|Mail|mail-client|Hello|One new message|normal|1|-1|5000|20|20|5020|email.arrived|mail-client||false|false|false|default|Open"
     );
 
@@ -115,7 +115,7 @@ fn notification_state_is_reactive_and_records_are_immutable() {
         .unwrap();
     assert!(runtime.refresh().unwrap());
     assert!(
-        runtime.root().children[0]
+        runtime.root().unwrap().children[0]
             .text
             .contains("|2|Mail|mail-client|Updated|")
     );
@@ -152,7 +152,7 @@ fn notification_actions_are_ordered_and_event_only() {
         "#,
     );
     runtime
-        .dispatch(runtime.root().children[0].id, Event::Click)
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
         .unwrap();
     assert_eq!(
         runtime.take_actions(),
@@ -207,7 +207,7 @@ fn malformed_notification_state_and_actions_are_rejected_atomically() {
     });
     assert!(runtime.set_notifications(invalid).is_err());
     assert!(!runtime.refresh().unwrap());
-    assert_eq!(runtime.root().children[0].text, "Valid");
+    assert_eq!(runtime.root().unwrap().children[0].text, "Valid");
 
     let mut oversized = notification("2", 2, "Oversized");
     oversized.app_name = "x".repeat(64 * 1024);
@@ -232,7 +232,7 @@ fn malformed_notification_state_and_actions_are_rejected_atomically() {
             .is_err()
     );
     assert!(!runtime.refresh().unwrap());
-    assert_eq!(runtime.root().children[0].text, "Valid");
+    assert_eq!(runtime.root().unwrap().children[0].text, "Valid");
 
     let active = (1..=140)
         .map(|id| {
@@ -251,7 +251,7 @@ fn malformed_notification_state_and_actions_are_rejected_atomically() {
             .is_err()
     );
     assert!(!runtime.refresh().unwrap());
-    assert_eq!(runtime.root().children[0].text, "Valid");
+    assert_eq!(runtime.root().unwrap().children[0].text, "Valid");
 
     for argument in ["''", "'01'", "'0'", "'bad'", "7", "{}"] {
         let source = format!(
@@ -260,7 +260,7 @@ fn malformed_notification_state_and_actions_are_rejected_atomically() {
         let (_directory, mut runtime) = load_runtime(&source);
         assert!(
             runtime
-                .dispatch(runtime.root().children[0].id, Event::Click)
+                .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
                 .is_err(),
             "accepted {argument}"
         );
