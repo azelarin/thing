@@ -2,7 +2,8 @@ use std::{collections::BTreeSet, path::PathBuf};
 
 use thing_core::{Node, NodeId};
 use thing_runtime::{
-    Action, AudioSnapshot, Event, NiriState, OutputContext, Runtime, Scalar, ServiceSnapshot,
+    Action, AudioSnapshot, Event, MediaSnapshot, NiriState, OutputContext, Runtime, Scalar,
+    ServiceSnapshot,
 };
 
 struct Instance<K> {
@@ -133,6 +134,21 @@ impl<K: Clone + Eq> Configurations<K> {
         Ok(())
     }
 
+    pub(crate) fn set_media(&mut self, media: MediaSnapshot) -> Result<(), String> {
+        let mut services = self.services.clone();
+        services
+            .set_media(media.clone())
+            .map_err(|error| error.to_string())?;
+        for instance in &mut self.instances {
+            instance
+                .runtime
+                .set_media(media.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        self.services = services;
+        Ok(())
+    }
+
     pub(crate) fn set_niri(&mut self, state: NiriState) -> Result<(), String> {
         self.services
             .set_niri(state.clone())
@@ -225,7 +241,7 @@ mod tests {
 
     use tempfile::tempdir;
     use thing_core::{Kind, Scale};
-    use thing_runtime::{AudioDevice, AudioSource, AudioStream};
+    use thing_runtime::{AudioDevice, AudioSource, AudioStream, MediaPlayer};
 
     use super::*;
 
@@ -520,6 +536,73 @@ mod tests {
             text(&configurations, 3),
             "0.4:0.7:Microphone:2:true:Firefox"
         );
+    }
+
+    #[test]
+    fn media_updates_reach_existing_and_later_outputs_together() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            return ui.panel { children = { ui.text { text = function()
+                local players = services.media.players:get()
+                local id = if #players == 0 then '' else players[1].id
+                return `{services.media.title:get()}:{services.media.artist:get()}:{services.media.playing:get()}:{#players}:{id}`
+            end } } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        let player = MediaPlayer {
+            id: "p1".into(),
+            name: "org.mpris.MediaPlayer2.test".into(),
+            playing: true,
+            title: "Track".into(),
+            artist: "Artist".into(),
+            art_url: String::new(),
+            identity: "Test player".into(),
+            desktop_entry: "test".into(),
+            can_play_pause: true,
+            can_next: true,
+            can_previous: true,
+            can_stop: true,
+        };
+        configurations
+            .set_media(MediaSnapshot {
+                available: true,
+                selected_id: player.id.clone(),
+                playing: player.playing,
+                title: player.title.clone(),
+                artist: player.artist.clone(),
+                art_url: player.art_url.clone(),
+                identity: player.identity.clone(),
+                desktop_entry: player.desktop_entry.clone(),
+                can_play_pause: player.can_play_pause,
+                can_next: player.can_next,
+                can_previous: player.can_previous,
+                can_stop: player.can_stop,
+                players: vec![player],
+                error: String::new(),
+            })
+            .unwrap();
+        assert_eq!(configurations.refresh(), vec![1]);
+        assert_eq!(text(&configurations, 1), "Track:Artist:true:1:p1");
+
+        configurations.add(2, output("DP-2", 2560)).unwrap();
+        assert_eq!(text(&configurations, 2), "Track:Artist:true:1:p1");
+        assert!(
+            configurations
+                .set_media(MediaSnapshot {
+                    title: "bad\0title".into(),
+                    ..MediaSnapshot::default()
+                })
+                .is_err()
+        );
+        assert!(configurations.refresh().is_empty());
+        assert_eq!(text(&configurations, 1), "Track:Artist:true:1:p1");
+        assert_eq!(text(&configurations, 2), "Track:Artist:true:1:p1");
     }
 
     #[test]

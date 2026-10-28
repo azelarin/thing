@@ -10,7 +10,10 @@ mod reconcile;
 mod services;
 mod state;
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
-pub use services::{Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, ServiceSnapshot};
+pub use services::{
+    Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, MediaAction, MediaPlayer,
+    MediaSnapshot, ServiceSnapshot,
+};
 
 use mlua::{Error, Function, Lua, Result, Table, Value, VmState};
 pub use state::Scalar;
@@ -168,6 +171,7 @@ impl Runtime {
         services.set_sources(snapshot.sources)?;
         services.set_all_sources(snapshot.all_sources)?;
         services.set_streams(snapshot.streams)?;
+        services.set_media_players(snapshot.media_players)?;
         services.set_niri(snapshot.niri)?;
         if let Some(output) = &output {
             services.set_output(output)?;
@@ -239,6 +243,11 @@ impl Runtime {
     /// replaces output and input audio state in one update. call [`Self::refresh`] afterward.
     pub fn set_audio(&mut self, audio: AudioSnapshot) -> Result<()> {
         self.services.set_audio(audio)
+    }
+
+    /// replaces selected media player state in one update. call [`Self::refresh`] afterward.
+    pub fn set_media(&mut self, media: MediaSnapshot) -> Result<()> {
+        self.services.set_media(media)
     }
 
     /// replaces workspace and window lists. call [`Self::refresh`] to update widgets.

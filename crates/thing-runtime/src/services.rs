@@ -26,10 +26,23 @@ pub enum Action {
     SetSourceMuted(bool),
     SetDefaultSource(String),
     Niri(NiriAction),
+    Media {
+        action: MediaAction,
+        player: Option<String>,
+    },
     Launch {
         argv: Vec<String>,
         cwd: Option<String>,
     },
+}
+
+/// a media playback control request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaAction {
+    PlayPause,
+    Next,
+    Previous,
+    Stop,
 }
 
 const MAX_LAUNCH_ARGUMENTS: usize = 256;
@@ -82,6 +95,23 @@ pub struct AudioSnapshot {
     pub error: String,
 }
 
+/// one media player ownership lifetime and its current state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaPlayer {
+    pub id: String,
+    pub name: String,
+    pub playing: bool,
+    pub title: String,
+    pub artist: String,
+    pub art_url: String,
+    pub identity: String,
+    pub desktop_entry: String,
+    pub can_play_pause: bool,
+    pub can_next: bool,
+    pub can_previous: bool,
+    pub can_stop: bool,
+}
+
 impl AudioSnapshot {
     fn values(&self) -> [(&'static str, Scalar); 9] {
         [
@@ -114,6 +144,97 @@ impl AudioSnapshot {
     }
 }
 
+/// one confirmed generation of media player state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MediaSnapshot {
+    pub available: bool,
+    pub selected_id: String,
+    pub playing: bool,
+    pub title: String,
+    pub artist: String,
+    pub art_url: String,
+    pub identity: String,
+    pub desktop_entry: String,
+    pub can_play_pause: bool,
+    pub can_next: bool,
+    pub can_previous: bool,
+    pub can_stop: bool,
+    pub error: String,
+    pub players: Vec<MediaPlayer>,
+}
+
+impl MediaSnapshot {
+    fn values(&self) -> [(&'static str, Scalar); 13] {
+        [
+            ("media.available", Scalar::Boolean(self.available)),
+            (
+                "media.selected_id",
+                Scalar::String(self.selected_id.clone()),
+            ),
+            ("media.playing", Scalar::Boolean(self.playing)),
+            ("media.title", Scalar::String(self.title.clone())),
+            ("media.artist", Scalar::String(self.artist.clone())),
+            ("media.art_url", Scalar::String(self.art_url.clone())),
+            ("media.identity", Scalar::String(self.identity.clone())),
+            (
+                "media.desktop_entry",
+                Scalar::String(self.desktop_entry.clone()),
+            ),
+            ("media.can_play_pause", Scalar::Boolean(self.can_play_pause)),
+            ("media.can_next", Scalar::Boolean(self.can_next)),
+            ("media.can_previous", Scalar::Boolean(self.can_previous)),
+            ("media.can_stop", Scalar::Boolean(self.can_stop)),
+            ("media.error", Scalar::String(self.error.clone())),
+        ]
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (name, value) in self.values() {
+            validate_service(name, &value)?;
+        }
+        validate_media_players(&self.players)?;
+        let selected = self
+            .players
+            .iter()
+            .find(|player| player.id == self.selected_id);
+        let has_players = !self.players.is_empty();
+        let selected_matches = selected.map_or_else(
+            || {
+                self.selected_id.is_empty()
+                    && !self.playing
+                    && self.title.is_empty()
+                    && self.artist.is_empty()
+                    && self.art_url.is_empty()
+                    && self.identity.is_empty()
+                    && self.desktop_entry.is_empty()
+                    && !self.can_play_pause
+                    && !self.can_next
+                    && !self.can_previous
+                    && !self.can_stop
+            },
+            |player| {
+                player.playing == self.playing
+                    && player.title == self.title
+                    && player.artist == self.artist
+                    && player.art_url == self.art_url
+                    && player.identity == self.identity
+                    && player.desktop_entry == self.desktop_entry
+                    && player.can_play_pause == self.can_play_pause
+                    && player.can_next == self.can_next
+                    && player.can_previous == self.can_previous
+                    && player.can_stop == self.can_stop
+            },
+        );
+        if self.available != selected.is_some()
+            || self.available != has_players
+            || !selected_matches
+        {
+            return Err(Error::runtime("inconsistent media player snapshot"));
+        }
+        Ok(())
+    }
+}
+
 /// desktop service values used when loading a runtime.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ServiceSnapshot {
@@ -122,6 +243,7 @@ pub struct ServiceSnapshot {
     pub(crate) sources: Vec<AudioDevice>,
     pub(crate) all_sources: Vec<AudioSource>,
     pub(crate) streams: Vec<AudioStream>,
+    pub(crate) media_players: Vec<MediaPlayer>,
     pub(crate) niri: NiriState,
 }
 
@@ -162,6 +284,15 @@ impl ServiceSnapshot {
         Ok(())
     }
 
+    pub fn set_media(&mut self, media: MediaSnapshot) -> Result<()> {
+        media.validate()?;
+        for (name, value) in media.values() {
+            self.values.insert(name.into(), value);
+        }
+        self.media_players = media.players;
+        Ok(())
+    }
+
     pub fn set_niri(&mut self, state: NiriState) -> Result<()> {
         state.validate()?;
         self.niri = state;
@@ -173,6 +304,40 @@ struct DeviceList {
     tracker: Rc<RefCell<Tracker>>,
     revision: usize,
     devices: Rc<RefCell<Vec<AudioDevice>>>,
+}
+
+struct MediaPlayerList {
+    tracker: Rc<RefCell<Tracker>>,
+    revision: usize,
+    players: Rc<RefCell<Vec<MediaPlayer>>>,
+}
+
+impl UserData for MediaPlayerList {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |lua, this, ()| {
+            this.tracker.borrow_mut().read(this.revision);
+            let list = lua.create_table()?;
+            for (index, player) in this.players.borrow().iter().enumerate() {
+                let item = lua.create_table()?;
+                item.set("id", player.id.as_str())?;
+                item.set("name", player.name.as_str())?;
+                item.set("playing", player.playing)?;
+                item.set("title", player.title.as_str())?;
+                item.set("artist", player.artist.as_str())?;
+                item.set("art_url", player.art_url.as_str())?;
+                item.set("identity", player.identity.as_str())?;
+                item.set("desktop_entry", player.desktop_entry.as_str())?;
+                item.set("can_play_pause", player.can_play_pause)?;
+                item.set("can_next", player.can_next)?;
+                item.set("can_previous", player.can_previous)?;
+                item.set("can_stop", player.can_stop)?;
+                item.set_readonly(true);
+                list.raw_set(index + 1, item)?;
+            }
+            list.set_readonly(true);
+            Ok(list)
+        });
+    }
 }
 
 impl UserData for DeviceList {
@@ -261,6 +426,8 @@ pub(crate) struct Services {
     all_sources_revision: usize,
     streams: Rc<RefCell<Vec<AudioStream>>>,
     streams_revision: usize,
+    media_players: Rc<RefCell<Vec<MediaPlayer>>>,
+    media_players_revision: usize,
     niri: NiriData,
 }
 
@@ -270,6 +437,7 @@ impl Services {
         let sources_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let all_sources_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let streams_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
+        let media_players_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let niri = lua.create_table()?;
         let niri_data = NiriData::install(&niri, tracker.clone())?;
         let mut result = Self {
@@ -285,11 +453,14 @@ impl Services {
             all_sources_revision,
             streams: Rc::default(),
             streams_revision,
+            media_players: Rc::default(),
+            media_players_revision,
             niri: niri_data,
         };
         let services = lua.create_table()?;
         let audio = lua.create_table()?;
         let clock = lua.create_table()?;
+        let media = lua.create_table()?;
         let output = lua.create_table()?;
         audio.set(
             "devices",
@@ -323,6 +494,14 @@ impl Services {
                 streams: result.streams.clone(),
             },
         )?;
+        media.set(
+            "players",
+            MediaPlayerList {
+                tracker: result.tracker.clone(),
+                revision: media_players_revision,
+                players: result.media_players.clone(),
+            },
+        )?;
         for (name, value) in [
             ("audio.available", Scalar::Boolean(false)),
             ("audio.volume", Scalar::Number(0.0)),
@@ -335,6 +514,19 @@ impl Services {
             ("audio.error", Scalar::String(String::new())),
             ("clock.time", Scalar::String("--:--".into())),
             ("clock.date", Scalar::String(String::new())),
+            ("media.available", Scalar::Boolean(false)),
+            ("media.selected_id", Scalar::String(String::new())),
+            ("media.playing", Scalar::Boolean(false)),
+            ("media.title", Scalar::String(String::new())),
+            ("media.artist", Scalar::String(String::new())),
+            ("media.art_url", Scalar::String(String::new())),
+            ("media.identity", Scalar::String(String::new())),
+            ("media.desktop_entry", Scalar::String(String::new())),
+            ("media.can_play_pause", Scalar::Boolean(false)),
+            ("media.can_next", Scalar::Boolean(false)),
+            ("media.can_previous", Scalar::Boolean(false)),
+            ("media.can_stop", Scalar::Boolean(false)),
+            ("media.error", Scalar::String(String::new())),
             ("niri.available", Scalar::Boolean(false)),
             ("niri.error", Scalar::String(String::new())),
             ("output.available", Scalar::Boolean(false)),
@@ -356,6 +548,7 @@ impl Services {
             match service {
                 "audio" => audio.set(property, signal)?,
                 "clock" => clock.set(property, signal)?,
+                "media" => media.set(property, signal)?,
                 "niri" => niri.set(property, signal)?,
                 "output" => output.set(property, signal)?,
                 _ => return Err(Error::runtime("invalid service name")),
@@ -457,6 +650,23 @@ impl Services {
         )?;
         audio.set_readonly(true);
         for (name, action) in [
+            ("play_pause", MediaAction::PlayPause),
+            ("next", MediaAction::Next),
+            ("previous", MediaAction::Previous),
+            ("stop", MediaAction::Stop),
+        ] {
+            let actions = result.actions.clone();
+            let allowed = result.allowed.clone();
+            media.set(
+                name,
+                lua.create_function(move |_, player: Value| {
+                    let player = media_player_id(player)?;
+                    enqueue(&actions, &allowed, Action::Media { action, player })
+                })?,
+            )?;
+        }
+        media.set_readonly(true);
+        for (name, action) in [
             (
                 "focus_workspace",
                 NiriAction::FocusWorkspace as fn(u64) -> NiriAction,
@@ -488,6 +698,7 @@ impl Services {
         )?;
         services.set("audio", audio)?;
         services.set("clock", clock)?;
+        services.set("media", media)?;
         services.set("niri", niri)?;
         services.set("output", output)?;
         services.set_readonly(true);
@@ -633,6 +844,44 @@ impl Services {
         Ok(())
     }
 
+    pub fn set_media(&self, media: MediaSnapshot) -> Result<()> {
+        media.validate()?;
+        let players_changed = *self.media_players.borrow() != media.players;
+        let mut players = self.media_players.borrow_mut();
+        let mut tracker = self.tracker.borrow_mut();
+        let mut updates = media
+            .values()
+            .into_iter()
+            .map(|(name, value)| (self.signals[name], value))
+            .collect::<Vec<_>>();
+        if players_changed {
+            let revision = tracker.read(self.media_players_revision);
+            updates.push((
+                self.media_players_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            ));
+        }
+        tracker.write_batch(updates)?;
+        if players_changed {
+            *players = media.players;
+        }
+        Ok(())
+    }
+
+    pub fn set_media_players(&self, media_players: Vec<MediaPlayer>) -> Result<()> {
+        validate_media_players(&media_players)?;
+        if *self.media_players.borrow() != media_players {
+            *self.media_players.borrow_mut() = media_players;
+            let mut tracker = self.tracker.borrow_mut();
+            let revision = tracker.read(self.media_players_revision);
+            tracker.write(
+                self.media_players_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> ServiceSnapshot {
         let mut tracker = self.tracker.borrow_mut();
         let values = self
@@ -647,6 +896,7 @@ impl Services {
             sources: self.sources.borrow().clone(),
             all_sources: self.all_sources.borrow().clone(),
             streams: self.streams.borrow().clone(),
+            media_players: self.media_players.borrow().clone(),
             niri: self.niri.snapshot(),
         }
     }
@@ -755,6 +1005,23 @@ fn launch_working_directory(value: Value) -> Result<Option<String>> {
     Ok(Some(value.to_owned()))
 }
 
+fn media_player_id(value: Value) -> Result<Option<String>> {
+    let value = match value {
+        Value::Nil => return Ok(None),
+        Value::String(value) => value,
+        _ => return Err(Error::runtime("media player id must be a string or nil")),
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| Error::runtime("media player id must be valid utf-8"))?;
+    if value.is_empty() || value.len() > 4096 || value.contains('\0') {
+        return Err(Error::runtime(
+            "media player id must be nonempty, contain no NUL, and not exceed 4096 bytes",
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
 fn validate_service(name: &str, value: &Scalar) -> Result<()> {
     let valid = match (name, value) {
         (
@@ -762,6 +1029,12 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "audio.muted"
             | "audio.source_available"
             | "audio.source_muted"
+            | "media.available"
+            | "media.playing"
+            | "media.can_play_pause"
+            | "media.can_next"
+            | "media.can_previous"
+            | "media.can_stop"
             | "niri.available",
             Scalar::Boolean(_),
         ) => true,
@@ -774,9 +1047,18 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "audio.error"
             | "clock.time"
             | "clock.date"
+            | "media.selected_id"
+            | "media.title"
+            | "media.artist"
+            | "media.identity"
+            | "media.desktop_entry"
+            | "media.error"
             | "niri.error",
             Scalar::String(value),
         ) => value.len() <= 4096 && !value.contains('\0'),
+        ("media.art_url", Scalar::String(value)) => {
+            value.len() <= 16 * 1024 && !value.contains('\0')
+        }
         _ => false,
     };
     if valid {
@@ -854,6 +1136,35 @@ fn validate_sources(sources: &[AudioSource]) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn validate_media_players(players: &[MediaPlayer]) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    let invalid = players.len() > 64
+        || players.iter().any(|player| {
+            player.id.is_empty()
+                || player.id.len() > 4096
+                || player.id.contains('\0')
+                || !ids.insert(player.id.as_str())
+                || player.name.is_empty()
+                || invalid_media_text(&player.name, 4096)
+                || !names.insert(player.name.as_str())
+                || invalid_media_text(&player.title, 4096)
+                || invalid_media_text(&player.artist, 4096)
+                || invalid_media_text(&player.art_url, 16 * 1024)
+                || invalid_media_text(&player.identity, 4096)
+                || invalid_media_text(&player.desktop_entry, 4096)
+        });
+    if invalid {
+        Err(Error::runtime("invalid media player list"))
+    } else {
+        Ok(())
+    }
+}
+
+fn invalid_media_text(value: &str, max: usize) -> bool {
+    value.len() > max || value.contains('\0')
 }
 
 fn enqueue(actions: &RefCell<Vec<Action>>, allowed: &Cell<bool>, action: Action) -> Result<()> {
