@@ -717,7 +717,8 @@ not rolled back. displayed values follow server replies.
 volume changes preserve channel balance. the service reconnects after a server
 failure and discards commands from the old connection.
 `thing check` uses unavailable/empty service defaults and never connects to audio,
-media players, or the system power service.
+media players, the system power service, or the session bus for notification and
+tray state.
 
 ## media
 
@@ -899,6 +900,78 @@ opaque key during the same run.
 
 without `--notification-server`, the service remains unowned and empty.
 `thing check` never connects to the session bus.
+
+## system tray
+
+tray support is opt-in. use `host` when another process already provides the
+status notifier watcher:
+
+```sh
+thing run --system-tray host ./panel.luau
+```
+
+use `own-watcher` when thing should provide the watcher itself:
+
+```sh
+thing run --system-tray own-watcher ./panel.luau
+```
+
+own-watcher mode claims both the kde and freedesktop watcher names only when
+both are free. it never replaces a running watcher; if either name is already
+owned, thing follows the existing watcher as a host instead. without the option,
+thing does not start its tray worker. `thing check` also leaves it disabled and
+does not contact the session bus for tray state.
+
+`services.system_tray` contains these read-only values:
+
+| value | meaning |
+| --- | --- |
+| `available` | whether thing is attached to a watcher |
+| `watcher_owned` | whether thing currently owns the watcher names |
+| `error` | connection failure message, or an empty string |
+| `items:get()` | immutable array of current status notifier item records |
+
+each item has an opaque `id` for one bus-owner lifetime. use it unchanged as a
+widget key and action argument. it changes when the item or selected watcher is
+replaced, which prevents a delayed action from reaching a different process.
+`protocol_item_id` is the application's own status notifier id; it is metadata,
+not an action target and is not guaranteed to be unique.
+
+the other string fields are `category`, `title`, `status`, `icon_name`,
+`attention_icon_name`, `overlay_icon_name`, `tooltip_icon_name`,
+`tooltip_title`, and `tooltip_text`. `item_is_menu` and `has_menu` describe menu
+behavior. the four `has_*_icon_pixmap` fields report whether a bounded, valid
+pixmap was advertised.
+
+build the presentation in the configuration like any other dynamic list:
+
+```luau
+local tray = services.system_tray
+
+ui.row {
+    children = function()
+        local children = {}
+        for _, item in tray.items:get() do
+            table.insert(children, ui.button {
+                key = item.id,
+                on_click = function() tray.activate(item.id) end,
+                on_middle_click = function() tray.secondary_activate(item.id) end,
+                on_secondary_click = function() tray.context_menu(item.id) end,
+                children = { ui.image { icon = item.icon_name } },
+            })
+        end
+        return children
+    end,
+}
+```
+
+the three actions are event-handler only. thing currently passes `(0, 0)` as
+their coordinates because wayland clients do not know global screen
+coordinates, and it does not expose the protocol's scroll action. icon theme
+names work with `ui.image`, but advertised pixmap bytes are not retained or
+rendered yet. `has_menu` does not mean thing can render a DBusMenu layout; the
+context-menu action is only forwarded to the item. legacy XEmbed tray items are
+not supported.
 
 ## popups and input
 

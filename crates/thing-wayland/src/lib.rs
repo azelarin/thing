@@ -28,20 +28,33 @@ pub enum Renderer {
     Vulkan,
 }
 
+/// process-wide options for the wayland host.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RunOptions {
+    /// graphics backend used by every surface.
     pub renderer: Renderer,
+    /// whether thing should provide the desktop notification service.
     pub notification_server: bool,
+    /// status notifier policy, or `None` to leave tray support disabled.
+    pub system_tray: Option<SystemTrayMode>,
 }
 
 impl RunOptions {
+    /// select the graphics backend.
     pub fn with_renderer(mut self, renderer: Renderer) -> Self {
         self.renderer = renderer;
         self
     }
 
+    /// enable or disable the desktop notification service.
     pub fn with_notification_server(mut self, enabled: bool) -> Self {
         self.notification_server = enabled;
+        self
+    }
+
+    /// select a status notifier policy, or disable the tray worker with `None`.
+    pub fn with_system_tray(mut self, system_tray: Option<SystemTrayMode>) -> Self {
+        self.system_tray = system_tray;
         self
     }
 }
@@ -57,5 +70,16 @@ impl std::str::FromStr for Renderer {
                 "unknown renderer {value:?}; expected opengl or vulkan"
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_options_leave_opt_in_services_disabled_by_default() {
+        assert!(!RunOptions::default().notification_server);
+        assert_eq!(RunOptions::default().system_tray, None);
     }
 }

@@ -42,6 +42,7 @@ use thing_core::{
 };
 use thing_runtime::{
     Action, Event, OutputContext, Scalar, ServiceSnapshot, SurfaceKey, SurfaceTree,
+    SystemTrayAction,
 };
 use thing_ui::{Interaction, Layout, PaintFrame, ScrollState, Size};
 use wayland_client::{
@@ -68,7 +69,7 @@ use wayland_protocols::{
 use xkbcommon::xkb;
 
 use crate::{
-    Renderer, RunOptions,
+    Renderer, RunOptions, SystemTray,
     audio::Audio,
     configuration::Configurations,
     hover::{Command as HoverCommand, HoverKey, HoverStates, HoverTarget},
@@ -87,15 +88,10 @@ use crate::{
 /// configuration, or a compositor frame callback arrives; unchanged surfaces do
 /// not request frames.
 pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
-    run_with_options(
-        entry,
-        RunOptions {
-            renderer,
-            ..RunOptions::default()
-        },
-    )
+    run_with_options(entry, RunOptions::default().with_renderer(renderer))
 }
 
+/// run configured surfaces with process-wide service and renderer options.
 pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String> {
     let renderer = options.renderer;
     if renderer == Renderer::Vulkan && !cfg!(feature = "vulkan") {
@@ -171,6 +167,15 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
     };
     let mut event_loop: EventLoop<'static, App> =
         EventLoop::try_new().map_err(|error| error.to_string())?;
+    let (system_tray, system_tray_source) = match options.system_tray {
+        Some(mode) => {
+            let (ping, source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
+            let tray = SystemTray::start(mode, ping)
+                .map_err(|error| format!("cannot start system tray worker: {error}"))?;
+            (Some(tray), Some(source))
+        }
+        None => (None, None),
+    };
     let loop_handle = event_loop.handle();
     let mut app = App {
         render,
@@ -184,6 +189,7 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         power,
         niri,
         notifications,
+        system_tray,
         launcher,
         pending_launches: PendingLaunches::new(),
         surfaces: Vec::new(),
@@ -258,6 +264,12 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         event_loop
             .handle()
             .insert_source(source, |_, _, app| app.update_notifications())
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(source) = system_tray_source {
+        event_loop
+            .handle()
+            .insert_source(source, |_, _, app| app.update_system_tray())
             .map_err(|e| e.to_string())?;
     }
     WaylandSource::new(connection.clone(), queue)
@@ -602,6 +614,7 @@ struct App {
     power: Power,
     niri: Niri,
     notifications: Option<NotificationServer>,
+    system_tray: Option<SystemTray>,
     launcher: Launcher,
     pending_launches: PendingLaunches<XdgActivationTokenV1>,
     watch: Rc<Watch>,
@@ -715,6 +728,19 @@ impl App {
             return;
         };
         if let Err(error) = self.configurations.set_notifications(snapshot) {
+            eprintln!("thing: {error}");
+        }
+        self.refresh();
+    }
+    fn update_system_tray(&mut self) {
+        let Some(snapshot) = self
+            .system_tray
+            .as_ref()
+            .and_then(SystemTray::take_snapshot)
+        else {
+            return;
+        };
+        if let Err(error) = self.configurations.set_system_tray(snapshot) {
             eprintln!("thing: {error}");
         }
         self.refresh();
@@ -1448,7 +1474,9 @@ impl App {
                     .media
                     .send(action, player.as_deref())
                     .map_err(str::to_owned),
-                Action::SystemTray { .. } => Err("system tray capability is disabled".into()),
+                Action::SystemTray { action, item } => {
+                    send_system_tray_action(self.system_tray.as_ref(), action, &item)
+                }
                 Action::Launch { argv, cwd } => {
                     self.request_launch(LaunchRequest { argv, cwd }, origin.as_ref());
                     Ok(())
@@ -2468,6 +2496,17 @@ fn apply_input_region(
     Ok(())
 }
 
+fn send_system_tray_action(
+    system_tray: Option<&SystemTray>,
+    action: SystemTrayAction,
+    item: &str,
+) -> Result<(), String> {
+    system_tray
+        .ok_or_else(|| "system tray capability is disabled".to_owned())?
+        .send(action, item)
+        .map_err(str::to_owned)
+}
+
 fn earliest_deadline(
     reload: Option<Instant>,
     hover: Option<Instant>,
@@ -2530,13 +2569,23 @@ mod output_tests {
 
     use super::{
         PanelState, configured_panel_size, earliest_deadline, fallback_logical_size,
-        find_automatic_popup, find_manual_popup, interactive_path, panel_size, valid_dimensions,
-        validate_surface_capabilities,
+        find_automatic_popup, find_manual_popup, interactive_path, panel_size,
+        send_system_tray_action, valid_dimensions, validate_surface_capabilities,
     };
     use crate::{configuration::Configurations, panel};
     use tempfile::tempdir;
     use thing_core::{KeyboardMode, Kind, Node, NodeId, PanelEdge, PanelMargins, Scale};
-    use thing_runtime::{Event, OutputContext, ServiceSnapshot, SurfaceKey, SurfaceTree};
+    use thing_runtime::{
+        Event, OutputContext, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTrayAction,
+    };
+
+    #[test]
+    fn disabled_system_tray_rejects_actions_without_starting_a_worker() {
+        assert_eq!(
+            send_system_tray_action(None, SystemTrayAction::Activate, "tray1"),
+            Err("system tray capability is disabled".into())
+        );
+    }
 
     #[test]
     fn renderer_retry_can_wake_before_hover_and_configuration_deadlines() {
