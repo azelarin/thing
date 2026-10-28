@@ -11,6 +11,7 @@ mod media;
 mod niri;
 mod panel;
 mod popup;
+mod power;
 mod render;
 #[cfg(feature = "vulkan")]
 mod vulkan;

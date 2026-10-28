@@ -713,8 +713,8 @@ not rolled back. displayed values follow server replies.
 
 volume changes preserve channel balance. the service reconnects after a server
 failure and discards commands from the old connection.
-`thing check` uses unavailable/empty service defaults and never connects to audio
-or media players.
+`thing check` uses unavailable/empty service defaults and never connects to audio,
+media players, or the system power service.
 
 ## media
 
@@ -790,6 +790,41 @@ disconnection.
 remote url. `ui.image` currently accepts local filesystem paths and does not fetch
 urls, so passing `art_url` directly to `source` is not supported. playback
 position, seeking, and remote artwork loading are not part of this api yet.
+
+## power
+
+`services.power` reads battery and line-power state from UPower. `available`
+says whether the service has a current snapshot, `on_battery` reports the
+machine-wide power source, and `error` contains a connection failure message or
+an empty string. these values are read-only signals, so use `:get()` when a
+property should update with them.
+
+`display:get()` returns UPower's composite display device, or `nil` when no
+display device is available. this is usually the right record for a single
+battery indicator. `devices:get()` returns an immutable array of the individual
+power devices and leaves the composite record out. a configuration can use this
+list for systems with several batteries, an uninterruptible power supply, or
+battery-powered peripherals.
+
+each device record contains:
+
+| field | meaning |
+| --- | --- |
+| `id` | UPower object path; suitable for a widget key while the device exists |
+| `kind`, `state` | snake-case device kind and charge state, or `unknown` |
+| `power_supply` | whether the device supplies power to the machine |
+| `present`, `online` | physical presence or line-power status when applicable |
+| `percentage`, `capacity` | charge and battery health percentages when reported |
+| `time_to_empty`, `time_to_full` | remaining seconds, or `nil` when UPower reports no estimate |
+| `energy`, `energy_empty`, `energy_full`, `energy_full_design`, `energy_rate` | energy measurements in Wh and rate in W when applicable |
+| `native_path`, `vendor`, `model`, `serial`, `icon_name` | optional device metadata |
+| `warning_level`, `battery_level` | snake-case warning and coarse battery levels |
+
+optional fields use `nil` when a value does not apply or was not supplied.
+numeric zero remains a real value for percentages and energy measurements;
+UPower defines zero time estimates as unknown, so those become `nil`.
+the service follows devices appearing and disappearing, replaces its state when
+UPower restarts, and does not provide power-management actions.
 
 ## popups and input
 

@@ -112,6 +112,33 @@ pub struct MediaPlayer {
     pub can_stop: bool,
 }
 
+/// one UPower device identified by its object path.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PowerDevice {
+    pub id: String,
+    pub kind: String,
+    pub state: String,
+    pub power_supply: bool,
+    pub present: Option<bool>,
+    pub online: Option<bool>,
+    pub percentage: Option<f64>,
+    pub time_to_empty: Option<i64>,
+    pub time_to_full: Option<i64>,
+    pub energy: Option<f64>,
+    pub energy_empty: Option<f64>,
+    pub energy_full: Option<f64>,
+    pub energy_full_design: Option<f64>,
+    pub energy_rate: Option<f64>,
+    pub capacity: Option<f64>,
+    pub native_path: Option<String>,
+    pub vendor: Option<String>,
+    pub model: Option<String>,
+    pub serial: Option<String>,
+    pub icon_name: Option<String>,
+    pub warning_level: String,
+    pub battery_level: Option<String>,
+}
+
 impl AudioSnapshot {
     fn values(&self) -> [(&'static str, Scalar); 9] {
         [
@@ -235,6 +262,44 @@ impl MediaSnapshot {
     }
 }
 
+/// one confirmed generation of UPower state.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PowerSnapshot {
+    pub available: bool,
+    pub on_battery: bool,
+    pub display: Option<PowerDevice>,
+    pub devices: Vec<PowerDevice>,
+    pub error: String,
+}
+
+impl PowerSnapshot {
+    fn values(&self) -> [(&'static str, Scalar); 3] {
+        [
+            ("power.available", Scalar::Boolean(self.available)),
+            ("power.on_battery", Scalar::Boolean(self.on_battery)),
+            ("power.error", Scalar::String(self.error.clone())),
+        ]
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (name, value) in self.values() {
+            validate_service(name, &value)?;
+        }
+        validate_power_devices(&self.devices)?;
+        if let Some(display) = &self.display {
+            validate_power_device(display)?;
+        }
+        if self.available {
+            if !self.error.is_empty() {
+                return Err(Error::runtime("inconsistent power snapshot"));
+            }
+        } else if self.on_battery || self.display.is_some() || !self.devices.is_empty() {
+            return Err(Error::runtime("inconsistent power snapshot"));
+        }
+        Ok(())
+    }
+}
+
 /// desktop service values used when loading a runtime.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ServiceSnapshot {
@@ -244,6 +309,8 @@ pub struct ServiceSnapshot {
     pub(crate) all_sources: Vec<AudioSource>,
     pub(crate) streams: Vec<AudioStream>,
     pub(crate) media_players: Vec<MediaPlayer>,
+    pub(crate) power_display: Option<PowerDevice>,
+    pub(crate) power_devices: Vec<PowerDevice>,
     pub(crate) niri: NiriState,
 }
 
@@ -293,6 +360,16 @@ impl ServiceSnapshot {
         Ok(())
     }
 
+    pub fn set_power(&mut self, power: PowerSnapshot) -> Result<()> {
+        power.validate()?;
+        for (name, value) in power.values() {
+            self.values.insert(name.into(), value);
+        }
+        self.power_display = power.display;
+        self.power_devices = power.devices;
+        Ok(())
+    }
+
     pub fn set_niri(&mut self, state: NiriState) -> Result<()> {
         state.validate()?;
         self.niri = state;
@@ -338,6 +415,73 @@ impl UserData for MediaPlayerList {
             Ok(list)
         });
     }
+}
+
+struct PowerDeviceList {
+    tracker: Rc<RefCell<Tracker>>,
+    revision: usize,
+    devices: Rc<RefCell<Vec<PowerDevice>>>,
+}
+
+impl UserData for PowerDeviceList {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |lua, this, ()| {
+            this.tracker.borrow_mut().read(this.revision);
+            let list = lua.create_table()?;
+            for (index, device) in this.devices.borrow().iter().enumerate() {
+                list.raw_set(index + 1, power_device_table(lua, device)?)?;
+            }
+            list.set_readonly(true);
+            Ok(list)
+        });
+    }
+}
+
+struct PowerDisplay {
+    tracker: Rc<RefCell<Tracker>>,
+    revision: usize,
+    display: Rc<RefCell<Option<PowerDevice>>>,
+}
+
+impl UserData for PowerDisplay {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |lua, this, ()| {
+            this.tracker.borrow_mut().read(this.revision);
+            this.display
+                .borrow()
+                .as_ref()
+                .map(|device| power_device_table(lua, device))
+                .transpose()
+        });
+    }
+}
+
+fn power_device_table(lua: &Lua, device: &PowerDevice) -> Result<Table> {
+    let item = lua.create_table()?;
+    item.set("id", device.id.as_str())?;
+    item.set("kind", device.kind.as_str())?;
+    item.set("state", device.state.as_str())?;
+    item.set("power_supply", device.power_supply)?;
+    item.set("present", device.present)?;
+    item.set("online", device.online)?;
+    item.set("percentage", device.percentage)?;
+    item.set("time_to_empty", device.time_to_empty)?;
+    item.set("time_to_full", device.time_to_full)?;
+    item.set("energy", device.energy)?;
+    item.set("energy_empty", device.energy_empty)?;
+    item.set("energy_full", device.energy_full)?;
+    item.set("energy_full_design", device.energy_full_design)?;
+    item.set("energy_rate", device.energy_rate)?;
+    item.set("capacity", device.capacity)?;
+    item.set("native_path", device.native_path.as_deref())?;
+    item.set("vendor", device.vendor.as_deref())?;
+    item.set("model", device.model.as_deref())?;
+    item.set("serial", device.serial.as_deref())?;
+    item.set("icon_name", device.icon_name.as_deref())?;
+    item.set("warning_level", device.warning_level.as_str())?;
+    item.set("battery_level", device.battery_level.as_deref())?;
+    item.set_readonly(true);
+    Ok(item)
 }
 
 impl UserData for DeviceList {
@@ -428,6 +572,10 @@ pub(crate) struct Services {
     streams_revision: usize,
     media_players: Rc<RefCell<Vec<MediaPlayer>>>,
     media_players_revision: usize,
+    power_display: Rc<RefCell<Option<PowerDevice>>>,
+    power_display_revision: usize,
+    power_devices: Rc<RefCell<Vec<PowerDevice>>>,
+    power_devices_revision: usize,
     niri: NiriData,
 }
 
@@ -438,6 +586,8 @@ impl Services {
         let all_sources_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let streams_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let media_players_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
+        let power_display_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
+        let power_devices_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let niri = lua.create_table()?;
         let niri_data = NiriData::install(&niri, tracker.clone())?;
         let mut result = Self {
@@ -455,6 +605,10 @@ impl Services {
             streams_revision,
             media_players: Rc::default(),
             media_players_revision,
+            power_display: Rc::default(),
+            power_display_revision,
+            power_devices: Rc::default(),
+            power_devices_revision,
             niri: niri_data,
         };
         let services = lua.create_table()?;
@@ -462,6 +616,7 @@ impl Services {
         let clock = lua.create_table()?;
         let media = lua.create_table()?;
         let output = lua.create_table()?;
+        let power = lua.create_table()?;
         audio.set(
             "devices",
             DeviceList {
@@ -502,6 +657,22 @@ impl Services {
                 players: result.media_players.clone(),
             },
         )?;
+        power.set(
+            "display",
+            PowerDisplay {
+                tracker: result.tracker.clone(),
+                revision: power_display_revision,
+                display: result.power_display.clone(),
+            },
+        )?;
+        power.set(
+            "devices",
+            PowerDeviceList {
+                tracker: result.tracker.clone(),
+                revision: power_devices_revision,
+                devices: result.power_devices.clone(),
+            },
+        )?;
         for (name, value) in [
             ("audio.available", Scalar::Boolean(false)),
             ("audio.volume", Scalar::Number(0.0)),
@@ -527,6 +698,9 @@ impl Services {
             ("media.can_previous", Scalar::Boolean(false)),
             ("media.can_stop", Scalar::Boolean(false)),
             ("media.error", Scalar::String(String::new())),
+            ("power.available", Scalar::Boolean(false)),
+            ("power.on_battery", Scalar::Boolean(false)),
+            ("power.error", Scalar::String(String::new())),
             ("niri.available", Scalar::Boolean(false)),
             ("niri.error", Scalar::String(String::new())),
             ("output.available", Scalar::Boolean(false)),
@@ -551,6 +725,7 @@ impl Services {
                 "media" => media.set(property, signal)?,
                 "niri" => niri.set(property, signal)?,
                 "output" => output.set(property, signal)?,
+                "power" => power.set(property, signal)?,
                 _ => return Err(Error::runtime("invalid service name")),
             }
         }
@@ -666,6 +841,7 @@ impl Services {
             )?;
         }
         media.set_readonly(true);
+        power.set_readonly(true);
         for (name, action) in [
             (
                 "focus_workspace",
@@ -701,6 +877,7 @@ impl Services {
         services.set("media", media)?;
         services.set("niri", niri)?;
         services.set("output", output)?;
+        services.set("power", power)?;
         services.set_readonly(true);
         lua.globals().set("services", services)?;
         Ok(result)
@@ -882,6 +1059,79 @@ impl Services {
         Ok(())
     }
 
+    pub fn set_power(&self, power: PowerSnapshot) -> Result<()> {
+        power.validate()?;
+        let display_changed = *self.power_display.borrow() != power.display;
+        let devices_changed = *self.power_devices.borrow() != power.devices;
+        let mut display = self.power_display.borrow_mut();
+        let mut devices = self.power_devices.borrow_mut();
+        let mut tracker = self.tracker.borrow_mut();
+        let mut updates = power
+            .values()
+            .into_iter()
+            .map(|(name, value)| (self.signals[name], value))
+            .collect::<Vec<_>>();
+        if display_changed {
+            let revision = tracker.read(self.power_display_revision);
+            updates.push((
+                self.power_display_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            ));
+        }
+        if devices_changed {
+            let revision = tracker.read(self.power_devices_revision);
+            updates.push((
+                self.power_devices_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            ));
+        }
+        tracker.write_batch(updates)?;
+        if display_changed {
+            *display = power.display;
+        }
+        if devices_changed {
+            *devices = power.devices;
+        }
+        Ok(())
+    }
+
+    pub fn set_power_devices(
+        &self,
+        display: Option<PowerDevice>,
+        devices: Vec<PowerDevice>,
+    ) -> Result<()> {
+        validate_power_devices(&devices)?;
+        if let Some(display) = &display {
+            validate_power_device(display)?;
+        }
+        let display_changed = *self.power_display.borrow() != display;
+        let devices_changed = *self.power_devices.borrow() != devices;
+        let mut tracker = self.tracker.borrow_mut();
+        let mut updates = Vec::new();
+        if display_changed {
+            let revision = tracker.read(self.power_display_revision);
+            updates.push((
+                self.power_display_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            ));
+        }
+        if devices_changed {
+            let revision = tracker.read(self.power_devices_revision);
+            updates.push((
+                self.power_devices_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            ));
+        }
+        tracker.write_batch(updates)?;
+        if display_changed {
+            *self.power_display.borrow_mut() = display;
+        }
+        if devices_changed {
+            *self.power_devices.borrow_mut() = devices;
+        }
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> ServiceSnapshot {
         let mut tracker = self.tracker.borrow_mut();
         let values = self
@@ -897,6 +1147,8 @@ impl Services {
             all_sources: self.all_sources.borrow().clone(),
             streams: self.streams.borrow().clone(),
             media_players: self.media_players.borrow().clone(),
+            power_display: self.power_display.borrow().clone(),
+            power_devices: self.power_devices.borrow().clone(),
             niri: self.niri.snapshot(),
         }
     }
@@ -1035,6 +1287,8 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "media.can_next"
             | "media.can_previous"
             | "media.can_stop"
+            | "power.available"
+            | "power.on_battery"
             | "niri.available",
             Scalar::Boolean(_),
         ) => true,
@@ -1053,6 +1307,7 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "media.identity"
             | "media.desktop_entry"
             | "media.error"
+            | "power.error"
             | "niri.error",
             Scalar::String(value),
         ) => value.len() <= 4096 && !value.contains('\0'),
@@ -1161,6 +1416,73 @@ fn validate_media_players(players: &[MediaPlayer]) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn validate_power_devices(devices: &[PowerDevice]) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    let invalid = devices.len() > 128
+        || devices
+            .iter()
+            .any(|device| validate_power_device(device).is_err() || !ids.insert(&device.id));
+    if invalid {
+        Err(Error::runtime("invalid power device list"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_power_device(device: &PowerDevice) -> Result<()> {
+    let optional_text_valid = |value: &Option<String>| {
+        value
+            .as_ref()
+            .is_none_or(|value| !value.is_empty() && valid_power_text(value, 4096))
+    };
+    let optional_number_valid = |value: Option<f64>, range: Option<(f64, f64)>| {
+        value.is_none_or(|value| {
+            value.is_finite()
+                && range.is_none_or(|(minimum, maximum)| (minimum..=maximum).contains(&value))
+        })
+    };
+    let valid = device.id.starts_with('/')
+        && valid_power_text(&device.id, 4096)
+        && valid_power_enum(&device.kind)
+        && valid_power_enum(&device.state)
+        && valid_power_enum(&device.warning_level)
+        && device
+            .battery_level
+            .as_ref()
+            .is_none_or(|value| valid_power_enum(value))
+        && device.time_to_empty.is_none_or(|value| value > 0)
+        && device.time_to_full.is_none_or(|value| value > 0)
+        && optional_number_valid(device.percentage, Some((0.0, 100.0)))
+        && optional_number_valid(device.energy, Some((0.0, f64::MAX)))
+        && optional_number_valid(device.energy_empty, Some((0.0, f64::MAX)))
+        && optional_number_valid(device.energy_full, Some((0.0, f64::MAX)))
+        && optional_number_valid(device.energy_full_design, Some((0.0, f64::MAX)))
+        && optional_number_valid(device.energy_rate, None)
+        && optional_number_valid(device.capacity, Some((0.0, 100.0)))
+        && optional_text_valid(&device.native_path)
+        && optional_text_valid(&device.vendor)
+        && optional_text_valid(&device.model)
+        && optional_text_valid(&device.serial)
+        && optional_text_valid(&device.icon_name);
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::runtime("invalid power device"))
+    }
+}
+
+fn valid_power_enum(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+}
+
+fn valid_power_text(value: &str, max: usize) -> bool {
+    value.len() <= max && !value.contains('\0')
 }
 
 fn invalid_media_text(value: &str, max: usize) -> bool {

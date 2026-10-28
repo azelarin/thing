@@ -48,7 +48,7 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] luau configurations, reactive state, and reloads
 - [x] panels, popups, layout, text, and images
 - [x] multiple independent surfaces on each output
-- [x] clock, output audio controls, and niri workspaces and windows
+- [x] clock, power state, output audio controls, and niri workspaces and windows
 - [x] per-output configuration
 - [x] application launching
 - [x] panel sizing and input regions

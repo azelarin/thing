@@ -77,6 +77,7 @@ use crate::{
     niri::Niri,
     panel::{self, Geometry, ResolvedInputRegion},
     popup::{self, Position as PopupPosition},
+    power::Power,
     render::{FrameResult, Render, Window},
     watch::Watch,
 };
@@ -144,6 +145,8 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
     let audio = Audio::start(audio_ping).map_err(|e| format!("cannot start audio worker: {e}"))?;
     let (media_ping, media_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let media = Media::start(media_ping).map_err(|e| format!("cannot start media worker: {e}"))?;
+    let (power_ping, power_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
+    let power = Power::start(power_ping).map_err(|e| format!("cannot start power worker: {e}"))?;
     let (niri_ping, niri_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let niri = Niri::start(niri_ping).map_err(|e| format!("cannot start niri worker: {e}"))?;
     let mut event_loop: EventLoop<'static, App> =
@@ -158,6 +161,7 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
         hover: HoverStates::default(),
         audio,
         media,
+        power,
         niri,
         launcher,
         pending_launches: PendingLaunches::new(),
@@ -224,6 +228,10 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
     event_loop
         .handle()
         .insert_source(media_source, |_, _, app| app.update_media())
+        .map_err(|e| e.to_string())?;
+    event_loop
+        .handle()
+        .insert_source(power_source, |_, _, app| app.update_power())
         .map_err(|e| e.to_string())?;
     WaylandSource::new(connection.clone(), queue)
         .insert(event_loop.handle())
@@ -564,6 +572,7 @@ struct App {
     configurations: Configurations<wl_output::WlOutput>,
     audio: Audio,
     media: Media,
+    power: Power,
     niri: Niri,
     launcher: Launcher,
     pending_launches: PendingLaunches<XdgActivationTokenV1>,
@@ -656,6 +665,15 @@ impl App {
             return;
         };
         if let Err(error) = self.configurations.set_media(snapshot) {
+            eprintln!("thing: {error}");
+        }
+        self.refresh();
+    }
+    fn update_power(&mut self) {
+        let Some(snapshot) = self.power.take_snapshot() else {
+            return;
+        };
+        if let Err(error) = self.configurations.set_power(snapshot) {
             eprintln!("thing: {error}");
         }
         self.refresh();
