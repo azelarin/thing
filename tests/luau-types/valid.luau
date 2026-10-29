@@ -135,6 +135,12 @@ local recorder_process = services.process {
     key = "recorder",
     shutdown_signal = "interrupt",
 }
+local scheduled_process = services.process {
+    key = "scheduled-query",
+    command = { "query-command", "--compact" },
+    working_directory = "/tmp",
+    interval = 3000,
+}
 local process_button = ui.button {
     on_click = function()
         if query_process.running:get() then
@@ -143,13 +149,16 @@ local process_button = ui.button {
             query_process.start({ "query-command", "--compact" }, "/tmp")
         end
         recorder_process.stop()
+        scheduled_process.refresh()
+        scheduled_process.cancel()
     end,
     children = {
         ui.text {
             text = function()
                 local status: ThingManagedProcessStatus = query_process.status:get()
                 local code: number? = query_process.exit_code:get()
-                return `{status}:{code or "none"}:{query_process.stdout:get()}`
+                local scheduled_status: ThingManagedProcessStatus = scheduled_process.status:get()
+                return `{status}:{scheduled_status}:{code or "none"}:{query_process.stdout:get()}`
             end,
         },
     },

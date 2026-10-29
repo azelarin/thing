@@ -71,6 +71,8 @@ pub enum ManagedProcessAction {
         cwd: Option<String>,
     },
     Stop,
+    Refresh,
+    Cancel,
 }
 
 /// the signal sent before a managed process is forcibly stopped.
@@ -86,6 +88,15 @@ pub enum ManagedProcessShutdownSignal {
 pub struct ManagedProcessDefinition {
     pub key: String,
     pub shutdown_signal: ManagedProcessShutdownSignal,
+    pub command: Option<ManagedProcessCommand>,
+}
+
+/// a finite command started and repeated by the managed process supervisor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedProcessCommand {
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    pub interval_ms: Option<u64>,
 }
 
 /// lifecycle state for one managed process incarnation.
@@ -186,6 +197,8 @@ const MAX_MANAGED_PROCESS_KEY_BYTES: usize = 128;
 const MAX_MANAGED_PROCESS_STREAM_BYTES: usize = 64 * 1024;
 const MAX_MANAGED_PROCESS_RETAINED_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MANAGED_PROCESS_ERROR_BYTES: usize = 4096;
+const MIN_MANAGED_PROCESS_INTERVAL_MS: u64 = 1_000;
+const MAX_MANAGED_PROCESS_INTERVAL_MS: u64 = 31_536_000_000;
 const MAX_TRAY_PIXMAPS: usize = 32;
 const MAX_TRAY_PIXMAP_SIDE: u32 = 4096;
 const MAX_TRAY_PIXMAP_BYTES: usize = 256 * 1024;
@@ -2150,6 +2163,7 @@ fn managed_process_definition(value: Value) -> Result<ManagedProcessDefinition> 
         Value::String(key) => ManagedProcessDefinition {
             key: key.to_str()?.to_owned(),
             shutdown_signal: ManagedProcessShutdownSignal::Terminate,
+            command: None,
         },
         Value::Table(table) => {
             for pair in table.clone().pairs::<Value, Value>() {
@@ -2160,7 +2174,10 @@ fn managed_process_definition(value: Value) -> Result<ManagedProcessDefinition> 
                     ));
                 };
                 let key = key.to_str()?;
-                if !matches!(key.as_ref(), "key" | "shutdown_signal") {
+                if !matches!(
+                    key.as_ref(),
+                    "key" | "shutdown_signal" | "command" | "working_directory" | "interval"
+                ) {
                     return Err(Error::runtime(format!(
                         "unknown managed process option {key:?}"
                     )));
@@ -2181,9 +2198,32 @@ fn managed_process_definition(value: Value) -> Result<ManagedProcessDefinition> 
                     ));
                 }
             };
+            let command = match table.get::<Value>("command")? {
+                Value::Nil => {
+                    if !matches!(table.get::<Value>("working_directory")?, Value::Nil)
+                        || !matches!(table.get::<Value>("interval")?, Value::Nil)
+                    {
+                        return Err(Error::runtime(
+                            "managed process working_directory and interval require command",
+                        ));
+                    }
+                    None
+                }
+                Value::Table(arguments) => Some(ManagedProcessCommand {
+                    argv: launch_arguments(arguments)?,
+                    cwd: launch_working_directory(table.get("working_directory")?)?,
+                    interval_ms: managed_process_interval(table.get("interval")?)?,
+                }),
+                _ => {
+                    return Err(Error::runtime(
+                        "managed process command must be a dense array of strings",
+                    ));
+                }
+            };
             ManagedProcessDefinition {
                 key,
                 shutdown_signal,
+                command,
             }
         }
         _ => {
@@ -2194,6 +2234,29 @@ fn managed_process_definition(value: Value) -> Result<ManagedProcessDefinition> 
     };
     validate_managed_process_key(&definition.key)?;
     Ok(definition)
+}
+
+fn managed_process_interval(value: Value) -> Result<Option<u64>> {
+    let number = match value {
+        Value::Nil => return Ok(None),
+        Value::Integer(value) => value as f64,
+        Value::Number(value) => value,
+        _ => {
+            return Err(Error::runtime(format!(
+                "managed process interval must be a whole number between {MIN_MANAGED_PROCESS_INTERVAL_MS} and {MAX_MANAGED_PROCESS_INTERVAL_MS}"
+            )));
+        }
+    };
+    if !number.is_finite()
+        || number.fract() != 0.0
+        || !(MIN_MANAGED_PROCESS_INTERVAL_MS as f64..=MAX_MANAGED_PROCESS_INTERVAL_MS as f64)
+            .contains(&number)
+    {
+        return Err(Error::runtime(format!(
+            "managed process interval must be a whole number between {MIN_MANAGED_PROCESS_INTERVAL_MS} and {MAX_MANAGED_PROCESS_INTERVAL_MS}"
+        )));
+    }
+    Ok(Some(number as u64))
 }
 
 fn create_managed_process_signals(
@@ -2263,40 +2326,64 @@ fn managed_process_handle(
             },
         )?;
     }
-    let key = signals.definition.key.clone();
-    let start_actions = actions.clone();
-    let start_allowed = allowed.clone();
-    handle.set(
-        "start",
-        lua.create_function(move |_, (arguments, cwd): (Table, Value)| {
-            let argv = launch_arguments(arguments)?;
-            let cwd = launch_working_directory(cwd)?;
-            enqueue(
-                &start_actions,
-                &start_allowed,
-                Action::ManagedProcess {
-                    key: key.clone(),
-                    action: ManagedProcessAction::Start { argv, cwd },
-                },
-            )
-        })?,
-    )?;
-    let key = signals.definition.key;
-    let stop_actions = actions.clone();
-    let stop_allowed = allowed.clone();
-    handle.set(
-        "stop",
-        lua.create_function(move |_, ()| {
-            enqueue(
-                &stop_actions,
-                &stop_allowed,
-                Action::ManagedProcess {
-                    key: key.clone(),
-                    action: ManagedProcessAction::Stop,
-                },
-            )
-        })?,
-    )?;
+    if signals.definition.command.is_some() {
+        for (name, action) in [
+            ("refresh", ManagedProcessAction::Refresh),
+            ("cancel", ManagedProcessAction::Cancel),
+        ] {
+            let key = signals.definition.key.clone();
+            let actions = actions.clone();
+            let allowed = allowed.clone();
+            handle.set(
+                name,
+                lua.create_function(move |_, ()| {
+                    enqueue(
+                        &actions,
+                        &allowed,
+                        Action::ManagedProcess {
+                            key: key.clone(),
+                            action: action.clone(),
+                        },
+                    )
+                })?,
+            )?;
+        }
+    } else {
+        let key = signals.definition.key.clone();
+        let start_actions = actions.clone();
+        let start_allowed = allowed.clone();
+        handle.set(
+            "start",
+            lua.create_function(move |_, (arguments, cwd): (Table, Value)| {
+                let argv = launch_arguments(arguments)?;
+                let cwd = launch_working_directory(cwd)?;
+                enqueue(
+                    &start_actions,
+                    &start_allowed,
+                    Action::ManagedProcess {
+                        key: key.clone(),
+                        action: ManagedProcessAction::Start { argv, cwd },
+                    },
+                )
+            })?,
+        )?;
+        let key = signals.definition.key;
+        let stop_actions = actions.clone();
+        let stop_allowed = allowed.clone();
+        handle.set(
+            "stop",
+            lua.create_function(move |_, ()| {
+                enqueue(
+                    &stop_actions,
+                    &stop_allowed,
+                    Action::ManagedProcess {
+                        key: key.clone(),
+                        action: ManagedProcessAction::Stop,
+                    },
+                )
+            })?,
+        )?;
+    }
     handle.set_readonly(true);
     Ok(handle)
 }
@@ -3085,6 +3172,12 @@ mod tests {
                 key = 'recorder',
                 shutdown_signal = 'interrupt',
             }
+            scheduled = services.process {
+                key = 'scheduled',
+                command = { 'program', '--once' },
+                working_directory = '/tmp',
+                interval = 3000,
+            }
             "#,
         )
         .exec()
@@ -3095,17 +3188,43 @@ mod tests {
                 ManagedProcessDefinition {
                     key: "query".into(),
                     shutdown_signal: ManagedProcessShutdownSignal::Terminate,
+                    command: None,
                 },
                 ManagedProcessDefinition {
                     key: "recorder".into(),
                     shutdown_signal: ManagedProcessShutdownSignal::Interrupt,
+                    command: None,
+                },
+                ManagedProcessDefinition {
+                    key: "scheduled".into(),
+                    shutdown_signal: ManagedProcessShutdownSignal::Terminate,
+                    command: Some(ManagedProcessCommand {
+                        argv: vec!["program".into(), "--once".into()],
+                        cwd: Some("/tmp".into()),
+                        interval_ms: Some(3000),
+                    }),
                 },
             ]
         );
         assert!(lua.load("query.start({'program'})").exec().is_err());
+        assert!(lua.load("scheduled.refresh()").exec().is_err());
+        assert!(
+            lua.load("return scheduled.start")
+                .eval::<Value>()
+                .unwrap()
+                .is_nil()
+        );
+        assert!(
+            lua.load("return query.refresh")
+                .eval::<Value>()
+                .unwrap()
+                .is_nil()
+        );
 
         services.allow_actions(true);
-        lua.load("query.start({'program', '--flag'}, '/tmp'); recorder.stop()")
+        lua.load(
+            "query.start({'program', '--flag'}, '/tmp'); recorder.stop(); scheduled.refresh(); scheduled.cancel()",
+        )
             .exec()
             .unwrap();
         assert_eq!(
@@ -3121,6 +3240,14 @@ mod tests {
                 Action::ManagedProcess {
                     key: "recorder".into(),
                     action: ManagedProcessAction::Stop,
+                },
+                Action::ManagedProcess {
+                    key: "scheduled".into(),
+                    action: ManagedProcessAction::Refresh,
+                },
+                Action::ManagedProcess {
+                    key: "scheduled".into(),
+                    action: ManagedProcessAction::Cancel,
                 },
             ]
         );
@@ -3203,6 +3330,28 @@ mod tests {
                 .exec()
                 .is_err()
         );
+        for source in [
+            "services.process { key = 'missing-command', interval = 1000 }",
+            "services.process { key = 'sparse', command = { [2] = 'program' } }",
+            "services.process { key = 'short', command = { 'program' }, interval = 999 }",
+            "services.process { key = 'fractional', command = { 'program' }, interval = 1000.5 }",
+            "services.process { key = 'long', command = { 'program' }, interval = 31536000001 }",
+        ] {
+            assert!(lua.load(source).exec().is_err(), "accepted {source}");
+        }
+        lua.load(
+            "services.process { key = 'scheduled', command = { 'program' }, interval = 1000 }",
+        )
+        .exec()
+        .unwrap();
+        assert!(
+            lua.load(
+                "services.process { key = 'scheduled', command = { 'other' }, interval = 1000 }"
+            )
+            .exec()
+            .is_err()
+        );
+        assert!(lua.load("services.process('scheduled')").exec().is_err());
         assert!(lua.load("services.process('')").exec().is_err());
     }
 
