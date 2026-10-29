@@ -206,9 +206,9 @@ pub enum SystemTrayMenuAction {
     Activate,
 }
 
-const MAX_LAUNCH_ARGUMENTS: usize = 256;
-const MAX_LAUNCH_ARGUMENT_BYTES: usize = 4096;
-const MAX_LAUNCH_BYTES: usize = 64 * 1024;
+pub const MAX_LAUNCH_ARGUMENTS: usize = 256;
+pub const MAX_LAUNCH_ARGUMENT_BYTES: usize = 4096;
+pub const MAX_LAUNCH_BYTES: usize = 64 * 1024;
 const MAX_MANAGED_PROCESS_KEYS: usize = 32;
 const MAX_MANAGED_PROCESS_KEY_BYTES: usize = 128;
 const MAX_MANAGED_PROCESS_STREAM_BYTES: usize = 64 * 1024;
@@ -629,6 +629,62 @@ impl AudioSnapshot {
     }
 }
 
+/// one launchable action from a desktop entry, such as opening a new window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DesktopAction {
+    pub key: String,
+    pub name: String,
+    pub icon: String,
+    pub command: Vec<String>,
+}
+
+/// one installed application described by a desktop entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DesktopApplication {
+    /// the desktop file id, such as `org.gnome.Nautilus.desktop`.
+    pub id: String,
+    pub name: String,
+    pub generic_name: String,
+    pub comment: String,
+    pub icon: String,
+    pub keywords: Vec<String>,
+    pub categories: Vec<String>,
+    /// arguments for a launch without files. empty when the entry has no
+    /// `Exec`, such as one that only names a window's app id or that starts
+    /// through d-bus activation.
+    pub command: Vec<String>,
+    pub working_directory: Option<String>,
+    pub terminal: bool,
+    pub no_display: bool,
+    pub startup_wm_class: String,
+    pub dbus_activatable: bool,
+    pub actions: Vec<DesktopAction>,
+}
+
+/// one generation of the installed application list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ApplicationsSnapshot {
+    pub available: bool,
+    pub error: String,
+    pub applications: Vec<DesktopApplication>,
+}
+
+impl ApplicationsSnapshot {
+    fn values(&self) -> [(&'static str, Scalar); 2] {
+        [
+            ("applications.available", Scalar::Boolean(self.available)),
+            ("applications.error", Scalar::String(self.error.clone())),
+        ]
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (name, value) in self.values() {
+            validate_service(name, &value)?;
+        }
+        validate_applications(&self.applications)
+    }
+}
+
 /// one confirmed generation of media player state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MediaSnapshot {
@@ -836,6 +892,7 @@ pub struct ServiceSnapshot {
     pub(crate) all_sources: Vec<AudioSource>,
     pub(crate) streams: Vec<AudioStream>,
     pub(crate) media_players: Vec<MediaPlayer>,
+    pub(crate) applications: Vec<DesktopApplication>,
     pub(crate) power_display: Option<PowerDevice>,
     pub(crate) power_devices: Vec<PowerDevice>,
     pub(crate) notifications: Vec<Notification>,
@@ -887,6 +944,15 @@ impl ServiceSnapshot {
             self.values.insert(name.into(), value);
         }
         self.media_players = media.players;
+        Ok(())
+    }
+
+    pub fn set_applications(&mut self, applications: ApplicationsSnapshot) -> Result<()> {
+        applications.validate()?;
+        for (name, value) in applications.values() {
+            self.values.insert(name.into(), value);
+        }
+        self.applications = applications.applications;
         Ok(())
     }
 
@@ -958,6 +1024,69 @@ struct DeviceList {
     tracker: Rc<RefCell<Tracker>>,
     revision: usize,
     devices: Rc<RefCell<Vec<AudioDevice>>>,
+}
+
+struct ApplicationList {
+    tracker: Rc<RefCell<Tracker>>,
+    revision: usize,
+    applications: Rc<RefCell<Vec<DesktopApplication>>>,
+}
+
+fn readonly_strings(lua: &Lua, values: &[String]) -> Result<Table> {
+    let list = lua.create_table()?;
+    for (index, value) in values.iter().enumerate() {
+        list.raw_set(index + 1, value.as_str())?;
+    }
+    list.set_readonly(true);
+    Ok(list)
+}
+
+impl UserData for ApplicationList {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |lua, this, ()| {
+            this.tracker.borrow_mut().read(this.revision);
+            let list = lua.create_table()?;
+            for (index, application) in this.applications.borrow().iter().enumerate() {
+                let actions = lua.create_table()?;
+                for (action_index, action) in application.actions.iter().enumerate() {
+                    let item = lua.create_table()?;
+                    item.set("key", action.key.as_str())?;
+                    item.set("name", action.name.as_str())?;
+                    item.set("icon", action.icon.as_str())?;
+                    item.set("command", readonly_strings(lua, &action.command)?)?;
+                    item.set_readonly(true);
+                    actions.raw_set(action_index + 1, item)?;
+                }
+                actions.set_readonly(true);
+
+                let item = lua.create_table()?;
+                item.set("id", application.id.as_str())?;
+                item.set("name", application.name.as_str())?;
+                item.set("generic_name", application.generic_name.as_str())?;
+                item.set("comment", application.comment.as_str())?;
+                item.set("icon", application.icon.as_str())?;
+                item.set("keywords", readonly_strings(lua, &application.keywords)?)?;
+                item.set(
+                    "categories",
+                    readonly_strings(lua, &application.categories)?,
+                )?;
+                item.set("command", readonly_strings(lua, &application.command)?)?;
+                item.set(
+                    "working_directory",
+                    application.working_directory.as_deref(),
+                )?;
+                item.set("terminal", application.terminal)?;
+                item.set("no_display", application.no_display)?;
+                item.set("startup_wm_class", application.startup_wm_class.as_str())?;
+                item.set("dbus_activatable", application.dbus_activatable)?;
+                item.set("actions", actions)?;
+                item.set_readonly(true);
+                list.raw_set(index + 1, item)?;
+            }
+            list.set_readonly(true);
+            Ok(list)
+        });
+    }
 }
 
 struct MediaPlayerList {
@@ -1325,6 +1454,8 @@ pub(crate) struct Services {
     streams_revision: usize,
     media_players: Rc<RefCell<Vec<MediaPlayer>>>,
     media_players_revision: usize,
+    applications: Rc<RefCell<Vec<DesktopApplication>>>,
+    applications_revision: usize,
     power_display: Rc<RefCell<Option<PowerDevice>>>,
     power_display_revision: usize,
     power_devices: Rc<RefCell<Vec<PowerDevice>>>,
@@ -1346,6 +1477,7 @@ impl Services {
         let all_sources_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let streams_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let media_players_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
+        let applications_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let power_display_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let power_devices_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let notifications_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
@@ -1367,6 +1499,8 @@ impl Services {
             streams_revision,
             media_players: Rc::default(),
             media_players_revision,
+            applications: Rc::default(),
+            applications_revision,
             power_display: Rc::default(),
             power_display_revision,
             power_devices: Rc::default(),
@@ -1381,6 +1515,7 @@ impl Services {
             niri: niri_data,
         };
         let services = lua.create_table()?;
+        let applications = lua.create_table()?;
         let audio = lua.create_table()?;
         let authentication = lua.create_table()?;
         let clipboard = lua.create_table()?;
@@ -1421,6 +1556,14 @@ impl Services {
                 tracker: result.tracker.clone(),
                 revision: streams_revision,
                 streams: result.streams.clone(),
+            },
+        )?;
+        applications.set(
+            "entries",
+            ApplicationList {
+                tracker: result.tracker.clone(),
+                revision: applications_revision,
+                applications: result.applications.clone(),
             },
         )?;
         media.set(
@@ -1464,6 +1607,8 @@ impl Services {
             },
         )?;
         for (name, value) in [
+            ("applications.available", Scalar::Boolean(false)),
+            ("applications.error", Scalar::String(String::new())),
             ("audio.available", Scalar::Boolean(false)),
             ("audio.volume", Scalar::Number(0.0)),
             ("audio.muted", Scalar::Boolean(false)),
@@ -1527,6 +1672,7 @@ impl Services {
                 .split_once('.')
                 .ok_or_else(|| Error::runtime("invalid service name"))?;
             match service {
+                "applications" => applications.set(property, signal)?,
                 "audio" => audio.set(property, signal)?,
                 "authentication" => authentication.set(property, signal)?,
                 "clipboard" => clipboard.set(property, signal)?,
@@ -1746,6 +1892,7 @@ impl Services {
             })?,
         )?;
         media.set_readonly(true);
+        applications.set_readonly(true);
         for (name, action) in [
             ("activate", SystemTrayAction::Activate),
             ("secondary_activate", SystemTrayAction::SecondaryActivate),
@@ -1881,6 +2028,7 @@ impl Services {
                 managed_process_handle(lua, signals, &tracker, &actions, &allowed)
             })?,
         )?;
+        services.set("applications", applications)?;
         services.set("audio", audio)?;
         services.set("authentication", authentication)?;
         services.set("clipboard", clipboard)?;
@@ -2092,6 +2240,44 @@ impl Services {
         Ok(())
     }
 
+    pub fn set_applications(&self, applications: ApplicationsSnapshot) -> Result<()> {
+        applications.validate()?;
+        let changed = *self.applications.borrow() != applications.applications;
+        let mut list = self.applications.borrow_mut();
+        let mut tracker = self.tracker.borrow_mut();
+        let mut updates = applications
+            .values()
+            .into_iter()
+            .map(|(name, value)| (self.signals[name], value))
+            .collect::<Vec<_>>();
+        if changed {
+            let revision = tracker.read(self.applications_revision);
+            updates.push((
+                self.applications_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            ));
+        }
+        tracker.write_batch(updates)?;
+        if changed {
+            *list = applications.applications;
+        }
+        Ok(())
+    }
+
+    pub fn set_application_list(&self, applications: Vec<DesktopApplication>) -> Result<()> {
+        validate_applications(&applications)?;
+        if *self.applications.borrow() != applications {
+            *self.applications.borrow_mut() = applications;
+            let mut tracker = self.tracker.borrow_mut();
+            let revision = tracker.read(self.applications_revision);
+            tracker.write(
+                self.applications_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn set_media_players(&self, media_players: Vec<MediaPlayer>) -> Result<()> {
         validate_media_players(&media_players)?;
         if *self.media_players.borrow() != media_players {
@@ -2288,6 +2474,7 @@ impl Services {
             all_sources: self.all_sources.borrow().clone(),
             streams: self.streams.borrow().clone(),
             media_players: self.media_players.borrow().clone(),
+            applications: self.applications.borrow().clone(),
             power_display: self.power_display.borrow().clone(),
             power_devices: self.power_devices.borrow().clone(),
             notifications: self.notifications.borrow().clone(),
@@ -2803,6 +2990,7 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "audio.source_available"
             | "audio.source_muted"
             | "media.available"
+            | "applications.available"
             | "media.playing"
             | "media.can_play_pause"
             | "media.can_next"
@@ -2835,6 +3023,7 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "media.identity"
             | "media.desktop_entry"
             | "media.error"
+            | "applications.error"
             | "power.error"
             | "notifications.error"
             | "system_tray.error"
@@ -2942,6 +3131,57 @@ fn validate_sources(sources: &[AudioSource]) -> Result<()> {
         Err(Error::runtime("invalid audio source list"))
     } else {
         Ok(())
+    }
+}
+
+const MAX_APPLICATIONS: usize = 4096;
+
+fn validate_applications(applications: &[DesktopApplication]) -> Result<()> {
+    let text = |value: &str| value.len() <= 4096 && !value.contains('\0');
+    let list = |values: &[String], max: usize| {
+        values.len() <= max && values.iter().all(|value| text(value))
+    };
+    let command = |values: &[String]| {
+        values.len() <= MAX_LAUNCH_ARGUMENTS
+            && values
+                .iter()
+                .all(|value| value.len() <= MAX_LAUNCH_ARGUMENT_BYTES && !value.contains('\0'))
+            && values.iter().map(String::len).sum::<usize>() <= MAX_LAUNCH_BYTES
+            && values.first().is_none_or(|program| !program.is_empty())
+    };
+    let mut ids = BTreeSet::new();
+    let valid = applications.len() <= MAX_APPLICATIONS
+        && applications.iter().all(|application| {
+            !application.id.is_empty()
+                && text(&application.id)
+                && ids.insert(application.id.as_str())
+                && !application.name.is_empty()
+                && text(&application.name)
+                && text(&application.generic_name)
+                && text(&application.comment)
+                && text(&application.icon)
+                && text(&application.startup_wm_class)
+                && application
+                    .working_directory
+                    .as_deref()
+                    .is_none_or(|path| !path.is_empty() && text(path))
+                && list(&application.keywords, 64)
+                && list(&application.categories, 64)
+                && command(&application.command)
+                && application.actions.len() <= 32
+                && application.actions.iter().all(|action| {
+                    !action.key.is_empty()
+                        && text(&action.key)
+                        && !action.name.is_empty()
+                        && text(&action.name)
+                        && text(&action.icon)
+                        && command(&action.command)
+                })
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::runtime("invalid application list"))
     }
 }
 

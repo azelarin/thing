@@ -108,6 +108,7 @@ use crate::output::{fallback_logical_size, valid_dimensions};
 
 use crate::{
     Renderer, RunOptions, SystemTray,
+    applications::Applications,
     audio::Audio,
     clipboard::{Clipboard, OfferData as ClipboardOfferData, SourceData as ClipboardSourceData},
     configuration::{
@@ -222,6 +223,10 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
     let audio = Audio::start(audio_ping).map_err(|e| format!("cannot start audio worker: {e}"))?;
     let (media_ping, media_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let media = Media::start(media_ping).map_err(|e| format!("cannot start media worker: {e}"))?;
+    let (applications_ping, applications_source) =
+        calloop::ping::make_ping().map_err(|e| e.to_string())?;
+    let applications = Applications::start(applications_ping)
+        .map_err(|e| format!("cannot start applications worker: {e}"))?;
     let (power_ping, power_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let power = Power::start(power_ping).map_err(|e| format!("cannot start power worker: {e}"))?;
     let (niri_ping, niri_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
@@ -268,6 +273,7 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         hover: HoverStates::default(),
         audio,
         media,
+        applications,
         power,
         niri,
         notifications,
@@ -387,6 +393,10 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
     event_loop
         .handle()
         .insert_source(media_source, |_, _, app| app.update_media())
+        .map_err(|e| e.to_string())?;
+    event_loop
+        .handle()
+        .insert_source(applications_source, |_, _, app| app.update_applications())
         .map_err(|e| e.to_string())?;
     event_loop
         .handle()
@@ -995,6 +1005,7 @@ pub(crate) struct App {
     configurations: Configurations<wl_output::WlOutput>,
     audio: Audio,
     media: Media,
+    applications: Applications,
     power: Power,
     niri: Niri,
     notifications: Option<NotificationServer>,
@@ -1217,6 +1228,15 @@ impl App {
             return;
         };
         if let Err(error) = self.configurations.set_media(snapshot) {
+            eprintln!("thing: {error}");
+        }
+        self.refresh();
+    }
+    fn update_applications(&mut self) {
+        let Some(snapshot) = self.applications.take_snapshot() else {
+            return;
+        };
+        if let Err(error) = self.configurations.set_applications(snapshot) {
             eprintln!("thing: {error}");
         }
         self.refresh();
