@@ -758,6 +758,7 @@ impl Layout {
         } else {
             scroll_parent
         };
+        crate::brush::validate(node, local_bounds)?;
         self.placements.push(Placement {
             id: node.id,
             bounds,

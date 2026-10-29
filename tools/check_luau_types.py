@@ -29,6 +29,11 @@ class Case:
 CASES = (
     Case("valid.luau"),
     Case("valid-timers.luau"),
+    Case("valid-brushes.luau"),
+    Case(
+        "invalid-brushes.luau",
+        ("Property 'kind' is not compatible.", "Property 'position' is not compatible."),
+    ),
     Case(
         "invalid-timers.luau",
         (

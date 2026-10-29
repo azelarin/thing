@@ -169,6 +169,17 @@ export type ThingTransformOrigin = {
 
 type ThingAnimatedNumber = number | (() -> number) | ThingNumberTransition | ThingNumberSpring
 type ThingAnimatedOptionalNumber = number | (() -> number?) | ThingNumberTransition | ThingNumberSpring
+export type ThingGradientPoint = { x: number, y: number }
+export type ThingGradientStop = { position: number, color: string }
+export type ThingLinearGradient = {
+    kind: "linear",
+    from: ThingGradientPoint,
+    to: ThingGradientPoint,
+    stops: { ThingGradientStop },
+}
+export type ThingBrush = string | ThingLinearGradient
+
+type ThingAnimatedBrush = ThingBrush | (() -> ThingBrush) | ThingColorTransition
 type ThingAnimatedColor = string | (() -> string) | ThingColorTransition
 type ThingImageSourceValue = string | ThingImageSource
 
@@ -203,7 +214,7 @@ export type ThingStyle = {
     font_size: ThingReactive<number>?,
     font_weight: ThingReactive<number>?,
     font_family: ThingReactive<string>?,
-    background: ThingAnimatedColor?,
+    background: ThingAnimatedBrush?,
     foreground: ThingAnimatedColor?,
     opacity: ThingAnimatedNumber?,
     translate_x: ThingAnimatedNumber?,
@@ -247,7 +258,7 @@ export type ThingTextStyle = {
     font_family: ThingReactive<string>?,
     text_align: ThingReactive<ThingTextAlign>?,
     tabular_digits: ThingReactive<boolean>?,
-    background: ThingAnimatedColor?,
+    background: ThingAnimatedBrush?,
     foreground: ThingAnimatedColor?,
     opacity: ThingAnimatedNumber?,
     translate_x: ThingAnimatedNumber?,
@@ -294,7 +305,7 @@ export type ThingTextInputStyle = {
     placeholder_color: ThingReactive<string>?,
     selection_color: ThingReactive<string>?,
     caret_color: ThingReactive<string>?,
-    background: ThingAnimatedColor?,
+    background: ThingAnimatedBrush?,
     foreground: ThingAnimatedColor?,
     opacity: ThingAnimatedNumber?,
     translate_x: ThingAnimatedNumber?,
@@ -404,7 +415,7 @@ export type ThingPathProperties = {
     data: ThingReactive<string>,
     view_box: ThingReactive<ThingPathViewBox>,
     fit: ThingReactive<ThingPathFit>?,
-    fill: ThingReactive<string?>?,
+    fill: ThingReactive<ThingBrush?>?,
     fill_rule: ThingReactive<ThingPathFillRule>?,
     stroke: ThingReactive<string>?,
     stroke_width: ThingReactive<number>?,

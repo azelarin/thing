@@ -5,14 +5,15 @@ use std::{
 
 use parley::PositionedLayoutItem;
 use skia_safe::{
-    Canvas, ClipOp, Color as SkiaColor, ColorType, Font, FontArguments, FontMgr, FourByteTag, M44,
-    Matrix, Paint, PaintCap, PaintJoin, PaintStyle, Path as SkiaPath, PathBuilder, PathFillType,
-    Point, RRect, Rect as SkiaRect, SamplingOptions, Typeface,
+    Canvas, ClipOp, Color as SkiaColor, Color4f, ColorSpace, ColorType, Font, FontArguments,
+    FontMgr, FourByteTag, M44, Matrix, Paint, PaintCap, PaintJoin, PaintStyle, Path as SkiaPath,
+    PathBuilder, PathFillType, Point, RRect, Rect as SkiaRect, SamplingOptions, TileMode, Typeface,
     font_arguments::{VariationPosition, variation_position::Coordinate as VariationCoordinate},
     gpu::{
         self, DirectContext, SurfaceOrigin, backend_render_targets, direct_contexts,
         gl::{Format, FramebufferInfo},
     },
+    gradient::{self, Interpolation, interpolation},
 };
 use skrifa::MetadataProvider;
 use thing_core::{
@@ -359,7 +360,10 @@ impl Painter {
             let opacity = placement.opacity * placement.disabled_opacity;
             let bounds = placement.local_bounds();
             let shape = rounded_rect(bounds, node.style.radius);
-            canvas.draw_rrect(shape, &fill(color(node.style.background), opacity));
+            canvas.draw_rrect(
+                shape,
+                &brush_paint(&node.style.background, bounds, opacity)?,
+            );
 
             if node.style.border_width > 0.0 {
                 let width = node.style.border_width.min(bounds.width).min(bounds.height);
@@ -783,14 +787,7 @@ fn draw_path(canvas: &Canvas, node: &Node, bounds: Rect, opacity: f32) -> Result
     let Some(view_box) = node.path.view_box else {
         return Ok(());
     };
-    let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
-    let padding_y = node.style.padding_y.unwrap_or(node.style.padding);
-    let area = Rect {
-        x: bounds.x + padding_x,
-        y: bounds.y + padding_y,
-        width: (bounds.width - 2.0 * padding_x).max(0.0),
-        height: (bounds.height - 2.0 * padding_y).max(0.0),
-    };
+    let area = crate::brush::path_area(bounds, &node.style);
     let Some(transform) = PathTransform::new(view_box, area, node.path.fit) else {
         return Ok(());
     };
@@ -811,9 +808,10 @@ fn draw_path(canvas: &Canvas, node: &Node, bounds: Rect, opacity: f32) -> Result
         true,
     );
 
-    let path_fill = node.path.fill.unwrap_or(node.style.foreground);
-    if path_fill.0[3] > 0 {
-        canvas.draw_path(&path, &fill(color(path_fill), opacity));
+    let fallback = thing_core::Brush::Solid(node.style.foreground);
+    let path_fill = node.path.fill.as_ref().unwrap_or(&fallback);
+    if !path_fill.is_transparent() {
+        canvas.draw_path(&path, &brush_paint(path_fill, area, opacity)?);
     }
     if node.path.stroke_width > 0.0 && node.path.stroke.0[3] > 0 {
         let mut paint = stroke(color(node.path.stroke), node.path.stroke_width, opacity);
@@ -984,6 +982,43 @@ fn rounded_rect(bounds: Rect, radius: f32) -> RRect {
 
 fn to_skia_rect(bounds: Rect) -> SkiaRect {
     SkiaRect::from_xywh(bounds.x, bounds.y, bounds.width, bounds.height)
+}
+
+fn brush_paint(brush: &thing_core::Brush, bounds: Rect, opacity: f32) -> Result<Paint, String> {
+    let gradient = match brush {
+        thing_core::Brush::Solid(value) => return Ok(fill(color(*value), opacity)),
+        thing_core::Brush::Linear(gradient) => gradient,
+    };
+    let Some(resolved) = crate::brush::resolve(gradient, bounds)? else {
+        return Ok(fill(SkiaColor::TRANSPARENT, opacity));
+    };
+    let colors = resolved
+        .colors
+        .iter()
+        .map(|color| Color4f::new(color[0], color[1], color[2], color[3]))
+        .collect::<Vec<_>>();
+    let specification = gradient::Gradient::new(
+        gradient::Colors::new(
+            &colors,
+            Some(&resolved.positions),
+            TileMode::Clamp,
+            ColorSpace::new_srgb_linear(),
+        ),
+        Interpolation {
+            in_premul: interpolation::InPremul::Yes,
+            color_space: interpolation::ColorSpace::SRGBLinear,
+            ..Interpolation::default()
+        },
+    );
+    let shader = gradient::shaders::linear_gradient(
+        ((0.0, 0.0), (1.0, 0.0)),
+        &specification,
+        &resolved.local_matrix,
+    )
+    .ok_or("gradient cannot be represented by the renderer")?;
+    let mut paint = fill(SkiaColor::WHITE, opacity);
+    paint.set_shader(shader);
+    Ok(paint)
 }
 
 fn color(value: thing_core::Color) -> SkiaColor {
@@ -1164,6 +1199,158 @@ mod tests {
         assert!((190..=192).contains(&pixel.a()));
         assert!((80..=90).contains(&pixel.r()));
         assert!((165..=175).contains(&pixel.b()));
+    }
+
+    fn linear_brush(stops: &[(f64, &str)], vertical: bool) -> thing_core::Brush {
+        use thing_core::{Brush, GradientPoint, GradientStop, LinearGradient};
+        Brush::Linear(LinearGradient {
+            from: GradientPoint { x: 0.0, y: 0.0 },
+            to: GradientPoint {
+                x: if vertical { 0.0 } else { 1.0 },
+                y: if vertical { 1.0 } else { 0.0 },
+            },
+            stops: stops
+                .iter()
+                .map(|(position, color)| GradientStop {
+                    position: *position,
+                    color: color.parse().unwrap(),
+                })
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn gradient_raster_interpolates_linear_light_and_rounds_the_background() {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((100, 20)).unwrap();
+        let bounds = Rect {
+            width: 100.0,
+            height: 20.0,
+            ..Rect::default()
+        };
+        let brush = linear_brush(&[(0.0, "#000000"), (1.0, "#ffffff")], false);
+        surface.canvas().draw_rrect(
+            rounded_rect(bounds, 10.0),
+            &brush_paint(&brush, bounds, 1.0).unwrap(),
+        );
+        let pixels = surface.peek_pixels().unwrap();
+        assert_eq!(pixels.get_color((0, 0)).a(), 0);
+        let middle = pixels.get_color((50, 10));
+        assert_eq!(middle.a(), 255);
+        assert!((187..=190).contains(&middle.r()), "{middle:?}");
+        assert_eq!(middle.r(), middle.g());
+        assert_eq!(middle.g(), middle.b());
+    }
+
+    #[test]
+    fn gradient_raster_premultiplies_before_interpolation_and_applies_opacity_once() {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((100, 20)).unwrap();
+        let bounds = Rect {
+            width: 100.0,
+            height: 20.0,
+            ..Rect::default()
+        };
+        let brush = linear_brush(&[(0.0, "#ff000080"), (1.0, "#0000ff00")], false);
+        surface.canvas().draw_rect(
+            to_skia_rect(bounds),
+            &brush_paint(&brush, bounds, 0.5).unwrap(),
+        );
+        let pixel = surface.peek_pixels().unwrap().get_color((50, 10));
+        assert!((30..=33).contains(&pixel.a()), "{pixel:?}");
+        assert!(
+            pixel.r() >= 250 && pixel.g() == 0 && pixel.b() == 0,
+            "{pixel:?}"
+        );
+    }
+
+    #[test]
+    fn gradient_raster_survives_magnification_of_a_small_widget() {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((100, 20)).unwrap();
+        let bounds = Rect {
+            width: 0.000_001,
+            height: 0.000_000_2,
+            ..Rect::default()
+        };
+        let brush = linear_brush(&[(0.0, "#000000"), (1.0, "#ffffff")], false);
+        surface.canvas().scale((100_000_000.0, 100_000_000.0));
+        surface.canvas().draw_rect(
+            to_skia_rect(bounds),
+            &brush_paint(&brush, bounds, 1.0).unwrap(),
+        );
+        let pixel = surface.peek_pixels().unwrap().get_color((50, 10));
+        assert!((187..=190).contains(&pixel.r()), "{pixel:?}");
+    }
+
+    #[test]
+    fn gradient_raster_keeps_multiple_coincident_stops() {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((100, 20)).unwrap();
+        let bounds = Rect {
+            width: 100.0,
+            height: 20.0,
+            ..Rect::default()
+        };
+        let brush = linear_brush(
+            &[
+                (0.0, "#ff0000"),
+                (0.5, "#ff0000"),
+                (0.5, "#00ff00"),
+                (0.5, "#0000ff"),
+                (1.0, "#0000ff"),
+            ],
+            false,
+        );
+        surface.canvas().draw_rect(
+            to_skia_rect(bounds),
+            &brush_paint(&brush, bounds, 1.0).unwrap(),
+        );
+        let pixels = surface.peek_pixels().unwrap();
+        assert_eq!(pixels.get_color((49, 10)), SkiaColor::RED);
+        assert_eq!(pixels.get_color((50, 10)), SkiaColor::BLUE);
+    }
+
+    #[test]
+    fn gradient_raster_follows_the_local_transform() {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((100, 20)).unwrap();
+        let bounds = Rect {
+            width: 100.0,
+            height: 20.0,
+            ..Rect::default()
+        };
+        let brush = linear_brush(&[(0.0, "#000000"), (1.0, "#ffffff")], false);
+        surface.canvas().translate((100.0, 0.0)).scale((-1.0, 1.0));
+        surface.canvas().draw_rect(
+            to_skia_rect(bounds),
+            &brush_paint(&brush, bounds, 1.0).unwrap(),
+        );
+        let pixels = surface.peek_pixels().unwrap();
+        assert!(pixels.get_color((10, 10)).r() > 240);
+        assert!(pixels.get_color((90, 10)).r() < 95);
+    }
+
+    #[test]
+    fn gradient_raster_path_uses_the_padded_box_before_fitting() {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((100, 80)).unwrap();
+        let bounds = Rect {
+            width: 100.0,
+            height: 80.0,
+            ..Rect::default()
+        };
+        let mut node = Node::new(NodeId(1), Kind::Path);
+        node.path.set_data("M0 0H100V50H0Z".into()).unwrap();
+        node.path.view_box = Some(thing_core::ViewBox {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 50.0,
+        });
+        node.style.padding = 10.0;
+        node.path.fill = Some(linear_brush(&[(0.0, "#ff0000"), (1.0, "#ff000000")], true));
+        draw_path(surface.canvas(), &node, bounds, 1.0).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        assert_eq!(pixels.get_color((5, 40)).a(), 0);
+        assert_eq!(pixels.get_color((50, 15)).a(), 0);
+        let inside = pixels.get_color((50, 22));
+        assert!((199..=205).contains(&inside.a()), "{inside:?}");
+        assert!(inside.r() >= 250);
     }
 
     #[test]

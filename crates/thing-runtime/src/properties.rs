@@ -39,11 +39,92 @@ fn color(value: Value, name: &str) -> Result<thing_core::Color> {
     string(value, name)?.parse().map_err(Error::external)
 }
 
-fn optional_color(value: Value, name: &str) -> Result<Option<thing_core::Color>> {
+fn brush(value: Value, name: &str) -> Result<thing_core::Brush> {
+    let Value::Table(table) = value else {
+        return color(value, name).map(Into::into);
+    };
+    for field in table.clone().pairs::<String, Value>() {
+        let (field, _) = field?;
+        if !matches!(field.as_str(), "kind" | "from" | "to" | "stops") {
+            return Err(Error::runtime(format!("unknown brush property {field:?}")));
+        }
+    }
+    if string(table.raw_get("kind")?, "brush.kind")? != "linear" {
+        return Err(Error::runtime("brush kind must be 'linear'"));
+    }
+    fn point(value: Value) -> Result<thing_core::GradientPoint> {
+        let Value::Table(table) = value else {
+            return Err(Error::runtime("gradient endpoints must be point tables"));
+        };
+        for pair in table.clone().pairs::<String, Value>() {
+            let (field, _) = pair?;
+            if !matches!(field.as_str(), "x" | "y") {
+                return Err(Error::runtime(format!(
+                    "unknown gradient endpoint property {field:?}"
+                )));
+            }
+        }
+        Ok(thing_core::GradientPoint {
+            x: number(table.raw_get("x")?, "gradient x")?,
+            y: number(table.raw_get("y")?, "gradient y")?,
+        })
+    }
+    let from = point(table.raw_get("from")?)?;
+    let to = point(table.raw_get("to")?)?;
+    let stops: Table = table.raw_get("stops")?;
+    let length = stops.raw_len();
+    if !(2..=16).contains(&length) {
+        return Err(Error::runtime("a gradient needs 2 through 16 stops"));
+    }
+    for pair in stops.clone().pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        let index = match key {
+            Value::Integer(index) => index as f64,
+            Value::Number(index) => index,
+            _ => return Err(Error::runtime("gradient stops must be a dense array")),
+        };
+        if !index.is_finite() || index.fract() != 0.0 || !(1.0..=length as f64).contains(&index) {
+            return Err(Error::runtime("gradient stops must be a dense array"));
+        }
+    }
+    let mut parsed = Vec::with_capacity(length);
+    let mut previous_position = 0.0_f64;
+    for index in 1..=length {
+        let stop: Table = stops.raw_get(index)?;
+        for pair in stop.clone().pairs::<String, Value>() {
+            let (field, _) = pair?;
+            if !matches!(field.as_str(), "position" | "color") {
+                return Err(Error::runtime(format!(
+                    "unknown gradient stop property {field:?}"
+                )));
+            }
+        }
+        let position = number(stop.raw_get("position")?, "gradient stop position")?;
+        if !(0.0..=1.0).contains(&position) || position < previous_position {
+            return Err(Error::runtime(
+                "gradient stop positions must be ordered and between 0 and 1",
+            ));
+        }
+        previous_position = position;
+        parsed.push(thing_core::GradientStop {
+            position,
+            color: color(stop.raw_get("color")?, "gradient stop color")?,
+        });
+    }
+    let brush = thing_core::Brush::Linear(thing_core::LinearGradient {
+        from,
+        to,
+        stops: parsed,
+    });
+    brush.validate().map_err(Error::external)?;
+    Ok(brush)
+}
+
+fn optional_brush(value: Value, name: &str) -> Result<Option<thing_core::Brush>> {
     if value.is_nil() {
         Ok(None)
     } else {
-        color(value, name).map(Some)
+        brush(value, name).map(Some)
     }
 }
 
@@ -548,7 +629,7 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
             .map_err(Error::external)?,
         "view_box" if node.kind == Kind::Path => node.path.view_box = Some(path_view_box(value)?),
         "fit" if node.kind == Kind::Path => node.path.fit = path_fit(value)?,
-        "fill" if node.kind == Kind::Path => node.path.fill = optional_color(value, name)?,
+        "fill" if node.kind == Kind::Path => node.path.fill = optional_brush(value, name)?,
         "fill_rule" if node.kind == Kind::Path => node.path.fill_rule = path_fill_rule(value)?,
         "stroke" if node.kind == Kind::Path => node.path.stroke = color(value, name)?,
         "stroke_width" if node.kind == Kind::Path => {
@@ -669,7 +750,7 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
             node.style.tabular_digits = boolean(value, name)?
         }
         "style.opacity" => node.style.opacity = number(value, name)? as f32,
-        "style.background" => node.style.background = color(value, name)?,
+        "style.background" => node.style.background = brush(value, name)?,
         "style.foreground" => node.style.foreground = color(value, name)?,
         "style.translate_x" => node.style.translate_x = number(value, name)? as f32,
         "style.translate_y" => node.style.translate_y = number(value, name)? as f32,
@@ -693,7 +774,7 @@ fn apply_color(node: &mut Node, name: &str, color: Color) -> Result<()> {
         "style.hover_overlay" => node.style.hover_overlay = color,
         "style.pressed_overlay" => node.style.pressed_overlay = color,
         "style.focus_ring_color" => node.style.focus_ring_color = color,
-        "style.background" => node.style.background = color,
+        "style.background" => node.style.background = color.into(),
         "style.foreground" => node.style.foreground = color,
         _ => {
             return Err(Error::runtime(format!(

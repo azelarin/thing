@@ -3312,7 +3312,7 @@ mod transition_tests {
         runtime.advance(start + Duration::from_millis(40)).unwrap();
         assert_eq!(
             child_with_key(root(&runtime), "animated").style.background,
-            Color([170, 170, 170, 255])
+            thing_core::Brush::Solid(Color([170, 170, 170, 255]))
         );
 
         runtime
@@ -3320,17 +3320,17 @@ mod transition_tests {
             .unwrap();
         assert_eq!(
             child_with_key(root(&runtime), "animated").style.background,
-            Color([170, 170, 170, 255])
+            thing_core::Brush::Solid(Color([170, 170, 170, 255]))
         );
         runtime.advance(start + Duration::from_millis(90)).unwrap();
         assert_eq!(
             child_with_key(root(&runtime), "animated").style.background,
-            Color([124, 124, 124, 255])
+            thing_core::Brush::Solid(Color([124, 124, 124, 255]))
         );
         runtime.advance(start + Duration::from_millis(140)).unwrap();
         assert_eq!(
             child_with_key(root(&runtime), "animated").style.background,
-            Color([0, 0, 0, 255])
+            thing_core::Brush::Solid(Color([0, 0, 0, 255]))
         );
         assert!(!runtime.is_animating(animated));
     }
@@ -3365,14 +3365,14 @@ mod transition_tests {
         assert!(runtime.dispatch(invalid, Event::Click).is_err());
         assert_eq!(
             child_with_key(root(&runtime), "animated").style.background,
-            Color([0x11, 0x22, 0x33, 0xff])
+            thing_core::Brush::Solid(Color([0x11, 0x22, 0x33, 0xff]))
         );
         assert!(!runtime.is_animating(animated));
 
         assert!(runtime.dispatch(recover, Event::Click).unwrap());
         assert_eq!(
             child_with_key(root(&runtime), "animated").style.background,
-            Color([0x44, 0x55, 0x66, 0x80])
+            thing_core::Brush::Solid(Color([0x44, 0x55, 0x66, 0x80]))
         );
         assert!(!runtime.is_animating(animated));
     }
@@ -3934,7 +3934,10 @@ mod transition_tests {
             "#,
         );
         let style = &root(&runtime).children[0].style;
-        assert_eq!(style.background, Color([1, 2, 3, 4]));
+        assert_eq!(
+            style.background,
+            thing_core::Brush::Solid(Color([1, 2, 3, 4]))
+        );
         assert_eq!(style.foreground, Color([0x11, 0x12, 0x13, 0x14]));
         assert_eq!(style.border_color, Color([0x21, 0x22, 0x23, 0x24]));
         assert_eq!(style.hover_overlay, Color([0x31, 0x32, 0x33, 0x34]));
