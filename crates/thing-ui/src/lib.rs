@@ -6,6 +6,7 @@ mod frame;
 mod images;
 mod layout;
 mod secret;
+mod shadow;
 mod skia;
 mod text;
 mod visual;
@@ -19,3 +20,5 @@ pub use secret::{MAX_SECRET_BYTES, SecretBytes, SecretInputEditor};
 pub use skia::Painter;
 pub use text::TextSystem;
 pub use visual::Affine;
+
+pub use shadow::validate_shadows;

@@ -342,6 +342,7 @@ pub fn check(entry: &Path) -> Result<usize, String> {
 struct PreparedLockLayout {
     root: Node,
     size: (u32, u32),
+    scale: Scale,
     layout: Layout,
     scroll: ScrollState,
 }
@@ -350,6 +351,7 @@ struct LockLayoutValidationEntry {
     output: wl_output::WlOutput,
     size: (u32, u32),
     scroll: ScrollState,
+    scale: Scale,
 }
 
 struct PreparedLockOutput {
@@ -391,6 +393,7 @@ impl<'a> LockLayoutPreflight<'a> {
             &surface.root,
             entry.size,
             entry.scroll.clone(),
+            entry.scale,
         )?;
         let mut prepared = self.prepared.borrow_mut();
         if let Some(previous) = prepared
@@ -418,6 +421,7 @@ struct Surface {
     output: wl_output::WlOutput,
     size: (u32, u32),
     scale: Scale,
+    preferred_scale: Scale,
     viewport: Option<WpViewport>,
     fractional: Option<WpFractionalScaleV1>,
     layouts: SurfaceLayouts,
@@ -529,7 +533,7 @@ impl App {
             .iter()
             .find(|surface| &surface.output == output)
         {
-            context.scale = surface.scale;
+            context.scale = surface.preferred_scale;
         }
         Some(context)
     }
@@ -556,6 +560,7 @@ impl App {
             output,
             size,
             scroll,
+            scale: surface.map_or(context.scale, |surface| surface.preferred_scale),
         }
     }
 
@@ -583,6 +588,10 @@ impl App {
             surface.prepared = (prepared.layout.size == surface.size
                 && current == Some(&prepared.layout.root))
             .then_some(prepared.layout);
+            if let Some(prepared) = &surface.prepared {
+                surface.dirty |= surface.scale != prepared.scale;
+                surface.scale = prepared.scale;
+            }
         }
     }
 
@@ -607,7 +616,7 @@ impl App {
         };
         let prepared = preflight.into_prepared();
         match result {
-            Ok(true) => {
+            Ok(_) => {
                 self.install_prepared_layouts(prepared);
                 if let Some(surface) = self
                     .surfaces
@@ -618,10 +627,34 @@ impl App {
                 }
                 self.update_watch();
             }
-            Ok(false) => {}
             Err(error) => {
                 eprintln!("thing: cannot configure lock output: {error}");
             }
+        }
+    }
+
+    fn set_surface_scale(&mut self, index: usize, scale: Scale) {
+        let Some(surface) = self.surfaces.get_mut(index) else {
+            return;
+        };
+        surface.preferred_scale = scale;
+        let output = surface.output.clone();
+        let Some(mut context) = self.configurations.output(&output).cloned() else {
+            return;
+        };
+        context.scale = scale;
+        let entry = self.layout_validation_entry(output.clone(), &context, false);
+        let preflight = LockLayoutPreflight::new(&mut self.render, vec![entry]);
+        let result = self
+            .configurations
+            .set_output_checked(&output, context, |surfaces| {
+                preflight.validate(&output, surfaces)
+            });
+        let prepared = preflight.into_prepared();
+        self.update_watch();
+        match result {
+            Ok(_) => self.install_prepared_layouts(prepared),
+            Err(error) => eprintln!("thing: cannot update lock output scale: {error}"),
         }
     }
 
@@ -655,6 +688,7 @@ impl App {
             output,
             size: (1, 1),
             scale,
+            preferred_scale: scale,
             viewport,
             fractional,
             layouts: SurfaceLayouts::default(),
@@ -1470,6 +1504,7 @@ impl App {
                     root,
                     surface.size,
                     surface.scroll.clone(),
+                    surface.scale,
                 )?;
                 (prepared.layout, prepared.scroll)
             };
@@ -1646,16 +1681,19 @@ impl SessionLockHandler for App {
             self.fail("the compositor configured an empty lock surface".into());
             return;
         }
-        let Some(surface) = self
+        let Some(index) = self
             .surfaces
-            .iter_mut()
-            .find(|surface| surface.role.wl_surface() == role.wl_surface())
+            .iter()
+            .position(|surface| surface.role.wl_surface() == role.wl_surface())
         else {
             return;
         };
+        let surface = &mut self.surfaces[index];
         surface.size = configure.new_size;
         surface.configured = true;
         surface.dirty = true;
+        let scale = surface.preferred_scale;
+        self.set_surface_scale(index, scale);
     }
 }
 
@@ -1664,9 +1702,18 @@ impl CompositorHandler for App {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: i32,
+        wl: &wl_surface::WlSurface,
+        scale: i32,
     ) {
+        if let Some(index) = self
+            .surfaces
+            .iter()
+            .position(|surface| surface.role.wl_surface() == wl)
+            && self.surfaces[index].fractional.is_none()
+        {
+            let scale = Scale::from_120ths(scale.clamp(1, 16) as u32 * 120).unwrap_or_default();
+            self.set_surface_scale(index, scale);
+        }
     }
 
     fn transform_changed(
@@ -1939,32 +1986,12 @@ impl Dispatch<WpFractionalScaleV1, wl_surface::WlSurface> for App {
     ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event
             && let Some(scale) = Scale::from_120ths(scale)
-            && let Some(surface) = app
+            && let Some(index) = app
                 .surfaces
-                .iter_mut()
-                .find(|surface| surface.role.wl_surface() == wl)
+                .iter()
+                .position(|surface| surface.role.wl_surface() == wl)
         {
-            surface.scale = scale;
-            surface.dirty = true;
-            let output = surface.output.clone();
-            if let Some(mut context) = app.configurations.output(&output).cloned() {
-                context.scale = scale;
-                let entry = app.layout_validation_entry(output.clone(), &context, false);
-                let preflight = LockLayoutPreflight::new(&mut app.render, vec![entry]);
-                let result = app
-                    .configurations
-                    .set_output_checked(&output, context, |surfaces| {
-                        preflight.validate(&output, surfaces)
-                    });
-                let prepared = preflight.into_prepared();
-                match result {
-                    Ok(true) => app.install_prepared_layouts(prepared),
-                    Ok(false) => {}
-                    Err(error) => {
-                        eprintln!("thing: cannot update lock output scale: {error}")
-                    }
-                }
-            }
+            app.set_surface_scale(index, scale);
         }
     }
 }
@@ -2011,6 +2038,7 @@ fn prepare_lock_layout(
     root: &Node,
     size: (u32, u32),
     mut scroll: ScrollState,
+    scale: Scale,
 ) -> Result<PreparedLockLayout, String> {
     let layout = render
         .layout(
@@ -2022,9 +2050,15 @@ fn prepare_lock_layout(
             &mut scroll,
         )
         .map_err(|error| format!("cannot lay out lock surface: {error}"))?;
+    let physical = (
+        scale.physical_size(size.0).unwrap_or(0),
+        scale.physical_size(size.1).unwrap_or(0),
+    );
+    thing_ui::validate_shadows(root, &layout, physical, scale.factor())?;
     Ok(PreparedLockLayout {
         root: root.clone(),
         size,
+        scale,
         layout,
         scroll,
     })

@@ -711,6 +711,7 @@ struct PreparedSurfaceLayout {
     key: SurfaceKey,
     root: Node,
     size: (u32, u32),
+    scale: Scale,
     layout: Layout,
     scroll: ScrollState,
 }
@@ -726,6 +727,7 @@ struct LayoutSurfaceState {
     root: NodeId,
     role: LayoutSurfaceRole,
     size: (u32, u32),
+    preferred_scale: Scale,
     scroll: ScrollState,
     focused: Option<NodeId>,
 }
@@ -954,6 +956,7 @@ struct Surface {
     size: (u32, u32),
     panel: Option<PanelState>,
     scale: Scale,
+    preferred_scale: Scale,
     viewport: Option<WpViewport>,
     fractional: Option<WpFractionalScaleV1>,
     layouts: SurfaceLayouts,
@@ -1164,6 +1167,7 @@ impl App {
                     Role::Popup(_) => LayoutSurfaceRole::Popup,
                 },
                 size: surface.size,
+                preferred_scale: surface.preferred_scale,
                 scroll: surface.scroll.clone(),
                 focused: surface.input.keyboard_focused(),
             })
@@ -1220,6 +1224,10 @@ impl App {
                         && prepared.root == *root
                 });
                 surface.prepared = prepared.map(|index| output.surfaces.swap_remove(index));
+                if let Some(prepared) = &surface.prepared {
+                    surface.dirty |= surface.scale != prepared.scale;
+                    surface.scale = prepared.scale;
+                }
             }
         }
         self.reconcile_idle_inhibitors();
@@ -1777,6 +1785,7 @@ impl App {
             size: init.size,
             panel: None,
             scale: init.scale,
+            preferred_scale: init.scale,
             viewport,
             fractional,
             layouts: SurfaceLayouts::default(),
@@ -1808,7 +1817,7 @@ impl App {
             .iter()
             .find(|surface| &surface.output == output && matches!(surface.role, Role::Panel(_)))
         {
-            context.scale = surface.scale;
+            context.scale = surface.preferred_scale;
         }
         Some(context)
     }
@@ -2010,6 +2019,26 @@ impl App {
             .surfaces
             .get(index)
             .ok_or("configured surface is unavailable")?;
+        let accepted = surface.scale;
+        let preferred = surface.preferred_scale;
+        if preferred != accepted
+            && let Ok(prepared) = self.prepare_surface_layout_at_scale(index, size, preferred)
+        {
+            return Ok(prepared);
+        }
+        self.prepare_surface_layout_at_scale(index, size, accepted)
+    }
+
+    fn prepare_surface_layout_at_scale(
+        &mut self,
+        index: usize,
+        size: (u32, u32),
+        scale: Scale,
+    ) -> Result<PreparedSurfaceLayout, String> {
+        let surface = self
+            .surfaces
+            .get(index)
+            .ok_or("configured surface is unavailable")?;
         let root = self
             .configurations
             .surface_root(&surface.output, &surface.key)
@@ -2023,42 +2052,63 @@ impl App {
             size,
             surface.scroll.clone(),
             surface.input.keyboard_focused(),
+            scale,
         )
+    }
+
+    fn set_surface_scale(&mut self, index: usize, scale: Scale) {
+        let Some(surface) = self.surfaces.get_mut(index) else {
+            return;
+        };
+        surface.preferred_scale = scale;
+        let output = surface.output.clone();
+        if matches!(surface.role, Role::Panel(_)) {
+            self.set_output_scale(&output, scale);
+        } else {
+            let size = surface.size;
+            match self.prepare_surface_layout_at_scale(index, size, scale) {
+                Ok(prepared) => {
+                    let surface = &mut self.surfaces[index];
+                    surface.scale = prepared.scale;
+                    surface.prepared = Some(prepared);
+                    surface.dirty = true;
+                }
+                Err(error) => eprintln!("thing: cannot update popup scale: {error}"),
+            }
+        }
     }
 
     fn set_output_scale(&mut self, output: &wl_output::WlOutput, scale: Scale) {
         let Some(mut context) = self.configurations.output(output).cloned() else {
             return;
         };
-        if context.scale != scale {
-            context.scale = scale;
-            let layer_shell_version = self.layer_shell_version;
-            let entry = self.layout_validation_entry(output.clone(), context.clone());
-            let preflight = LayoutPreflight::new(
-                &mut self.render,
-                layer_shell_version,
-                self.idle_inhibit.active().is_some(),
-                vec![entry],
-            );
-            let result = self
-                .configurations
-                .set_output_checked(output, context, |surfaces| {
-                    preflight.validate(output, surfaces)
-                });
-            let prepared = preflight.into_prepared();
-            self.update_watch();
-            match result {
-                Ok(changed) => {
-                    if changed {
-                        self.invalidate_output(output);
-                        self.install_prepared_layouts(prepared);
-                    } else {
-                        self.reconcile_custom_pointer(output);
-                    }
-                    self.reconcile_published_configuration();
+        context.scale = scale;
+        let layer_shell_version = self.layer_shell_version;
+        let entry = self.layout_validation_entry(output.clone(), context.clone());
+        let preflight = LayoutPreflight::new(
+            &mut self.render,
+            layer_shell_version,
+            self.idle_inhibit.active().is_some(),
+            vec![entry],
+        );
+        let result = self
+            .configurations
+            .set_output_checked(output, context, |surfaces| {
+                preflight.validate(output, surfaces)
+            });
+        let prepared = preflight.into_prepared();
+        self.update_watch();
+        match result {
+            Ok(changed) => {
+                if changed {
+                    self.invalidate_output(output);
+                } else {
+                    self.reconcile_custom_pointer(output);
                 }
-                Err(error) => eprintln!("thing: cannot update output scale: {error}"),
+                self.install_prepared_layouts(prepared);
+                self.reconcile_published_configuration();
             }
+            Err(error) => eprintln!("thing: cannot update output scale: {error}"),
         }
         let indices: Vec<_> = self
             .surfaces
@@ -2802,7 +2852,15 @@ impl App {
         else {
             return true;
         };
-        match prepare_surface_layout(&mut self.render, key, &root, size, scroll, focused) {
+        match prepare_surface_layout(
+            &mut self.render,
+            key,
+            &root,
+            size,
+            scroll,
+            focused,
+            surface.scale,
+        ) {
             Ok(prepared) => {
                 let surface = &mut self.surfaces[index];
                 surface.scroll = prepared.scroll.clone();
@@ -5828,6 +5886,7 @@ fn prepare_candidate_layouts(
             || (prospective, ScrollState::default(), None),
             |panel| (panel.size, panel.scroll.clone(), panel.focused),
         );
+        let scale = panel.map_or(output.scale, |panel| panel.preferred_scale);
         prepared.push(prepare_surface_layout(
             render,
             surface.key.clone(),
@@ -5835,6 +5894,7 @@ fn prepare_candidate_layouts(
             size,
             scroll,
             focused,
+            scale,
         )?);
         if size != prospective {
             prepare_surface_layout(
@@ -5844,6 +5904,7 @@ fn prepare_candidate_layouts(
                 prospective,
                 ScrollState::default(),
                 None,
+                scale,
             )?;
         }
 
@@ -5860,6 +5921,7 @@ fn prepare_candidate_layouts(
                 || (prospective, ScrollState::default(), None),
                 |popup| (popup.size, popup.scroll.clone(), popup.focused),
             );
+            let scale = existing.map_or(output.scale, |popup| popup.preferred_scale);
             prepared.push(prepare_surface_layout(
                 render,
                 surface.key.clone(),
@@ -5867,6 +5929,7 @@ fn prepare_candidate_layouts(
                 size,
                 scroll,
                 focused,
+                scale,
             )?);
             if size != prospective {
                 prepare_surface_layout(
@@ -5876,6 +5939,7 @@ fn prepare_candidate_layouts(
                     prospective,
                     ScrollState::default(),
                     None,
+                    scale,
                 )?;
             }
         }
@@ -5890,6 +5954,7 @@ fn prepare_surface_layout(
     size: (u32, u32),
     mut scroll: ScrollState,
     focused: Option<NodeId>,
+    scale: Scale,
 ) -> Result<PreparedSurfaceLayout, String> {
     let logical_size = Size {
         width: size.0 as f32,
@@ -5903,10 +5968,16 @@ fn prepare_surface_layout(
             .layout(root, logical_size, &mut scroll)
             .map_err(|error| format!("cannot reveal focused widget: {error}"))?;
     }
+    let physical = (
+        scale.physical_size(size.0).unwrap_or(0),
+        scale.physical_size(size.1).unwrap_or(0),
+    );
+    thing_ui::validate_shadows(root, &layout, physical, scale.factor())?;
     Ok(PreparedSurfaceLayout {
         key,
         root: root.clone(),
         size,
+        scale,
         layout,
         scroll,
     })
@@ -6491,18 +6562,11 @@ impl CompositorHandler for App {
         wl: &wl_surface::WlSurface,
         scale: i32,
     ) {
-        if let Some(index) = self.index(wl) {
-            let surface = &mut self.surfaces[index];
-            if surface.fractional.is_none() {
-                let scale = Scale::from_120ths(scale.clamp(1, 16) as u32 * 120).unwrap_or_default();
-                surface.scale = scale;
-                surface.dirty = true;
-                let panel = matches!(surface.role, Role::Panel(_));
-                let output = surface.output.clone();
-                if panel {
-                    self.set_output_scale(&output, scale);
-                }
-            }
+        if let Some(index) = self.index(wl)
+            && self.surfaces[index].fractional.is_none()
+        {
+            let scale = Scale::from_120ths(scale.clamp(1, 16) as u32 * 120).unwrap_or_default();
+            self.set_surface_scale(index, scale);
         }
     }
     fn transform_changed(
@@ -6585,10 +6649,10 @@ impl OutputHandler for App {
             Ok(changed) => {
                 if changed {
                     self.invalidate_output(&output);
-                    self.install_prepared_layouts(prepared);
                 } else {
                     self.reconcile_custom_pointer(&output);
                 }
+                self.install_prepared_layouts(prepared);
                 self.reconcile_published_configuration();
             }
             Err(error) => eprintln!("thing: cannot update output: {error}"),
@@ -6721,6 +6785,7 @@ impl LayerShellHandler for App {
                     surface.layouts.invalidate_input();
                 }
                 surface.size = size;
+                surface.scale = prepared.scale;
                 surface.prepared = Some(prepared);
                 surface.configured = true;
                 surface.dirty = true;
@@ -6773,6 +6838,7 @@ impl PopupHandler for App {
                 surface.layouts.invalidate_input();
                 surface.size = size;
             }
+            surface.scale = prepared.scale;
             surface.prepared = Some(prepared);
             surface.configured = true;
             // position-only configurations also need a commit to move the popup.
@@ -8492,14 +8558,7 @@ impl Dispatch<WpFractionalScaleV1, wl_surface::WlSurface> for App {
             && let Some(index) = app.index(wl)
             && let Some(scale) = Scale::from_120ths(scale)
         {
-            let surface = &mut app.surfaces[index];
-            surface.scale = scale;
-            surface.dirty = true;
-            let panel = matches!(surface.role, Role::Panel(_));
-            let output = surface.output.clone();
-            if panel {
-                app.set_output_scale(&output, scale);
-            }
+            app.set_surface_scale(index, scale);
         }
     }
 }

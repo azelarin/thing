@@ -22,7 +22,14 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests/rendering"
 ARTIFACTS = ROOT / "target/render-tests"
-CASES = ("image-fit", "stencil", "gradients")
+CASES = ("image-fit", "stencil", "gradients", "shadows")
+# shadows accept a state only after the same passing frame is captured twice.
+STABLE_FRAMES = {"shadows": 2}
+RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
+# the runtime error each panel-invalid.luau must produce, in thing check and in
+# the log of the running host.
+INVALID_RELOADS = {"shadows": "shadow blur must be between 0 and 32"}
+MAX_LOG_BYTES = 1024 * 1024
 COMMAND_TIMEOUT = 8.0
 INNER_TIMEOUT = 35.0
 OUTER_TIMEOUT = 45.0
@@ -192,6 +199,99 @@ def verify_gradients(image, stage, scale):
     expect_color(image, (450, 245), scale, (59, 59, 59), "mirrored gradient end")
 
 
+SHADOW_BACKGROUND = (224, 224, 224)
+SHADOW_WHITE = (255, 255, 255)
+SHADOW_GREEN = (0, 160, 0)
+
+
+def sample(image, point, scale):
+    """average the 3x3 physical pixels around a logical point."""
+    x, y = physical(point[0], scale), physical(point[1], scale)
+    pixels = [image.pixel(x + dx, y + dy) for dy in (-1, 0, 1) for dx in (-1, 0, 1)]
+    return tuple(round(sum(pixel[channel] for pixel in pixels) / 9) for channel in range(3))
+
+
+def brightness(color):
+    return sum(color) / 3
+
+
+def verify_shadows(image, stage, scale):
+    def color(label, point, expected, tolerance=14):
+        actual = sample(image, point, scale)
+        if max(abs(channel - target) for channel, target in zip(actual, expected)) > tolerance:
+            raise FixtureError(f"{label} at logical {point} was {actual}; expected {expected}")
+        return actual
+
+    def clear(label, point):
+        return color(label, point, SHADOW_BACKGROUND)
+
+    def dark(label, point, limit=70):
+        actual = sample(image, point, scale)
+        if brightness(actual) > limit:
+            raise FixtureError(f"{label} at logical {point} was {actual}; expected a dark shadow")
+        return actual
+
+    color("panel background", (580, 430), SHADOW_BACKGROUND)
+    # a: transparent rounded box with a hard shadow offset by (10, 10).
+    clear("a: knockout keeps the transparent center", (80, 80))
+    dark("a: hard shadow inside its edge", (112, 62))
+    clear("a: hard shadow has no halo", (112, 58))
+    dark("a: shadow near its rounded corner", (112, 112))
+    clear("a: shadow corner stays rounded", (118, 118))
+    # b: blur 16 below a white box. compare interior samples, not a curve.
+    color("b: blurred box", (220, 80), SHADOW_WHITE)
+    near = brightness(sample(image, (220, 114), scale))
+    beyond = brightness(sample(image, (220, 128), scale))
+    if not (60 < beyond < SHADOW_BACKGROUND[0] - 25 and near + 40 < beyond):
+        raise FixtureError(
+            f"b: blur falloff was {near:.0f} near the box and {beyond:.0f} beyond the "
+            "hard edge; expected a darker shadow fading past that edge"
+        )
+    clear("b: blur fades out", (220, 150))
+    # c and d: the same shadow escapes a tight column but not a scroll viewport.
+    color("c: box in a tight container", (360, 80), SHADOW_WHITE)
+    dark("c: shadow overflows a tight container", (360, 120))
+    color("d: box in a scroll viewport", (500, 80), SHADOW_WHITE)
+    clear("d: scroll viewport clips the shadow", (500, 120))
+    # e: concave path offset by (8, 8) follows its silhouette.
+    color("e: concave path fill", (60, 230), SHADOW_GREEN)
+    dark("e: shadow under the top arm", (95, 214))
+    dark("e: shadow beside the top arm", (114, 208))
+    dark("e: shadow beside the stem", (74, 240))
+    clear("e: concavity stays clear", (95, 235))
+    clear("e: no shadow on the far side", (45, 220))
+    # f: even-odd ring with spread 6.
+    color("f: ring fill", (195, 220), SHADOW_GREEN)
+    dark("f: spread grows into the hole", (208, 220))
+    clear("f: hole center stays clear", (220, 220))
+    dark("f: spread grows outside", (187, 220))
+    clear("f: grown corner stays round", (184, 184))
+    # g: spread -10 with a downward offset of 24.
+    color("g: square fill", (360, 240), SHADOW_GREEN)
+    dark("g: shrunk shadow below", (360, 257))
+    clear("g: shrinking narrows the shadow", (334, 257))
+    clear("g: shrinking shortens the shadow", (360, 268))
+    # h: scale_x = -1 mirrors a local offset of (12, 0).
+    color("h: mirrored box", (500, 220), SHADOW_WHITE)
+    dark("h: mirrored offset moves the shadow left", (464, 220))
+    clear("h: no shadow on the unmirrored side", (536, 220))
+    # i: a half-opaque parent dims the box and its shadow once.
+    color("i: half-opaque box", (80, 360), (240, 240, 240))
+    color("i: shadow uses opacity once", (80, 400), (112, 112, 112), tolerance=16)
+    # j: rotation 90 turns a downward offset to the left.
+    color("j: rotated box", (220, 360), SHADOW_WHITE)
+    dark("j: rotation turns the offset left", (180, 360))
+    clear("j: no shadow below the rotated box", (220, 400))
+    # k: the reload moves this shadow from below the box to above it.
+    color("k: reload target box", (360, 360), SHADOW_WHITE)
+    if stage == "reload":
+        dark("k: reloaded shadow above", (360, 320))
+        clear("k: reload removed the shadow below", (360, 400))
+    else:
+        dark("k: shadow below", (360, 400))
+        clear("k: no shadow above", (360, 320))
+
+
 def verify_capture(case, image, stage, scale):
     if case == "image-fit":
         verify_image_fit(image, stage, scale)
@@ -199,6 +299,8 @@ def verify_capture(case, image, stage, scale):
         verify_stencil(image, stage, scale)
     elif case == "gradients":
         verify_gradients(image, stage, scale)
+    elif case == "shadows":
+        verify_shadows(image, stage, scale)
     else:
         raise FixtureError(f"unknown renderer fixture: {case}")
 
@@ -341,9 +443,14 @@ def ensure_running(process):
         raise FixtureError(f"thing exited before the fixture completed (status {status})")
 
 
-def capture_until(grim, environment, process, output, path, case, stage, scale, deadline):
+def capture_until(
+    grim, environment, process, output, path, case, stage, scale, deadline, *, frames=1
+):
+    """capture until `frames` consecutive identical frames pass the probes."""
     last_error = None
     temporary = path.with_name(f".{path.name}.tmp")
+    accepted = None
+    count = 0
     while time.monotonic() < deadline:
         ensure_running(process)
         try:
@@ -358,11 +465,34 @@ def capture_until(grim, environment, process, output, path, case, stage, scale, 
             verify_capture(case, image, stage, scale)
         except FixtureError as error:
             last_error = error
+            accepted = None
+            count = 0
         else:
-            ensure_running(process)
-            return
+            if accepted is not None and image == accepted:
+                count += 1
+            else:
+                accepted = image
+                count = 1
+            if count >= frames:
+                ensure_running(process)
+                return
+            last_error = FixtureError(f"waiting for {frames} identical frames")
         time.sleep(0.15)
     raise FixtureError(f"{stage} frame did not match the fixture: {last_error}")
+
+
+def wait_for_rejection(log_path, offset, detail, process, deadline):
+    """wait for the host to log a rejected reload after `offset` and return it."""
+    while time.monotonic() < deadline:
+        ensure_running(process)
+        with log_path.open("rb") as log:
+            log.seek(offset)
+            text = log.read(MAX_LOG_BYTES).decode("utf-8", errors="replace")
+        for line in text.splitlines():
+            if RELOAD_REJECTED in line and detail in line:
+                return line.strip()
+        time.sleep(0.1)
+    raise FixtureError(f"thing did not report the rejected reload: {detail}")
 
 
 def stop_child(process, timeout=STOP_TIMEOUT):
@@ -434,7 +564,10 @@ def run_inner(run_directory, binary, renderer, case, niri, grim):
 
     fixture = run_directory / "fixture"
     panel = fixture / "panel.luau"
-    log = (run_directory / "thing.log").open("w", encoding="utf-8")
+    log_path = run_directory / "thing.log"
+    log = log_path.open("w", encoding="utf-8")
+    frames = STABLE_FRAMES.get(case, 1)
+    rejection = None
     process = None
     try:
         process = subprocess.Popen(
@@ -453,6 +586,7 @@ def run_inner(run_directory, binary, renderer, case, niri, grim):
             "scale-1",
             1.0,
             min(deadline, time.monotonic() + 10),
+            frames=frames,
         )
 
         checked(
@@ -477,7 +611,33 @@ def run_inner(run_directory, binary, renderer, case, niri, grim):
             "scale-1.25",
             1.25,
             min(deadline, time.monotonic() + 10),
+            frames=frames,
         )
+
+        invalid = fixture / "panel-invalid.luau"
+        if invalid.exists():
+            # only log written after the replacement counts as evidence.
+            offset = log_path.stat().st_size
+            atomic_copy(invalid, panel)
+            rejection = wait_for_rejection(
+                log_path,
+                offset,
+                INVALID_RELOADS[case],
+                process,
+                min(deadline, time.monotonic() + 10),
+            )
+            capture_until(
+                grim,
+                environment,
+                process,
+                output,
+                run_directory / "rejected.ppm",
+                case,
+                "rejected",
+                1.25,
+                min(deadline, time.monotonic() + 10),
+                frames=frames,
+            )
 
         reload = fixture / "panel-reload.luau"
         if reload.exists():
@@ -492,13 +652,17 @@ def run_inner(run_directory, binary, renderer, case, niri, grim):
                 "reload",
                 1.25,
                 min(deadline, time.monotonic() + 10),
+                frames=frames,
             )
-        return {
+        result = {
             "ok": True,
             "case": case,
             "output": output,
             "renderer": renderer,
         }
+        if rejection is not None:
+            result["rejected_reload"] = rejection
+        return result
     finally:
         stop_child(process)
         log.close()
@@ -561,11 +725,24 @@ def parent_environment():
     return environment
 
 
-def validate_configs(binary, fixture, deadline):
+def validate_configs(binary, fixture, deadline, case):
     for name in ("panel.luau", "panel-reload.luau"):
         path = fixture / name
         if path.exists():
             checked([binary, "check", path], deadline=deadline)
+    invalid = fixture / "panel-invalid.luau"
+    if invalid.exists():
+        expect_rejected_config(binary, invalid, INVALID_RELOADS[case], deadline)
+
+
+def expect_rejected_config(binary, path, detail, deadline):
+    try:
+        checked([binary, "check", path], deadline=deadline)
+    except FixtureError as error:
+        if detail in str(error):
+            return
+        raise FixtureError(f"{path.name} failed for another reason: {error}") from error
+    raise FixtureError(f"{path.name} unexpectedly passed thing check")
 
 
 def wait_for_result(process, result_path, deadline, case):
@@ -589,7 +766,7 @@ def run_case(binary, renderer, case, programs, keep_artifacts):
     succeeded = False
     try:
         deadline = time.monotonic() + OUTER_TIMEOUT
-        validate_configs(binary, run_directory / "fixture", deadline)
+        validate_configs(binary, run_directory / "fixture", deadline, case)
         checked(
             [programs["niri"], "validate", "-c", run_directory / "niri.kdl"],
             deadline=deadline,

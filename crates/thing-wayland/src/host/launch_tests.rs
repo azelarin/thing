@@ -115,6 +115,8 @@ struct Control {
     seat: Option<ObjectId>,
     panel: Option<ObjectId>,
     released: usize,
+    preferred_scales: Vec<i32>,
+    sent_scales: usize,
 }
 
 struct LayerState {
@@ -149,11 +151,22 @@ impl ServerState {
 
     /// carries out requests from the test thread between client dispatches.
     fn run_commands(&mut self) {
-        let (clicks, release) = {
+        let (clicks, release, scales) = {
             let mut control = self.control();
             let release = std::mem::take(&mut control.release_tokens);
-            (std::mem::take(&mut control.clicks), release)
+            (
+                std::mem::take(&mut control.clicks),
+                release,
+                std::mem::take(&mut control.preferred_scales),
+            )
         };
+        for scale in scales {
+            let panel = self.control().panel.clone().expect("the panel exists");
+            let surface = self.surfaces[&panel].clone();
+            assert!(surface.version() >= 6);
+            surface.preferred_buffer_scale(scale);
+            self.control().sent_scales += 1;
+        }
         for button in clicks {
             let pointer = self.pointer.clone().expect("the host has a pointer");
             let panel = self.control().panel.clone().expect("the panel exists");
@@ -659,6 +672,10 @@ impl Host {
     /// starts the host. `token_wait` replaces the 250 ms limit on waiting for
     /// an activation token where a scenario needs a longer one.
     fn start(token_wait: Option<Duration>) -> Self {
+        Self::start_with_panel(token_wait, PANEL)
+    }
+
+    fn start_with_panel(token_wait: Option<Duration>, source: &str) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let applications = root.join("applications");
@@ -698,7 +715,7 @@ impl Host {
         }
         entry("plain.desktop", "");
         let panel = root.join("panel.luau");
-        fs::write(&panel, PANEL).unwrap();
+        fs::write(&panel, source).unwrap();
 
         let bus = Bus::start(&[]);
         let (wayland, connection) = PrivateWayland::start();
@@ -889,6 +906,222 @@ impl Host {
         );
         assert_eq!(request.surface, control.panel);
     }
+}
+
+const SCALE_SHADOW_PANEL: &str = r#"
+        return ui.panel {
+            style = { width = 320, height = 40 },
+            children = { ui.row { style = {
+                width = 40, height = 20, scale_x = 4, scale_y = 4,
+                box_shadow = { color = '#000000', blur = 32 },
+            } } },
+        }
+    "#;
+
+fn dispatch_protocol_events(host: &mut Host) {
+    // the fixed shared-memory buffer only supports the original scale, so
+    // scale assertions dispatch events without asking the test renderer to draw.
+    let deadline = Instant::now() + SETTLE;
+    while Instant::now() < deadline {
+        host.connection.flush().unwrap();
+        host.event_loop
+            .dispatch(Some(Duration::from_millis(10)), &mut host.app)
+            .unwrap();
+    }
+}
+
+fn prefer_scale(host: &mut Host, scale: i32) {
+    let before = host.wayland.control().sent_scales;
+    host.wayland.control().preferred_scales.push(scale);
+    dispatch_protocol_events(host);
+    assert_eq!(host.wayland.control().sent_scales, before + 1);
+    assert_eq!(host.app.surfaces[0].preferred_scale.factor(), scale as f32);
+}
+
+fn assert_shadow_frame_is_renderable(host: &Host) {
+    let surface = &host.app.surfaces[0];
+    let root = host
+        .app
+        .configurations
+        .surface_root(&surface.output, &surface.key)
+        .unwrap();
+    let physical = (
+        surface.scale.physical_size(surface.size.0).unwrap(),
+        surface.scale.physical_size(surface.size.1).unwrap(),
+    );
+    let layout = host.app.surfaces[0].layouts.presented().unwrap();
+    thing_ui::validate_shadows(root, layout, physical, surface.scale.factor())
+        .expect("the accepted frame must remain renderable after a scale change");
+}
+
+fn scale_change_keeps_a_renderable_shadow_frame() {
+    let mut host = Host::start_with_panel(None, SCALE_SHADOW_PANEL);
+    let accepted = host.app.surfaces[0].scale;
+    assert_eq!(accepted, Scale::default());
+    prefer_scale(&mut host, 3);
+    assert_shadow_frame_is_renderable(&host);
+    assert_eq!(host.app.surfaces[0].scale, accepted);
+    let output = host.app.surfaces[0].output.clone();
+    assert_eq!(
+        host.app
+            .configurations
+            .output(&output)
+            .unwrap()
+            .scale
+            .factor(),
+        3.0
+    );
+    // the output context already has this preference, but it must still be
+    // checked before a repeated event can change the accepted buffer scale.
+    prefer_scale(&mut host, 3);
+    assert_eq!(host.app.surfaces[0].scale, accepted);
+    assert_shadow_frame_is_renderable(&host);
+}
+
+fn adaptive_shadow_accepts_the_new_scale() {
+    let source = SCALE_SHADOW_PANEL.replace(
+        "box_shadow = { color = '#000000', blur = 32 }",
+        "box_shadow = function() return { color = '#000000', blur = 32 / services.output.scale:get() } end",
+    );
+    let mut host = Host::start_with_panel(None, &source);
+    prefer_scale(&mut host, 3);
+    assert_eq!(host.app.surfaces[0].scale.factor(), 3.0);
+    let prepared = host.app.surfaces[0].prepared.as_ref().unwrap();
+    let surface = &host.app.surfaces[0];
+    let physical = (
+        surface.scale.physical_size(surface.size.0).unwrap(),
+        surface.scale.physical_size(surface.size.1).unwrap(),
+    );
+    thing_ui::validate_shadows(
+        &prepared.root,
+        &prepared.layout,
+        physical,
+        prepared.scale.factor(),
+    )
+    .unwrap();
+}
+
+fn a_later_handler_adopts_a_rejected_scale() {
+    let source = r#"
+        local blur = ui.state(32)
+        return ui.panel {
+            style = { width = 320, height = 40, align = 'start', justify = 'start' },
+            children = { ui.button {
+                on_click = function() blur:set(8) end,
+                style = {
+                    width = 40, height = 20, scale_x = 4, scale_y = 4,
+                    box_shadow = function() return { color = '#000000', blur = blur:get() } end,
+                },
+            } },
+        }
+    "#;
+    let mut host = Host::start_with_panel(None, source);
+    prefer_scale(&mut host, 3);
+    assert_eq!(host.app.surfaces[0].scale, Scale::default());
+    host.wayland.control().clicks.push(Button::Viewer);
+    dispatch_protocol_events(&mut host);
+    let surface = &host.app.surfaces[0];
+    assert_eq!(surface.scale.factor(), 3.0);
+    let prepared = surface.prepared.as_ref().unwrap();
+    let physical = (
+        surface.scale.physical_size(surface.size.0).unwrap(),
+        surface.scale.physical_size(surface.size.1).unwrap(),
+    );
+    thing_ui::validate_shadows(
+        &prepared.root,
+        &prepared.layout,
+        physical,
+        prepared.scale.factor(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_output_scale_dependent_shadow_can_accept_its_preference() {
+    isolated(
+        "an_output_scale_dependent_shadow_can_accept_its_preference",
+        adaptive_shadow_accepts_the_new_scale,
+    );
+}
+
+#[test]
+fn a_handler_can_recover_after_a_shadow_scale_rejection() {
+    isolated(
+        "a_handler_can_recover_after_a_shadow_scale_rejection",
+        a_later_handler_adopts_a_rejected_scale,
+    );
+}
+
+#[test]
+fn a_preferred_scale_change_cannot_leave_an_unrenderable_shadow_frame() {
+    isolated(
+        "a_preferred_scale_change_cannot_leave_an_unrenderable_shadow_frame",
+        scale_change_keeps_a_renderable_shadow_frame,
+    );
+}
+
+fn popup_candidates_use_their_own_scale() {
+    let mut host = Host::start(None);
+    let mut root = Node::new(NodeId(100), Kind::Panel);
+    root.style.width = Some(320.0);
+    root.style.height = Some(40.0);
+    let mut popup = Node::new(NodeId(101), Kind::Popup);
+    popup.visible = true;
+    popup.style.width = Some(320.0);
+    popup.style.height = Some(40.0);
+    let mut card = Node::new(NodeId(102), Kind::Row);
+    card.style.width = Some(40.0);
+    card.style.height = Some(20.0);
+    card.style.scale_x = 4.0;
+    card.style.scale_y = 4.0;
+    card.style.box_shadow = Some(thing_core::Shadow {
+        color: thing_core::Color([0, 0, 0, 255]),
+        offset: Point::default(),
+        blur: 32.0,
+        spread: 0.0,
+    });
+    popup.children.push(card);
+    root.children.push(popup);
+    let surfaces = [SurfaceTree {
+        key: SurfaceKey::Default,
+        namespace: "private".into(),
+        root,
+    }];
+    let output = OutputContext {
+        name: Some("private".into()),
+        width: 320,
+        height: 240,
+        scale: Scale::default(),
+    };
+    let mut current = [LayoutSurfaceState {
+        key: SurfaceKey::Default,
+        root: NodeId(101),
+        role: LayoutSurfaceRole::Popup,
+        size: (320, 40),
+        scroll: ScrollState::default(),
+        focused: None,
+        preferred_scale: Scale::from_120ths(360).unwrap(),
+    }];
+    let error = prepare_candidate_layouts(&mut host.app.render, &surfaces, &output, &current)
+        .err()
+        .expect("the popup cannot use its owner's lower scale to pass validation");
+    assert!(error.contains("device sigma"), "{error}");
+    current[0].preferred_scale = Scale::from_120ths(150).unwrap();
+    let prepared =
+        prepare_candidate_layouts(&mut host.app.render, &surfaces, &output, &current).unwrap();
+    let popup = prepared
+        .iter()
+        .find(|prepared| prepared.root.id == NodeId(101))
+        .unwrap();
+    assert_eq!(popup.scale, current[0].preferred_scale);
+}
+
+#[test]
+fn popup_shadow_limits_use_the_popup_scale() {
+    isolated(
+        "popup_shadow_limits_use_the_popup_scale",
+        popup_candidates_use_their_own_scale,
+    );
 }
 
 fn activation_data(token: &str) -> Vec<(String, String)> {

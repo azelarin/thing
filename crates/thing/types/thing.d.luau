@@ -179,6 +179,14 @@ export type ThingLinearGradient = {
 }
 export type ThingBrush = string | ThingLinearGradient
 
+export type ThingShadow = {
+    color: string,
+    blur: number?,
+    spread: number?,
+    offset_x: number?,
+    offset_y: number?,
+}
+
 type ThingAnimatedBrush = ThingBrush | (() -> ThingBrush) | ThingColorTransition
 type ThingAnimatedColor = string | (() -> string) | ThingColorTransition
 type ThingImageSourceValue = string | ThingImageSource
@@ -215,6 +223,7 @@ export type ThingStyle = {
     font_weight: ThingReactive<number>?,
     font_family: ThingReactive<string>?,
     background: ThingAnimatedBrush?,
+    box_shadow: ThingReactive<ThingShadow?>?,
     foreground: ThingAnimatedColor?,
     opacity: ThingAnimatedNumber?,
     translate_x: ThingAnimatedNumber?,
@@ -259,6 +268,7 @@ export type ThingTextStyle = {
     text_align: ThingReactive<ThingTextAlign>?,
     tabular_digits: ThingReactive<boolean>?,
     background: ThingAnimatedBrush?,
+    box_shadow: ThingReactive<ThingShadow?>?,
     foreground: ThingAnimatedColor?,
     opacity: ThingAnimatedNumber?,
     translate_x: ThingAnimatedNumber?,
@@ -306,6 +316,7 @@ export type ThingTextInputStyle = {
     selection_color: ThingReactive<string>?,
     caret_color: ThingReactive<string>?,
     background: ThingAnimatedBrush?,
+    box_shadow: ThingReactive<ThingShadow?>?,
     foreground: ThingAnimatedColor?,
     opacity: ThingAnimatedNumber?,
     translate_x: ThingAnimatedNumber?,
@@ -423,6 +434,7 @@ export type ThingPathProperties = {
     stroke_width: ThingReactive<number>?,
     stroke_cap: ThingReactive<ThingPathStrokeCap>?,
     stroke_join: ThingReactive<ThingPathStrokeJoin>?,
+    shadow: ThingReactive<ThingShadow?>?,
 }
 
 export type ThingButtonProperties = {
