@@ -161,7 +161,7 @@ jobs:
           thing_skia_archive="$RUNNER_TEMP/thing-skia-$THING_RENDERER.tar.gz"
           thing_install_root="$RUNNER_TEMP/thing-install-$THING_RENDERER"
           thing_target="$RUNNER_TEMP/thing-install-target-$THING_RENDERER"
-          thing_install_features=thing-ui/ci-no-skia-compile
+          thing_install_features=ci-no-skia-compile
           if [[ "$THING_RENDERER" == vulkan ]]; then
             thing_install_features="vulkan,$thing_install_features"
           fi
