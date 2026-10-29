@@ -375,7 +375,11 @@ mod tests {
     fn closed_and_empty_transport_states_are_distinct() {
         let (left, right) = pair();
         assert!(matches!(receive(right.as_fd()).unwrap(), Receive::Empty));
+        // another test can fork before exec closes its inherited descriptors.
+        let inherited_peer = left.try_clone().unwrap();
         drop(left);
+        assert!(matches!(receive(right.as_fd()).unwrap(), Receive::Empty));
+        inherited_peer.shutdown(std::net::Shutdown::Write).unwrap();
         assert!(matches!(receive(right.as_fd()).unwrap(), Receive::Closed));
     }
 
