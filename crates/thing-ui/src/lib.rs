@@ -1,5 +1,6 @@
 //! logical-pixel layout and input, independent of the window system and renderer.
 
+mod brush;
 mod editor;
 mod frame;
 mod images;

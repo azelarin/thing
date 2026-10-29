@@ -57,7 +57,7 @@ the renderer fixtures are opt-in because they open a nested compositor and use
 the gpu. after building the backend you want to check, run:
 
 ```sh
-python3 tools/check_rendering.py --binary ./target/debug/thing --renderer vulkan image-fit stencil
+python3 tools/check_rendering.py --binary ./target/debug/thing --renderer vulkan image-fit stencil gradients
 ```
 
 the tool requires a wayland session, `dbus-run-session`, niri, and grim. it does

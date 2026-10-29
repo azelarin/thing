@@ -1,10 +1,12 @@
 //! widget values, geometry, and validation.
 
+mod brush;
 mod color;
 mod geometry;
 mod vector;
 mod widget;
 
+pub use brush::{Brush, GradientPoint, GradientStop, LinearGradient};
 pub use color::{Color, ParseColorError};
 pub use geometry::{HorizontalRange, Point, Rect, Scale};
 pub use widget::{

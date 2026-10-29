@@ -282,7 +282,10 @@ fn loads_vector_paths_with_explicit_paint_controls() {
     let path = &runtime.root().unwrap().children[0];
     assert_eq!(path.kind, Kind::Path);
     assert_eq!(path.path.fit, PathFit::Cover);
-    assert_eq!(path.path.fill, Some(Color([0x12, 0x34, 0x56, 0x78])));
+    assert_eq!(
+        path.path.fill,
+        Some(thing_core::Brush::Solid(Color([0x12, 0x34, 0x56, 0x78])))
+    );
     assert_eq!(path.path.fill_rule, PathFillRule::EvenOdd);
     assert_eq!(path.path.stroke, Color([0xab, 0xcd, 0xef, 0xff]));
     assert_eq!(path.path.stroke_width, 2.5);

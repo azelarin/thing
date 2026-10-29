@@ -1116,6 +1116,41 @@ style = {
 }
 ```
 
+### gradients
+
+`style.background` and a path's `fill` accept a hex color or a linear gradient:
+
+```luau
+background = {
+    kind = 'linear',
+    from = { x = 0, y = 0 },
+    to = { x = 1, y = 0 },
+    stops = {
+        { position = 0, color = '#7aa2f7' },
+        { position = 1, color = '#bb9af7' },
+    },
+}
+```
+
+endpoints are fractions of the paint box: `(0, 0)` is its top-left corner and
+`(1, 1)` its bottom-right. a background uses the widget's border box; a path
+uses its content box after padding, before the path is fitted into it. the
+existing radius and path clips still apply. moving, scaling, or rotating a
+widget moves its gradient with it.
+
+use 2 through 16 stops, ordered by `position` from 0 to 1. equal positions make
+a sharp color change; several stops can share a position. outside the first
+and last stops, the nearest color continues. colors mix in linear srgb with
+premultiplied alpha, so fading a color to transparent does not introduce a dark
+fringe. inherited opacity applies to the result.
+
+endpoints must be finite and different, but can lie outside the paint box.
+coordinates that cannot be represented by the renderer are rejected during
+layout. a function can return a whole gradient to react to state; changing a
+stop in a plain table does not trigger a refresh. color transitions still work
+with solid backgrounds. to animate a gradient, animate state used by the
+function that returns it; gradient tables do not interpolate automatically.
+
 ### visual transforms
 
 translation, signed scale, and rotation change how a widget and its descendants

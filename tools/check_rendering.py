@@ -22,7 +22,7 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests/rendering"
 ARTIFACTS = ROOT / "target/render-tests"
-CASES = ("image-fit", "stencil")
+CASES = ("image-fit", "stencil", "gradients")
 COMMAND_TIMEOUT = 8.0
 INNER_TIMEOUT = 35.0
 OUTER_TIMEOUT = 45.0
@@ -171,11 +171,34 @@ def verify_stencil(image, _stage, scale):
         )
 
 
+def verify_gradients(image, stage, scale):
+    dark = (32, 32, 32)
+    expect_color(image, (10, 10), scale, dark, "gradient rounded corner")
+    for x in (40, 240, 440):
+        progress = (x - 10) / 460
+        if stage == "reload":
+            progress = 1 - progress
+        gray = round(255 * (12.92 * progress if progress <= 0.0031308 else 1.055 * progress ** (1 / 2.4) - 0.055))
+        expect_color(image, (x, 35), scale, (gray, gray, gray), "linear-light gradient")
+    expect_color(image, (120, 95), scale, (255, 0, 0), "far-endpoint hard stop left")
+    expect_color(image, (360, 95), scale, (0, 0, 255), "far-endpoint hard stop right")
+    expect_color(image, (240, 145), scale, dark, "path contain margin")
+    expect_color(image, (15, 170), scale, dark, "path padding")
+    for y in (153, 185):
+        alpha = 1 - (y - 140) / 60
+        expected = (round(255 * alpha + 32 * (1 - alpha)), round(32 * (1 - alpha)), round(32 * (1 - alpha)))
+        expect_color(image, (240, y), scale, expected, "path premultiplied fade")
+    expect_color(image, (30, 245), scale, (250, 250, 250), "mirrored gradient start")
+    expect_color(image, (450, 245), scale, (59, 59, 59), "mirrored gradient end")
+
+
 def verify_capture(case, image, stage, scale):
     if case == "image-fit":
         verify_image_fit(image, stage, scale)
     elif case == "stencil":
         verify_stencil(image, stage, scale)
+    elif case == "gradients":
+        verify_gradients(image, stage, scale)
     else:
         raise FixtureError(f"unknown renderer fixture: {case}")
 

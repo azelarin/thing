@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, collections::HashSet, error::Error, fmt, sync::Arc};
 
-use crate::{Color, vector::normalize_path};
+use crate::{Brush, Color, vector::normalize_path};
 
 /// an identity scoped to one loaded configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -140,7 +140,7 @@ pub struct VectorPath {
     pub segments: Vec<VectorSegment>,
     pub view_box: Option<ViewBox>,
     pub fit: PathFit,
-    pub fill: Option<Color>,
+    pub fill: Option<Brush>,
     pub fill_rule: PathFillRule,
     pub stroke: Color,
     pub stroke_width: f32,
@@ -180,6 +180,9 @@ impl VectorPath {
     }
 
     fn validate(&self) -> Result<(), TreeError> {
+        if let Some(fill) = &self.fill {
+            fill.validate()?;
+        }
         if self.data.is_none() || self.segments.is_empty() {
             return Err(TreeError("path requires data".into()));
         }
@@ -519,7 +522,7 @@ pub struct Style {
     pub font_family: String,
     pub text_align: TextAlign,
     pub tabular_digits: bool,
-    pub background: Color,
+    pub background: Brush,
     pub foreground: Color,
     pub opacity: f32,
     pub translate_x: f32,
@@ -568,7 +571,7 @@ impl Default for Style {
             font_family: "sans-serif".into(),
             text_align: TextAlign::Start,
             tabular_digits: false,
-            background: Color::TRANSPARENT,
+            background: Brush::default(),
             foreground: Color::WHITE,
             opacity: 1.0,
             translate_x: 0.0,
@@ -935,6 +938,7 @@ impl Node {
             return Err(TreeError("pointer_area requires an event handler".into()));
         }
         let style = &self.style;
+        style.background.validate()?;
         if (self.kind == Kind::Popup
             || (depth == 0 && matches!(self.kind, Kind::Panel | Kind::Lock)))
             && [
