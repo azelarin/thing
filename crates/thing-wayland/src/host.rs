@@ -2128,6 +2128,15 @@ impl App {
                 });
             let prepared = preflight.into_prepared();
             if changed? {
+                for surface in self
+                    .surfaces
+                    .iter_mut()
+                    .filter(|surface| surface.output == output)
+                {
+                    // a deferred Vulkan frame may retain the previous animation's geometry.
+                    surface.layouts.invalidate_input();
+                    surface.dirty = true;
+                }
                 // animated panel dimensions must reach layer shell before this
                 // frame is laid out. pointer paths still update after present.
                 let owners: Vec<_> = self
