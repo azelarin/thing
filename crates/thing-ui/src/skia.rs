@@ -398,7 +398,6 @@ impl Painter {
                     canvas,
                     node,
                     bounds,
-                    placement.clip,
                     opacity,
                     (input.focused == Some(node.id))
                         .then_some(secret_input.as_deref_mut())

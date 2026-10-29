@@ -18,6 +18,7 @@ use smithay_client_toolkit::{
 };
 use tempfile::TempDir;
 use thing_runtime::{AuthenticationSnapshot, ServiceSnapshot, SurfaceKey};
+use thing_ui::Affine;
 use wayland_client::{
     Connection, delegate_noop,
     globals::{GlobalList, registry_queue_init},
@@ -40,7 +41,7 @@ use wayland_server::{
     },
 };
 
-use super::{App, validate_lock_surfaces};
+use super::{App, LockLayoutPreflight, first_secret_input};
 use crate::{
     authentication::{AuthenticationBroker, ProcessContext},
     configuration::Configurations,
@@ -51,6 +52,17 @@ use crate::{
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
 const PROBE_ENV: &str = "THING_LOCK_HOST_WIRE_PROBE";
+const LOCK_FIXTURE: &str = r#"
+return ui.lock {
+    style = { width = 320, height = 240, background = '#000000' },
+    children = {
+        ui.secret_input {
+            autofocus = true,
+            style = { width = 200, height = 40, translate_x = 8, rotation = 3 },
+        },
+    },
+}
+"#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Request {
@@ -565,21 +577,7 @@ fn shared_buffer(globals: &GlobalList, qh: &wayland_client::QueueHandle<App>) ->
 fn lock_fixture() -> (TempDir, std::path::PathBuf) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("lock.luau");
-    std::fs::write(
-        &path,
-        r#"
-        return ui.lock {
-            style = { width = 320, height = 240, background = '#000000' },
-            children = {
-                ui.secret_input {
-                    autofocus = true,
-                    style = { width = 200, height = 40 },
-                },
-            },
-        }
-        "#,
-    )
-    .unwrap();
+    std::fs::write(&path, LOCK_FIXTURE).unwrap();
     (directory, path.canonicalize().unwrap())
 }
 
@@ -659,7 +657,7 @@ fn run_host_probe() {
     let mut private = private_server();
     let qh = private.queue.handle();
     let buffer = shared_buffer(&private.globals, &qh);
-    let (mut app, _event_loop) = app_for_private_server(&mut private, entry, &buffer);
+    let (mut app, _event_loop) = app_for_private_server(&mut private, entry.clone(), &buffer);
 
     let outputs: Vec<_> = app
         .outputs
@@ -670,20 +668,42 @@ fn run_host_probe() {
         })
         .collect();
     assert_eq!(outputs.len(), 1);
+    let entries = outputs
+        .iter()
+        .map(|(output, context)| app.layout_validation_entry(output.clone(), context, true))
+        .collect();
+    let preflight = LockLayoutPreflight::new(&mut app.render, entries);
     app.configurations
-        .reload_for_checked(outputs.clone(), |_, runtime| {
-            validate_lock_surfaces(runtime.surfaces())
+        .reload_for_checked(outputs.clone(), |output, runtime| {
+            preflight.validate(output, runtime.surfaces())
         })
         .unwrap();
+    let _ = preflight.into_prepared();
     let lock = app.session_lock_state.lock(&qh).unwrap();
     app.session_lock = Some(lock);
-    for (output, _) in outputs {
-        app.create_surface(output, &qh);
+    for (output, _) in &outputs {
+        app.create_surface(output.clone(), &qh);
     }
     app.loading_outputs = false;
 
     drive(&mut private, &mut app, true);
     assert_eq!(app.lifecycle.phase(), super::model::Phase::Locked);
+    let root = app
+        .configurations
+        .surface_root(&outputs[0].0, &SurfaceKey::Default)
+        .unwrap();
+    let secret = first_secret_input(root).unwrap();
+    let target = app.surfaces[0].layouts.presented_target(secret).unwrap();
+    let placement = app.surfaces[0]
+        .layouts
+        .presented()
+        .unwrap()
+        .get(secret)
+        .unwrap();
+    assert_ne!(placement.transform, Affine::IDENTITY);
+    assert!(app.focus_from_keyboard(0, target.clone()));
+    let (_, width) = app.secret_node_and_width(0, &target).unwrap();
+    assert_eq!(width, 200.0);
     let records = private.records();
     let lock = record_position(&records, Request::Lock);
     let lock_surface = record_position(&records, Request::LockSurface(1));
@@ -693,6 +713,45 @@ fn run_host_probe() {
     let locked = record_position(&records, Request::Locked);
     assert!(lock < lock_surface && lock_surface < ack && ack < attach);
     assert!(attach < commit && commit < locked);
+
+    let output = &outputs[0].0;
+    let consumer = app.configurations.consumer(output).unwrap().to_owned();
+    let root = app
+        .configurations
+        .surface_root(output, &SurfaceKey::Default)
+        .unwrap()
+        .clone();
+    std::fs::write(
+        &entry,
+        r#"
+        local child = ui.secret_input {
+            autofocus = true,
+            style = { width = 200, height = 40 },
+        }
+        for _ = 1, 20 do
+            child = ui.column {
+                style = { scale_x = 100 },
+                children = { child },
+            }
+        end
+        return ui.lock {
+            style = { width = 320, height = 240 },
+            children = { child },
+        }
+        "#,
+    )
+    .unwrap();
+    app.reload();
+    assert_eq!(app.configurations.consumer(output), Some(consumer.as_str()));
+    assert_eq!(
+        app.configurations
+            .surface_root(output, &SurfaceKey::Default),
+        Some(&root)
+    );
+    assert!(!app.render_failed);
+    drive(&mut private, &mut app, true);
+    std::fs::write(&entry, LOCK_FIXTURE).unwrap();
+    app.reload();
 
     let second_output = private.add_output(2);
     for _ in 0..3 {

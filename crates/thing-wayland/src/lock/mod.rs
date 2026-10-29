@@ -5,6 +5,7 @@ mod model;
 mod wire_tests;
 
 use std::{
+    cell::RefCell,
     path::Path,
     rc::Rc,
     time::{Duration, Instant},
@@ -42,7 +43,7 @@ use thing_runtime::{
     AuthenticationSnapshot, AuthenticationState, KeyInput, OutputContext, Runtime, Scalar,
     ServiceSnapshot, SurfaceKey, SurfaceTree,
 };
-use thing_ui::{Interaction, PaintFrame, ScrollState, SecretInputEditor, Size};
+use thing_ui::{Interaction, Layout, PaintFrame, ScrollState, SecretInputEditor, Size};
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     globals::registry_queue_init,
@@ -242,10 +243,16 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
                 })
         })
         .collect::<Result<_, _>>()?;
+    let entries = outputs
+        .iter()
+        .map(|(output, context)| app.layout_validation_entry(output.clone(), context, true))
+        .collect();
+    let preflight = LockLayoutPreflight::new(&mut app.render, entries);
     app.configurations
-        .reload_for_checked(outputs.clone(), |_, runtime| {
-            validate_lock_surfaces(runtime.surfaces())
+        .reload_for_checked(outputs.clone(), |output, runtime| {
+            preflight.validate(output, runtime.surfaces())
         })?;
+    let _ = preflight.into_prepared();
     app.update_watch();
 
     event_loop
@@ -331,6 +338,79 @@ pub fn check(entry: &Path) -> Result<usize, String> {
     Ok(runtime.files().len())
 }
 
+struct PreparedLockLayout {
+    root: Node,
+    size: (u32, u32),
+    layout: Layout,
+    scroll: ScrollState,
+}
+
+struct LockLayoutValidationEntry {
+    output: wl_output::WlOutput,
+    size: (u32, u32),
+    scroll: ScrollState,
+}
+
+struct PreparedLockOutput {
+    output: wl_output::WlOutput,
+    layout: PreparedLockLayout,
+}
+
+struct LockLayoutPreflight<'a> {
+    render: RefCell<&'a mut Render>,
+    entries: Vec<LockLayoutValidationEntry>,
+    prepared: RefCell<Vec<PreparedLockOutput>>,
+}
+
+impl<'a> LockLayoutPreflight<'a> {
+    fn new(render: &'a mut Render, entries: Vec<LockLayoutValidationEntry>) -> Self {
+        Self {
+            render: RefCell::new(render),
+            entries,
+            prepared: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn validate(
+        &self,
+        output: &wl_output::WlOutput,
+        surfaces: &[SurfaceTree],
+    ) -> Result<(), String> {
+        validate_lock_surfaces(surfaces)?;
+        let [surface] = surfaces else {
+            unreachable!("lock surface validation requires one surface")
+        };
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| &entry.output == output)
+            .ok_or("lock layout preflight has no output context")?;
+        let layout = prepare_lock_layout(
+            &mut self.render.borrow_mut(),
+            &surface.root,
+            entry.size,
+            entry.scroll.clone(),
+        )?;
+        let mut prepared = self.prepared.borrow_mut();
+        if let Some(previous) = prepared
+            .iter_mut()
+            .find(|previous| previous.output == *output)
+        {
+            previous.layout = layout;
+        } else {
+            prepared.push(PreparedLockOutput {
+                output: output.clone(),
+                layout,
+            });
+        }
+        Ok(())
+    }
+
+    fn into_prepared(self) -> Vec<PreparedLockOutput> {
+        self.prepared.into_inner()
+    }
+}
+
 struct Surface {
     window: Option<Window>,
     role: SessionLockSurface,
@@ -340,6 +420,7 @@ struct Surface {
     viewport: Option<WpViewport>,
     fractional: Option<WpFractionalScaleV1>,
     layouts: SurfaceLayouts,
+    prepared: Option<PreparedLockLayout>,
     scroll: ScrollState,
     input: Interaction,
     focus_target: Option<ScopedUiTarget>,
@@ -451,23 +532,81 @@ impl App {
         Some(context)
     }
 
+    fn layout_validation_entry(
+        &self,
+        output: wl_output::WlOutput,
+        context: &OutputContext,
+        replacement: bool,
+    ) -> LockLayoutValidationEntry {
+        let surface = self
+            .surfaces
+            .iter()
+            .find(|surface| surface.output == output);
+        let size = surface
+            .filter(|surface| surface.configured)
+            .map_or((context.width, context.height), |surface| surface.size);
+        let scroll = if replacement {
+            ScrollState::default()
+        } else {
+            surface.map_or_else(ScrollState::default, |surface| surface.scroll.clone())
+        };
+        LockLayoutValidationEntry {
+            output,
+            size,
+            scroll,
+        }
+    }
+
+    fn current_layout_validation_entry(
+        &self,
+        output: &wl_output::WlOutput,
+    ) -> Option<LockLayoutValidationEntry> {
+        self.configurations
+            .output(output)
+            .map(|context| self.layout_validation_entry(output.clone(), context, false))
+    }
+
+    fn install_prepared_layouts(&mut self, outputs: Vec<PreparedLockOutput>) {
+        for prepared in outputs {
+            let Some(surface) = self
+                .surfaces
+                .iter_mut()
+                .find(|surface| surface.output == prepared.output)
+            else {
+                continue;
+            };
+            let current = self
+                .configurations
+                .surface_root(&surface.output, &SurfaceKey::Default);
+            surface.prepared = (prepared.layout.size == surface.size
+                && current == Some(&prepared.layout.root))
+            .then_some(prepared.layout);
+        }
+    }
+
     fn configure_output(&mut self, output: wl_output::WlOutput, qh: &QueueHandle<Self>) {
         self.create_surface(output.clone(), qh);
         let Some(context) = self.output_context(&output) else {
             return;
         };
+        let entry = self.layout_validation_entry(output.clone(), &context, false);
+        let preflight = LockLayoutPreflight::new(&mut self.render, vec![entry]);
         let result = if self.configurations.contains(&output) {
             self.configurations
-                .set_output_checked(&output, context, validate_lock_surfaces)
+                .set_output_checked(&output, context, |surfaces| {
+                    preflight.validate(&output, surfaces)
+                })
         } else {
             self.configurations
                 .add_checked(output.clone(), context, |runtime| {
-                    validate_lock_surfaces(runtime.surfaces())
+                    preflight.validate(&output, runtime.surfaces())
                 })
                 .map(|()| true)
         };
+        let prepared = preflight.into_prepared();
         match result {
             Ok(true) => {
+                self.install_prepared_layouts(prepared);
                 if let Some(surface) = self
                     .surfaces
                     .iter_mut()
@@ -517,6 +656,7 @@ impl App {
             viewport,
             fractional,
             layouts: SurfaceLayouts::default(),
+            prepared: None,
             scroll: ScrollState::default(),
             input: Interaction::default(),
             focus_target: None,
@@ -549,7 +689,7 @@ impl App {
     }
 
     fn reload(&mut self) {
-        let outputs = self
+        let outputs: Vec<_> = self
             .outputs
             .outputs()
             .filter_map(|output| {
@@ -558,18 +698,25 @@ impl App {
                     .map(|context| (output, context))
             })
             .collect();
-        if let Err(error) = self
+        let entries = outputs
+            .iter()
+            .map(|(output, context)| self.layout_validation_entry(output.clone(), context, true))
+            .collect();
+        let preflight = LockLayoutPreflight::new(&mut self.render, entries);
+        let result = self
             .configurations
-            .reload_for_checked(outputs, |_, runtime| {
-                validate_lock_surfaces(runtime.surfaces())
-            })
-        {
+            .reload_for_checked(outputs, |output, runtime| {
+                preflight.validate(output, runtime.surfaces())
+            });
+        let prepared = preflight.into_prepared();
+        if let Err(error) = result {
             eprintln!("thing: lock reload failed; keeping the previous surfaces: {error}");
             return;
         }
         self.clear_key_repeat();
         for surface in &mut self.surfaces {
             surface.layouts = SurfaceLayouts::default();
+            surface.prepared = None;
             surface.scroll = ScrollState::default();
             surface.input = Interaction::default();
             surface.focus_target = None;
@@ -577,6 +724,7 @@ impl App {
             surface.autofocus_pending = true;
             surface.dirty = true;
         }
+        self.install_prepared_layouts(prepared);
         let wake = self.image_ping.clone();
         if let Err(error) = self.render.reset_painter(move || wake.ping()) {
             eprintln!("thing: cannot refresh lock renderer caches: {error}");
@@ -586,9 +734,20 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        let configured_outputs: Vec<_> = self.configurations.keys().cloned().collect();
+        let entries = configured_outputs
+            .iter()
+            .filter_map(|output| self.current_layout_validation_entry(output))
+            .collect();
+        let preflight = LockLayoutPreflight::new(&mut self.render, entries);
         let changed = self
             .configurations
-            .refresh_checked(|_, surfaces| validate_lock_surfaces(surfaces));
+            .refresh_checked(|output, surfaces| preflight.validate(output, surfaces));
+        let prepared = preflight
+            .into_prepared()
+            .into_iter()
+            .filter(|prepared| changed.contains(&prepared.output))
+            .collect();
         for output in changed {
             if let Some(surface) = self
                 .surfaces
@@ -598,6 +757,7 @@ impl App {
                 surface.dirty = true;
             }
         }
+        self.install_prepared_layouts(prepared);
     }
 
     fn set_authentication(&mut self, snapshot: AuthenticationSnapshot) {
@@ -992,9 +1152,17 @@ impl App {
             eprintln!("thing: lock output has no configuration root");
             return RootKeyDispatch::Failed;
         };
-        let result =
-            self.configurations
-                .dispatch_key_checked(&output, root, input, validate_lock_surfaces);
+        let Some(entry) = self.current_layout_validation_entry(&output) else {
+            eprintln!("thing: lock output has no layout context");
+            return RootKeyDispatch::Failed;
+        };
+        let preflight = LockLayoutPreflight::new(&mut self.render, vec![entry]);
+        let result = self
+            .configurations
+            .dispatch_key_checked(&output, root, input, |surfaces| {
+                preflight.validate(&output, surfaces)
+            });
+        let prepared = preflight.into_prepared();
         self.update_watch();
         let outcome = match result {
             Ok(Some(outcome)) => outcome,
@@ -1008,6 +1176,7 @@ impl App {
         let handled = outcome.handled;
         if outcome.dispatch.changed {
             self.surfaces[index].dirty = true;
+            self.install_prepared_layouts(prepared);
         }
         if !outcome.dispatch.actions.is_empty() || !outcome.dispatch.ui_actions.is_empty() {
             eprintln!("thing: actions are unavailable in lock key handlers");
@@ -1188,15 +1357,25 @@ impl App {
             .map(|surface| surface.output.clone())
             .collect();
         for output in ready_outputs {
-            if self
+            let entry = self
+                .current_layout_validation_entry(&output)
+                .ok_or("animated lock output has no layout context")?;
+            let preflight = LockLayoutPreflight::new(&mut self.render, vec![entry]);
+            let changed = self
                 .configurations
-                .advance_checked(&output, now, validate_lock_surfaces)?
-                && let Some(surface) = self
+                .advance_checked(&output, now, |surfaces| {
+                    preflight.validate(&output, surfaces)
+                })?;
+            let prepared = preflight.into_prepared();
+            if changed {
+                self.install_prepared_layouts(prepared);
+                if let Some(surface) = self
                     .surfaces
                     .iter_mut()
                     .find(|surface| surface.output == output)
-            {
-                surface.dirty = true;
+                {
+                    surface.dirty = true;
+                }
             }
         }
         self.reconcile_layout_focus();
@@ -1237,15 +1416,21 @@ impl App {
                 .window
                 .as_mut()
                 .ok_or("lock render surface was not initialized")?;
-            let mut scroll = surface.scroll.clone();
-            let layout = self.render.layout(
-                root,
-                Size {
-                    width: surface.size.0 as f32,
-                    height: surface.size.1 as f32,
-                },
-                &mut scroll,
-            )?;
+            let prepared = surface
+                .prepared
+                .take()
+                .filter(|prepared| prepared.size == surface.size && &prepared.root == root);
+            let (layout, scroll) = if let Some(prepared) = prepared {
+                (prepared.layout, prepared.scroll)
+            } else {
+                let prepared = prepare_lock_layout(
+                    &mut self.render,
+                    root,
+                    surface.size,
+                    surface.scroll.clone(),
+                )?;
+                (prepared.layout, prepared.scroll)
+            };
             if let Some(id) = surface.input.focused
                 && !layout.focus_order().any(|candidate| candidate == id)
             {
@@ -1716,11 +1901,20 @@ impl Dispatch<WpFractionalScaleV1, wl_surface::WlSurface> for App {
             let output = surface.output.clone();
             if let Some(mut context) = app.configurations.output(&output).cloned() {
                 context.scale = scale;
-                if let Err(error) =
-                    app.configurations
-                        .set_output_checked(&output, context, validate_lock_surfaces)
-                {
-                    eprintln!("thing: cannot update lock output scale: {error}");
+                let entry = app.layout_validation_entry(output.clone(), &context, false);
+                let preflight = LockLayoutPreflight::new(&mut app.render, vec![entry]);
+                let result = app
+                    .configurations
+                    .set_output_checked(&output, context, |surfaces| {
+                        preflight.validate(&output, surfaces)
+                    });
+                let prepared = preflight.into_prepared();
+                match result {
+                    Ok(true) => app.install_prepared_layouts(prepared),
+                    Ok(false) => {}
+                    Err(error) => {
+                        eprintln!("thing: cannot update lock output scale: {error}")
+                    }
                 }
             }
         }
@@ -1762,6 +1956,30 @@ impl ProvidesRegistryState for App {
     }
 
     registry_handlers![OutputState, SeatState];
+}
+
+fn prepare_lock_layout(
+    render: &mut Render,
+    root: &Node,
+    size: (u32, u32),
+    mut scroll: ScrollState,
+) -> Result<PreparedLockLayout, String> {
+    let layout = render
+        .layout(
+            root,
+            Size {
+                width: size.0 as f32,
+                height: size.1 as f32,
+            },
+            &mut scroll,
+        )
+        .map_err(|error| format!("cannot lay out lock surface: {error}"))?;
+    Ok(PreparedLockLayout {
+        root: root.clone(),
+        size,
+        layout,
+        scroll,
+    })
 }
 
 fn validate_lock_surfaces(surfaces: &[SurfaceTree]) -> Result<(), String> {
