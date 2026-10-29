@@ -7,6 +7,8 @@ use taffy::{
 };
 use thing_core::{CrossAlign, Kind, MainAlign, Node, NodeId, Point, Rect};
 
+use crate::Affine;
+
 /// a size in logical pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Size {
@@ -19,11 +21,15 @@ pub trait Measurer {
     fn measure(&mut self, node: &Node, max_width: Option<f32>) -> Size;
 }
 
-/// one visible widget in painting order, with its inherited clipping rectangle.
+/// one visible widget in painting order with stable and transformed geometry.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Placement {
     pub id: NodeId,
+    /// stable Taffy geometry in surface coordinates.
     pub bounds: Rect,
+    /// the transformed border box without clipping.
+    pub border_aabb: Rect,
+    pub transform: Affine,
     pub clip: Rect,
     pub interactive: bool,
     pub pointer_events: bool,
@@ -31,6 +37,61 @@ pub struct Placement {
     pub enabled: bool,
     pub opacity: f32,
     pub(crate) disabled_opacity: f32,
+    pub(crate) inverse: Option<Affine>,
+    pub(crate) clip_chain: usize,
+}
+
+impl Placement {
+    pub fn local_bounds(self) -> Rect {
+        Rect {
+            width: self.bounds.width,
+            height: self.bounds.height,
+            ..Rect::default()
+        }
+    }
+
+    pub fn surface_to_local(self, point: Point) -> Option<Point> {
+        self.inverse?.point(point)
+    }
+
+    pub fn magnification(self) -> f64 {
+        self.transform.magnification()
+    }
+
+    pub fn is_invertible(self) -> bool {
+        self.inverse.is_some()
+    }
+}
+
+/// semantic geometry retained even when an ancestor clips all painting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SemanticPlacement {
+    pub id: NodeId,
+    pub parent: Option<NodeId>,
+    pub scroll_parent: Option<NodeId>,
+    /// stable Taffy geometry in surface-local logical pixels.
+    pub bounds: Rect,
+    /// the transformed border box without clipping.
+    pub border_aabb: Rect,
+    pub transform: Affine,
+    pub enabled: bool,
+    pub scroll_offset: Option<f32>,
+    pub max_scroll_offset: Option<f32>,
+    inverse: Option<Affine>,
+}
+
+impl SemanticPlacement {
+    pub fn local_bounds(self) -> Rect {
+        Rect {
+            width: self.bounds.width,
+            height: self.bounds.height,
+            ..Rect::default()
+        }
+    }
+
+    pub fn is_invertible(self) -> bool {
+        self.inverse.is_some()
+    }
 }
 
 /// scroll offsets for one surface, measured in logical pixels.
@@ -88,16 +149,25 @@ struct RevealRegion {
 
 #[derive(Clone, Copy, Debug)]
 struct PointerRegion {
-    bounds: Rect,
-    clip: Rect,
     scroll_handler: Option<NodeId>,
     scroll: Option<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ClipRegion {
+    pub(crate) bounds: Rect,
+    pub(crate) transform: Affine,
+    pub(crate) inverse: Option<Affine>,
+    pub(crate) aabb: Rect,
+    pub(crate) parent: Option<usize>,
+    pub(crate) depth: usize,
 }
 
 #[derive(Clone, Copy)]
 struct Inherited {
     origin: Point,
-    clip: Rect,
+    clip_chain: usize,
+    clip_aabb: Rect,
     enabled: bool,
     opacity: f32,
     disabled_opacity: f32,
@@ -108,8 +178,11 @@ struct Inherited {
 #[derive(Clone, Copy)]
 struct RevealInherited {
     origin: Point,
+    transform: Affine,
     enabled: bool,
+    parent: Option<NodeId>,
     scroll_parent: Option<NodeId>,
+    reveal_scroll_parent: Option<NodeId>,
 }
 
 /// resolved geometry for one surface. popup children have separate surfaces and
@@ -117,7 +190,10 @@ struct RevealInherited {
 #[derive(Debug, Default)]
 pub struct Layout {
     placements: Vec<Placement>,
+    semantic_placements: Vec<SemanticPlacement>,
+    semantic_indices: BTreeMap<NodeId, usize>,
     pointer_regions: Vec<PointerRegion>,
+    clip_regions: Vec<ClipRegion>,
     scroll_areas: Vec<ScrollArea>,
     reveal_regions: Vec<RevealRegion>,
 }
@@ -214,17 +290,28 @@ impl Layout {
             height: size.height,
         };
         let mut result = Self::default();
+        result.clip_regions.push(ClipRegion {
+            bounds: clip,
+            transform: Affine::IDENTITY,
+            inverse: Some(Affine::IDENTITY),
+            aabb: clip,
+            parent: None,
+            depth: 0,
+        });
         let mut next_state = state.clone();
         next_state.retain_tree(root);
-        result.collect_reveal_regions(
+        result.collect_semantic_regions(
             root,
             &tree,
             &ids,
             &mut next_state,
             RevealInherited {
                 origin: Point { x: 0.0, y: 0.0 },
+                transform: Affine::IDENTITY,
                 enabled: true,
+                parent: None,
                 scroll_parent: None,
+                reveal_scroll_parent: None,
             },
         )?;
         result.collect(
@@ -234,7 +321,8 @@ impl Layout {
             &mut next_state,
             Inherited {
                 origin: Point { x: 0.0, y: 0.0 },
-                clip,
+                clip_chain: 0,
+                clip_aabb: clip,
                 enabled: true,
                 opacity: 1.0,
                 disabled_opacity: 1.0,
@@ -250,6 +338,16 @@ impl Layout {
         &self.placements
     }
 
+    pub fn semantic_placements(&self) -> &[SemanticPlacement] {
+        &self.semantic_placements
+    }
+
+    pub fn semantic_placement(&self, id: NodeId) -> Option<&SemanticPlacement> {
+        self.semantic_indices
+            .get(&id)
+            .and_then(|index| self.semantic_placements.get(*index))
+    }
+
     /// widgets whose presented geometry can begin pointer input.
     pub fn pointer_targets(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.placements
@@ -260,34 +358,47 @@ impl Layout {
                     || placement.pointer_events
                     || placement.scroll_events
                     || region.scroll == Some(placement.id))
-                .then_some(placement.id)
+                .then_some(placement)
+                .filter(|placement| placement.inverse.is_some())
+                .map(|placement| placement.id)
             })
+    }
+
+    pub fn pointer_target_is_eligible(&self, id: NodeId) -> bool {
+        self.pointer_targets().any(|candidate| candidate == id)
     }
 
     pub fn get(&self, id: NodeId) -> Option<&Placement> {
         self.placements.iter().find(|placement| placement.id == id)
     }
 
+    pub fn surface_to_local(&self, id: NodeId, point: Point) -> Option<Point> {
+        self.get(id)?.surface_to_local(point)
+    }
+
     /// hit test from front to back. text inside a button does not hide its parent.
     pub fn hit_test(&self, point: Point) -> Option<NodeId> {
         self.placements
             .iter()
+            .enumerate()
             .rev()
-            .find(|p| p.interactive && p.bounds.contains(point) && p.clip.contains(point))
-            .map(|p| p.id)
+            .find(|(index, placement)| {
+                placement.interactive && self.placement_contains(*index, point)
+            })
+            .map(|(_, placement)| placement.id)
     }
 
     /// find the deepest semantic control or custom pointer target under a point.
     pub fn pointer_event_target(&self, point: Point) -> Option<NodeId> {
         self.placements
             .iter()
+            .enumerate()
             .rev()
-            .find(|placement| {
+            .find(|(index, placement)| {
                 (placement.interactive || placement.pointer_events)
-                    && placement.bounds.contains(point)
-                    && placement.clip.contains(point)
+                    && self.placement_contains(*index, point)
             })
-            .map(|placement| placement.id)
+            .map(|(_, placement)| placement.id)
     }
 
     pub fn focus_order(&self) -> impl Iterator<Item = NodeId> + '_ {
@@ -425,11 +536,47 @@ impl Layout {
     fn pointer_region(&self, point: Point) -> Option<&PointerRegion> {
         self.pointer_regions
             .iter()
+            .enumerate()
             .rev()
-            .find(|region| region.bounds.contains(point) && region.clip.contains(point))
+            .find(|(index, _)| self.placement_contains(*index, point))
+            .map(|(_, region)| region)
     }
 
-    fn collect_reveal_regions(
+    fn placement_contains(&self, index: usize, point: Point) -> bool {
+        let Some(placement) = self.placements.get(index) else {
+            return false;
+        };
+        placement
+            .surface_to_local(point)
+            .is_some_and(|local| placement.local_bounds().contains(local))
+            && self.clip_contains(placement.clip_chain, point)
+    }
+
+    fn clip_contains(&self, mut index: usize, point: Point) -> bool {
+        loop {
+            let Some(region) = self.clip_regions.get(index) else {
+                return false;
+            };
+            if !region.aabb.contains(point)
+                || region
+                    .inverse
+                    .and_then(|inverse| inverse.point(point))
+                    .is_none_or(|local| !region.bounds.contains(local))
+            {
+                return false;
+            }
+            let Some(parent) = region.parent else {
+                return true;
+            };
+            index = parent;
+        }
+    }
+
+    pub(crate) fn clip_region(&self, index: usize) -> Option<&ClipRegion> {
+        self.clip_regions.get(index)
+    }
+
+    fn collect_semantic_regions(
         &mut self,
         node: &Node,
         tree: &tf::TaffyTree<NodeId>,
@@ -449,7 +596,50 @@ impl Layout {
             width: geometry.size.width,
             height: geometry.size.height,
         };
+        let local_bounds = Rect {
+            width: bounds.width,
+            height: bounds.height,
+            ..Rect::default()
+        };
+        // Skia consumes f32 coefficients. Every downstream geometry operation
+        // uses those exact coefficients so painting and input cannot diverge.
+        let transform = inherited
+            .transform
+            .compose(Affine::translation(
+                f64::from(geometry.location.x),
+                f64::from(geometry.location.y),
+            ))?
+            .compose(Affine::widget(
+                &node.style,
+                geometry.size.width,
+                geometry.size.height,
+            )?)?
+            .renderer_canonical()?;
+        let inverse = transform.inverse()?;
+        let border_aabb = transform.rect_aabb(local_bounds)?;
         let enabled = inherited.enabled && node.enabled;
+        let scroll = (node.kind == Kind::Scroll).then(|| {
+            let max_offset = if geometry.scroll_height().is_finite() {
+                geometry.scroll_height().max(0.0)
+            } else {
+                0.0
+            };
+            (state.offset(node.id).clamp(0.0, max_offset), max_offset)
+        });
+        self.semantic_indices
+            .insert(node.id, self.semantic_placements.len());
+        self.semantic_placements.push(SemanticPlacement {
+            id: node.id,
+            parent: inherited.parent,
+            scroll_parent: inherited.scroll_parent,
+            bounds,
+            border_aabb,
+            transform,
+            enabled,
+            scroll_offset: scroll.map(|(offset, _)| offset),
+            max_scroll_offset: scroll.map(|(_, max_offset)| max_offset),
+            inverse,
+        });
         self.reveal_regions.push(RevealRegion {
             id: node.id,
             bounds,
@@ -461,46 +651,48 @@ impl Layout {
                     .all(f32::is_finite)
                 && bounds.width > 0.0
                 && bounds.height > 0.0,
-            scroll_parent: inherited.scroll_parent,
+            scroll_parent: inherited.reveal_scroll_parent,
         });
 
         let mut child_origin = Point {
             x: bounds.x,
             y: bounds.y,
         };
+        let mut child_transform = transform;
         let mut child_scroll_parent = inherited.scroll_parent;
-        if node.kind == Kind::Scroll {
-            let max_offset = if geometry.scroll_height().is_finite() {
-                geometry.scroll_height().max(0.0)
-            } else {
-                0.0
-            };
-            let offset = state.offset(node.id).clamp(0.0, max_offset);
+        let mut child_reveal_scroll_parent = inherited.reveal_scroll_parent;
+        if let Some((offset, max_offset)) = scroll {
             state.set(node.id, offset);
+            child_scroll_parent = Some(node.id);
             if enabled {
                 self.scroll_areas.push(ScrollArea {
                     id: node.id,
-                    parent: inherited.scroll_parent,
+                    parent: inherited.reveal_scroll_parent,
                     viewport: bounds,
                     offset,
                     max_offset,
                 });
-                child_scroll_parent = Some(node.id);
+                child_reveal_scroll_parent = Some(node.id);
             }
             child_origin.y -= offset;
+            child_transform =
+                child_transform.compose(Affine::translation(0.0, -f64::from(offset)))?;
         }
 
         for child in &node.children {
             if child.kind != Kind::Popup {
-                self.collect_reveal_regions(
+                self.collect_semantic_regions(
                     child,
                     tree,
                     ids,
                     state,
                     RevealInherited {
                         origin: child_origin,
+                        transform: child_transform,
                         enabled,
+                        parent: Some(node.id),
                         scroll_parent: child_scroll_parent,
+                        reveal_scroll_parent: child_reveal_scroll_parent,
                     },
                 )?;
             }
@@ -521,7 +713,8 @@ impl Layout {
         }
         let Inherited {
             origin,
-            clip,
+            clip_chain,
+            clip_aabb,
             enabled,
             opacity,
             disabled_opacity,
@@ -535,6 +728,17 @@ impl Layout {
             width: geometry.size.width,
             height: geometry.size.height,
         };
+        let local_bounds = Rect {
+            width: bounds.width,
+            height: bounds.height,
+            ..Rect::default()
+        };
+        let semantic = *self
+            .semantic_placement(node.id)
+            .ok_or("visual layout is missing semantic geometry")?;
+        let transform = semantic.transform;
+        let inverse = semantic.inverse;
+        let border_aabb = semantic.border_aabb;
         // a disabled branch inherits the factor chosen by the widget that
         // disables it instead of compounding a factor at every descendant.
         let disabled_opacity = if enabled && !node.enabled {
@@ -557,23 +761,34 @@ impl Layout {
         self.placements.push(Placement {
             id: node.id,
             bounds,
-            clip,
+            border_aabb,
+            transform,
+            clip: clip_aabb,
             interactive: enabled && node.kind.is_interactive(),
             pointer_events: enabled && node.pointer_events,
             scroll_events: enabled && node.scroll_events,
             enabled,
             opacity,
             disabled_opacity,
+            inverse,
+            clip_chain,
         });
         self.pointer_regions.push(PointerRegion {
-            bounds,
-            clip,
             scroll_handler: pointer_scroll_handler,
             scroll: pointer_scroll,
         });
-        let Some(child_clip) = bounds.intersection(clip) else {
+        let Some(child_clip_aabb) = border_aabb.intersection(clip_aabb) else {
             return Ok(());
         };
+        let child_clip_chain = self.clip_regions.len();
+        self.clip_regions.push(ClipRegion {
+            bounds: local_bounds,
+            transform,
+            inverse,
+            aabb: border_aabb,
+            parent: Some(clip_chain),
+            depth: self.clip_regions[clip_chain].depth + 1,
+        });
         let mut child_origin = Point {
             x: bounds.x,
             y: bounds.y,
@@ -600,7 +815,8 @@ impl Layout {
                     state,
                     Inherited {
                         origin: child_origin,
-                        clip: child_clip,
+                        clip_chain: child_clip_chain,
+                        clip_aabb: child_clip_aabb,
                         enabled,
                         opacity,
                         disabled_opacity,
@@ -1571,6 +1787,184 @@ mod tests {
         assert_eq!(layout.get(NodeId(5)).unwrap().bounds.y, 10.0);
         assert_eq!(layout.hit_test(Point { x: 10.0, y: 39.0 }), Some(NodeId(5)));
         assert!(!layout.scroll_y(point, 1.0, &mut state));
+    }
+
+    #[test]
+    fn transformed_hit_testing_uses_local_geometry_and_exact_ancestor_clips() {
+        let mut root = fixed(1, Kind::Row, 100.0, 100.0);
+        root.style.align = CrossAlign::Start;
+        root.style.justify = MainAlign::Start;
+        root.style.rotation = 45.0;
+        root.children.push(fixed(2, Kind::Button, 40.0, 40.0));
+
+        let size = Size {
+            width: 100.0,
+            height: 100.0,
+        };
+        let layout = Layout::compute(&root, size, &mut FixedText).unwrap();
+        let point = layout
+            .get(NodeId(2))
+            .unwrap()
+            .transform
+            .point(Point { x: 20.0, y: 20.0 })
+            .unwrap();
+        assert_eq!(layout.hit_test(point), Some(NodeId(2)));
+
+        root.children[0].style.translate_x = 90.0;
+        root.children[0].style.translate_y = 30.0;
+        let layout = Layout::compute(&root, size, &mut FixedText).unwrap();
+        let child = layout.get(NodeId(2)).unwrap();
+        let point = child.transform.point(Point { x: 20.0, y: 20.0 }).unwrap();
+        assert!((0.0..100.0).contains(&point.x));
+        assert!((0.0..100.0).contains(&point.y));
+        let local = layout.surface_to_local(NodeId(2), point).unwrap();
+        assert!((local.x - 20.0).abs() < 0.001);
+        assert!((local.y - 20.0).abs() < 0.001);
+        assert_eq!(layout.hit_test(point), None);
+    }
+
+    #[test]
+    fn singular_controls_keep_semantic_focus_but_cannot_receive_pointer_input() {
+        let mut button = fixed(1, Kind::Button, 80.0, 30.0);
+        button.style.scale_x = 0.0;
+        let layout = Layout::compute(
+            &button,
+            Size {
+                width: 80.0,
+                height: 30.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+
+        assert_eq!(layout.focus_order().collect::<Vec<_>>(), [NodeId(1)]);
+        assert!(layout.pointer_targets().next().is_none());
+        assert_eq!(layout.hit_test(Point { x: 40.0, y: 15.0 }), None);
+        assert!(
+            layout
+                .surface_to_local(NodeId(1), Point::default())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn singular_ancestors_keep_semantic_descendants_outside_the_paint_walk() {
+        let mut panel = fixed(1, Kind::Panel, 200.0, 50.0);
+        let mut branch = fixed(2, Kind::Row, 160.0, 30.0);
+        branch.style.scale_x = 0.0;
+        branch.children.push(fixed(3, Kind::TextInput, 160.0, 30.0));
+        panel.children.push(branch);
+
+        let layout = Layout::compute(
+            &panel,
+            Size {
+                width: 200.0,
+                height: 50.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+
+        assert!(layout.get(NodeId(3)).is_none());
+        let input = layout.semantic_placement(NodeId(3)).unwrap();
+        assert_eq!(input.parent, Some(NodeId(2)));
+        assert!(input.enabled);
+        assert!(!input.is_invertible());
+        assert_eq!(input.scroll_offset, None);
+        assert!(layout.focus_order().any(|id| id == NodeId(3)));
+    }
+
+    #[test]
+    fn renderer_rounded_nested_transform_is_canonical_for_input() {
+        let mut leaf = fixed(6, Kind::Button, 10.0, 10.0);
+        leaf.style.rotation = -45.0;
+        leaf.style.transform_origin.x = 0.0;
+        leaf.style.transform_origin.y = 0.0;
+        for id in (2..=5).rev() {
+            let mut scale = fixed(id, Kind::Row, 10.0, 10.0);
+            scale.style.scale_x = 100.0;
+            scale.style.scale_y = 0.01;
+            scale.style.transform_origin.x = 0.0;
+            scale.style.transform_origin.y = 0.0;
+            scale.children.push(leaf);
+            leaf = scale;
+        }
+        let mut root = fixed(1, Kind::Panel, 10.0, 10.0);
+        root.style.rotation = 45.0;
+        root.style.transform_origin.x = 0.0;
+        root.style.transform_origin.y = 0.0;
+        root.children.push(leaf);
+
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 10.0,
+                height: 10.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        let leaf = layout.semantic_placement(NodeId(6)).unwrap();
+        let [xx, xy, _, yx, yy, _] = leaf.transform.skia_values().unwrap();
+
+        assert_eq!(xx * yy - xy * yx, 0.0);
+        assert!(!leaf.is_invertible());
+        assert!(!layout.pointer_targets().any(|id| id == NodeId(6)));
+    }
+
+    #[test]
+    fn unrepresentable_nested_transforms_are_rejected_before_layout_publication() {
+        let mut branch = fixed(21, Kind::Button, 10.0, 10.0);
+        for id in (1..=20).rev() {
+            let mut parent = fixed(id, Kind::Row, 10.0, 10.0);
+            parent.style.scale_x = 100.0;
+            parent.style.scale_y = 100.0;
+            parent.style.transform_origin.x = 0.0;
+            parent.style.transform_origin.y = 0.0;
+            parent.children.push(branch);
+            branch = parent;
+        }
+
+        let error = Layout::compute(
+            &branch,
+            Size {
+                width: 10.0,
+                height: 10.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap_err();
+        assert!(error.contains("renderer coordinate range"));
+    }
+
+    #[test]
+    fn scroll_offsets_follow_the_transformed_branch_without_changing_reveal_geometry() {
+        let mut root = fixed(1, Kind::Panel, 120.0, 40.0);
+        let mut scroll = fixed(2, Kind::Scroll, 100.0, 40.0);
+        scroll.style.translate_x = 20.0;
+        scroll.children.push(fixed(3, Kind::Button, 100.0, 40.0));
+        scroll.children.push(fixed(4, Kind::Button, 100.0, 40.0));
+        root.children.push(scroll);
+        let size = Size {
+            width: 120.0,
+            height: 40.0,
+        };
+        let mut state = ScrollState::default();
+        let layout = scrolled(&root, size, &mut state);
+        assert!(layout.scroll_y(Point { x: 25.0, y: 10.0 }, 40.0, &mut state));
+
+        let layout = scrolled(&root, size, &mut state);
+        assert_eq!(layout.get(NodeId(4)).unwrap().bounds.y, 0.0);
+        let scroll = layout.semantic_placement(NodeId(2)).unwrap();
+        assert_eq!(scroll.scroll_offset, Some(40.0));
+        assert_eq!(scroll.max_scroll_offset, Some(40.0));
+        assert_eq!(
+            layout.semantic_placement(NodeId(4)).unwrap().scroll_parent,
+            Some(NodeId(2))
+        );
+        assert_eq!(layout.hit_test(Point { x: 25.0, y: 10.0 }), Some(NodeId(4)));
+        assert_eq!(layout.hit_test(Point { x: 5.0, y: 10.0 }), None);
+        assert!(!layout.reveal_y(NodeId(4), &mut state));
     }
 
     #[test]

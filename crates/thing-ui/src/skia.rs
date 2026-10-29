@@ -5,9 +5,9 @@ use std::{
 
 use parley::PositionedLayoutItem;
 use skia_safe::{
-    Canvas, ClipOp, Color as SkiaColor, ColorType, Font, FontArguments, FontMgr, FourByteTag,
-    Paint, PaintCap, PaintJoin, PaintStyle, Path as SkiaPath, PathBuilder, PathFillType, Point,
-    RRect, Rect as SkiaRect, SamplingOptions, Typeface,
+    Canvas, ClipOp, Color as SkiaColor, ColorType, Font, FontArguments, FontMgr, FourByteTag, M44,
+    Matrix, Paint, PaintCap, PaintJoin, PaintStyle, Path as SkiaPath, PathBuilder, PathFillType,
+    Point, RRect, Rect as SkiaRect, SamplingOptions, Typeface,
     font_arguments::{VariationPosition, variation_position::Coordinate as VariationCoordinate},
     gpu::{
         self, DirectContext, SurfaceOrigin, backend_render_targets, direct_contexts,
@@ -21,7 +21,7 @@ use thing_core::{
 };
 
 use crate::{
-    Interaction, Layout, PaintFrame, ScrollState, SecretInputEditor, Size, TextInputEditor,
+    Affine, Interaction, Layout, PaintFrame, ScrollState, SecretInputEditor, Size, TextInputEditor,
     TextSystem, images::Images,
 };
 
@@ -339,16 +339,25 @@ impl Painter {
         canvas.clear(SkiaColor::TRANSPARENT);
         canvas.reset_matrix();
         canvas.scale((scale, scale));
+        let surface_matrix = canvas.local_to_device();
         self.text.retain(root);
+        let mut active_clips = Vec::new();
 
         for placement in layout.placements() {
             let Some(node) = root.find(placement.id) else {
                 continue;
             };
+            sync_clip_chain(
+                canvas,
+                layout,
+                placement.clip_chain,
+                &surface_matrix,
+                &mut active_clips,
+            )?;
             let saved = canvas.save();
-            canvas.clip_rect(to_skia_rect(placement.clip), ClipOp::Intersect, false);
+            set_surface_transform(canvas, &surface_matrix, placement.transform)?;
             let opacity = placement.opacity * placement.disabled_opacity;
-            let bounds = placement.bounds;
+            let bounds = placement.local_bounds();
             let shape = rounded_rect(bounds, node.style.radius);
             canvas.draw_rrect(shape, &fill(color(node.style.background), opacity));
 
@@ -375,12 +384,11 @@ impl Painter {
             }
 
             let drawn = match node.kind {
-                Kind::Text => self.draw_text(canvas, node, bounds, placement.clip, opacity),
+                Kind::Text => self.draw_text(canvas, node, bounds, opacity),
                 Kind::TextInput => self.draw_text_input(
                     canvas,
                     node,
                     bounds,
-                    placement.clip,
                     opacity,
                     (input.focused == Some(node.id))
                         .then_some(text_input.as_deref_mut())
@@ -402,7 +410,13 @@ impl Painter {
                     Ok(())
                 }
                 Kind::Image => {
-                    self.draw_image(canvas, node, bounds, scale, opacity);
+                    self.draw_image(
+                        canvas,
+                        node,
+                        bounds,
+                        f64::from(scale) * placement.magnification(),
+                        opacity,
+                    );
                     Ok(())
                 }
                 Kind::Path => draw_path(canvas, node, bounds, opacity),
@@ -410,6 +424,9 @@ impl Painter {
             };
             canvas.restore_to_count(saved);
             drawn?;
+        }
+        while active_clips.pop().is_some() {
+            canvas.restore();
         }
         Ok(())
     }
@@ -419,19 +436,12 @@ impl Painter {
         canvas: &Canvas,
         node: &Node,
         bounds: Rect,
-        inherited_clip: Rect,
         opacity: f32,
     ) -> Result<(), String> {
-        let clip = if node.max_lines.is_some() {
-            let Some(clip) = bounds.intersection(inherited_clip) else {
-                return Ok(());
-            };
-            clip
-        } else {
-            inherited_clip
-        };
         let saved = canvas.save();
-        canvas.clip_rect(to_skia_rect(clip), ClipOp::Intersect, false);
+        if node.max_lines.is_some() {
+            canvas.clip_rect(to_skia_rect(bounds), ClipOp::Intersect, false);
+        }
         let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
         let padding_y = node.style.padding_y.unwrap_or(node.style.padding);
         let layout = self
@@ -455,16 +465,15 @@ impl Painter {
         canvas: &Canvas,
         node: &Node,
         bounds: Rect,
-        inherited_clip: Rect,
         opacity: f32,
         active: Option<&mut TextInputEditor>,
     ) -> Result<(), String> {
         let content = text_input_content(node, bounds);
-        let Some(clip) = content.intersection(inherited_clip) else {
+        if content.width <= 0.0 || content.height <= 0.0 {
             return Ok(());
-        };
+        }
         let saved = canvas.save();
-        canvas.clip_rect(to_skia_rect(clip), ClipOp::Intersect, false);
+        canvas.clip_rect(to_skia_rect(content), ClipOp::Intersect, false);
 
         if let Some(editor) = active {
             editor.prepare(node, content.width);
@@ -552,7 +561,7 @@ impl Painter {
         )
     }
 
-    fn draw_image(&mut self, canvas: &Canvas, node: &Node, bounds: Rect, scale: f32, opacity: f32) {
+    fn draw_image(&mut self, canvas: &Canvas, node: &Node, bounds: Rect, scale: f64, opacity: f32) {
         let area = image_area(node, bounds);
         let Some((image, width, height)) =
             self.images.get(&node.image, node.image_fit, area, scale)
@@ -588,6 +597,58 @@ impl Drop for Painter {
             self.context.release_resources_and_abandon();
         }
     }
+}
+
+fn sync_clip_chain(
+    canvas: &Canvas,
+    layout: &Layout,
+    target: usize,
+    surface_matrix: &M44,
+    active: &mut Vec<usize>,
+) -> Result<(), String> {
+    let mut cursor = Some(target);
+    let mut tail = Vec::new();
+    while let Some(index) = cursor {
+        let region = layout
+            .clip_region(index)
+            .ok_or("layout refers to a missing clip region")?;
+        while active.len() > region.depth + 1 {
+            active.pop();
+            canvas.restore();
+        }
+        if active.get(region.depth) == Some(&index) {
+            break;
+        }
+        tail.push(index);
+        cursor = region.parent;
+    }
+    if cursor.is_none() {
+        while active.pop().is_some() {
+            canvas.restore();
+        }
+    }
+    for index in tail.into_iter().rev() {
+        let region = layout
+            .clip_region(index)
+            .ok_or("layout refers to a missing clip region")?;
+        canvas.save();
+        set_surface_transform(canvas, surface_matrix, region.transform)?;
+        canvas.clip_rect(to_skia_rect(region.bounds), ClipOp::Intersect, false);
+        canvas.set_matrix(surface_matrix);
+        active.push(index);
+    }
+    Ok(())
+}
+
+fn set_surface_transform(
+    canvas: &Canvas,
+    surface_matrix: &M44,
+    transform: Affine,
+) -> Result<(), String> {
+    let [xx, xy, tx, yx, yy, ty] = transform.skia_values()?;
+    canvas.set_matrix(surface_matrix);
+    canvas.concat(&Matrix::new_all(xx, xy, tx, yx, yy, ty, 0.0, 0.0, 1.0));
+    Ok(())
 }
 
 fn draw_layout(

@@ -522,6 +522,12 @@ pub struct Style {
     pub background: Color,
     pub foreground: Color,
     pub opacity: f32,
+    pub translate_x: f32,
+    pub translate_y: f32,
+    pub scale_x: f32,
+    pub scale_y: f32,
+    pub rotation: f32,
+    pub transform_origin: TransformOrigin,
 }
 
 impl Default for Style {
@@ -565,6 +571,32 @@ impl Default for Style {
             background: Color::TRANSPARENT,
             foreground: Color::WHITE,
             opacity: 1.0,
+            translate_x: 0.0,
+            translate_y: 0.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            rotation: 0.0,
+            transform_origin: TransformOrigin::default(),
+        }
+    }
+}
+
+/// a transform pivot relative to a widget's border box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransformOrigin {
+    pub x: f32,
+    pub y: f32,
+    pub offset_x: f32,
+    pub offset_y: f32,
+}
+
+impl Default for TransformOrigin {
+    fn default() -> Self {
+        Self {
+            x: 0.5,
+            y: 0.5,
+            offset_x: 0.0,
+            offset_y: 0.0,
         }
     }
 }
@@ -1064,6 +1096,47 @@ impl Node {
         }
         if !style.font_weight.is_finite() || !(1.0..=1000.0).contains(&style.font_weight) {
             return Err(TreeError("font weight must be between 1 and 1000".into()));
+        }
+        if [style.translate_x, style.translate_y]
+            .into_iter()
+            .any(|value| !value.is_finite() || !(-100_000.0..=100_000.0).contains(&value))
+        {
+            return Err(TreeError(
+                "transform translation must be finite and between -100,000 and 100,000".into(),
+            ));
+        }
+        if [style.scale_x, style.scale_y]
+            .into_iter()
+            .any(|value| !value.is_finite() || !(-100.0..=100.0).contains(&value))
+        {
+            return Err(TreeError(
+                "transform scale must be finite and between -100 and 100".into(),
+            ));
+        }
+        if !style.rotation.is_finite() || !(-1_000_000.0..=1_000_000.0).contains(&style.rotation) {
+            return Err(TreeError(
+                "transform rotation must be finite and between -1,000,000 and 1,000,000 degrees"
+                    .into(),
+            ));
+        }
+        if [style.transform_origin.x, style.transform_origin.y]
+            .into_iter()
+            .any(|value| !value.is_finite() || !(-10.0..=10.0).contains(&value))
+        {
+            return Err(TreeError(
+                "transform origin fractions must be finite and between -10 and 10".into(),
+            ));
+        }
+        if [
+            style.transform_origin.offset_x,
+            style.transform_origin.offset_y,
+        ]
+        .into_iter()
+        .any(|value| !value.is_finite() || !(-100_000.0..=100_000.0).contains(&value))
+        {
+            return Err(TreeError(
+                "transform origin offsets must be finite and between -100,000 and 100,000".into(),
+            ));
         }
         if matches!(self.kind, Kind::Slider | Kind::Range) {
             self.slider.validate()?;
@@ -1741,6 +1814,33 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+    }
+
+    #[test]
+    fn visual_transform_limits_allow_mirroring_external_pivots_and_zero_scale() {
+        let mut node = Node::new(NodeId(1), Kind::Row);
+        node.style.translate_x = -100_000.0;
+        node.style.scale_x = -1.0;
+        node.style.scale_y = 0.0;
+        node.style.rotation = 1_000_000.0;
+        node.style.transform_origin = TransformOrigin {
+            x: -2.0,
+            y: 3.0,
+            offset_x: 40.0,
+            offset_y: -20.0,
+        };
+        assert!(node.validate().is_ok());
+
+        node.style.scale_x = 100.01;
+        assert!(node.validate().unwrap_err().to_string().contains("scale"));
+        node.style.scale_x = 1.0;
+        node.style.transform_origin.x = f32::NAN;
+        assert!(
+            node.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("origin fractions")
         );
     }
 

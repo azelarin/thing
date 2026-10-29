@@ -116,6 +116,15 @@ CASES = (
             "Expected this to be 'number', but got",
         ),
     ),
+    Case(
+        "invalid-transforms.luau",
+        (
+            "Property 'translate_x' is not compatible.",
+            "Property 'rotation' is not compatible.",
+            "Property 'x' is not compatible.",
+            "Property 'offset_y' is not compatible.",
+        ),
+    ),
 )
 
 

@@ -1494,7 +1494,6 @@ impl Runtime {
             for surface in &candidate {
                 surface.root.validate().map_err(Error::external)?;
             }
-            validate(&candidate).map_err(Error::runtime)?;
             let mut target = candidate.clone();
             for (index, binding) in &self.bindings {
                 if retired.contains(index) {
@@ -1515,7 +1514,13 @@ impl Runtime {
             for surface in &target {
                 surface.root.validate().map_err(Error::external)?;
             }
-            validate(&target).map_err(Error::runtime)?;
+            // target geometry must be representable before animation starts,
+            // but the displayed candidate is validated last so a successful
+            // host can retain and reuse that exact layout plan.
+            if target != candidate {
+                validate(&target).map_err(Error::runtime)?;
+            }
+            validate(&candidate).map_err(Error::runtime)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -2770,7 +2775,7 @@ mod managed_process_tests {
 
 #[cfg(test)]
 mod transition_tests {
-    use std::{fs, time::Duration};
+    use std::{cell::Cell, fs, time::Duration};
 
     use tempfile::TempDir;
     use thing_core::Color;
@@ -3298,6 +3303,66 @@ mod transition_tests {
     }
 
     #[test]
+    fn checked_refresh_validates_the_displayed_frame_last_before_cache_commit() {
+        let source = r#"
+            local expanded = ui.state(false)
+            return ui.panel { children = {
+                ui.button { on_click = function() expanded:set(true) end },
+                ui.row { style = { width = ui.transition(function()
+                    return expanded:get() and 200 or 100
+                end, { duration = 100, easing = 'linear' }) } },
+            } }
+        "#;
+        let (_directory, _path, mut runtime) = load(source);
+        let button = root(&runtime).children[0].id;
+        let last_plan = Cell::new(77.0_f32);
+        let candidate_plan = Cell::new(None);
+        let reject_displayed = |surfaces: &[SurfaceTree]| {
+            let width = surfaces[0].root.children[1].style.width.unwrap();
+            candidate_plan.set(Some(width));
+            if (width - 100.0).abs() < 0.001 {
+                Err("displayed frame is unsupported".into())
+            } else {
+                Ok(())
+            }
+        };
+        let failed = runtime.dispatch_inner_checked(
+            button,
+            Event::Click,
+            Some(Instant::now()),
+            &reject_displayed,
+        );
+        if failed.is_ok() {
+            last_plan.set(candidate_plan.get().unwrap());
+        }
+        assert!(failed.is_err());
+        close(last_plan.get(), 77.0);
+        close(root(&runtime).children[1].style.width.unwrap(), 100.0);
+
+        let (_directory, _path, mut runtime) = load(source);
+        let button = root(&runtime).children[0].id;
+        let validations = std::cell::RefCell::new(Vec::new());
+        let result = runtime.dispatch_inner_checked(
+            button,
+            Event::Click,
+            Some(Instant::now()),
+            &|surfaces: &[SurfaceTree]| {
+                let width = surfaces[0].root.children[1].style.width.unwrap();
+                validations.borrow_mut().push(width);
+                candidate_plan.set(Some(width));
+                Ok(())
+            },
+        );
+        if result.is_ok() {
+            last_plan.set(candidate_plan.get().unwrap());
+        }
+        assert!(result.unwrap());
+        assert_eq!(&*validations.borrow(), &[200.0, 100.0]);
+        close(last_plan.get(), 100.0);
+        close(root(&runtime).children[1].style.width.unwrap(), 100.0);
+    }
+
+    #[test]
     fn checked_advance_rejects_an_intermediate_frame_without_advancing_state() {
         let (_directory, _path, mut runtime) = load(
             r#"
@@ -3685,5 +3750,40 @@ mod transition_tests {
         assert_eq!(style.pressed_overlay, Color([0x41, 0x42, 0x43, 0x44]));
         assert_eq!(style.focus_ring_color, Color([0x51, 0x52, 0x53, 0x54]));
         assert!(!runtime.has_active_transitions());
+    }
+
+    #[test]
+    fn reactive_transform_properties_publish_together_or_preserve_the_previous_style() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local invalid = ui.state(false)
+            return ui.panel { children = {
+                ui.button { on_click = function() invalid:set(true) end },
+                ui.row { style = {
+                    translate_x = function() return invalid:get() and 20 or 4 end,
+                    scale_x = function() return invalid:get() and 101 or -1 end,
+                    rotation = function() return invalid:get() and 30 or 15 end,
+                    transform_origin = function()
+                        return { x = invalid:get() and 2 or 0, y = 1, offset_x = 3 }
+                    end,
+                } },
+            } }
+            "#,
+        );
+        let button = root(&runtime).children[0].id;
+        let style = &root(&runtime).children[1].style;
+        close(style.translate_x, 4.0);
+        close(style.scale_x, -1.0);
+        close(style.rotation, 15.0);
+        close(style.transform_origin.x, 0.0);
+        close(style.transform_origin.y, 1.0);
+        close(style.transform_origin.offset_x, 3.0);
+
+        assert!(runtime.dispatch(button, Event::Click).is_err());
+        let style = &root(&runtime).children[1].style;
+        close(style.translate_x, 4.0);
+        close(style.scale_x, -1.0);
+        close(style.rotation, 15.0);
+        close(style.transform_origin.x, 0.0);
     }
 }

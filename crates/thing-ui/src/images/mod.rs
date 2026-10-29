@@ -31,6 +31,12 @@ impl Key {
             .map(|bits| f64::from_bits(bits.get()))
             .unwrap_or_else(|| f64::from(self.width) / f64::from(self.height))
     }
+
+    fn same_request_identity(&self, other: &Self) -> bool {
+        self.image == other.image
+            && self.fit == other.fit
+            && self.cover_aspect_bits == other.cover_aspect_bits
+    }
 }
 
 struct Pixels {
@@ -190,7 +196,7 @@ impl Images {
         image: &Image,
         fit: ImageFit,
         bounds: Rect,
-        scale: f32,
+        scale: f64,
     ) -> Option<(SkiaImage, u32, u32)> {
         if image.source.is_none()
             && image.memory.is_none()
@@ -206,33 +212,74 @@ impl Images {
         self.tick = self.tick.saturating_add(1);
         if let Some(entry) = self.cache.get_mut(&key) {
             entry.touched = self.tick;
-            return match &entry.state {
+            if let State::Ready {
+                image,
+                width,
+                height,
+            } = &entry.state
+            {
+                return Some((image.clone(), *width, *height));
+            }
+        }
+
+        let fallback = self
+            .cache
+            .iter()
+            .filter(|(candidate, entry)| {
+                candidate.same_request_identity(&key) && matches!(entry.state, State::Ready { .. })
+            })
+            .min_by_key(|(candidate, _)| {
+                let sufficient = candidate.width >= key.width && candidate.height >= key.height;
+                (
+                    !sufficient,
+                    if sufficient {
+                        u64::from(candidate.width) * u64::from(candidate.height)
+                    } else {
+                        u64::MAX - u64::from(candidate.width) * u64::from(candidate.height)
+                    },
+                )
+            })
+            .map(|(candidate, _)| candidate.clone());
+        if let Some(entry) = fallback.as_ref().and_then(|key| self.cache.get_mut(key)) {
+            entry.touched = self.tick;
+        }
+
+        let pending = self.cache.iter().any(|(candidate, entry)| {
+            candidate.same_request_identity(&key) && matches!(entry.state, State::Pending)
+        });
+        if !self.cache.contains_key(&key)
+            && !pending
+            && lock(&self.shared.inbox).requests.len() < 32
+        {
+            while self.cache.len() >= 128 {
+                if !self.evict(fallback.as_ref()) {
+                    break;
+                }
+            }
+            if self.cache.len() < 128 {
+                self.cache.insert(
+                    key.clone(),
+                    Entry {
+                        state: State::Pending,
+                        touched: self.tick,
+                    },
+                );
+                lock(&self.shared.inbox).requests.push_back(key);
+                self.shared.changed.notify_one();
+            }
+        }
+
+        fallback.and_then(|key| {
+            let entry = self.cache.get(&key)?;
+            match &entry.state {
                 State::Ready {
                     image,
                     width,
                     height,
                 } => Some((image.clone(), *width, *height)),
                 _ => None,
-            };
-        }
-        if lock(&self.shared.inbox).requests.len() >= 32 {
-            return None;
-        }
-        while self.cache.len() >= 128 {
-            if !self.evict(None) {
-                return None;
             }
-        }
-        self.cache.insert(
-            key.clone(),
-            Entry {
-                state: State::Pending,
-                touched: self.tick,
-            },
-        );
-        lock(&self.shared.inbox).requests.push_back(key);
-        self.shared.changed.notify_one();
-        None
+        })
     }
 
     fn evict(&mut self, except: Option<&Key>) -> bool {
@@ -281,14 +328,15 @@ impl Images {
     }
 }
 
-fn request_dimensions(bounds: Rect, scale: f32) -> (u32, u32) {
+fn request_dimensions(bounds: Rect, scale: f64) -> (u32, u32) {
+    let scale = (scale.max(0.0) * 4.0).ceil() / 4.0;
     (
-        (bounds.width * scale).ceil().clamp(1.0, 4096.0) as u32,
-        (bounds.height * scale).ceil().clamp(1.0, 4096.0) as u32,
+        (f64::from(bounds.width) * scale).ceil().clamp(1.0, 4096.0) as u32,
+        (f64::from(bounds.height) * scale).ceil().clamp(1.0, 4096.0) as u32,
     )
 }
 
-fn request_key(image: &Image, fit: ImageFit, bounds: Rect, scale: f32) -> Key {
+fn request_key(image: &Image, fit: ImageFit, bounds: Rect, scale: f64) -> Key {
     let (width, height) = request_dimensions(bounds, scale);
     let cover_aspect_bits = (fit == ImageFit::Cover).then(|| {
         let aspect = f64::from(bounds.width) / f64::from(bounds.height);
@@ -863,6 +911,9 @@ mod tests {
             ..Rect::default()
         };
         assert_eq!(request_dimensions(bounds, 1.25), (126, 51));
+        assert_eq!(request_dimensions(bounds, 1.01), (126, 51));
+        assert_eq!(request_dimensions(bounds, 1.24), (126, 51));
+        assert_eq!(request_dimensions(bounds, 1.26), (151, 61));
         assert_eq!(
             request_dimensions(
                 Rect {
@@ -873,6 +924,83 @@ mod tests {
                 2.0,
             ),
             (4096, 1)
+        );
+    }
+
+    #[test]
+    fn a_pending_scale_upgrade_reuses_one_ready_image_without_queue_churn() {
+        let image = Image {
+            source: Some("missing.png".into()),
+            ..Image::default()
+        };
+        let ready_bounds = Rect {
+            width: 20.0,
+            height: 10.0,
+            ..Rect::default()
+        };
+        let ready_key = request_key(&image, ImageFit::Fill, ready_bounds, 1.0);
+        let info = ImageInfo::new((20, 10), ColorType::RGBA8888, AlphaType::Premul, None);
+        let raster =
+            skia_images::raster_from_data(&info, Data::new_copy(&vec![0; 20 * 10 * 4]), 20 * 4)
+                .unwrap();
+        let shared = Arc::new(Shared::default());
+        let mut cache = BTreeMap::new();
+        cache.insert(
+            ready_key,
+            Entry {
+                state: State::Ready {
+                    image: raster,
+                    width: 20,
+                    height: 10,
+                },
+                touched: 0,
+            },
+        );
+        let mut images = Images {
+            shared: shared.clone(),
+            cache,
+            retired: Vec::new(),
+            bytes: 20 * 10 * 4,
+            retired_bytes: 0,
+            tick: 0,
+        };
+
+        let first = images
+            .get(
+                &image,
+                ImageFit::Fill,
+                Rect {
+                    width: 40.0,
+                    height: 20.0,
+                    ..Rect::default()
+                },
+                1.0,
+            )
+            .unwrap();
+        assert_eq!((first.1, first.2), (20, 10));
+        assert_eq!(lock(&shared.inbox).requests.len(), 1);
+
+        let second = images
+            .get(
+                &image,
+                ImageFit::Fill,
+                Rect {
+                    width: 80.0,
+                    height: 40.0,
+                    ..Rect::default()
+                },
+                1.0,
+            )
+            .unwrap();
+        assert_eq!((second.1, second.2), (20, 10));
+        assert_eq!(lock(&shared.inbox).requests.len(), 1);
+        assert_eq!(
+            images
+                .cache
+                .values()
+                .filter(|entry| matches!(entry.state, State::Pending))
+                .count(),
+            1
         );
     }
 

@@ -885,9 +885,13 @@ put layout and paint values in `style`. dimensions use logical pixels.
 | `background` | transparent |
 | `foreground` | white |
 | `opacity` | `1` |
+| `translate_x`, `translate_y`, `rotation` | `0` |
+| `scale_x`, `scale_y` | `1` |
+| `transform_origin` | `{ x = 0.5, y = 0.5, offset_x = 0, offset_y = 0 }` |
 
-colors use `#RRGGBB` or `#RRGGBBAA`. numeric style values must be finite and between
-0 and 100,000; opacity and disabled opacity are between 0 and 1. parent opacity
+colors use `#RRGGBB` or `#RRGGBBAA`. numeric style values must be finite. sizes,
+spacing, and radii are between 0 and 100,000; opacity and disabled opacity are
+between 0 and 1. parent opacity
 multiplies child opacity. a disabled ancestor applies its disabled opacity to the
 whole branch without compounding it at every descendant.
 `start` and `end` text alignment follow the text direction. other style values do
@@ -923,6 +927,44 @@ min, max, and fractional dimensions are for widgets inside a surface. they are
 rejected on a root panel or popup because wayland surfaces are either given an
 exact size or filled by the compositor. use `width` and `height` for the surface,
 then put the responsive or constrained dimension on an inner container.
+
+### visual transforms
+
+translation, signed scale, and rotation change how a widget and its descendants
+are painted without changing flex layout, scrolling limits, the wayland surface
+size, or a panel's compositor input region:
+
+```luau
+style = {
+    translate_x = 12,
+    translate_y = -4,
+    scale_x = -1,
+    scale_y = 1,
+    rotation = 15,
+    transform_origin = { x = 0.5, y = 1, offset_x = 0, offset_y = 4 },
+}
+```
+
+translation and origin offsets use logical pixels. rotation is clockwise in
+degrees. origin x and y are fractions of the widget's border box: `0` is the
+start edge, `0.5` the center, and `1` the end edge. fractions outside that range
+place the pivot outside the widget. local scale is applied first, then rotation,
+then translation in the parent's axes. transforms on ancestors compose with
+their descendants.
+
+painting, clips, pointer input, sliders, text selection, input-method cursor
+geometry, and popup anchors use the same transformed geometry. a negative scale
+mirrors input with the drawing. a zero scale is allowed, but the resulting
+singular branch cannot receive pointer input; its widgets remain available to
+semantic keyboard focus. tab order, `ui.reveal`, flex placement, and scroll
+extent continue to use the stable untransformed layout.
+
+translation and origin offsets are limited to `-100000` through `100000`, scale
+to `-100` through `100`, rotation to `-1000000` through `1000000`, and origin
+fractions to `-10` through `10`. each transform property may be reactive. they
+update immediately and are not currently accepted by `ui.transition` or
+`ui.spring`. an update whose nested transform cannot be represented by the
+renderer is rejected, leaving the last valid scene active.
 
 set an overlay color to transparent or the focus ring width to `0` to remove that
 part of the built-in interaction appearance. for example, this keeps only a thin
