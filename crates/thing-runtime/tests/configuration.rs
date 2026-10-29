@@ -630,7 +630,8 @@ fn pointer_areas_require_handlers_and_reject_focus_semantics() {
         "return ui.panel { children = { ui.pointer_area { on_scroll = true } } }",
         "return ui.panel { children = { ui.pointer_area { autofocus = true, on_pointer = function() end } } }",
         "return ui.panel { children = { ui.row { on_pointer = function() end } } }",
-        "return ui.panel { children = { ui.row { on_scroll = function() end } } }",
+        "return ui.panel { children = { ui.text { on_scroll = function() end } } }",
+        "return ui.panel { children = { ui.image { on_scroll = function() end } } }",
     ] {
         let (_directory, path) = fixture(source);
         assert!(Runtime::load(path).is_err(), "accepted {source}");
@@ -683,6 +684,77 @@ fn scroll_only_pointer_areas_receive_readonly_metadata_without_press_semantics()
     assert!(!outcome.consumed);
     assert_eq!(runtime.root().unwrap().children[1].text, "received");
     assert!(runtime.active_pointer_target().is_none());
+}
+
+#[test]
+fn containers_handle_scroll_without_becoming_controls() {
+    let (_directory, path) = fixture(
+        r#"
+        local log = ui.state('')
+        local function record(name)
+            return function(x, y, event)
+                log:set(`{log:get()}{name}:{x},{y},{event.local_x},{event.source};`)
+                return name == 'panel'
+            end
+        end
+        return ui.panel {
+            on_scroll = record('panel'),
+            children = {
+                ui.row { on_scroll = record('row') },
+                ui.column { on_scroll = record('column') },
+                ui.centerbox {
+                    on_scroll = record('centerbox'),
+                    children = { ui.row {}, ui.row {}, ui.row {} },
+                },
+                ui.stack { on_scroll = record('stack') },
+                ui.scroll { on_scroll = record('scroll') },
+                ui.button { children = { ui.popup { on_scroll = record('popup') } } },
+                ui.text { text = function() return log:get() end },
+            },
+        }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    let root = runtime.root().unwrap().clone();
+    let mut handlers = vec![root.id];
+    handlers.extend(root.children[..5].iter().map(|node| node.id));
+    handlers.push(root.children[5].children[0].id);
+    for id in &handlers {
+        let node = root.find(*id).unwrap();
+        assert!(!node.kind.is_interactive(), "{:?}", node.kind);
+        assert!(runtime.focus_target(*id).is_none(), "{:?}", node.kind);
+        assert!(runtime.pointer_target(*id).is_none(), "{:?}", node.kind);
+        let target = runtime.scroll_target(*id).unwrap();
+        let mut input = scroll_input();
+        input.x = -0.5;
+        input.y = 0.25;
+        let outcome = runtime
+            .dispatch_scroll_checked(&target, input, |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome.consumed,
+            node.kind == Kind::Panel,
+            "{:?}",
+            node.kind
+        );
+    }
+    assert_eq!(
+        runtime.root().unwrap().children[6].text,
+        "panel:-0.5,0.25,4,wheel;row:-0.5,0.25,4,wheel;column:-0.5,0.25,4,wheel;\
+         centerbox:-0.5,0.25,4,wheel;stack:-0.5,0.25,4,wheel;scroll:-0.5,0.25,4,wheel;\
+         popup:-0.5,0.25,4,wheel;"
+    );
+
+    let (_directory, path) =
+        fixture("return ui.lock { on_scroll = function() end, children = { ui.secret_input {} } }");
+    assert!(
+        Runtime::load_lock(path)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("on_scroll is not supported on Lock")
+    );
 }
 
 #[test]

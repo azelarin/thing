@@ -1911,8 +1911,13 @@ mod tests {
         )
         .unwrap();
         let point = Point { x: 10.0, y: 10.0 };
-        assert_eq!(layout.scroll_event_target(point), Some(area));
-        assert_eq!(layout.scroll_targets(point), [scroll]);
+        assert_eq!(
+            layout.scroll_route(point),
+            [
+                thing_ui::ScrollStep::Viewport(scroll),
+                thing_ui::ScrollStep::Handler(area)
+            ]
+        );
         let (consumer, targets) = configurations.presented_targets(&1, root, &layout).unwrap();
         let area_target = targets.get(&area).unwrap().clone();
         let scroll_target = targets.get(&scroll).unwrap().clone();

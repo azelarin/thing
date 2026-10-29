@@ -129,6 +129,13 @@ impl Applications {
         )
     }
 
+    /// a worker that watches no directories, for host tests.
+    #[cfg(test)]
+    pub(crate) fn inert() -> io::Result<Self> {
+        let (ping, _) = calloop::ping::make_ping()?;
+        Self::start_with(Environment::default(), ping)
+    }
+
     fn start_with(environment: Environment, ping: Ping) -> io::Result<Self> {
         let (wake, reader) = UnixStream::pair()?;
         wake.set_nonblocking(true)?;

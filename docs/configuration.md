@@ -214,6 +214,7 @@ surface properties belong on the root `ui.panel`.
 | `input_region` | whole surface | pointer and touch input rectangles, or `false` for click-through |
 | `idle_inhibit` | `false` | ask the compositor to suppress idle behavior while this surface is visible and relevant |
 | `on_key` | absent | handles keyboard presses while the surface has keyboard focus |
+| `on_scroll` | absent | handles wheel input that reaches the panel; see [wheel events](#wheel-events) |
 
 `edge` is the convenient form for bars. a top or bottom bar fills the output
 width unless `style.width` is set; its height defaults to 36 logical pixels. a
@@ -336,8 +337,8 @@ widget kind; unkeyed children match by position and kind.
 | `pointer_area` | `children`, with at least one of `on_pointer` or `on_scroll` |
 | `slider` | `min`, `max`, `value`, `step`, `on_change`, `on_hover` |
 | `range` | `children`, `min`, `max`, `value`, `step`, `inset`, `on_change`, `on_hover`, `on_pressed` |
-| `popup` | `visible`, `open_on_hover`, `open_on_click`, `open_delay`, `close_delay`, `anchor`, `alignment`, `offset`, `constraints`, `on_key`, `on_hover`, `on_close` |
-| containers | `children`: array of widgets, or a function returning one |
+| `popup` | `visible`, `open_on_hover`, `open_on_click`, `open_delay`, `close_delay`, `anchor`, `alignment`, `offset`, `constraints`, `on_key`, `on_scroll`, `on_hover`, `on_close` |
+| containers | `children`: array of widgets, or a function returning one; optional `on_scroll` |
 
 use a positive `max_lines` to limit a text widget. omitted lines are clipped by
 default. `overflow = 'ellipsis'` adds an ellipsis, but currently supports only
@@ -412,10 +413,9 @@ an explicit height, or use `grow = 1` inside a column whose height is already
 bounded. otherwise it grows to fit its children and has nowhere to scroll. one
 wheel step moves 40 logical pixels; high-resolution input keeps fractional
 movement. nested viewports keep the event until they reach the limit in that
-direction, then the next event moves the outer viewport. the deepest button or
-pointer area with an `on_scroll` handler receives the event first. returning
-`false` allows the same event to move the presented viewport; returning `true`
-or nothing consumes it.
+direction, then the next event moves the outer viewport. handlers and viewports
+share one route from the widget under the pointer outward, described in
+[wheel events](#wheel-events).
 
 the offset stays with the scroll widget while reactive updates preserve its
 identity, including while it is hidden, and is clamped when its content shrinks.
@@ -505,10 +505,65 @@ wheels retain fractional steps. for continuous devices without wheel-step data,
 while `surface_x` and `surface_y` are logical surface coordinates. `source` is
 `wheel`, `finger`, `continuous`, `wheel_tilt`, or `unknown`; the remaining fields
 report the `shift`, `ctrl`, `alt`, and `logo` modifiers. the event table is
-read-only. a handler error discards actions queued by that callback and stops the
-built-in scroll fallback. it does not undo arbitrary changes already made to
-luau values. a scroll gesture does not open a grabbed popup. buttons remain
+read-only. a scroll gesture does not open a grabbed popup. buttons remain
 keyboard-activatable through the primary `on_click` handler.
+
+### wheel events
+
+buttons, pointer areas, panels, popups, and the `row`, `column`, `centerbox`,
+`stack`, and `scroll` containers accept `on_scroll`. a container handler covers
+the container's whole box, including background that no child uses, and the
+container stays a container: it does not become clickable, focusable, or a
+press target. this lets a bar or calendar react to the wheel without wrapping
+its layout in a button:
+
+```luau
+local month = ui.state(0)
+
+ui.column {
+    on_scroll = function(x, y)
+        local step = if x ~= 0 then x else y
+        if step == 0 then
+            return false
+        end
+        month:set(month:get() + (if step > 0 then 1 else -1))
+    end,
+    children = {
+        ui.text { text = function() return `month offset {month:get()}` end },
+    },
+}
+```
+
+each wheel event follows one route: the topmost widget under the pointer, then
+its ancestors in order. the widgets in that branch get their turn from the
+inside out: a widget's own `on_scroll` handler runs first, and a `scroll`
+container then moves its content. returning `true` or nothing consumes the
+event. returning `false` passes it to the next widget on the route, and a
+viewport that is already at its limit in that direction passes it on as well.
+every handler receives the same deltas and metadata, with `local_x` and
+`local_y` in its own coordinates.
+
+this replaces the earlier rule, in which only the deepest button or pointer area
+ran and then the viewports under it scrolled. a scroll view inside a handler's
+widget now moves before that handler runs, so the handler sees the event only
+once the view reaches its limit. a handler that should act before a scroll view
+belongs on the `scroll` widget itself or inside it.
+
+only that branch is considered. a sibling that is covered by another widget
+does not receive the event, even when the covering widget has no handler.
+clipped parts of a widget, hidden and disabled widgets, and widgets whose
+transform collapses them cannot be on the route.
+
+the route is fixed when the event arrives. a handler may change, hide, or
+replace widgets, including its own ancestors, but the event never moves to a
+different widget: before each step, thing checks that the next widget is still
+the one that was under the pointer, keeping its key, and stops when it is not.
+a handler that removes the surface also ends the route. an error in a handler,
+an invalid return value, or an update that fails validation ends the route too,
+and discards the actions that callback queued. it does not undo
+changes already made to luau values.
+
+wheel input reaches panels and popups. lock surfaces do not deliver wheel events.
 
 `on_hover(inside)` receives `true` when the pointer enters a button, slider,
 range, or popup and `false` when it leaves. moving between a control and its
