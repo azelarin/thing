@@ -2,7 +2,11 @@
 use std::time::Duration;
 
 use thing_core::Node;
+#[cfg(test)]
+use thing_ui::Measurer;
 use thing_ui::{Layout, PaintFrame, Painter, ScrollState, Size};
+#[cfg(test)]
+use wayland_client::protocol::wl_buffer;
 use wayland_client::{Connection, protocol::wl_surface::WlSurface};
 
 use crate::{Renderer, egl};
@@ -32,12 +36,19 @@ enum Backend {
         graphics: vulkan::Graphics,
         painter: Option<Box<Painter>>,
     },
+    #[cfg(test)]
+    Test {
+        buffer: wl_buffer::WlBuffer,
+        size: (u32, u32),
+    },
 }
 
 pub enum Window {
     OpenGl(egl::Window),
     #[cfg(feature = "vulkan")]
     Vulkan(vulkan::Window),
+    #[cfg(test)]
+    Test(WlSurface),
 }
 
 impl Drop for Render {
@@ -47,6 +58,13 @@ impl Drop for Render {
 }
 
 impl Render {
+    #[cfg(test)]
+    pub(crate) fn new_test(buffer: wl_buffer::WlBuffer, size: (u32, u32)) -> Self {
+        Self {
+            backend: Backend::Test { buffer, size },
+        }
+    }
+
     pub fn new(
         renderer: Renderer,
         connection: &Connection,
@@ -106,6 +124,10 @@ impl Render {
                     .ok_or("vulkan painter is unavailable")?
                     .reset(wake)?;
             }
+            #[cfg(test)]
+            Backend::Test { .. } => {
+                let _ = wake;
+            }
         }
         Ok(())
     }
@@ -123,6 +145,13 @@ impl Render {
             #[cfg(feature = "vulkan")]
             Backend::Vulkan { graphics, .. } => {
                 vulkan::Window::new(graphics, surface, width, height).map(Window::Vulkan)
+            }
+            #[cfg(test)]
+            Backend::Test { size, .. } => {
+                if *size != (width, height) {
+                    return Err("test buffer does not match the lock surface size".into());
+                }
+                Ok(Window::Test(surface.clone()))
             }
         }
     }
@@ -143,6 +172,10 @@ impl Render {
                 .as_deref_mut()
                 .ok_or("vulkan painter is unavailable")?
                 .layout(root, size, scroll),
+            #[cfg(test)]
+            Backend::Test { .. } => {
+                Layout::compute_with_scroll(root, size, scroll, &mut TestMeasurer)
+            }
         }
     }
 
@@ -174,7 +207,18 @@ impl Render {
                 frame,
                 before_present,
             ),
-            #[cfg(feature = "vulkan")]
+            #[cfg(test)]
+            (Backend::Test { buffer, size }, Window::Test(surface)) => {
+                if frame.physical != *size {
+                    return Err("test frame does not match its shared-memory buffer".into());
+                }
+                before_present();
+                surface.attach(Some(buffer), 0, 0);
+                surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+                surface.commit();
+                Ok(FrameResult::Presented { redraw: false })
+            }
+            #[cfg(any(feature = "vulkan", test))]
             _ => Err("render surface belongs to a different graphics backend".into()),
         }
     }
@@ -192,6 +236,8 @@ impl Render {
                     .free_gpu_resources();
                 Ok(())
             }
+            #[cfg(test)]
+            Backend::Test { .. } => Ok(()),
         }
     }
 
@@ -200,6 +246,8 @@ impl Render {
             Backend::OpenGl { .. } => Ok(()),
             #[cfg(feature = "vulkan")]
             Backend::Vulkan { graphics, .. } => graphics.check_error(),
+            #[cfg(test)]
+            Backend::Test { .. } => Ok(()),
         }
     }
 
@@ -216,7 +264,19 @@ impl Render {
                 }
                 painter.take();
             }
+            #[cfg(test)]
+            Backend::Test { .. } => {}
         }
+    }
+}
+
+#[cfg(test)]
+struct TestMeasurer;
+
+#[cfg(test)]
+impl Measurer for TestMeasurer {
+    fn measure(&mut self, _: &Node, _: Option<f32>) -> Size {
+        Size::default()
     }
 }
 

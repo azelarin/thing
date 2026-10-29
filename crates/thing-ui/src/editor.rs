@@ -484,6 +484,13 @@ impl TextInputEditor {
         self.ensure_caret_visible();
     }
 
+    pub(crate) fn select_byte_range(&mut self, anchor: usize, focus: usize) {
+        self.editor
+            .driver(&mut self.fonts, &mut self.context)
+            .select_byte_range(anchor, focus);
+        self.ensure_caret_visible();
+    }
+
     pub fn move_to_point(&mut self, x: f32, y: f32) {
         self.cancel_composition();
         let before = self.display_selection();

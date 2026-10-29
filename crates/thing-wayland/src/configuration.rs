@@ -6,11 +6,11 @@ use std::{
 
 use thing_core::{Node, NodeId};
 use thing_runtime::{
-    Action, AudioSnapshot, ClipboardSnapshot, Event, KeyInput, ManagedProcessDefinition,
-    ManagedProcessSnapshot, ManagedProcessState, MediaSnapshot, NiriState, NotificationSnapshot,
-    OutputContext, PointerDispatchOutcome as RuntimePointerOutcome, PointerEvent, PowerSnapshot,
-    Runtime, Scalar, ScrollInput, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTraySnapshot,
-    UiAction, UiTarget,
+    Action, AudioSnapshot, AuthenticationSnapshot, ClipboardSnapshot, Event, KeyInput,
+    ManagedProcessDefinition, ManagedProcessSnapshot, ManagedProcessState, MediaSnapshot,
+    NiriState, NotificationSnapshot, OutputContext,
+    PointerDispatchOutcome as RuntimePointerOutcome, PointerEvent, PowerSnapshot, Runtime, Scalar,
+    ScrollInput, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTraySnapshot, UiAction, UiTarget,
 };
 use thing_ui::Layout;
 
@@ -19,6 +19,28 @@ struct Instance<K> {
     consumer: String,
     output: OutputContext,
     runtime: Runtime,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ConfigurationMode {
+    #[default]
+    Shell,
+    Lock,
+}
+
+impl ConfigurationMode {
+    fn load(
+        self,
+        entry: &PathBuf,
+        output: OutputContext,
+        services: &ServiceSnapshot,
+    ) -> Result<Runtime, String> {
+        let runtime = match self {
+            Self::Shell => Runtime::load_for_output(entry, output, services),
+            Self::Lock => Runtime::load_lock_for_output(entry, output, services),
+        };
+        runtime.map_err(|error| error.to_string())
+    }
 }
 
 pub(crate) struct PreparedConfigurations<K> {
@@ -38,6 +60,7 @@ pub(crate) struct PreparedOutput<K> {
 /// loaded configurations and desktop state shared by every output.
 pub(crate) struct Configurations<K> {
     entry: PathBuf,
+    mode: ConfigurationMode,
     services: ServiceSnapshot,
     instances: Vec<Instance<K>>,
     next_consumer: u64,
@@ -155,8 +178,17 @@ impl<K> PreparedOutput<K> {
 
 impl<K: Clone + Eq> Configurations<K> {
     pub(crate) fn new(entry: PathBuf, services: ServiceSnapshot) -> Self {
+        Self::with_mode(entry, services, ConfigurationMode::Shell)
+    }
+
+    pub(crate) fn new_lock(entry: PathBuf, services: ServiceSnapshot) -> Self {
+        Self::with_mode(entry, services, ConfigurationMode::Lock)
+    }
+
+    fn with_mode(entry: PathBuf, services: ServiceSnapshot, mode: ConfigurationMode) -> Self {
         Self {
             entry,
+            mode,
             services,
             instances: Vec::new(),
             next_consumer: 1,
@@ -180,8 +212,9 @@ impl<K: Clone + Eq> Configurations<K> {
         if self.contains(&key) {
             return Ok(None);
         }
-        let runtime = Runtime::load_for_output(&self.entry, output.clone(), &self.services)
-            .map_err(|error| error.to_string())?;
+        let runtime = self
+            .mode
+            .load(&self.entry, output.clone(), &self.services)?;
         validate(&runtime)?;
         let definitions = collect_managed_process_definitions(
             self.instances
@@ -220,7 +253,6 @@ impl<K: Clone + Eq> Configurations<K> {
         self.add_checked(key, output, |_| Ok(()))
     }
 
-    #[cfg(test)]
     pub(crate) fn add_checked(
         &mut self,
         key: K,
@@ -230,7 +262,6 @@ impl<K: Clone + Eq> Configurations<K> {
         self.add_checked_with_processes(key, output, validate, |_| Ok(()))
     }
 
-    #[cfg(test)]
     pub(crate) fn add_checked_with_processes(
         &mut self,
         key: K,
@@ -241,8 +272,9 @@ impl<K: Clone + Eq> Configurations<K> {
         if self.contains(&key) {
             return Ok(());
         }
-        let mut runtime = Runtime::load_for_output(&self.entry, output.clone(), &self.services)
-            .map_err(|error| error.to_string())?;
+        let mut runtime = self
+            .mode
+            .load(&self.entry, output.clone(), &self.services)?;
         validate(&runtime)?;
         let definitions = collect_managed_process_definitions(
             self.instances
@@ -273,7 +305,6 @@ impl<K: Clone + Eq> Configurations<K> {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn remove(&mut self, key: &K) -> Option<String> {
         let removed = self.remove_with_processes(key, |_| Ok(()))?;
         removed
@@ -660,6 +691,24 @@ impl<K: Clone + Eq> Configurations<K> {
         Ok(())
     }
 
+    pub(crate) fn set_authentication(
+        &mut self,
+        authentication: AuthenticationSnapshot,
+    ) -> Result<(), String> {
+        let mut services = self.services.clone();
+        services
+            .set_authentication(authentication.clone())
+            .map_err(|error| error.to_string())?;
+        for instance in &mut self.instances {
+            instance
+                .runtime
+                .set_authentication(authentication.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        self.services = services;
+        Ok(())
+    }
+
     pub(crate) fn set_niri(&mut self, state: NiriState) -> Result<(), String> {
         self.services
             .set_niri(state.clone())
@@ -864,8 +913,7 @@ impl<K: Clone + Eq> Configurations<K> {
             {
                 return Err("duplicate output while reloading configuration".into());
             }
-            let runtime = Runtime::load_for_output(&self.entry, output.clone(), &services)
-                .map_err(|error| error.to_string())?;
+            let runtime = self.mode.load(&self.entry, output.clone(), &services)?;
             validate(&key, &runtime)?;
             let consumer = allocate_consumer(&mut next_consumer)?;
             candidates.push(Instance {
@@ -907,7 +955,6 @@ impl<K: Clone + Eq> Configurations<K> {
         self.reload_for_checked(outputs, |_, _| Ok(()))
     }
 
-    #[cfg(test)]
     pub(crate) fn reload_for_checked(
         &mut self,
         outputs: Vec<(K, OutputContext)>,
@@ -916,7 +963,6 @@ impl<K: Clone + Eq> Configurations<K> {
         self.reload_for_checked_with_processes(outputs, validate, |_| Ok(()))
     }
 
-    #[cfg(test)]
     pub(crate) fn reload_for_checked_with_processes(
         &mut self,
         outputs: Vec<(K, OutputContext)>,
@@ -936,8 +982,7 @@ impl<K: Clone + Eq> Configurations<K> {
             {
                 return Err("duplicate output while reloading configuration".into());
             }
-            let runtime = Runtime::load_for_output(&self.entry, output.clone(), &services)
-                .map_err(|error| error.to_string())?;
+            let runtime = self.mode.load(&self.entry, output.clone(), &services)?;
             validate(&key, &runtime)?;
             let consumer = allocate_consumer(&mut next_consumer)?;
             candidates.push(Instance {
@@ -1145,6 +1190,62 @@ mod tests {
             node.children.iter().find_map(find)
         }
         find(configurations.root(&key).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn lock_configurations_keep_the_lock_loader_across_reload() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("lock.luau");
+        fs::write(
+            &entry,
+            "return ui.lock { children = { ui.text { text = 'old' } } }",
+        )
+        .unwrap();
+        let mut configurations =
+            Configurations::new_lock(entry.clone(), ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        assert_eq!(configurations.root(&1).unwrap().kind, Kind::Lock);
+        assert_eq!(text(&configurations, 1), "old");
+
+        fs::write(
+            &entry,
+            "return ui.lock { children = { ui.text { text = 'new' } } }",
+        )
+        .unwrap();
+        configurations.reload().unwrap();
+        assert_eq!(configurations.root(&1).unwrap().kind, Kind::Lock);
+        assert_eq!(text(&configurations, 1), "new");
+    }
+
+    #[test]
+    fn prepared_lock_candidates_keep_the_lock_loader() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("lock.luau");
+        fs::write(
+            &entry,
+            "return ui.lock { children = { ui.text { text = 'old' } } }",
+        )
+        .unwrap();
+        let mut configurations =
+            Configurations::new_lock(entry.clone(), ServiceSnapshot::default());
+        let candidate = configurations
+            .prepare_add_checked(1, output("DP-1", 1920), |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        configurations.commit_add(candidate);
+        assert_eq!(configurations.root(&1).unwrap().kind, Kind::Lock);
+
+        fs::write(
+            &entry,
+            "return ui.lock { children = { ui.text { text = 'new' } } }",
+        )
+        .unwrap();
+        let replacement = configurations
+            .prepare_reload_for_checked(vec![(1, output("DP-1", 1920))], |_, _| Ok(()))
+            .unwrap();
+        configurations.commit_reload(replacement);
+        assert_eq!(configurations.root(&1).unwrap().kind, Kind::Lock);
+        assert_eq!(text(&configurations, 1), "new");
     }
 
     fn power_device(path: &str) -> PowerDevice {

@@ -1,6 +1,20 @@
 third-party notices
 ===================
 
+pam-client
+----------
+
+thing uses pam-client 0.5.0, copyright Christoph Grenz and contributors, under
+the Mozilla Public License 2.0. the dependency is used without source changes.
+its source and license text are available from:
+
+https://crates.io/crates/pam-client/0.5.0
+
+the pinned crate archive has sha-256 checksum
+51bd776116a7ada5ebbe31f54cdc5b1030ed7265686cf7c8a21c057a2f8dab9a.
+
+--------------------------------------------------------------------------------
+
 thing's Skia renderer statically links code from the projects listed below.
 these notices match the dependencies pinned by rust-skia 0.156.0 and
 rust-skia/skia m156.5 at commit

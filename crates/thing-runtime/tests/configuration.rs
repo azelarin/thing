@@ -167,7 +167,7 @@ fn key_handler_errors_discard_actions_and_missing_handlers_are_distinct() {
 }
 
 #[test]
-fn on_key_is_available_only_on_panel_and_popup_roots() {
+fn on_key_requires_a_surface_root_and_function() {
     for source in [
         "return ui.panel { on_key = true }",
         "return ui.panel { children = { ui.row { on_key = function() return true end } } }",

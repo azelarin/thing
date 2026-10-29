@@ -55,7 +55,7 @@ jobs:
       - name: install native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y dbus-daemon libwayland-dev libegl1-mesa-dev libgles-dev libxkbcommon-dev libfontconfig1-dev libfreetype6-dev libpulse-dev fonts-dejavu-core
+          sudo apt-get install -y dbus-daemon libwayland-dev libegl1-mesa-dev libgles-dev libxkbcommon-dev libfontconfig1-dev libfreetype6-dev libpulse-dev libpam0g-dev libclang-dev fonts-dejavu-core
       - name: download skia binaries
         run: |
           gl_archive="$RUNNER_TEMP/skia-gl.tar.gz"

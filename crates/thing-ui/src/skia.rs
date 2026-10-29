@@ -21,7 +21,8 @@ use thing_core::{
 };
 
 use crate::{
-    Interaction, Layout, PaintFrame, ScrollState, Size, TextInputEditor, TextSystem, images::Images,
+    Interaction, Layout, PaintFrame, ScrollState, SecretInputEditor, Size, TextInputEditor,
+    TextSystem, images::Images,
 };
 
 const RESOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -332,6 +333,7 @@ impl Painter {
             scale,
             input,
             mut text_input,
+            mut secret_input,
         } = frame;
         self.images.collect();
         canvas.clear(SkiaColor::TRANSPARENT);
@@ -383,6 +385,17 @@ impl Painter {
                     (input.focused == Some(node.id))
                         .then_some(text_input.as_deref_mut())
                         .flatten(),
+                ),
+                Kind::SecretInput => self.draw_text_input(
+                    canvas,
+                    node,
+                    bounds,
+                    placement.clip,
+                    opacity,
+                    (input.focused == Some(node.id))
+                        .then_some(secret_input.as_deref_mut())
+                        .flatten()
+                        .map(SecretInputEditor::display),
                 ),
                 Kind::Slider => {
                     draw_slider(canvas, node, bounds, opacity);

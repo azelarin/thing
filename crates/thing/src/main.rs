@@ -1,8 +1,8 @@
 use std::{env, ffi::OsStr, path::PathBuf, process::ExitCode};
 use thing_runtime::Runtime;
-use thing_wayland::{Renderer, RunOptions, SystemTrayMode};
+use thing_wayland::{Renderer, RunOptions, SystemTrayMode, authentication};
 
-const HELP: &str = "thing — a programmable Wayland shell\n\nUsage:\n  thing run [--renderer <opengl|vulkan>] [--notification-server] [--system-tray <host|own-watcher>] [--clipboard] <entry.luau>\n  thing check <entry.luau>\n  thing types\n\nCommands:\n  run    Open a panel on each Wayland output\n  check  Evaluate a configuration and validate its widget tree\n  types  Write Luau editor definitions to standard output\n\nOptions:\n      --renderer             Select the graphics backend for run (default: opengl)\n      --notification-server  Provide the desktop notification service\n      --system-tray          Enable status notifier support in host or own-watcher mode\n      --clipboard            Read and control the regular Wayland clipboard\n  -h, --help                 Show this help\n  -V, --version              Show the version\n";
+const HELP: &str = "thing — a programmable Wayland shell\n\nUsage:\n  thing run [--renderer <opengl|vulkan>] [--notification-server] [--system-tray <host|own-watcher>] [--clipboard] <entry.luau>\n  thing lock [--renderer <opengl|vulkan>] <entry.luau>\n  thing check [--lock] <entry.luau>\n  thing types\n\nCommands:\n  run    Open a panel on each Wayland output\n  lock   Lock the current Wayland session\n  check  Evaluate a configuration and validate its widget tree\n  types  Write Luau editor definitions to standard output\n\nOptions:\n      --renderer             Select the graphics backend for run or lock (default: opengl)\n      --notification-server  Provide the desktop notification service\n      --system-tray          Enable status notifier support in host or own-watcher mode\n      --clipboard            Read and control the regular Wayland clipboard\n      --lock                 Validate a session-lock configuration with check\n  -h, --help                 Show this help\n  -V, --version              Show the version\n";
 const LUAU_TYPES: &str = include_str!("../types/thing.d.luau");
 
 fn main() -> ExitCode {
@@ -20,6 +20,13 @@ fn run() -> Result<(), (u8, String)> {
     let Some(command) = args.next() else {
         return Err((2, "expected a command; see 'thing --help'".into()));
     };
+    if command == OsStr::new(authentication::HELPER_SENTINEL) {
+        if args.next().is_some() {
+            return Err((2, "authentication helper does not accept arguments".into()));
+        }
+        return authentication::run_helper()
+            .map_err(|_| (1, "authentication helper failed".into()));
+    }
     if command == "--help" || command == "-h" {
         print!("{HELP}");
         return Ok(());
@@ -43,7 +50,7 @@ fn run() -> Result<(), (u8, String)> {
         }
         return Ok(());
     }
-    if command != "check" && command != "run" {
+    if command != "check" && command != "run" && command != "lock" {
         return Err((
             2,
             format!("unknown command {command:?}; see 'thing --help'"),
@@ -53,6 +60,7 @@ fn run() -> Result<(), (u8, String)> {
     let mut notification_server = false;
     let mut system_tray = None;
     let mut clipboard = false;
+    let mut check_lock = false;
     let mut path = None;
     let mut positional_only = false;
     while let Some(argument) = args.next() {
@@ -64,7 +72,10 @@ fn run() -> Result<(), (u8, String)> {
             print!("{HELP}");
             return Ok(());
         }
-        if command == "run" && !positional_only && argument == OsStr::new("--renderer") {
+        if (command == "run" || command == "lock")
+            && !positional_only
+            && argument == OsStr::new("--renderer")
+        {
             let value = args
                 .next()
                 .ok_or_else(|| (2, "expected a value after --renderer".into()))?;
@@ -79,7 +90,11 @@ fn run() -> Result<(), (u8, String)> {
             clipboard = true;
             continue;
         }
-        if command == "run"
+        if command == "check" && !positional_only && argument == OsStr::new("--lock") {
+            check_lock = true;
+            continue;
+        }
+        if (command == "run" || command == "lock")
             && !positional_only
             && let Some(value) = argument
                 .to_str()
@@ -123,12 +138,18 @@ fn run() -> Result<(), (u8, String)> {
             .with_clipboard(clipboard);
         return thing_wayland::run_with_options(&path, options).map_err(|error| (1, error));
     }
-    let runtime = Runtime::load(&path).map_err(|error| (1, error.to_string()))?;
-    println!(
-        "{}: valid ({} file(s))",
-        path.display(),
-        runtime.files().len()
-    );
+    if command == "lock" {
+        return thing_wayland::run_lock(&path, renderer).map_err(|error| (1, error));
+    }
+    let files = if check_lock {
+        thing_wayland::check_lock(&path).map_err(|error| (1, error))?
+    } else {
+        Runtime::load(&path)
+            .map_err(|error| (1, error.to_string()))?
+            .files()
+            .len()
+    };
+    println!("{}: valid ({} file(s))", path.display(), files);
     Ok(())
 }
 

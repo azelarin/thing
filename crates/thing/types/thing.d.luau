@@ -296,6 +296,14 @@ export type ThingPanelProperties = {
     children: ThingChildren?,
 }
 
+export type ThingLockProperties = {
+    visible: ThingReactive<boolean>?,
+    enabled: ThingReactive<boolean>?,
+    style: ThingStyle?,
+    on_key: ((event: ThingKeyEvent) -> boolean)?,
+    children: ThingChildren?,
+}
+
 export type ThingContainerProperties = {
     key: string?,
     visible: ThingReactive<boolean>?,
@@ -324,6 +332,16 @@ export type ThingTextInputProperties = {
     placeholder: ThingReactive<string>?,
     on_change: (value: string) -> (),
     on_submit: ((value: string) -> ())?,
+    on_hover: ((inside: boolean) -> ())?,
+}
+
+export type ThingSecretInputProperties = {
+    key: string?,
+    autofocus: boolean?,
+    visible: ThingReactive<boolean>?,
+    enabled: ThingReactive<boolean>?,
+    style: ThingTextInputStyle?,
+    placeholder: ThingReactive<string>?,
     on_hover: ((inside: boolean) -> ())?,
 }
 
@@ -618,6 +636,16 @@ declare extern type ThingAudioService with
     read set_default_source: (name: string) -> ()
 end
 
+export type ThingAuthenticationState =
+    "idle" | "authenticating" | "waiting" | "rejected" | "unavailable"
+
+declare extern type ThingAuthenticationService with
+    read available: ThingSignal<boolean>
+    read state: ThingSignal<ThingAuthenticationState>
+    read prompt: ThingSignal<string>
+    read message: ThingSignal<string>
+end
+
 declare extern type ThingClipboardService with
     read available: ThingSignal<boolean>
     read text: ThingSignal<string?>
@@ -730,6 +758,7 @@ end
 
 declare extern type ThingServices with
     read audio: ThingAudioService
+    read authentication: ThingAuthenticationService
     read clipboard: ThingClipboardService
     read clock: ThingClockService
     read media: ThingMediaService
@@ -748,6 +777,7 @@ end
 
 declare ui: {
     panel: (properties: ThingPanelProperties) -> ThingWidget,
+    lock: (properties: ThingLockProperties) -> ThingWidget,
     popup: (properties: ThingPopupProperties) -> ThingWidget,
     row: (properties: ThingContainerProperties) -> ThingWidget,
     centerbox: (properties: ThingContainerProperties) -> ThingWidget,
@@ -756,6 +786,7 @@ declare ui: {
     scroll: (properties: ThingContainerProperties) -> ThingWidget,
     text: (properties: ThingTextProperties) -> ThingWidget,
     text_input: (properties: ThingTextInputProperties) -> ThingWidget,
+    secret_input: (properties: ThingSecretInputProperties) -> ThingWidget,
     image: (properties: ThingImageProperties) -> ThingWidget,
     path: (properties: ThingPathProperties) -> ThingWidget,
     button: (properties: ThingButtonProperties) -> ThingWidget,

@@ -1,5 +1,17 @@
 use std::{fs, process::Command};
 
+use thing_wayland::authentication::HELPER_SENTINEL;
+
+#[test]
+fn authentication_helper_entry_point_is_not_an_extensible_public_command() {
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .args([HELPER_SENTINEL, "unexpected"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not accept arguments"));
+}
+
 #[test]
 fn types_writes_the_luau_definition_without_runtime_dependencies() {
     let output = Command::new(env!("CARGO_BIN_EXE_thing"))
@@ -82,17 +94,80 @@ fn check_works_without_display_and_returns_distinct_error_codes() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("expected opengl or vulkan"));
 
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .arg("lock")
+        .args(["--renderer", "software"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected opengl or vulkan"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .arg("lock")
+        .arg("--notification-server")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option"));
+
     #[cfg(not(feature = "vulkan"))]
     {
-        let output = Command::new(env!("CARGO_BIN_EXE_thing"))
-            .arg("run")
-            .args(["--renderer", "vulkan"])
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&output.stderr).contains("--features vulkan"));
+        for command in ["run", "lock"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+                .arg(command)
+                .args(["--renderer", "vulkan"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("--features vulkan"));
+        }
     }
+}
+
+#[test]
+fn lock_check_uses_the_lock_loader_without_desktop_services() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("lock.luau");
+    fs::write(
+        &path,
+        "return ui.lock { children = { ui.secret_input { autofocus = true } } }",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/does/not/exist")
+        .args(["check", "--lock"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("valid (1 file(s))"));
+    assert!(output.stderr.is_empty());
+
+    fs::write(&path, "return ui.lock {}").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/does/not/exist")
+        .args(["check", "--lock"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("exactly one secret_input"));
+
+    fs::write(&path, "return ui.panel {}").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .args(["check", "--lock"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ui.lock"));
 }
 
 #[test]

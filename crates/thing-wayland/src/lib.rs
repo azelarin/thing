@@ -1,20 +1,25 @@
 //! wayland host for the thing runtime.
 
 mod audio;
+pub mod authentication;
 mod clipboard;
 mod clock;
 mod configuration;
 mod data_transfer;
 mod egl;
+mod focus;
 mod focused_clipboard;
 mod host;
 mod hover;
 mod input_method;
+mod keyboard;
 mod launch;
+mod lock;
 mod managed_process;
 mod media;
 mod niri;
 mod notifications;
+mod output;
 mod panel;
 mod popup;
 mod power;
@@ -25,6 +30,7 @@ mod system_tray;
 mod text_data;
 mod watch;
 pub use host::{run, run_with_options};
+pub use lock::{check as check_lock, run as run_lock};
 pub use system_tray::{SystemTray, SystemTrayMode};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
