@@ -63,6 +63,19 @@ impl Power {
         Self::start_at(None, ping)
     }
 
+    /// a service without a worker, for host tests that must not reach the
+    /// desktop session.
+    #[cfg(test)]
+    pub(crate) fn inert() -> io::Result<Self> {
+        let (wake, _) = UnixStream::pair()?;
+        wake.set_nonblocking(true)?;
+        Ok(Self {
+            shared: Default::default(),
+            wake,
+            worker: None,
+        })
+    }
+
     fn start_at(address: Option<String>, ping: Ping) -> io::Result<Self> {
         let (wake, reader) = UnixStream::pair()?;
         wake.set_nonblocking(true)?;

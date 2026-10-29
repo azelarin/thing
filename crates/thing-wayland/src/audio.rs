@@ -55,6 +55,19 @@ impl Audio {
         Self::start_with_server(ping, None)
     }
 
+    /// a service without a worker, for host tests that must not reach the
+    /// desktop session.
+    #[cfg(test)]
+    pub(crate) fn inert() -> io::Result<Self> {
+        let (wake, _) = UnixStream::pair()?;
+        wake.set_nonblocking(true)?;
+        Ok(Self {
+            shared: Default::default(),
+            wake,
+            worker: None,
+        })
+    }
+
     fn start_with_server(ping: Ping, server: Option<String>) -> io::Result<Self> {
         let (wake, reader) = UnixStream::pair()?;
         wake.set_nonblocking(true)?;

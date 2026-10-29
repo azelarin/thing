@@ -528,6 +528,14 @@ declare extern type ThingDesktopAction with
     read command: ThingReadonlyArray<string>
 end
 
+export type ThingDesktopArguments = "none" | "file" | "files" | "url" | "urls"
+
+export type ThingApplicationLaunchOptions = {
+    action: string?,
+    uris: { string }?,
+    terminal: { string }?,
+}
+
 declare extern type ThingDesktopApplication with
     read id: string
     read name: string
@@ -542,6 +550,7 @@ declare extern type ThingDesktopApplication with
     read no_display: boolean
     read startup_wm_class: string
     read dbus_activatable: boolean
+    read accepts: ThingDesktopArguments
     read actions: ThingReadonlyArray<ThingDesktopAction>
 end
 
@@ -753,6 +762,7 @@ declare extern type ThingApplicationsService with
     read available: ThingSignal<boolean>
     read error: ThingSignal<string>
     read entries: ThingSignal<ThingReadonlyArray<ThingDesktopApplication>>
+    read launch: (id: string, options: ThingApplicationLaunchOptions?) -> ()
 end
 
 declare extern type ThingMediaService with

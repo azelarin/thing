@@ -67,6 +67,23 @@ pub enum Action {
         argv: Vec<String>,
         cwd: Option<String>,
     },
+    LaunchApplication(ApplicationLaunch),
+}
+
+/// a request to start an installed application from its desktop entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplicationLaunch {
+    /// the desktop file id.
+    pub id: String,
+    /// the entry revision the configuration saw. a changed or removed entry is
+    /// refused rather than launched in its place.
+    pub revision: u64,
+    /// a key from the entry's `actions`.
+    pub action: Option<String>,
+    /// absolute paths or uris to open.
+    pub uris: Vec<String>,
+    /// arguments placed before the command when the entry runs in a terminal.
+    pub terminal: Vec<String>,
 }
 
 const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
@@ -684,11 +701,46 @@ pub struct DesktopAction {
     pub command: Vec<String>,
 }
 
+/// which files or urls a launch of an application accepts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DesktopArguments {
+    /// the entry takes no files or urls.
+    #[default]
+    None,
+    /// one local file per process, from `%f`.
+    File,
+    /// several local files in one process, from `%F`.
+    Files,
+    /// one url per process, from `%u`.
+    Url,
+    /// several urls in one process, from `%U` or d-bus activation.
+    Urls,
+}
+
+impl DesktopArguments {
+    fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::File => "file",
+            Self::Files => "files",
+            Self::Url => "url",
+            Self::Urls => "urls",
+        }
+    }
+
+    fn local_only(self) -> bool {
+        matches!(self, Self::File | Self::Files)
+    }
+}
+
 /// one installed application described by a desktop entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DesktopApplication {
     /// the desktop file id, such as `org.gnome.Nautilus.desktop`.
     pub id: String,
+    /// a nonzero number that changes whenever the entry changes and stays the
+    /// same across rescans that leave it unchanged.
+    pub revision: u64,
     pub name: String,
     pub generic_name: String,
     pub comment: String,
@@ -704,6 +756,8 @@ pub struct DesktopApplication {
     pub no_display: bool,
     pub startup_wm_class: String,
     pub dbus_activatable: bool,
+    /// the files or urls that `services.applications.launch` accepts.
+    pub accepts: DesktopArguments,
     pub actions: Vec<DesktopAction>,
 }
 
@@ -1127,6 +1181,7 @@ impl UserData for ApplicationList {
                 item.set("no_display", application.no_display)?;
                 item.set("startup_wm_class", application.startup_wm_class.as_str())?;
                 item.set("dbus_activatable", application.dbus_activatable)?;
+                item.set("accepts", application.accepts.name())?;
                 item.set("actions", actions)?;
                 item.set_readonly(true);
                 list.raw_set(index + 1, item)?;
@@ -1526,6 +1581,7 @@ pub(crate) struct Services {
     managed_processes: Rc<RefCell<BTreeMap<String, ManagedProcessState>>>,
     managed_process_signals: Rc<RefCell<BTreeMap<String, ManagedProcessSignals>>>,
     managed_process_declarations_open: Rc<Cell<bool>>,
+    application_launches_allowed: Rc<Cell<bool>>,
     niri: NiriData,
 }
 
@@ -1574,6 +1630,7 @@ impl Services {
             managed_processes: Rc::default(),
             managed_process_signals: Rc::default(),
             managed_process_declarations_open: Rc::new(Cell::new(true)),
+            application_launches_allowed: Rc::new(Cell::new(true)),
             niri: niri_data,
         };
         let services = lua.create_table()?;
@@ -1962,6 +2019,27 @@ impl Services {
             })?,
         )?;
         media.set_readonly(true);
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        let launches_allowed = result.application_launches_allowed.clone();
+        let list = result.applications.clone();
+        applications.set(
+            "launch",
+            lua.create_function(move |_, (id, options): (Value, Value)| {
+                if !allowed.get() {
+                    return Err(Error::runtime(
+                        "service actions are allowed only in event handlers",
+                    ));
+                }
+                if !launches_allowed.get() {
+                    return Err(Error::runtime(
+                        "applications cannot be launched from lock configurations",
+                    ));
+                }
+                let launch = application_launch(&list.borrow(), id, options)?;
+                enqueue(&actions, &allowed, Action::LaunchApplication(launch))
+            })?,
+        )?;
         applications.set_readonly(true);
         for (name, action) in [
             ("activate", SystemTrayAction::Activate),
@@ -2147,6 +2225,11 @@ impl Services {
     }
     pub fn allow_actions(&self, allowed: bool) {
         self.allowed.set(allowed);
+    }
+
+    /// lock configurations may not start applications.
+    pub fn forbid_application_launches(&self) {
+        self.application_launches_allowed.set(false);
     }
 
     pub fn freeze_managed_process_declarations(&self) {
@@ -3018,6 +3101,149 @@ fn launch_arguments(table: Table) -> Result<Vec<String>> {
     Ok(arguments)
 }
 
+/// validates a launch against the list the configuration currently sees, and
+/// binds it to the observed entry revision.
+fn application_launch(
+    applications: &[DesktopApplication],
+    id: Value,
+    options: Value,
+) -> Result<ApplicationLaunch> {
+    let Value::String(id) = id else {
+        return Err(Error::runtime("application id must be a string"));
+    };
+    let id = id
+        .to_str()
+        .map_err(|_| Error::runtime("application id must be valid utf-8"))?;
+    let application = applications
+        .iter()
+        .find(|application| application.id == *id)
+        .ok_or_else(|| Error::runtime(format!("unknown application {:?}", &*id)))?;
+    let mut launch = ApplicationLaunch {
+        id: application.id.clone(),
+        revision: application.revision,
+        action: None,
+        uris: Vec::new(),
+        terminal: Vec::new(),
+    };
+    let options = match options {
+        Value::Nil => return Ok(launch),
+        Value::Table(options) => options,
+        _ => {
+            return Err(Error::runtime(
+                "application launch options must be a table or nil",
+            ));
+        }
+    };
+    for pair in options.pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        let known = matches!(&key, Value::String(key)
+            if matches!(key.as_bytes().as_ref(), b"action" | b"uris" | b"terminal"));
+        if !known {
+            return Err(Error::runtime(
+                "application launch options accept only action, uris, and terminal",
+            ));
+        }
+    }
+    match options.raw_get::<Value>("action")? {
+        Value::Nil => {}
+        Value::String(key) => {
+            let key = key
+                .to_str()
+                .map_err(|_| Error::runtime("application action must be valid utf-8"))?;
+            if !application.actions.iter().any(|action| action.key == *key) {
+                return Err(Error::runtime(format!(
+                    "application {:?} has no action {:?}",
+                    application.id, &*key
+                )));
+            }
+            launch.action = Some(key.to_owned());
+        }
+        _ => return Err(Error::runtime("application action must be a string")),
+    }
+    match options.raw_get::<Value>("uris")? {
+        Value::Nil => {}
+        Value::Table(uris) => {
+            launch.uris = launch_arguments(uris)
+                .ok()
+                .filter(|uris| uris.iter().all(|uri| !uri.is_empty()))
+                .ok_or_else(|| Error::runtime(launch_uri_error()))?;
+        }
+        _ => return Err(Error::runtime(launch_uri_error())),
+    }
+    match options.raw_get::<Value>("terminal")? {
+        Value::Nil => {}
+        Value::Table(terminal) => launch.terminal = launch_arguments(terminal)?,
+        _ => {
+            return Err(Error::runtime(
+                "application terminal must be an array of strings",
+            ));
+        }
+    }
+    if launch.uris.is_empty() {
+        return Ok(launch);
+    }
+    // the d-bus method for actions takes no uris, so neither backend accepts them.
+    if launch.action.is_some() {
+        return Err(Error::runtime("application actions do not accept uris"));
+    }
+    if application.accepts == DesktopArguments::None {
+        return Err(Error::runtime(format!(
+            "application {:?} does not accept files or urls",
+            application.id
+        )));
+    }
+    for uri in &launch.uris {
+        if !uri.starts_with('/') && uri_scheme(uri).is_none() {
+            return Err(Error::runtime(
+                "application uris must be absolute paths or uris with a scheme",
+            ));
+        }
+        if application.accepts.local_only() && !is_local_file(uri) {
+            return Err(Error::runtime(format!(
+                "application {:?} opens only local files; remote urls are not downloaded",
+                application.id
+            )));
+        }
+    }
+    Ok(launch)
+}
+
+fn launch_uri_error() -> String {
+    format!(
+        "application uris must be a nonempty dense array of at most {MAX_LAUNCH_ARGUMENTS} \
+         nonempty strings within the launch size limits"
+    )
+}
+
+/// returns the scheme of an absolute uri, such as `https` in `https://...`.
+pub fn uri_scheme(uri: &str) -> Option<&str> {
+    let (scheme, _) = uri.split_once(':')?;
+    let mut characters = scheme.chars();
+    (characters.next()?.is_ascii_alphabetic()
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        }))
+    .then_some(scheme)
+}
+
+/// whether a launch uri names a file on this machine: an absolute path, or a
+/// `file:` uri without a host other than `localhost`.
+pub fn is_local_file(uri: &str) -> bool {
+    if uri.starts_with('/') {
+        return true;
+    }
+    if !uri_scheme(uri).is_some_and(|scheme| scheme.eq_ignore_ascii_case("file")) {
+        return false;
+    }
+    let rest = &uri[5..];
+    match rest.strip_prefix("//") {
+        Some(authority) => authority
+            .split_once('/')
+            .is_some_and(|(host, _)| host.is_empty() || host.eq_ignore_ascii_case("localhost")),
+        None => rest.starts_with('/'),
+    }
+}
+
 fn launch_working_directory(value: Value) -> Result<Option<String>> {
     let value = match value {
         Value::Nil => return Ok(None),
@@ -3281,6 +3507,7 @@ fn validate_applications(applications: &[DesktopApplication]) -> Result<()> {
     let valid = applications.len() <= MAX_APPLICATIONS
         && applications.iter().all(|application| {
             !application.id.is_empty()
+                && application.revision != 0
                 && text(&application.id)
                 && ids.insert(application.id.as_str())
                 && !application.name.is_empty()

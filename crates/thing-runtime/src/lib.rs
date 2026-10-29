@@ -13,16 +13,16 @@ mod timer;
 mod transition;
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
 pub use services::{
-    Action, ApplicationsSnapshot, AudioDevice, AudioSnapshot, AudioSource, AudioStream,
-    AuthenticationSnapshot, AuthenticationState, ClipboardSnapshot, DesktopAction,
-    DesktopApplication, MAX_LAUNCH_ARGUMENT_BYTES, MAX_LAUNCH_ARGUMENTS, MAX_LAUNCH_BYTES,
-    MAX_MEDIA_RATE, MAX_MEDIA_TIME_US, MAX_NOTIFICATION_HISTORY, ManagedProcessAction,
-    ManagedProcessCommand, ManagedProcessDefinition, ManagedProcessShutdownSignal,
-    ManagedProcessSnapshot, ManagedProcessState, ManagedProcessStatus, MediaAction, MediaPlayer,
-    MediaPosition, MediaSnapshot, Notification, NotificationButton, NotificationCloseReason,
-    NotificationSnapshot, NotificationUrgency, PowerDevice, PowerSnapshot, ServiceSnapshot,
-    SystemTrayAction, SystemTrayItem, SystemTrayMenu, SystemTrayMenuAction, SystemTrayMenuItem,
-    SystemTraySnapshot,
+    Action, ApplicationLaunch, ApplicationsSnapshot, AudioDevice, AudioSnapshot, AudioSource,
+    AudioStream, AuthenticationSnapshot, AuthenticationState, ClipboardSnapshot, DesktopAction,
+    DesktopApplication, DesktopArguments, MAX_LAUNCH_ARGUMENT_BYTES, MAX_LAUNCH_ARGUMENTS,
+    MAX_LAUNCH_BYTES, MAX_MEDIA_RATE, MAX_MEDIA_TIME_US, MAX_NOTIFICATION_HISTORY,
+    ManagedProcessAction, ManagedProcessCommand, ManagedProcessDefinition,
+    ManagedProcessShutdownSignal, ManagedProcessSnapshot, ManagedProcessState,
+    ManagedProcessStatus, MediaAction, MediaPlayer, MediaPosition, MediaSnapshot, Notification,
+    NotificationButton, NotificationCloseReason, NotificationSnapshot, NotificationUrgency,
+    PowerDevice, PowerSnapshot, ServiceSnapshot, SystemTrayAction, SystemTrayItem, SystemTrayMenu,
+    SystemTrayMenuAction, SystemTrayMenuItem, SystemTraySnapshot, is_local_file, uri_scheme,
 };
 pub use timer::TimerToken;
 
@@ -483,6 +483,9 @@ impl Runtime {
             return Err(Error::runtime(
                 "scheduled processes are unavailable in lock configurations",
             ));
+        }
+        if matches!(mode, ConfigurationMode::Lock) {
+            services.forbid_application_launches();
         }
         services.freeze_managed_process_declarations();
         timers.borrow_mut().freeze();

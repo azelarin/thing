@@ -1,8 +1,13 @@
 //! installed desktop applications, rescanned when application directories change.
 
+mod activation;
 mod entry;
+mod plan;
+#[cfg(test)]
+pub(crate) mod test_bus;
 
 use std::{
+    collections::BTreeMap,
     ffi::CString,
     fs, io,
     io::Write,
@@ -19,7 +24,10 @@ use std::{
 use calloop::ping::Ping;
 use thing_runtime::ApplicationsSnapshot;
 
-use entry::Environment;
+use entry::{Entry, Environment};
+
+pub(crate) use activation::{ActivationCall, Activator};
+pub(crate) use plan::{Plan, plan};
 
 const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
     | libc::IN_MOVED_FROM
@@ -39,8 +47,63 @@ const UNWATCHED_RETRY: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 struct Shared {
-    latest: Option<ApplicationsSnapshot>,
+    latest: Option<Published>,
     stop: bool,
+}
+
+/// one generation of the list, with the launch data that belongs to it.
+pub(crate) struct Published {
+    pub snapshot: ApplicationsSnapshot,
+    pub catalog: Arc<Catalog>,
+}
+
+/// the launch templates of every listed application, keyed by desktop file id.
+#[derive(Debug, Default)]
+pub(crate) struct Catalog {
+    entries: BTreeMap<String, Entry>,
+}
+
+impl Catalog {
+    fn get(&self, id: &str) -> Option<&Entry> {
+        self.entries.get(id)
+    }
+
+    /// the revision of a listed entry, or `None` once it is gone.
+    pub(crate) fn revision(&self, id: &str) -> Option<u64> {
+        self.get(id).map(|entry| entry.application.revision)
+    }
+}
+
+/// gives each entry a revision that survives rescans that leave it unchanged,
+/// so a launch queued before an unrelated change still applies.
+#[derive(Default)]
+struct Revisions {
+    known: BTreeMap<String, (Entry, u64)>,
+    next: u64,
+}
+
+impl Revisions {
+    fn assign(&mut self, entries: Vec<Entry>) -> Vec<Entry> {
+        let mut known = BTreeMap::new();
+        let entries = entries
+            .into_iter()
+            .map(|mut entry| {
+                let id = entry.application.id.clone();
+                let revision = match self.known.remove(&id) {
+                    Some((previous, revision)) if previous == entry => revision,
+                    _ => {
+                        self.next += 1;
+                        self.next
+                    }
+                };
+                known.insert(id, (entry.clone(), revision));
+                entry.application.revision = revision;
+                entry
+            })
+            .collect();
+        self.known = known;
+        entries
+    }
 }
 
 pub(crate) struct Applications {
@@ -52,6 +115,18 @@ pub(crate) struct Applications {
 impl Applications {
     pub fn start(ping: Ping) -> io::Result<Self> {
         Self::start_with(Environment::from_process(), ping)
+    }
+
+    /// watches only the given application directories, for host tests.
+    #[cfg(test)]
+    pub(crate) fn start_in(directories: Vec<std::path::PathBuf>, ping: Ping) -> io::Result<Self> {
+        Self::start_with(
+            Environment {
+                directories,
+                ..Environment::default()
+            },
+            ping,
+        )
     }
 
     fn start_with(environment: Environment, ping: Ping) -> io::Result<Self> {
@@ -70,7 +145,7 @@ impl Applications {
         })
     }
 
-    pub fn take_snapshot(&self) -> Option<ApplicationsSnapshot> {
+    pub fn take_snapshot(&self) -> Option<Published> {
         lock(&self.shared).latest.take()
     }
 }
@@ -87,6 +162,7 @@ impl Drop for Applications {
 
 fn run(environment: &Environment, shared: &Mutex<Shared>, wake: &UnixStream, ping: &Ping) {
     let mut previous = None;
+    let mut revisions = Revisions::default();
     loop {
         if lock(shared).stop {
             return;
@@ -94,6 +170,7 @@ fn run(environment: &Environment, shared: &Mutex<Shared>, wake: &UnixStream, pin
         // install watches before scanning, so a change during the scan
         // triggers another one rather than being missed.
         let watches = Watches::install(environment);
+        let entries = revisions.assign(entry::scan(environment));
         let snapshot = ApplicationsSnapshot {
             available: true,
             error: watches
@@ -101,11 +178,23 @@ fn run(environment: &Environment, shared: &Mutex<Shared>, wake: &UnixStream, pin
                 .err()
                 .map(|error| format!("cannot watch application directories: {error}"))
                 .unwrap_or_default(),
-            applications: entry::scan(environment),
+            applications: entries
+                .iter()
+                .map(|entry| entry.application.clone())
+                .collect(),
         };
         if previous.as_ref() != Some(&snapshot) {
             previous = Some(snapshot.clone());
-            lock(shared).latest = Some(snapshot);
+            let catalog = Catalog {
+                entries: entries
+                    .into_iter()
+                    .map(|entry| (entry.application.id.clone(), entry))
+                    .collect(),
+            };
+            lock(shared).latest = Some(Published {
+                snapshot,
+                catalog: Arc::new(catalog),
+            });
             ping.ping();
         }
         let inotify = watches.as_ref().ok().map(|watches| watches.fd.as_raw_fd());
@@ -286,14 +375,21 @@ mod tests {
         applications: &Applications,
         predicate: impl Fn(&ApplicationsSnapshot) -> bool,
     ) -> ApplicationsSnapshot {
+        wait_for_published(applications, predicate).snapshot
+    }
+
+    fn wait_for_published(
+        applications: &Applications,
+        predicate: impl Fn(&ApplicationsSnapshot) -> bool,
+    ) -> Published {
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut observed = Vec::new();
         while Instant::now() < deadline {
-            if let Some(snapshot) = applications.take_snapshot() {
-                if predicate(&snapshot) {
-                    return snapshot;
+            if let Some(published) = applications.take_snapshot() {
+                if predicate(&published.snapshot) {
+                    return published;
                 }
-                observed.push(snapshot);
+                observed.push(published.snapshot);
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -375,6 +471,60 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("editor.desktop"), entry("editor")).unwrap();
         wait_for(&applications, |snapshot| names(snapshot) == ["editor"]);
+    }
+
+    #[test]
+    fn revisions_survive_unrelated_changes_and_follow_edits() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let write = |name: &str, exec: &str| {
+            fs::write(
+                directory.path().join(name),
+                format!("[Desktop Entry]\nType=Application\nName={name}\nExec={exec}\n"),
+            )
+            .unwrap();
+        };
+        write("editor.desktop", "edit %d");
+        write("viewer.desktop", "view %f");
+        let environment = Environment {
+            directories: vec![directory.path().into()],
+            ..Environment::default()
+        };
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let applications = Applications::start_with(environment, ping).unwrap();
+        let revisions = |published: &Published| {
+            published
+                .snapshot
+                .applications
+                .iter()
+                .map(|application| {
+                    let entry = published.catalog.get(&application.id).unwrap();
+                    assert_eq!(entry.application, *application);
+                    (application.id.clone(), application.revision)
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let first = revisions(&wait_for_published(&applications, |snapshot| {
+            snapshot.applications.len() == 2
+        }));
+
+        // another entry appearing leaves existing revisions alone.
+        write("tool.desktop", "tool");
+        let second = revisions(&wait_for_published(&applications, |snapshot| {
+            snapshot.applications.len() == 3
+        }));
+        assert_eq!(second["editor.desktop"], first["editor.desktop"]);
+        assert_eq!(second["viewer.desktop"], first["viewer.desktop"]);
+
+        // a deprecated code changes the template but not the listed command,
+        // and the revision still follows it.
+        write("editor.desktop", "edit %n");
+        let third = wait_for_published(&applications, |snapshot| {
+            snapshot.applications[0].revision != first["editor.desktop"]
+        });
+        assert_eq!(third.snapshot.applications[0].command, ["edit"]);
+        let third = revisions(&third);
+        assert_eq!(third["viewer.desktop"], first["viewer.desktop"]);
+        assert_eq!(third["tool.desktop"], second["tool.desktop"]);
     }
 
     #[test]
