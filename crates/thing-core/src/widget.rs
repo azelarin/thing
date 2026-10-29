@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, collections::HashSet, error::Error, fmt, sync::Arc};
 
-use crate::{Brush, Color, vector::normalize_path};
+use crate::{Brush, Color, Shadow, vector::normalize_path};
 
 /// an identity scoped to one loaded configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -141,6 +141,7 @@ pub struct VectorPath {
     pub view_box: Option<ViewBox>,
     pub fit: PathFit,
     pub fill: Option<Brush>,
+    pub shadow: Option<Shadow>,
     pub fill_rule: PathFillRule,
     pub stroke: Color,
     pub stroke_width: f32,
@@ -156,6 +157,7 @@ impl Default for VectorPath {
             view_box: None,
             fit: PathFit::Contain,
             fill: None,
+            shadow: None,
             fill_rule: PathFillRule::NonZero,
             stroke: Color::TRANSPARENT,
             stroke_width: 1.0,
@@ -180,6 +182,9 @@ impl VectorPath {
     }
 
     fn validate(&self) -> Result<(), TreeError> {
+        if let Some(shadow) = self.shadow {
+            shadow.validate()?;
+        }
         if let Some(fill) = &self.fill {
             fill.validate()?;
         }
@@ -540,6 +545,7 @@ pub struct Style {
     pub text_align: TextAlign,
     pub tabular_digits: bool,
     pub background: Brush,
+    pub box_shadow: Option<Shadow>,
     pub foreground: Color,
     pub opacity: f32,
     pub translate_x: f32,
@@ -589,6 +595,7 @@ impl Default for Style {
             text_align: TextAlign::Start,
             tabular_digits: false,
             background: Brush::default(),
+            box_shadow: None,
             foreground: Color::WHITE,
             opacity: 1.0,
             translate_x: 0.0,
@@ -957,6 +964,9 @@ impl Node {
         }
         let style = &self.style;
         style.background.validate()?;
+        if let Some(shadow) = style.box_shadow {
+            shadow.validate()?;
+        }
         if (self.kind == Kind::Popup
             || (depth == 0 && matches!(self.kind, Kind::Panel | Kind::Lock)))
             && [

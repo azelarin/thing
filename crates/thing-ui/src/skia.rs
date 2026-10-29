@@ -327,15 +327,38 @@ impl Painter {
     }
 
     fn draw(&mut self, canvas: &Canvas, frame: PaintFrame<'_>) -> Result<(), String> {
+        Scene {
+            typefaces: &mut self.typefaces,
+            fonts: &self.fonts,
+            text: &mut self.text,
+            images: &mut self.images,
+        }
+        .draw(canvas, frame)
+    }
+}
+
+struct Scene<'a> {
+    typefaces: &'a mut TypefaceCache,
+    fonts: &'a FontMgr,
+    text: &'a mut TextSystem,
+    images: &'a mut Images,
+}
+
+impl Scene<'_> {
+    fn draw(&mut self, canvas: &Canvas, frame: PaintFrame<'_>) -> Result<(), String> {
+        let restored = skia_safe::AutoCanvasRestore::guard(canvas, true);
+        let canvas: &Canvas = &restored;
         let PaintFrame {
             root,
             layout,
-            physical: _,
+            physical,
             scale,
             input,
             mut text_input,
             mut secret_input,
         } = frame;
+        let nodes = crate::shadow::node_index(root);
+        let shadows = crate::shadow::ShadowPlan::prepare(&nodes, layout, physical, scale)?;
         self.images.collect();
         canvas.clear(SkiaColor::TRANSPARENT);
         canvas.reset_matrix();
@@ -344,8 +367,35 @@ impl Painter {
         self.text.retain(root);
         let mut active_clips = Vec::new();
 
-        for placement in layout.placements() {
-            let Some(node) = root.find(placement.id) else {
+        for semantic in layout.semantic_placements() {
+            let Some(node) = nodes.get(&semantic.id).copied() else {
+                continue;
+            };
+            let effects = shadows.nodes.get(&semantic.id);
+            let opacity = semantic.opacity * semantic.disabled_opacity;
+            if let Some(shadow) = effects.and_then(|effects| effects.box_shadow.as_ref()) {
+                draw_shadow(
+                    canvas,
+                    layout,
+                    semantic,
+                    shadow,
+                    opacity,
+                    &surface_matrix,
+                    &mut active_clips,
+                )?;
+            }
+            let Some(placement) = layout.get(semantic.id) else {
+                if let Some(shadow) = effects.and_then(|effects| effects.path_shadow.as_ref()) {
+                    draw_shadow(
+                        canvas,
+                        layout,
+                        semantic,
+                        shadow,
+                        opacity,
+                        &surface_matrix,
+                        &mut active_clips,
+                    )?;
+                }
                 continue;
             };
             sync_clip_chain(
@@ -387,6 +437,27 @@ impl Painter {
                 canvas.draw_rrect(shape, &stroke(color(focus_color), focus_width, opacity));
             }
 
+            canvas.restore_to_count(saved);
+            if let Some(shadow) = effects.and_then(|effects| effects.path_shadow.as_ref()) {
+                draw_shadow(
+                    canvas,
+                    layout,
+                    semantic,
+                    shadow,
+                    opacity,
+                    &surface_matrix,
+                    &mut active_clips,
+                )?;
+                sync_clip_chain(
+                    canvas,
+                    layout,
+                    placement.clip_chain,
+                    &surface_matrix,
+                    &mut active_clips,
+                )?;
+            }
+            let saved = canvas.save();
+            set_surface_transform(canvas, &surface_matrix, placement.transform)?;
             let drawn = match node.kind {
                 Kind::Text => self.draw_text(canvas, node, bounds, opacity),
                 Kind::TextInput => self.draw_text_input(
@@ -452,8 +523,8 @@ impl Painter {
             .layout(node, Some((bounds.width - 2.0 * padding_x).max(0.0)));
         draw_layout(
             canvas,
-            &mut self.typefaces,
-            &self.fonts,
+            self.typefaces,
+            self.fonts,
             layout,
             Point::new(bounds.x + padding_x, bounds.y + padding_y),
             node.style.foreground,
@@ -501,8 +572,8 @@ impl Painter {
             } else {
                 draw_layout(
                     canvas,
-                    &mut self.typefaces,
-                    &self.fonts,
+                    self.typefaces,
+                    self.fonts,
                     layout,
                     Point::new(content.x + offset_x, content.y + offset_y),
                     node.style.foreground,
@@ -555,8 +626,8 @@ impl Painter {
         };
         draw_layout(
             canvas,
-            &mut self.typefaces,
-            &self.fonts,
+            self.typefaces,
+            self.fonts,
             layout,
             Point::new(x, y),
             foreground,
@@ -600,6 +671,29 @@ impl Drop for Painter {
             self.context.release_resources_and_abandon();
         }
     }
+}
+
+fn draw_shadow(
+    canvas: &Canvas,
+    layout: &Layout,
+    placement: &crate::SemanticPlacement,
+    shadow: &crate::shadow::PreparedShadow,
+    opacity: f32,
+    surface_matrix: &M44,
+    active: &mut Vec<usize>,
+) -> Result<(), String> {
+    sync_clip_chain(
+        canvas,
+        layout,
+        placement.shadow_clip_chain,
+        surface_matrix,
+        active,
+    )?;
+    let saved = canvas.save();
+    set_surface_transform(canvas, surface_matrix, placement.transform)?;
+    let result = shadow.draw(canvas, opacity);
+    canvas.restore_to_count(saved);
+    result
 }
 
 fn sync_clip_chain(
@@ -783,19 +877,26 @@ fn draw_slider(canvas: &Canvas, node: &Node, bounds: Rect, opacity: f32) {
     );
 }
 
-fn draw_path(canvas: &Canvas, node: &Node, bounds: Rect, opacity: f32) -> Result<(), String> {
+pub(crate) fn fitted_path(node: &Node, bounds: Rect) -> Result<Option<(SkiaPath, Rect)>, String> {
     let Some(view_box) = node.path.view_box else {
-        return Ok(());
+        return Ok(None);
     };
     let area = crate::brush::path_area(bounds, &node.style);
     let Some(transform) = PathTransform::new(view_box, area, node.path.fit) else {
-        return Ok(());
+        return Ok(None);
     };
     let mut path = transformed_path(&node.path.segments, transform)?;
     path.set_fill_type(match node.path.fill_rule {
         PathFillRule::NonZero => PathFillType::Winding,
         PathFillRule::EvenOdd => PathFillType::EvenOdd,
     });
+    Ok(Some((path, area)))
+}
+
+fn draw_path(canvas: &Canvas, node: &Node, bounds: Rect, opacity: f32) -> Result<(), String> {
+    let Some((path, area)) = fitted_path(node, bounds)? else {
+        return Ok(());
+    };
     canvas.clip_rrect(
         rounded_rect(
             area,
@@ -972,7 +1073,7 @@ fn image_radius(radius: f32, clip: Rect) -> f32 {
     radius.min(clip.width / 2.0).min(clip.height / 2.0)
 }
 
-fn rounded_rect(bounds: Rect, radius: f32) -> RRect {
+pub(crate) fn rounded_rect(bounds: Rect, radius: f32) -> RRect {
     let radius = radius
         .max(0.0)
         .min(bounds.width / 2.0)
@@ -1021,12 +1122,12 @@ fn brush_paint(brush: &thing_core::Brush, bounds: Rect, opacity: f32) -> Result<
     Ok(paint)
 }
 
-fn color(value: thing_core::Color) -> SkiaColor {
+pub(crate) fn color(value: thing_core::Color) -> SkiaColor {
     let [r, g, b, a] = value.0;
     SkiaColor::from_argb(a, r, g, b)
 }
 
-fn fill(color: SkiaColor, opacity: f32) -> Paint {
+pub(crate) fn fill(color: SkiaColor, opacity: f32) -> Paint {
     let mut paint = Paint::default();
     paint.set_anti_alias(true);
     paint.set_color(color);
@@ -1199,6 +1300,355 @@ mod tests {
         assert!((190..=192).contains(&pixel.a()));
         assert!((80..=90).contains(&pixel.r()));
         assert!((165..=175).contains(&pixel.b()));
+    }
+
+    fn raster_scene(
+        root: &Node,
+        width: i32,
+        height: i32,
+        scale: f32,
+    ) -> Result<skia_safe::Surface, String> {
+        let mut text = TextSystem::default();
+        let layout = Layout::compute(
+            root,
+            Size {
+                width: width as f32 / scale,
+                height: height as f32 / scale,
+            },
+            &mut text,
+        )?;
+        let mut surface = skia_safe::surfaces::raster_n32_premul((width, height)).unwrap();
+        Scene {
+            typefaces: &mut TypefaceCache::default(),
+            fonts: &FontMgr::default(),
+            text: &mut text,
+            images: &mut Images::new(|| {}).unwrap(),
+        }
+        .draw(
+            surface.canvas(),
+            PaintFrame {
+                root,
+                layout: &layout,
+                physical: (width as u32, height as u32),
+                scale,
+                input: Interaction::default(),
+                text_input: None,
+                secret_input: None,
+            },
+        )?;
+        Ok(surface)
+    }
+
+    fn shadow_card(scroll: bool) -> Node {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        root.style.padding = 20.0;
+        root.style.align = thing_core::CrossAlign::Start;
+        root.style.justify = thing_core::MainAlign::Start;
+        root.style.background = thing_core::Color::WHITE.into();
+        let mut parent = Node::new(NodeId(2), if scroll { Kind::Scroll } else { Kind::Column });
+        parent.style.width = Some(60.0);
+        parent.style.height = Some(60.0);
+        let mut card = Node::new(NodeId(3), Kind::Row);
+        card.style.width = Some(60.0);
+        card.style.height = Some(60.0);
+        card.style.box_shadow = Some(thing_core::Shadow {
+            color: thing_core::Color([0, 0, 0, 255]),
+            offset: thing_core::Point { x: 0.0, y: 6.0 },
+            blur: 12.0,
+            spread: 0.0,
+        });
+        parent.children.push(card);
+        root.children.push(parent);
+        root
+    }
+
+    #[test]
+    fn shadows_escape_tight_containers_but_stop_at_scroll_viewports() {
+        for scroll in [false, true] {
+            let mut surface = raster_scene(&shadow_card(scroll), 120, 120, 1.0).unwrap();
+            let pixels = surface.peek_pixels().unwrap();
+            assert_eq!(pixels.get_color((50, 50)), SkiaColor::WHITE);
+            let below = pixels.get_color((50, 85));
+            if scroll {
+                assert_eq!(below, SkiaColor::WHITE);
+            } else {
+                assert!(below.r() < 180, "{below:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_subnormal_shadow_blur_draws_a_hard_edge() {
+        let mut root = shadow_card(false);
+        root.children[0].children[0]
+            .style
+            .box_shadow
+            .as_mut()
+            .unwrap()
+            .blur = f32::from_bits(1);
+        let mut surface = raster_scene(&root, 120, 120, 1.0).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        assert_eq!(pixels.get_color((50, 50)), SkiaColor::WHITE);
+        assert_eq!(pixels.get_color((50, 83)), SkiaColor::BLACK);
+    }
+
+    #[test]
+    fn hard_shadows_and_negative_spread_leave_the_center_clear() {
+        let mut root = shadow_card(false);
+        let shadow = root.children[0].children[0]
+            .style
+            .box_shadow
+            .as_mut()
+            .unwrap();
+        shadow.blur = 0.0;
+        shadow.spread = -4.0;
+        shadow.offset.y = 12.0;
+        let mut surface = raster_scene(&root, 120, 120, 1.0).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        assert_eq!(pixels.get_color((50, 50)), SkiaColor::WHITE);
+        assert_eq!(pixels.get_color((50, 85)), SkiaColor::BLACK);
+        assert_eq!(pixels.get_color((22, 85)), SkiaColor::WHITE);
+    }
+
+    #[test]
+    fn path_shadows_follow_the_clipped_silhouette_outside_its_content_box() {
+        let mut root = shadow_card(false);
+        let card = &mut root.children[0].children[0];
+        card.kind = Kind::Path;
+        card.style.box_shadow = None;
+        card.path.set_data("M0 0H60V20H20V60H0Z".into()).unwrap();
+        card.path.view_box = Some(ViewBox {
+            x: 0.0,
+            y: 0.0,
+            width: 60.0,
+            height: 60.0,
+        });
+        card.path.fill = Some(thing_core::Color([0, 160, 0, 255]).into());
+        card.path.shadow = Some(thing_core::Shadow {
+            color: thing_core::Color([0, 0, 0, 255]),
+            offset: thing_core::Point { x: 6.0, y: 6.0 },
+            blur: 0.0,
+            spread: 0.0,
+        });
+        let mut surface = raster_scene(&root, 120, 120, 1.0).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        assert_eq!(pixels.get_color((30, 30)), SkiaColor::from_rgb(0, 160, 0));
+        assert_eq!(pixels.get_color((42, 65)), SkiaColor::BLACK);
+        assert_eq!(pixels.get_color((60, 65)), SkiaColor::WHITE);
+        assert_eq!(pixels.get_color((30, 83)), SkiaColor::BLACK);
+    }
+
+    #[test]
+    fn shadow_opacity_is_inherited_once_and_fractional_scaling_preserves_geometry() {
+        let mut root = shadow_card(false);
+        root.children[0].style.opacity = 0.5;
+        let shadow = root.children[0].children[0]
+            .style
+            .box_shadow
+            .as_mut()
+            .unwrap();
+        shadow.blur = 0.0;
+        shadow.offset.y = 12.0;
+        for (width, scale) in [(120, 1.0), (150, 1.25)] {
+            let mut surface = raster_scene(&root, width, width, scale).unwrap();
+            let point = ((50.0 * scale) as i32, (85.0 * scale) as i32);
+            let color = surface.peek_pixels().unwrap().get_color(point);
+            assert!((125..=130).contains(&color.r()), "{color:?}");
+        }
+    }
+
+    #[test]
+    fn shadow_sigma_rejects_extreme_scaling_and_accepts_nonuniform_scaling() {
+        let mut root = shadow_card(false);
+        let card = &mut root.children[0].children[0];
+        card.style.scale_x = 100.0;
+        card.style.box_shadow.as_mut().unwrap().blur = 10.0;
+        assert!(raster_scene(&root, 120, 120, 1.0).is_ok());
+        root.children[0].style.scale_y = 100.0;
+        assert!(
+            raster_scene(&root, 120, 120, 1.0)
+                .unwrap_err()
+                .contains("128 pixel device sigma")
+        );
+    }
+
+    /// a 20 pixel path icon whose closed zigzag has `points` line segments.
+    fn shadowed_icon(id: u64, points: usize, shadow: thing_core::Shadow) -> Node {
+        let mut icon = Node::new(NodeId(id), Kind::Path);
+        icon.style.width = Some(20.0);
+        icon.style.height = Some(20.0);
+        let mut data = String::from("M0 20");
+        for index in 0..points {
+            let x = index as f32 * 20.0 / points as f32;
+            data.push_str(&format!(" L{x} {}", if index % 2 == 0 { 0 } else { 10 }));
+        }
+        data.push_str(" L20 20Z");
+        icon.path.set_data(data).unwrap();
+        icon.path.view_box = Some(ViewBox {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+        });
+        icon.path.fill = Some(thing_core::Color([0, 160, 0, 255]).into());
+        icon.path.shadow = Some(shadow);
+        icon
+    }
+
+    /// a 60 pixel scroll viewport at (20, 20) holding `children` in a column.
+    fn scrolled_icons(children: Vec<Node>) -> Node {
+        let mut root = shadow_card(true);
+        let viewport = &mut root.children[0];
+        viewport.children.clear();
+        let mut column = Node::new(NodeId(10), Kind::Column);
+        column.style.align = thing_core::CrossAlign::Start;
+        column.children = children;
+        viewport.children.push(column);
+        root
+    }
+
+    #[test]
+    fn offscreen_path_shadows_do_not_spend_the_visible_path_budget() {
+        let shadow = thing_core::Shadow {
+            color: thing_core::Color([0, 0, 0, 255]),
+            offset: thing_core::Point { x: 6.0, y: 0.0 },
+            blur: 4.0,
+            spread: 0.0,
+        };
+        // eighty icons of 61 segments exceed the 4096 segment frame budget,
+        // although only the first three fit in the viewport.
+        let icons = (0..80)
+            .map(|index| shadowed_icon(100 + index, 60, shadow))
+            .collect::<Vec<_>>();
+        assert!(
+            icons
+                .iter()
+                .map(|icon| icon.path.segments.len())
+                .sum::<usize>()
+                > 4096
+        );
+        let root = scrolled_icons(icons);
+        let mut surface = raster_scene(&root, 120, 120, 1.0).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        // the viewport centers the column at x 40 to 60. the visible icons
+        // still cast gray shadows to their right, and none escape below.
+        let shadow = pixels.get_color((63, 30));
+        assert!(shadow.r() < 200 && shadow.r() == shadow.g(), "{shadow:?}");
+        assert_eq!(pixels.get_color((63, 90)), SkiaColor::WHITE);
+    }
+
+    fn hard_shadow(x: f32, y: f32, spread: f32) -> thing_core::Shadow {
+        thing_core::Shadow {
+            color: thing_core::Color([0, 0, 0, 255]),
+            offset: thing_core::Point { x, y },
+            blur: 0.0,
+            spread,
+        }
+    }
+
+    /// replaces the card with a 60 pixel path at (20, 20) drawn in a 60
+    /// pixel view box.
+    fn path_card(data: &str, shadow: thing_core::Shadow) -> Node {
+        let mut root = shadow_card(false);
+        let card = &mut root.children[0].children[0];
+        card.kind = Kind::Path;
+        card.style.box_shadow = None;
+        card.path.set_data(data.into()).unwrap();
+        card.path.view_box = Some(ViewBox {
+            x: 0.0,
+            y: 0.0,
+            width: 60.0,
+            height: 60.0,
+        });
+        card.path.fill = Some(thing_core::Color([0, 160, 0, 255]).into());
+        card.path.shadow = Some(shadow);
+        root
+    }
+
+    #[test]
+    fn positive_path_spread_grows_with_round_corners_and_keeps_holes() {
+        // a square at surface (30, 30) to (70, 70).
+        let root = path_card("M10 10H50V50H10Z", hard_shadow(0.0, 0.0, 4.0));
+        let mut surface = raster_scene(&root, 120, 120, 1.0).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        assert_eq!(pixels.get_color((50, 50)), SkiaColor::from_rgb(0, 160, 0));
+        assert_eq!(pixels.get_color((26, 50)), SkiaColor::BLACK);
+        assert_eq!(pixels.get_color((24, 50)), SkiaColor::WHITE);
+        // round joins keep the grown corner circular.
+        assert_eq!(pixels.get_color((26, 26)), SkiaColor::WHITE);
+        assert_eq!(pixels.get_color((28, 28)), SkiaColor::BLACK);
+
+        // an even-odd ring grows into its hole only by the spread.
+        let mut root = path_card("M0 0H60V60H0Z M15 15H45V45H15Z", hard_shadow(0.0, 0.0, 4.0));
+        root.children[0].children[0].path.fill_rule = thing_core::PathFillRule::EvenOdd;
+        let mut surface = raster_scene(&root, 120, 120, 1.0).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        assert_eq!(pixels.get_color((25, 50)), SkiaColor::from_rgb(0, 160, 0));
+        assert_eq!(pixels.get_color((37, 50)), SkiaColor::BLACK);
+        assert_eq!(pixels.get_color((50, 50)), SkiaColor::WHITE);
+    }
+
+    #[test]
+    fn negative_path_spread_and_mirrors_keep_their_geometry() {
+        // the square shrinks to (36, 36) to (64, 64) and moves down by 20.
+        let root = path_card("M10 10H50V50H10Z", hard_shadow(0.0, 20.0, -6.0));
+        let mut surface = raster_scene(&root, 120, 120, 1.0).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        assert_eq!(pixels.get_color((50, 77)), SkiaColor::BLACK);
+        assert_eq!(pixels.get_color((33, 77)), SkiaColor::WHITE);
+        assert_eq!(pixels.get_color((50, 86)), SkiaColor::WHITE);
+
+        // a mirrored widget mirrors its local offset too.
+        let mut root = path_card("M10 10H50V50H10Z", hard_shadow(8.0, 0.0, 0.0));
+        root.children[0].children[0].style.scale_x = -1.0;
+        let mut surface = raster_scene(&root, 120, 120, 1.0).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        assert_eq!(pixels.get_color((26, 50)), SkiaColor::BLACK);
+        assert_eq!(pixels.get_color((74, 50)), SkiaColor::WHITE);
+    }
+
+    #[test]
+    fn path_shadows_reach_into_a_viewport_from_hidden_sources() {
+        let mut spacer = Node::new(NodeId(20), Kind::Column);
+        spacer.style.width = Some(20.0);
+        spacer.style.height = Some(60.0);
+        let mut icon = shadowed_icon(21, 2, hard_shadow(0.0, -10.0, 0.0));
+        icon.path.set_data("M0 0H20V20H0Z".into()).unwrap();
+        // the icon lies just below the viewport, and its shadow rises into it.
+        let root = scrolled_icons(vec![spacer, icon]);
+        let mut surface = raster_scene(&root, 120, 120, 1.0).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        // the viewport centers the column, so the icon spans x 40 to 60.
+        assert_eq!(pixels.get_color((50, 75)), SkiaColor::BLACK);
+        assert_eq!(pixels.get_color((50, 85)), SkiaColor::WHITE);
+    }
+
+    #[test]
+    fn visible_path_shadows_with_oversized_intermediate_geometry_are_refused() {
+        // a dense wave whose shrinking outline exceeds the per-shadow limit.
+        let mut data = String::from("M0 30");
+        for index in 0..48 {
+            let x = index as f32 * 1.25;
+            let y = if index % 2 == 0 { 0 } else { 60 };
+            data.push_str(&format!(
+                " C{} {y} {} {y} {} 30",
+                x + 0.4,
+                x + 0.8,
+                x + 1.25
+            ));
+        }
+        data.push_str(" L60 60 L0 60Z");
+        let root = path_card(&data, hard_shadow(0.0, 0.0, -32.0));
+        let error = raster_scene(&root, 120, 120, 1.0).err().unwrap();
+        assert!(error.contains("path geometry budget"), "{error}");
+
+        // the same path scrolled far out of view is never prepared.
+        let mut spacer = Node::new(NodeId(20), Kind::Column);
+        spacer.style.width = Some(20.0);
+        spacer.style.height = Some(200.0);
+        let wave = root.children[0].children[0].clone();
+        let root = scrolled_icons(vec![spacer, wave]);
+        assert!(raster_scene(&root, 120, 120, 1.0).is_ok());
     }
 
     fn linear_brush(stops: &[(f64, &str)], vertical: bool) -> thing_core::Brush {

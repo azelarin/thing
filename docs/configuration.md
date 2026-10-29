@@ -694,6 +694,7 @@ pixels after the path is fitted, including with `fit = 'fill'`.
 padding defines the content box. `style.radius` clips the drawing within that
 box; the widget's background and border still use its complete bounds. a path is
 a visual leaf, so interaction belongs on a surrounding button or other control.
+`shadow` casts a shadow from the filled shape, described in [shadows](#shadows).
 
 path data is limited to 256 kib and 4,096 segments both before and after arcs and
 shorthand commands are normalized. coordinates and view-box edges must stay
@@ -1160,6 +1161,7 @@ put layout and paint values in `style`. dimensions use logical pixels.
 | `text_align` | `start`; also accepts `center` or `end` |
 | `tabular_digits` | `false`; requests equal-width digits from fonts that support them |
 | `background` | transparent |
+| `box_shadow` | none; an outside shadow, described in [shadows](#shadows) |
 | `foreground` | white |
 | `opacity` | `1` |
 | `translate_x`, `translate_y`, `rotation` | `0` |
@@ -1253,6 +1255,71 @@ layout. a function can return a whole gradient to react to state; changing a
 stop in a plain table does not trigger a refresh. color transitions still work
 with solid backgrounds. to animate a gradient, animate state used by the
 function that returns it; gradient tables do not interpolate automatically.
+
+### shadows
+
+`style.box_shadow` casts a shadow from a widget's rounded border box. a path's
+`shadow` property casts one from its filled shape. both take the same table, and
+a function that returns `nil` removes the shadow:
+
+```luau
+local raised = ui.state(false)
+
+ui.button {
+    on_click = function() raised:set(not raised:get()) end,
+    style = {
+        width = 120,
+        height = 40,
+        radius = 8,
+        background = '#1e1e2e',
+        box_shadow = function()
+            if not raised:get() then
+                return nil
+            end
+            return { color = '#00000080', blur = 12, offset_y = 4 }
+        end,
+    },
+    children = {
+        ui.path {
+            data = 'M 12 2 L 22 20 H 2 Z',
+            view_box = { x = 0, y = 0, width = 24, height = 24 },
+            fill = '#89b4fa',
+            shadow = { color = '#11111bcc', blur = 2, offset_x = 1, offset_y = 1 },
+            style = { width = 18, height = 18 },
+        },
+    },
+}
+```
+
+| field | meaning |
+| --- | --- |
+| `color` | required; `#RRGGBB` or `#RRGGBBAA` |
+| `blur` | `0` to `32`; the blur radius, where `0` gives a hard edge |
+| `spread` | `-32` to `32`; grows the shape before blurring, or shrinks it when negative |
+| `offset_x`, `offset_y` | `-100000` to `100000`; moves the shadow |
+
+the numeric fields default to `0` and use logical pixels in the widget's own
+coordinates, so they scale, rotate, and mirror with its transform. any other
+field, a missing color, or a value outside these ranges is an error.
+
+shadows are drawn only outside their shape. the widget's own area stays clear
+even when its background is transparent. a box shadow follows the border box
+and its `radius`. a path shadow follows the fitted path's filled geometry, cut
+to the rounded content box before spread, offset, and blur. its color comes
+from `color` alone: fill color, gradient alpha, and strokes do not shape it,
+and a transparent fill still casts it. inherited opacity and disabled opacity
+apply to a shadow once.
+
+a shadow does not change layout, enlarge the surface, or widen a panel's input
+region. the surface edge and scroll viewports clip it. other ancestors currently
+do not, so a shadow can extend past a tight container.
+
+a layout is rejected when a shadow is too costly to draw: its blur grows too
+large through transforms and output scale, too much blurred area accumulates
+on one surface, or a path shadow's geometry is too complex. negative spread on
+detailed paths is the most expensive case. path shadows also accept simpler
+paths than `ui.path` itself. a rejected reactive update leaves the current tree
+in place. simplify the path, or reduce its spread, blur, or scale.
 
 ### visual transforms
 

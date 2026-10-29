@@ -249,5 +249,317 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual(process.polls, 2)
 
 
+BACKGROUND = check_rendering.SHADOW_BACKGROUND
+WHITE = check_rendering.SHADOW_WHITE
+GREEN = check_rendering.SHADOW_GREEN
+BLACK = (0, 0, 0)
+SHADOWS = frozenset("abcefghijk")
+
+
+class Canvas:
+    """a logical 640 by 480 frame painted with axis-aligned rectangles."""
+
+    def __init__(self, scale):
+        self.scale = scale
+        self.width = check_rendering.physical(640, scale)
+        self.height = check_rendering.physical(480, scale)
+        self.pixels = bytearray(bytes(BACKGROUND) * (self.width * self.height))
+
+    def rect(self, left, top, right, bottom, color):
+        physical = check_rendering.physical
+        x0, x1 = physical(left, self.scale), physical(right, self.scale)
+        for y in range(physical(top, self.scale), physical(bottom, self.scale)):
+            start = (y * self.width + x0) * 3
+            self.pixels[start : start + (x1 - x0) * 3] = bytes(color) * (x1 - x0)
+        return self
+
+    def image(self):
+        return Ppm(self.width, self.height, bytes(self.pixels))
+
+    def ppm(self):
+        return f"P6\n{self.width} {self.height}\n255\n".encode() + bytes(self.pixels)
+
+
+def gallery(scale, *, reload=False, shadows=SHADOWS):
+    """a plausible shadows frame. it approximates each case with rectangles
+    placed to satisfy the probes; it does not model the renderer."""
+    canvas = Canvas(scale)
+    rect = canvas.rect
+    if "a" in shadows:
+        rect(60, 60, 120, 120, BLACK).rect(114, 114, 120, 120, BACKGROUND)
+        rect(50, 50, 110, 110, BACKGROUND)
+    rect(190, 50, 250, 110, WHITE)
+    if "b" in shadows:
+        for top, bottom, value in ((110, 120, 30), (120, 126, 110), (126, 134, 170), (134, 140, 210)):
+            rect(190, top, 250, bottom, (value,) * 3)
+    rect(330, 50, 390, 110, WHITE)
+    if "c" in shadows:
+        rect(330, 110, 390, 130, BLACK)
+    rect(470, 50, 530, 110, WHITE)
+    if "e" in shadows:
+        rect(58, 198, 118, 218, BLACK).rect(58, 198, 78, 258, BLACK)
+    rect(50, 190, 110, 210, GREEN).rect(50, 190, 70, 250, GREEN)
+    if "f" in shadows:
+        rect(184, 184, 256, 256, BLACK)
+        for x, y in ((184, 184), (253, 184), (184, 253), (253, 253)):
+            rect(x, y, x + 3, y + 3, BACKGROUND)
+    rect(190, 190, 250, 250, GREEN)
+    rect(205, 205, 235, 235, BLACK if "f" in shadows else BACKGROUND)
+    rect(211, 211, 229, 229, BACKGROUND)
+    if "g" in shadows:
+        rect(340, 250, 380, 264, BLACK)
+    rect(330, 190, 390, 250, GREEN)
+    if "h" in shadows:
+        rect(458, 190, 470, 250, BLACK)
+    rect(470, 190, 530, 250, WHITE)
+    rect(50, 330, 110, 390, (240, 240, 240))
+    if "i" in shadows:
+        rect(50, 390, 110, 410, (112, 112, 112))
+    if "j" in shadows:
+        rect(170, 330, 190, 390, BLACK)
+    rect(190, 330, 250, 390, WHITE)
+    rect(330, 330, 390, 390, WHITE)
+    if "k" in shadows:
+        rect(330, 310 if reload else 390, 390, 330 if reload else 410, BLACK)
+    return canvas
+
+
+class ShadowOracleTest(unittest.TestCase):
+    def verify(self, canvas, stage="scale-1"):
+        check_rendering.verify_capture("shadows", canvas.image(), stage, canvas.scale)
+
+    def test_accepts_plausible_frames_at_both_scales(self):
+        for scale in (1.0, 1.25):
+            with self.subTest(scale=scale):
+                for stage in ("scale-1", "scale-1.25", "rejected"):
+                    self.verify(gallery(scale), stage)
+                self.verify(gallery(scale, reload=True), "reload")
+
+    def test_rejects_blank_and_unshadowed_frames(self):
+        for canvas in (Canvas(1.0), gallery(1.0, shadows=frozenset())):
+            with self.assertRaises(FixtureError):
+                self.verify(canvas)
+
+    def test_reports_the_probe_each_mistake_breaks(self):
+        cases = {
+            "f: hole center stays clear": gallery(1.25).rect(211, 211, 229, 229, BLACK),
+            "f: grown corner stays round": gallery(1.0).rect(184, 184, 187, 187, BLACK),
+            "d: scroll viewport clips the shadow": gallery(1.0).rect(470, 110, 530, 130, BLACK),
+            "h: mirrored offset moves the shadow left": gallery(
+                1.25, shadows=SHADOWS - {"h"}
+            ).rect(530, 190, 542, 250, BLACK),
+            "c: shadow overflows a tight container": gallery(1.0, shadows=SHADOWS - {"c"}),
+            "a: knockout keeps the transparent center": gallery(1.0).rect(
+                50, 50, 110, 110, BLACK
+            ),
+            # a bounding-box shadow fills the concavity of the path.
+            "e: concavity stays clear": gallery(1.0)
+            .rect(58, 198, 118, 258, BLACK)
+            .rect(50, 190, 110, 210, GREEN)
+            .rect(50, 190, 70, 250, GREEN),
+            "b: blur falloff": gallery(1.0)
+            .rect(190, 110, 250, 122, BLACK)
+            .rect(190, 122, 250, 140, BACKGROUND),
+            "g: shrinking narrows the shadow": gallery(1.25).rect(330, 250, 390, 274, BLACK),
+            "i: shadow uses opacity once": gallery(1.0).rect(50, 390, 110, 410, (168,) * 3),
+            "j: rotation turns the offset left": gallery(1.0, shadows=SHADOWS - {"j"}),
+        }
+        for label, canvas in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(FixtureError, label):
+                    self.verify(canvas)
+
+    def test_stale_pixels_do_not_pass_the_valid_reload(self):
+        with self.assertRaisesRegex(FixtureError, "k: reloaded shadow above"):
+            self.verify(gallery(1.25), "reload")
+        with self.assertRaisesRegex(FixtureError, "k: shadow below"):
+            self.verify(gallery(1.25, reload=True), "rejected")
+
+
+class StableCaptureTest(unittest.TestCase):
+    def capture(self, frames, required):
+        calls = []
+        sequence = iter(frames)
+
+        def grab(arguments, **_kwargs):
+            calls.append(arguments)
+            Path(arguments[-1]).write_bytes(next(sequence).ppm())
+
+        class RunningProcess:
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory(prefix="thing-render-stable-") as directory:
+            with (
+                mock.patch.object(check_rendering, "checked", side_effect=grab),
+                mock.patch.object(check_rendering.time, "sleep"),
+                mock.patch.object(
+                    check_rendering.time, "monotonic", side_effect=range(len(frames) + 1)
+                ),
+            ):
+                check_rendering.capture_until(
+                    Path("grim"),
+                    {},
+                    RunningProcess(),
+                    "output",
+                    Path(directory) / "capture.ppm",
+                    "shadows",
+                    "scale-1",
+                    1.0,
+                    len(frames),
+                    frames=required,
+                )
+        return len(calls)
+
+    def test_waits_for_two_identical_passing_frames(self):
+        first = gallery(1.0)
+        # a passing frame that still differs outside every probe.
+        second = gallery(1.0).rect(630, 470, 640, 480, BLACK)
+        self.assertEqual(self.capture([first, second, second], 2), 3)
+        self.assertEqual(self.capture([first], 1), 1)
+
+    def test_a_failing_frame_restarts_the_count(self):
+        good = gallery(1.0)
+        broken = gallery(1.0).rect(211, 211, 229, 229, BLACK)
+        with self.assertRaisesRegex(FixtureError, "waiting for 2 identical frames"):
+            self.capture([good, broken, good], 2)
+        self.assertEqual(self.capture([good, broken, good, good], 2), 4)
+
+
+class RejectedReloadTest(unittest.TestCase):
+    LINE = (
+        "thing: reload failed; keeping the previous surfaces: "
+        "runtime error: shadow blur must be between 0 and 32 logical pixels"
+    )
+
+    class RunningProcess:
+        def __init__(self, status=None):
+            self.status = status
+
+        def poll(self):
+            return self.status
+
+    def wait(self, contents, offset, process=None, deadline=0.3):
+        with tempfile.TemporaryDirectory(prefix="thing-render-log-") as directory:
+            log = Path(directory) / "thing.log"
+            log.write_text(contents, encoding="utf-8")
+            return check_rendering.wait_for_rejection(
+                log,
+                offset,
+                check_rendering.INVALID_RELOADS["shadows"],
+                process or self.RunningProcess(),
+                time.monotonic() + deadline,
+            )
+
+    def test_accepts_only_a_rejection_logged_after_the_replacement(self):
+        earlier = "thing: started\n"
+        self.assertEqual(self.wait(earlier + self.LINE + "\n", len(earlier)), self.LINE)
+        stale = self.LINE + "\n"
+        with self.assertRaisesRegex(FixtureError, "did not report the rejected reload"):
+            self.wait(stale + "thing: started\n", len(stale))
+
+    def test_ignores_a_rejection_for_another_reason(self):
+        other = "thing: reload failed; keeping the previous surfaces: syntax error\n"
+        with self.assertRaisesRegex(FixtureError, "did not report"):
+            self.wait(other, 0)
+
+    def test_stops_when_thing_exits(self):
+        with self.assertRaisesRegex(FixtureError, "thing exited"):
+            self.wait("", 0, self.RunningProcess(status=1))
+
+    def test_requires_the_invalid_fixture_to_fail_for_its_stated_reason(self):
+        path = Path("panel-invalid.luau")
+        detail = check_rendering.INVALID_RELOADS["shadows"]
+        failure = FixtureError(f"command failed: thing check: thing: runtime error: {detail} logical pixels")
+        with mock.patch.object(check_rendering, "checked", side_effect=failure):
+            check_rendering.expect_rejected_config(Path("thing"), path, detail, 0)
+        with mock.patch.object(
+            check_rendering, "checked", side_effect=FixtureError("command failed: syntax error")
+        ):
+            with self.assertRaisesRegex(FixtureError, "another reason"):
+                check_rendering.expect_rejected_config(Path("thing"), path, detail, 0)
+        with mock.patch.object(check_rendering, "checked"):
+            with self.assertRaisesRegex(FixtureError, "unexpectedly passed"):
+                check_rendering.expect_rejected_config(Path("thing"), path, detail, 0)
+
+
+class StageTest(unittest.TestCase):
+    def run_stages(self, case):
+        events = []
+
+        class Process:
+            def __init__(self, *_arguments, **_kwargs):
+                self.stopped = False
+
+            def poll(self):
+                return 0 if self.stopped else None
+
+            def terminate(self):
+                self.stopped = True
+
+            def wait(self, timeout=None):
+                return 0
+
+        with tempfile.TemporaryDirectory(prefix="thing-render-stages-") as directory:
+            with mock.patch.object(check_rendering, "ARTIFACTS", Path(directory)):
+                run_directory = check_rendering.prepare_run_directory(case, "opengl")
+            panel = run_directory / "fixture" / "panel.luau"
+
+            def capture(*arguments, frames=1):
+                events.append((arguments[6], panel.read_text(), frames))
+
+            def rejection(log_path, offset, detail, _process, _deadline):
+                events.append(("witness", panel.read_text(), offset <= log_path.stat().st_size))
+                return "logged rejection"
+
+            patches = (
+                mock.patch.object(check_rendering, "private_environment", return_value={}),
+                mock.patch.object(check_rendering, "wait_for_output", return_value=("out", 1.0)),
+                mock.patch.object(check_rendering, "checked"),
+                mock.patch.object(check_rendering.subprocess, "Popen", Process),
+                mock.patch.object(check_rendering, "capture_until", side_effect=capture),
+                mock.patch.object(check_rendering, "wait_for_rejection", side_effect=rejection),
+            )
+            for patch in patches:
+                patch.start()
+                self.addCleanup(patch.stop)
+            result = check_rendering.run_inner(
+                run_directory, Path("thing"), "opengl", case, Path("niri"), Path("grim")
+            )
+            fixture = check_rendering.FIXTURES / case
+            texts = {
+                name: (fixture / f"{name}.luau").read_text()
+                for name in ("panel", "panel-invalid", "panel-reload")
+                if (fixture / f"{name}.luau").exists()
+            }
+        return events, result, texts
+
+    def test_shadows_reject_a_reload_before_recovering(self):
+        events, result, texts = self.run_stages("shadows")
+        self.assertEqual(
+            events,
+            [
+                ("scale-1", texts["panel"], 2),
+                ("scale-1.25", texts["panel"], 2),
+                ("witness", texts["panel-invalid"], True),
+                ("rejected", texts["panel-invalid"], 2),
+                ("reload", texts["panel-reload"], 2),
+            ],
+        )
+        self.assertEqual(result["rejected_reload"], "logged rejection")
+
+    def test_other_cases_keep_their_single_frame_stages(self):
+        events, result, texts = self.run_stages("gradients")
+        self.assertEqual(
+            events,
+            [
+                ("scale-1", texts["panel"], 1),
+                ("scale-1.25", texts["panel"], 1),
+                ("reload", texts["panel-reload"], 1),
+            ],
+        )
+        self.assertNotIn("rejected_reload", result)
+
+
 if __name__ == "__main__":
     unittest.main()

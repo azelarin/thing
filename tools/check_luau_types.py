@@ -185,6 +185,18 @@ CASES = (
             "Expected this to be 'number', but got",
         ),
     ),
+    Case("valid-shadows.luau"),
+    Case(
+        "invalid-shadows.luau",
+        (
+            "Key 'softness' not found in table 'ThingShadow'",
+            "because the former is missing field 'color'",
+            "Expected this to be exactly 'string', but got 'number'",
+            "Property 'blur' is not compatible.",
+            "Expected this to be 'ThingShadow?', but got 'string'",
+            "but got\n\t'{| color: string, offset_x: boolean |}'",
+        ),
+    ),
     Case(
         "invalid-transforms.luau",
         (

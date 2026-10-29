@@ -82,6 +82,10 @@ return ui.lock {
             },
         },
         help,
+        ui.row { style = {
+            width = 40, height = 20, scale_x = 4, scale_y = 4,
+            box_shadow = { color = '#000000', blur = 32 },
+        } },
     },
 }
 "#;
@@ -770,6 +774,40 @@ fn run_host_probe() {
         app.surfaces[0].layouts.presented_target(secret),
         Some(target.clone())
     );
+    // a rejected density must keep the locked frame and its password editor.
+    app.set_surface_scale(0, thing_core::Scale::from_120ths(360).unwrap());
+    assert_eq!(app.surfaces[0].scale, thing_core::Scale::default());
+    assert_eq!(app.surfaces[0].preferred_scale.factor(), 3.0);
+    assert_eq!(
+        app.surfaces[0].secret_input.as_ref().unwrap().editor.len(),
+        2
+    );
+    assert_eq!(app.surfaces[0].focus_target.as_ref(), Some(&target));
+    assert_eq!(app.lifecycle.phase(), super::model::Phase::Locked);
+    assert!(!app.render_failed);
+    let fractional = thing_core::Scale::from_120ths(150).unwrap();
+    app.set_surface_scale(0, fractional);
+    assert_eq!(app.surfaces[0].scale, fractional);
+    let prepared = app.surfaces[0].prepared.as_ref().unwrap();
+    let physical = (
+        fractional.physical_size(app.surfaces[0].size.0).unwrap(),
+        fractional.physical_size(app.surfaces[0].size.1).unwrap(),
+    );
+    thing_ui::validate_shadows(
+        &prepared.root,
+        &prepared.layout,
+        physical,
+        fractional.factor(),
+    )
+    .unwrap();
+    assert_eq!(
+        app.surfaces[0].secret_input.as_ref().unwrap().editor.len(),
+        2
+    );
+    // the fixed shared-memory renderer uses a scale-one buffer for the rest
+    // of this lifecycle scenario.
+    app.set_surface_scale(0, thing_core::Scale::default());
+
     app.set_authentication(AuthenticationSnapshot {
         available: true,
         state: AuthenticationState::Idle,

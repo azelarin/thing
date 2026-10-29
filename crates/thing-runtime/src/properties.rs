@@ -120,6 +120,49 @@ fn brush(value: Value, name: &str) -> Result<thing_core::Brush> {
     Ok(brush)
 }
 
+fn shadow(value: Value) -> Result<Option<thing_core::Shadow>> {
+    use thing_core::{MAX_SHADOW_BLUR, MAX_SHADOW_OFFSET, MAX_SHADOW_SPREAD, Shadow};
+    if value.is_nil() {
+        return Ok(None);
+    }
+    let Value::Table(table) = value else {
+        return Err(Error::runtime("shadow must be a table or nil"));
+    };
+    for pair in table.clone().pairs::<String, Value>() {
+        let (field, _) = pair?;
+        if !matches!(
+            field.as_str(),
+            "color" | "blur" | "offset_x" | "offset_y" | "spread"
+        ) {
+            return Err(Error::runtime(format!("unknown shadow property {field:?}")));
+        }
+    }
+    let scalar = |name: &str, minimum: f32, maximum: f32| -> Result<f32> {
+        let value = table.raw_get::<Value>(name)?;
+        if value.is_nil() {
+            return Ok(0.0);
+        }
+        let value = number(value, name)?;
+        if !(f64::from(minimum)..=f64::from(maximum)).contains(&value) {
+            return Err(Error::runtime(format!(
+                "shadow {name} must be between {minimum} and {maximum} logical pixels"
+            )));
+        }
+        Ok(value as f32)
+    };
+    let shadow = Shadow {
+        color: color(table.raw_get("color")?, "shadow color")?,
+        offset: thing_core::Point {
+            x: scalar("offset_x", -MAX_SHADOW_OFFSET, MAX_SHADOW_OFFSET)?,
+            y: scalar("offset_y", -MAX_SHADOW_OFFSET, MAX_SHADOW_OFFSET)?,
+        },
+        blur: scalar("blur", 0.0, MAX_SHADOW_BLUR)?,
+        spread: scalar("spread", -MAX_SHADOW_SPREAD, MAX_SHADOW_SPREAD)?,
+    };
+    shadow.validate().map_err(Error::external)?;
+    Ok(Some(shadow))
+}
+
 fn optional_brush(value: Value, name: &str) -> Result<Option<thing_core::Brush>> {
     if value.is_nil() {
         Ok(None)
@@ -629,6 +672,7 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
             .map_err(Error::external)?,
         "view_box" if node.kind == Kind::Path => node.path.view_box = Some(path_view_box(value)?),
         "fit" if node.kind == Kind::Path => node.path.fit = path_fit(value)?,
+        "shadow" if node.kind == Kind::Path => node.path.shadow = shadow(value)?,
         "fill" if node.kind == Kind::Path => node.path.fill = optional_brush(value, name)?,
         "fill_rule" if node.kind == Kind::Path => node.path.fill_rule = path_fill_rule(value)?,
         "stroke" if node.kind == Kind::Path => node.path.stroke = color(value, name)?,
@@ -750,6 +794,7 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
             node.style.tabular_digits = boolean(value, name)?
         }
         "style.opacity" => node.style.opacity = number(value, name)? as f32,
+        "style.box_shadow" => node.style.box_shadow = shadow(value)?,
         "style.background" => node.style.background = brush(value, name)?,
         "style.foreground" => node.style.foreground = color(value, name)?,
         "style.translate_x" => node.style.translate_x = number(value, name)? as f32,

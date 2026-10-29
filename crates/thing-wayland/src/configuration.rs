@@ -554,6 +554,7 @@ impl<K: Clone + Eq> Configurations<K> {
             return Ok(false);
         };
         if instance.output == output {
+            validate(instance.runtime.surfaces())?;
             return Ok(false);
         }
         instance
@@ -561,10 +562,16 @@ impl<K: Clone + Eq> Configurations<K> {
             .set_output(output.clone())
             .map_err(|error| error.to_string())?;
         instance.output = output;
-        instance
+        let changed = instance
             .runtime
-            .refresh_checked(validate)
-            .map_err(|error| error.to_string())
+            .refresh_checked(&validate)
+            .map_err(|error| error.to_string())?;
+        // output changes can affect rendering even when no reactive property
+        // reads them, so an unchanged tree still needs candidate validation.
+        if !changed {
+            validate(instance.runtime.surfaces())?;
+        }
+        Ok(changed)
     }
 
     pub(crate) fn set_service(&mut self, name: &str, value: Scalar) -> Result<(), String> {

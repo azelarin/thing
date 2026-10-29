@@ -75,6 +75,10 @@ pub struct SemanticPlacement {
     pub border_aabb: Rect,
     pub transform: Affine,
     pub enabled: bool,
+    pub opacity: f32,
+    pub(crate) disabled_opacity: f32,
+    pub(crate) shadow_clip_chain: usize,
+    pub(crate) shadow_clip: Rect,
     pub scroll_offset: Option<f32>,
     pub max_scroll_offset: Option<f32>,
     inverse: Option<Affine>,
@@ -180,8 +184,6 @@ struct Inherited {
     clip_chain: usize,
     clip_aabb: Rect,
     enabled: bool,
-    opacity: f32,
-    disabled_opacity: f32,
     parent: Option<usize>,
 }
 
@@ -193,6 +195,10 @@ struct RevealInherited {
     parent: Option<NodeId>,
     scroll_parent: Option<NodeId>,
     reveal_scroll_parent: Option<NodeId>,
+    opacity: f32,
+    disabled_opacity: f32,
+    shadow_clip_chain: usize,
+    shadow_clip: Rect,
 }
 
 /// resolved geometry for one surface. popup children have separate surfaces and
@@ -200,6 +206,7 @@ struct RevealInherited {
 #[derive(Debug, Default)]
 pub struct Layout {
     placements: Vec<Placement>,
+    placement_indices: BTreeMap<NodeId, usize>,
     semantic_placements: Vec<SemanticPlacement>,
     semantic_indices: BTreeMap<NodeId, usize>,
     pointer_regions: Vec<PointerRegion>,
@@ -322,6 +329,10 @@ impl Layout {
                 parent: None,
                 scroll_parent: None,
                 reveal_scroll_parent: None,
+                opacity: 1.0,
+                disabled_opacity: 1.0,
+                shadow_clip_chain: 0,
+                shadow_clip: clip,
             },
         )?;
         result.collect(
@@ -334,8 +345,6 @@ impl Layout {
                 clip_chain: 0,
                 clip_aabb: clip,
                 enabled: true,
-                opacity: 1.0,
-                disabled_opacity: 1.0,
                 parent: None,
             },
         )?;
@@ -378,7 +387,9 @@ impl Layout {
     }
 
     pub fn get(&self, id: NodeId) -> Option<&Placement> {
-        self.placements.iter().find(|placement| placement.id == id)
+        self.placement_indices
+            .get(&id)
+            .and_then(|index| self.placements.get(*index))
     }
 
     pub fn surface_to_local(&self, id: NodeId, point: Point) -> Option<Point> {
@@ -599,6 +610,12 @@ impl Layout {
         let inverse = transform.inverse()?;
         let border_aabb = transform.rect_aabb(local_bounds)?;
         let enabled = inherited.enabled && node.enabled;
+        let opacity = inherited.opacity * node.style.opacity;
+        let disabled_opacity = if inherited.enabled && !node.enabled {
+            node.style.disabled_opacity
+        } else {
+            inherited.disabled_opacity
+        };
         let scroll = (node.kind == Kind::Scroll).then(|| {
             let max_offset = if geometry.scroll_height().is_finite() {
                 geometry.scroll_height().max(0.0)
@@ -617,6 +634,10 @@ impl Layout {
             border_aabb,
             transform,
             enabled,
+            opacity,
+            disabled_opacity,
+            shadow_clip_chain: inherited.shadow_clip_chain,
+            shadow_clip: inherited.shadow_clip,
             scroll_offset: scroll.map(|(offset, _)| offset),
             max_scroll_offset: scroll.map(|(_, max_offset)| max_offset),
             inverse,
@@ -660,6 +681,26 @@ impl Layout {
                 child_transform.compose(Affine::translation(0.0, -f64::from(offset)))?;
         }
 
+        let (shadow_clip_chain, shadow_clip) = if node.kind == Kind::Scroll {
+            let index = self.clip_regions.len();
+            self.clip_regions.push(ClipRegion {
+                bounds: local_bounds,
+                transform,
+                inverse,
+                aabb: border_aabb,
+                parent: Some(inherited.shadow_clip_chain),
+                depth: self.clip_regions[inherited.shadow_clip_chain].depth + 1,
+            });
+            (
+                index,
+                inherited
+                    .shadow_clip
+                    .intersection(border_aabb)
+                    .unwrap_or_default(),
+            )
+        } else {
+            (inherited.shadow_clip_chain, inherited.shadow_clip)
+        };
         for child in &node.children {
             if child.kind != Kind::Popup {
                 self.collect_semantic_regions(
@@ -674,6 +715,10 @@ impl Layout {
                         parent: Some(node.id),
                         scroll_parent: child_scroll_parent,
                         reveal_scroll_parent: child_reveal_scroll_parent,
+                        opacity,
+                        disabled_opacity,
+                        shadow_clip_chain,
+                        shadow_clip,
                     },
                 )?;
             }
@@ -697,8 +742,6 @@ impl Layout {
             clip_chain,
             clip_aabb,
             enabled,
-            opacity,
-            disabled_opacity,
             parent,
         } = inherited;
         let geometry = tree.layout(ids[&node.id]).map_err(|e| e.to_string())?;
@@ -719,17 +762,12 @@ impl Layout {
         let transform = semantic.transform;
         let inverse = semantic.inverse;
         let border_aabb = semantic.border_aabb;
-        // a disabled branch inherits the factor chosen by the widget that
-        // disables it instead of compounding a factor at every descendant.
-        let disabled_opacity = if enabled && !node.enabled {
-            node.style.disabled_opacity
-        } else {
-            disabled_opacity
-        };
         let enabled = enabled && node.enabled;
-        let opacity = opacity * node.style.opacity;
+        let opacity = semantic.opacity;
+        let disabled_opacity = semantic.disabled_opacity;
         crate::brush::validate(node, local_bounds)?;
         let index = self.placements.len();
+        self.placement_indices.insert(node.id, index);
         self.placements.push(Placement {
             id: node.id,
             bounds,
@@ -785,8 +823,6 @@ impl Layout {
                         clip_chain: child_clip_chain,
                         clip_aabb: child_clip_aabb,
                         enabled,
-                        opacity,
-                        disabled_opacity,
                         parent: Some(index),
                     },
                 )?;
