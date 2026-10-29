@@ -975,10 +975,15 @@ extent continue to use the stable untransformed layout.
 
 translation and origin offsets are limited to `-100000` through `100000`, scale
 to `-100` through `100`, rotation to `-1000000` through `1000000`, and origin
-fractions to `-10` through `10`. each transform property may be reactive. they
-update immediately and are not currently accepted by `ui.transition` or
-`ui.spring`. an update whose nested transform cannot be represented by the
-renderer is rejected, leaving the last valid scene active.
+fractions to `-10` through `10`. each transform property may be reactive.
+translation, scale, and rotation also accept `ui.transition` and `ui.spring`.
+rotation follows the numeric angle directly: use `370` to turn forward from
+`350` through `360`. the transform origin changes immediately.
+
+spring frames stay within these limits while retaining their internal momentum.
+a scale animation may pass through zero; pointer input is unavailable while the
+transform is singular. an update whose nested transform cannot be represented
+by the renderer is rejected, leaving the last valid scene active.
 
 ### transitions and springs
 
@@ -1031,7 +1036,8 @@ distance from the target is at most epsilon and its speed is at most
 `epsilon * sqrt(stiffness)` units per second.
 
 numeric transitions and springs are available for `width`, `height`, `padding`,
-`padding_x`, `padding_y`, `gap`, `grow`, `radius`, `border_width`, and `opacity`.
+`padding_x`, `padding_y`, `gap`, `grow`, `radius`, `border_width`, `opacity`,
+`translate_x`, `translate_y`, `scale_x`, `scale_y`, and `rotation`.
 their property functions must return finite numbers, including for normally
 optional dimensions; they cannot move to or from an unspecified value. geometry
 changes go through the normal layout and hit testing paths.
