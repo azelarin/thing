@@ -1616,6 +1616,9 @@ notification lifetime first. each record contains:
 | `created_at_ms`, `updated_at_ms` | server-relative times for the first and latest revision |
 | `category`, `desktop_entry`, `image_path` | optional application metadata |
 | `resident`, `transient`, `action_icons` | standard notification behavior hints |
+| `can_reply`, `reply_placeholder` | whether the client accepts an inline reply, and its placeholder text |
+| `image` | an image the client sent as raw data, for `ui.image { source = ... }`, or `nil` |
+| `closed_reason`, `closed_at_ms` | for history records: `expired`, `dismissed`, or `closed_by_application`, and when |
 
 use the opaque `key` unchanged as the widget key and when sending an action:
 
@@ -1647,11 +1650,35 @@ notifications close after an action; resident notifications stay active. both
 `dismiss` and `invoke` are event-handler actions and reject stale keys.
 
 a timeout of zero never expires. the default timeout is five seconds, while
-critical notifications remain until they are closed. thing does not retain
-notification history. the accepted active record payload is limited to 512 kib
-per record and 8 mib in total. the service reconnects after a session-bus
-failure, discards queued actions from the old connection, and never reuses an
+critical notifications remain until they are closed. the accepted active record
+payload is limited to 512 kib per record and 8 mib in total. the service
+reconnects after a session-bus failure, discards queued actions from the old connection, and never reuses an
 opaque key during the same run.
+
+### replies, images, and history
+
+clients such as chat applications can ask for an inline reply. thing advertises
+the `inline-reply` capability; when a client offers it, `can_reply` is true and
+the reply is not listed among `actions`. `reply(key, text)` sends the text only
+to the client that sent the latest revision, not to every bus listener, and,
+like an action, closes the notification unless it is resident.
+the text must be nonempty, contain no NUL, and be at most 64 kib.
+
+when a client sends image data rather than a path, `image` holds it. images
+larger than 256 pixels on either side are scaled down, and an image that would
+push a record past its size limit is dropped while the notification is kept.
+`image_path` and `app_icon` are still provided as the client sent them, so the
+configuration decides which to prefer.
+
+`history:get()` returns closed notifications, newest first, with the same
+fields plus `closed_reason` and `closed_at_ms`. a notification marked
+`transient` is not kept. the history holds at most 128 records and 8 mib, and
+the oldest records leave first. `forget(key)` removes one record and
+`clear_history()` removes all of them; both are event-handler actions. actions
+and replies are rejected for history records. the history belongs to one
+connection to the session bus and starts empty after a reconnection. grouping,
+do not disturb, and how long a card stays on screen remain up to the
+configuration.
 
 without `--notification-server`, the service remains unowned and empty.
 `thing check` never connects to the session bus.

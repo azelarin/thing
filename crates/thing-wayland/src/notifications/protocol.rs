@@ -4,7 +4,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use zbus::{Connection, fdo, message::Header, object_server::SignalEmitter, zvariant::OwnedValue};
+use thing_core::ImagePixmap;
+use zbus::{
+    Connection, fdo,
+    message::Header,
+    names::OwnedUniqueName,
+    object_server::SignalEmitter,
+    zvariant::{OwnedValue, Structure},
+};
 
 use super::model::{
     CloseReason, Model, ModelError, Notification, NotificationAction, NotificationHints,
@@ -17,8 +24,15 @@ const MAX_QUEUED_MESSAGES: usize = 4;
 const MAX_NOTIFY_BODY_BYTES: u32 = 1024 * 1024;
 const MAX_HINTS: usize = 64;
 const MAX_RAW_ACTIONS: usize = 256;
+/// the action key that asks for an inline reply field, from the kde extension
+/// that telegram, discord, and other clients use.
+const INLINE_REPLY: &str = "inline-reply";
+// larger images are downscaled, which bounds retained memory per notification.
+const MAX_IMAGE_EDGE: u32 = 256;
+const MAX_SOURCE_IMAGE_EDGE: i32 = 8192;
 
-pub(crate) type ChangeHook = Arc<dyn Fn(Vec<Notification>) + Send + Sync>;
+/// receives the active notifications and the history, newest first.
+pub(crate) type ChangeHook = Arc<dyn Fn(Vec<Notification>, Vec<Notification>) + Send + Sync>;
 
 struct State {
     model: Mutex<Model>,
@@ -49,6 +63,10 @@ impl Notifications {
 
     pub(crate) fn active(&self) -> Vec<Notification> {
         lock(&self.state.model).active().to_vec()
+    }
+
+    pub(crate) fn history(&self) -> Vec<Notification> {
+        lock(&self.state.model).history().iter().cloned().collect()
     }
 
     pub(crate) fn next_key(&self) -> u64 {
@@ -97,6 +115,42 @@ impl Notifications {
         Ok(())
     }
 
+    pub(crate) async fn reply(
+        &self,
+        key: u64,
+        text: &str,
+        emitter: &SignalEmitter<'_>,
+    ) -> Result<(), String> {
+        let replied = lock(&self.state.model)
+            .reply(key, text, self.now_ms())
+            .map_err(model_message)?;
+        self.publish();
+        // unlike the close signal, the reply holds the user's text, so only the
+        // client that sent the notification receives it.
+        let client = emitter.clone().set_destination(replied.sender.into());
+        Self::notification_replied(&client, replied.id, text)
+            .await
+            .map_err(|error| error.to_string())?;
+        if replied.closed {
+            Self::notification_closed(emitter, replied.id, CloseReason::Dismissed.code())
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn forget(&self, key: u64) -> Result<(), String> {
+        lock(&self.state.model).forget(key).map_err(model_message)?;
+        self.publish();
+        Ok(())
+    }
+
+    pub(crate) fn clear_history(&self) {
+        if lock(&self.state.model).clear_history() {
+            self.publish();
+        }
+    }
+
     pub(crate) async fn expire(&self, emitter: &SignalEmitter<'_>) -> Result<usize, String> {
         let expired = lock(&self.state.model).expire(self.now_ms());
         if !expired.is_empty() {
@@ -120,14 +174,26 @@ impl Notifications {
     }
 
     fn publish(&self) {
-        (self.state.changed)(self.active());
+        let (active, history) = {
+            let model = lock(&self.state.model);
+            (
+                model.active().to_vec(),
+                model.history().iter().cloned().collect(),
+            )
+        };
+        (self.state.changed)(active, history);
     }
 }
 
 #[zbus::interface(name = "org.freedesktop.Notifications")]
 impl Notifications {
     fn get_capabilities(&self) -> Vec<String> {
-        vec!["actions".into(), "body".into()]
+        vec![
+            "actions".into(),
+            "body".into(),
+            "icon-static".into(),
+            INLINE_REPLY.into(),
+        ]
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -156,7 +222,13 @@ impl Notifications {
                 "notification request has too many hints".into(),
             ));
         }
-        let actions = parse_actions(actions)?;
+        let mut actions = parse_actions(actions)?;
+        // a message bus always names the sender. without one, a reply could only
+        // be broadcast, so the reply field is not offered.
+        let sender = header.sender().cloned().map(OwnedUniqueName::from);
+        // the reply action is a field, not a button, so it is kept apart.
+        let can_reply = sender.is_some() && actions.iter().any(|action| action.key == INLINE_REPLY);
+        actions.retain(|action| action.key != INLINE_REPLY);
         let hints = parse_hints(&hints);
         let request = NotificationRequest {
             app_name,
@@ -164,6 +236,8 @@ impl Notifications {
             summary,
             body,
             actions,
+            can_reply,
+            sender,
             hints,
             expire_timeout_ms: expire_timeout,
         };
@@ -217,6 +291,13 @@ impl Notifications {
     ) -> zbus::Result<()>;
 
     #[zbus(signal)]
+    async fn notification_replied(
+        emitter: &SignalEmitter<'_>,
+        id: u32,
+        text: &str,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
     async fn activation_token(
         emitter: &SignalEmitter<'_>,
         id: u32,
@@ -229,7 +310,7 @@ pub(crate) async fn serve(
     address: &str,
     timeout_policy: TimeoutPolicy,
 ) -> zbus::Result<(Connection, Notifications)> {
-    serve_with(Some(address), timeout_policy, 1, Arc::new(|_| {})).await
+    serve_with(Some(address), timeout_policy, 1, Arc::new(|_, _| {})).await
 }
 
 pub(crate) async fn serve_with(
@@ -304,7 +385,87 @@ fn parse_hints(hints: &HashMap<String, OwnedValue>) -> NotificationHints {
         suppress_sound: hint_bool(hints, "suppress-sound"),
         x,
         y,
+        reply_placeholder: hint_string(hints, "x-kde-reply-placeholder-text"),
+        // the hint was renamed twice; the newest name wins.
+        image: ["image-data", "image_data", "icon_data"]
+            .into_iter()
+            .find_map(|name| hints.get(name))
+            .and_then(parse_image),
     }
+}
+
+/// converts the specification's `(iiibiiay)` image into rgba, downscaling an
+/// image larger than `MAX_IMAGE_EDGE` by averaging blocks of pixels.
+fn parse_image(value: &OwnedValue) -> Option<ImagePixmap> {
+    let structure = <&Structure>::try_from(value).ok()?;
+    let [width, height, stride, alpha, bits, channels, data] = structure.fields() else {
+        return None;
+    };
+    let width = i32::try_from(width).ok()?;
+    let height = i32::try_from(height).ok()?;
+    let stride = i32::try_from(stride).ok()?;
+    let alpha = bool::try_from(alpha).ok()?;
+    let bits = i32::try_from(bits).ok()?;
+    let channels = i32::try_from(channels).ok()?;
+    // the request body is already limited to 1 mib, which bounds this copy.
+    let data = Vec::<u8>::try_from(data.try_clone().ok()?).ok()?;
+    let expected_channels = if alpha { 4 } else { 3 };
+    if !(1..=MAX_SOURCE_IMAGE_EDGE).contains(&width)
+        || !(1..=MAX_SOURCE_IMAGE_EDGE).contains(&height)
+        || bits != 8
+        || channels != expected_channels
+        || stride < width * channels
+    {
+        return None;
+    }
+    let (width, height, stride, channels) = (
+        width as usize,
+        height as usize,
+        stride as usize,
+        channels as usize,
+    );
+    // the last row may omit its padding.
+    let needed = stride
+        .checked_mul(height - 1)?
+        .checked_add(width.checked_mul(channels)?)?;
+    if data.len() < needed {
+        return None;
+    }
+    let factor = width.max(height).div_ceil(MAX_IMAGE_EDGE as usize);
+    let out_width = width.div_ceil(factor);
+    let out_height = height.div_ceil(factor);
+    let mut rgba = Vec::with_capacity(out_width * out_height * 4);
+    for out_y in 0..out_height {
+        for out_x in 0..out_width {
+            let mut sum = [0_u32; 4];
+            let mut count = 0_u32;
+            for y in out_y * factor..((out_y + 1) * factor).min(height) {
+                for x in out_x * factor..((out_x + 1) * factor).min(width) {
+                    let pixel = &data[y * stride + x * channels..][..channels];
+                    let weight = if alpha { u32::from(pixel[3]) } else { 255 };
+                    for (total, value) in sum.iter_mut().zip(&pixel[..3]) {
+                        *total += u32::from(*value) * weight;
+                    }
+                    sum[3] += weight;
+                    count += 1;
+                }
+            }
+            // averaging premultiplied colors keeps transparent pixels from
+            // darkening edges. a block of at most 32x32 pixels fits in u32, and
+            // adding half the divisor rounds to the nearest value.
+            let coverage = sum[3];
+            // zero coverage also means zero weighted colors, so a divisor of
+            // one keeps the block transparent without a special output path.
+            let divisor = coverage.max(1);
+            rgba.extend([
+                ((sum[0] + divisor / 2) / divisor) as u8,
+                ((sum[1] + divisor / 2) / divisor) as u8,
+                ((sum[2] + divisor / 2) / divisor) as u8,
+                ((coverage + count / 2) / count) as u8,
+            ]);
+        }
+    }
+    ImagePixmap::new(out_width as u32, out_height as u32, rgba).ok()
 }
 
 fn hint_string(hints: &HashMap<String, OwnedValue>, name: &str) -> String {
@@ -336,9 +497,10 @@ fn model_error(error: ModelError) -> fdo::Error {
             fdo::Error::InvalidArgs(model_message(error))
         }
         ModelError::Capacity => fdo::Error::LimitsExceeded(model_message(error)),
-        ModelError::UnknownNotification | ModelError::UnknownAction => {
-            fdo::Error::Failed(model_message(error))
-        }
+        ModelError::UnknownNotification
+        | ModelError::UnknownAction
+        | ModelError::ReplyUnavailable
+        | ModelError::InvalidReply => fdo::Error::Failed(model_message(error)),
     }
 }
 
@@ -349,6 +511,8 @@ fn model_message(error: ModelError) -> String {
         ModelError::Capacity => "notification capacity is exhausted",
         ModelError::UnknownNotification => "notification is no longer active",
         ModelError::UnknownAction => "notification action does not exist",
+        ModelError::ReplyUnavailable => "notification does not accept a reply",
+        ModelError::InvalidReply => "a reply must be nonempty and at most 64 kib",
     }
     .into()
 }
@@ -402,6 +566,9 @@ mod tests {
         #[zbus(signal)]
         fn action_invoked(&self, id: u32, action_key: &str) -> zbus::Result<()>;
 
+        #[zbus(signal)]
+        fn notification_replied(&self, id: u32, text: &str) -> zbus::Result<()>;
+
         fn get_server_information(&self) -> zbus::Result<(String, String, String, String)>;
     }
 
@@ -418,7 +585,10 @@ mod tests {
                 .unwrap();
             let proxy = TestNotificationsProxy::new(&client).await.unwrap();
 
-            assert_eq!(proxy.get_capabilities().await.unwrap(), ["actions", "body"]);
+            assert_eq!(
+                proxy.get_capabilities().await.unwrap(),
+                ["actions", "body", "icon-static", "inline-reply"]
+            );
             assert_eq!(
                 proxy.get_server_information().await.unwrap(),
                 (
@@ -548,6 +718,326 @@ mod tests {
             assert_eq!(server.active().len(), 1);
         });
         bus.stop();
+    }
+
+    #[test]
+    fn inline_replies_and_image_data_reach_the_model_and_the_client() {
+        let mut bus = Bus::start();
+        async_io::block_on(async {
+            let (server_connection, server) =
+                serve(&bus.address, TimeoutPolicy::default()).await.unwrap();
+            let client = zbus::connection::Builder::address(bus.address.as_str())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let proxy = TestNotificationsProxy::new(&client).await.unwrap();
+            // a 2x1 rgb image with two bytes of row padding.
+            let image = Value::from(Structure::from((
+                2_i32,
+                1_i32,
+                8_i32,
+                false,
+                8_i32,
+                3_i32,
+                vec![10_u8, 20, 30, 40, 50, 60, 0, 0],
+            )));
+            let hints = HashMap::from([
+                (
+                    "x-kde-reply-placeholder-text".into(),
+                    owned(Value::from("Reply to Ada")),
+                ),
+                ("image-data".into(), owned(image)),
+            ]);
+            let id = proxy
+                .notify(
+                    "chat",
+                    0,
+                    "",
+                    "Ada",
+                    "are you there?",
+                    vec![
+                        "default".into(),
+                        "Open".into(),
+                        "inline-reply".into(),
+                        "Reply".into(),
+                    ],
+                    hints,
+                    0,
+                )
+                .await
+                .unwrap();
+            let active = server.active();
+            let request = &active[0].request;
+            assert!(request.can_reply);
+            assert_eq!(request.hints.reply_placeholder, "Reply to Ada");
+            assert_eq!(
+                request
+                    .actions
+                    .iter()
+                    .map(|a| a.key.as_str())
+                    .collect::<Vec<_>>(),
+                ["default"]
+            );
+            let image = request.hints.image.as_ref().unwrap();
+            assert_eq!((image.width(), image.height()), (2, 1));
+            assert_eq!(image.rgba(), [10, 20, 30, 255, 40, 50, 60, 255]);
+
+            let key = active[0].key;
+            let mut replied = proxy.receive_notification_replied().await.unwrap();
+            let mut closed = proxy.receive_notification_closed().await.unwrap();
+            let emitter = SignalEmitter::new(&server_connection, OBJECT_PATH).unwrap();
+            // the reply field is not an ordinary action.
+            assert!(server.invoke(key, "inline-reply", &emitter).await.is_err());
+            server.reply(key, "yes!", &emitter).await.unwrap();
+            let signal = replied.next().await.unwrap();
+            let reply = signal.args().unwrap();
+            assert_eq!((*reply.id(), *reply.text()), (id, "yes!"));
+            let signal = closed.next().await.unwrap();
+            assert_eq!(
+                *signal.args().unwrap().reason(),
+                CloseReason::Dismissed.code()
+            );
+            assert!(server.active().is_empty());
+            let history = server.history();
+            assert_eq!(history[0].key, key);
+            assert!(server.reply(key, "late", &emitter).await.is_err());
+            server.forget(key).unwrap();
+            assert!(server.history().is_empty());
+            drop(server_connection);
+        });
+        bus.stop();
+    }
+
+    #[test]
+    fn replies_reach_only_the_latest_sender() {
+        let mut bus = Bus::start();
+        async_io::block_on(async {
+            let (server_connection, server) =
+                serve(&bus.address, TimeoutPolicy::default()).await.unwrap();
+            let emitter = SignalEmitter::new(&server_connection, OBJECT_PATH).unwrap();
+            let mut first = Client::connect(&bus.address).await;
+            let mut second = Client::connect(&bus.address).await;
+            let mut observer = Client::connect(&bus.address).await;
+
+            // the sender hears the reply, while everyone still hears the close.
+            let id = first.notify_replyable(0).await;
+            server
+                .reply(server.active()[0].key, "first", &emitter)
+                .await
+                .unwrap();
+            assert_eq!(first.next_reply().await, (id, "first".into()));
+            for client in [&mut first, &mut second, &mut observer] {
+                client.expect_close_without_reply(id).await;
+            }
+
+            // a replacement moves replies to the client that sent it.
+            let id = first.notify_replyable(0).await;
+            assert_eq!(second.notify_replyable(id).await, id);
+            server
+                .reply(server.active()[0].key, "second", &emitter)
+                .await
+                .unwrap();
+            assert_eq!(second.next_reply().await, (id, "second".into()));
+            for client in [&mut first, &mut second, &mut observer] {
+                client.expect_close_without_reply(id).await;
+            }
+
+            // after the sender disconnects, its unique name is never reassigned,
+            // so the reply reaches nobody and the close is still broadcast.
+            let id = second.notify_replyable(0).await;
+            let departed = second.unique_name();
+            drop(second);
+            let dbus = zbus::fdo::DBusProxy::new(&observer.connection)
+                .await
+                .unwrap();
+            let mut attempts = 0;
+            while dbus.name_has_owner((&departed).into()).await.unwrap() {
+                attempts += 1;
+                assert!(attempts < 400, "the bus did not notice the disconnect");
+                async_io::Timer::after(Duration::from_millis(5)).await;
+            }
+            server
+                .reply(server.active()[0].key, "gone", &emitter)
+                .await
+                .unwrap();
+            for client in [&mut first, &mut observer] {
+                client.expect_close_without_reply(id).await;
+            }
+            assert!(server.active().is_empty());
+            drop(server_connection);
+        });
+        bus.stop();
+    }
+
+    struct Client {
+        connection: zbus::Connection,
+        proxy: TestNotificationsProxy<'static>,
+        replies: NotificationRepliedStream,
+        closes: NotificationClosedStream,
+    }
+
+    impl Client {
+        async fn connect(address: &str) -> Self {
+            let connection = zbus::connection::Builder::address(address)
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let proxy = TestNotificationsProxy::new(&connection).await.unwrap();
+            let replies = proxy.receive_notification_replied().await.unwrap();
+            let closes = proxy.receive_notification_closed().await.unwrap();
+            Self {
+                connection,
+                proxy,
+                replies,
+                closes,
+            }
+        }
+
+        fn unique_name(&self) -> zbus::names::OwnedUniqueName {
+            self.connection.unique_name().unwrap().clone()
+        }
+
+        async fn notify_replyable(&self, replaces_id: u32) -> u32 {
+            self.proxy
+                .notify(
+                    "chat",
+                    replaces_id,
+                    "",
+                    "message",
+                    "",
+                    vec!["inline-reply".into(), "Reply".into()],
+                    HashMap::new(),
+                    0,
+                )
+                .await
+                .unwrap()
+        }
+
+        async fn next_reply(&mut self) -> (u32, String) {
+            let signal = self.replies.next().await.unwrap();
+            let args = signal.args().unwrap();
+            (*args.id(), args.text().to_string())
+        }
+
+        /// the bus keeps one sender's messages in order, and the reply is sent
+        /// before the close, so any reply meant for this client is queued by now.
+        async fn expect_close_without_reply(&mut self, id: u32) {
+            let signal = self.closes.next().await.unwrap();
+            let args = signal.args().unwrap();
+            assert_eq!(
+                (*args.id(), *args.reason()),
+                (id, CloseReason::Dismissed.code())
+            );
+            assert!(
+                futures_util::FutureExt::now_or_never(self.replies.next()).is_none(),
+                "a reply reached a client that did not send the notification"
+            );
+        }
+    }
+
+    #[test]
+    fn image_data_is_validated_converted_and_downscaled() {
+        let rgba = parse_image(&image(1, 2, 4, true, 8, 4, vec![1, 2, 3, 4, 5, 6, 7, 8])).unwrap();
+        assert_eq!(rgba.rgba(), [1, 2, 3, 4, 5, 6, 7, 8]);
+
+        // 512x2 becomes 256x1, each output pixel averaging a 2x2 block.
+        let mut data = Vec::new();
+        for y in 0..2 {
+            for x in 0..512 {
+                data.extend([if y == 0 { 0 } else { 200 }, (x % 2) as u8 * 100, 0]);
+            }
+        }
+        let scaled = parse_image(&image(512, 2, 1536, false, 8, 3, data)).unwrap();
+        assert_eq!((scaled.width(), scaled.height()), (256, 1));
+        assert_eq!(&scaled.rgba()[..4], [100, 50, 0, 255]);
+
+        for invalid in [
+            image(2, 1, 8, false, 16, 3, vec![0; 8]),
+            image(2, 1, 8, true, 8, 3, vec![0; 8]),
+            image(2, 1, 4, false, 8, 3, vec![0; 8]),
+            image(2, 2, 8, false, 8, 3, vec![0; 10]),
+            image(0, 1, 0, false, 8, 3, Vec::new()),
+            owned(Value::from(7_u32)),
+        ] {
+            assert!(parse_image(&invalid).is_none());
+        }
+    }
+
+    #[test]
+    fn downscaling_averages_premultiplied_colors() {
+        let pairs = |first: [u8; 4], second: [u8; 4]| [first, second].concat().repeat(256);
+        let first_pixel = |data: Vec<u8>| {
+            let scaled = parse_image(&image(512, 1, 2048, true, 8, 4, data)).unwrap();
+            assert_eq!((scaled.width(), scaled.height()), (256, 1));
+            <[u8; 4]>::try_from(&scaled.rgba()[..4]).unwrap()
+        };
+
+        // straight averaging would darken the edge to [127, 0, 0, 127].
+        assert_eq!(
+            first_pixel(pairs([255, 0, 0, 255], [0, 0, 0, 0])),
+            [255, 0, 0, 128]
+        );
+        // premultiplied (127.5, 0, 42.5, 170) is straight (191.25, 0, 63.75, 170).
+        assert_eq!(
+            first_pixel(pairs([255, 0, 0, 255], [0, 0, 255, 85])),
+            [191, 0, 64, 170]
+        );
+        // hidden colors under zero alpha contribute nothing.
+        assert_eq!(
+            first_pixel(pairs([0, 0, 0, 255], [255, 255, 255, 0])),
+            [0, 0, 0, 128]
+        );
+        assert_eq!(
+            first_pixel(pairs([90, 80, 70, 0], [10, 20, 30, 0])),
+            [0, 0, 0, 0]
+        );
+
+        // opaque rgb rounds halves up: (1.5, 3, 4.5) becomes (2, 3, 5).
+        let opaque = [[1_u8, 2, 3], [2, 4, 6]].concat().repeat(256);
+        let scaled = parse_image(&image(512, 1, 1536, false, 8, 3, opaque)).unwrap();
+        assert_eq!(&scaled.rgba()[..4], [2, 3, 5, 255]);
+
+        // a padded 257x2 image leaves a final block one column wide. the padding
+        // and the shorter last row must not be read.
+        let stride = 257 * 4 + 3;
+        let mut data = vec![0xee; stride + 257 * 4];
+        for y in 0..2 {
+            for x in 0..257 {
+                data[y * stride + x * 4..][..4].copy_from_slice(&[0, 0, 255, 255]);
+            }
+        }
+        data[256 * 4..][..4].copy_from_slice(&[255, 0, 0, 255]);
+        data[stride + 256 * 4..][..4].copy_from_slice(&[0, 255, 0, 0]);
+        let scaled = parse_image(&image(257, 2, stride as i32, true, 8, 4, data)).unwrap();
+        assert_eq!((scaled.width(), scaled.height()), (129, 1));
+        assert_eq!(&scaled.rgba()[..4], [0, 0, 255, 255]);
+        assert_eq!(&scaled.rgba()[128 * 4..], [255, 0, 0, 128]);
+
+        // one-pixel blocks keep every visible color and alpha exactly.
+        let exhaustive = (1..=255_u8)
+            .flat_map(|alpha| {
+                (0..=255_u8).flat_map(move |color| [color, 255 - color, color / 2, alpha])
+            })
+            .collect::<Vec<_>>();
+        let copied = parse_image(&image(256, 255, 1024, true, 8, 4, exhaustive.clone())).unwrap();
+        assert_eq!((copied.width(), copied.height()), (256, 255));
+        assert_eq!(copied.rgba(), exhaustive);
+    }
+
+    fn image(
+        width: i32,
+        height: i32,
+        stride: i32,
+        alpha: bool,
+        bits: i32,
+        channels: i32,
+        data: Vec<u8>,
+    ) -> OwnedValue {
+        owned(Value::from(Structure::from((
+            width, height, stride, alpha, bits, channels, data,
+        ))))
     }
 
     #[test]

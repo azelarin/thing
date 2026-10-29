@@ -1,8 +1,9 @@
 use std::fs;
 
+use thing_core::{ImageCandidate, ImagePixmap, ImageSource};
 use thing_runtime::{
-    Action, Event, Notification, NotificationButton, NotificationSnapshot, NotificationUrgency,
-    Runtime,
+    Action, Event, Notification, NotificationButton, NotificationCloseReason, NotificationSnapshot,
+    NotificationUrgency, Runtime,
 };
 
 fn load_runtime(source: &str) -> (tempfile::TempDir, Runtime) {
@@ -38,6 +39,10 @@ fn notification(key: &str, id: u32, summary: &str) -> Notification {
         resident: false,
         transient: false,
         action_icons: false,
+        can_reply: false,
+        reply_placeholder: String::new(),
+        image: None,
+        closed: None,
     }
 }
 
@@ -91,6 +96,7 @@ fn notification_state_is_reactive_and_records_are_immutable() {
 
     runtime
         .set_notifications(NotificationSnapshot {
+            history: Vec::new(),
             owned: true,
             error: String::new(),
             active: vec![notification("9007199254740993", 7, "Hello")],
@@ -108,6 +114,7 @@ fn notification_state_is_reactive_and_records_are_immutable() {
     updated.expires_at_ms = Some(5_040);
     runtime
         .set_notifications(NotificationSnapshot {
+            history: Vec::new(),
             owned: true,
             error: String::new(),
             active: vec![updated],
@@ -132,6 +139,7 @@ fn notification_state_is_reactive_and_records_are_immutable() {
         let (_directory, mut runtime) = load_runtime(&script);
         runtime
             .set_notifications(NotificationSnapshot {
+                history: Vec::new(),
                 owned: true,
                 error: String::new(),
                 active: vec![notification("1", 1, "Hello")],
@@ -193,6 +201,7 @@ fn malformed_notification_state_and_actions_are_rejected_atomically() {
         "#,
     );
     let valid = NotificationSnapshot {
+        history: Vec::new(),
         owned: true,
         error: String::new(),
         active: vec![notification("1", 1, "Valid")],
@@ -225,6 +234,7 @@ fn malformed_notification_state_and_actions_are_rejected_atomically() {
     assert!(
         runtime
             .set_notifications(NotificationSnapshot {
+                history: Vec::new(),
                 owned: true,
                 error: String::new(),
                 active: vec![oversized],
@@ -244,6 +254,7 @@ fn malformed_notification_state_and_actions_are_rejected_atomically() {
     assert!(
         runtime
             .set_notifications(NotificationSnapshot {
+                history: Vec::new(),
                 owned: true,
                 error: String::new(),
                 active,
@@ -266,4 +277,224 @@ fn malformed_notification_state_and_actions_are_rejected_atomically() {
         );
         assert!(runtime.take_actions().is_empty());
     }
+}
+
+fn closed(
+    mut notification: Notification,
+    reason: NotificationCloseReason,
+    at_ms: u64,
+) -> Notification {
+    notification.closed = Some((reason, at_ms));
+    notification
+}
+
+#[test]
+fn history_replies_and_images_are_exposed_to_luau() {
+    let (_directory, mut runtime) = load_runtime(
+        r#"
+        return ui.panel { children = { ui.text {
+            text = function()
+                local notifications = services.notifications
+                local active = notifications.active:get()[1]
+                if not active then
+                    return 'none'
+                end
+                local parts = {
+                    tostring(active.can_reply),
+                    active.reply_placeholder,
+                    tostring(active.image ~= nil),
+                    tostring(active.closed_reason),
+                }
+                for _, record in notifications.history:get() do
+                    table.insert(parts, record.key .. ':' .. record.closed_reason .. ':' .. record.closed_at_ms)
+                end
+                return table.concat(parts, '|')
+            end,
+        } } }
+        "#,
+    );
+    let mut chat = notification("9", 4, "Ada");
+    chat.can_reply = true;
+    chat.reply_placeholder = "Reply to Ada".into();
+    chat.image = Some(
+        ImageSource::new(
+            "notification-image:9:1".into(),
+            vec![
+                ImageCandidate::new(
+                    None,
+                    vec![ImagePixmap::new(1, 1, vec![0, 0, 0, 255]).unwrap()],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap(),
+    );
+    // closed protocol ids may be reused, so the history may repeat one.
+    let history = vec![
+        closed(
+            notification("8", 4, "earlier"),
+            NotificationCloseReason::Expired,
+            900,
+        ),
+        closed(
+            notification("7", 4, "older"),
+            NotificationCloseReason::ClosedByApplication,
+            800,
+        ),
+    ];
+    runtime
+        .set_notifications(NotificationSnapshot {
+            owned: true,
+            error: String::new(),
+            active: vec![chat],
+            history,
+        })
+        .unwrap();
+    assert!(runtime.refresh().unwrap());
+    assert_eq!(
+        runtime.root().unwrap().children[0].text,
+        "true|Reply to Ada|true|nil|8:expired:900|7:closed_by_application:800"
+    );
+}
+
+#[test]
+fn history_snapshots_are_validated_as_a_whole() {
+    let (_directory, mut runtime) = load_runtime("return ui.panel {}");
+    let active = notification("1", 1, "active");
+    let record = closed(
+        notification("2", 2, "closed"),
+        NotificationCloseReason::Dismissed,
+        50,
+    );
+    for (active, history) in [
+        // an active record must not be closed, and a history record must be.
+        (
+            vec![closed(
+                active.clone(),
+                NotificationCloseReason::Dismissed,
+                1,
+            )],
+            vec![],
+        ),
+        (vec![], vec![active.clone()]),
+        // keys are unique across both lists.
+        (
+            vec![active.clone()],
+            vec![closed(active.clone(), NotificationCloseReason::Expired, 9)],
+        ),
+    ] {
+        assert!(
+            runtime
+                .set_notifications(NotificationSnapshot {
+                    owned: true,
+                    error: String::new(),
+                    active,
+                    history,
+                })
+                .is_err()
+        );
+    }
+    assert!(
+        runtime
+            .set_notifications(NotificationSnapshot {
+                owned: false,
+                error: String::new(),
+                active: vec![],
+                history: vec![record.clone()],
+            })
+            .is_err()
+    );
+    runtime
+        .set_notifications(NotificationSnapshot {
+            owned: true,
+            error: String::new(),
+            active: vec![active],
+            history: vec![record],
+        })
+        .unwrap();
+}
+
+#[test]
+fn replies_and_history_controls_queue_actions() {
+    let (_directory, mut runtime) = load_runtime(
+        r#"
+        return ui.panel { children = { ui.button { on_click = function()
+            services.notifications.reply('9', 'on my way')
+            services.notifications.forget('8')
+            services.notifications.clear_history()
+        end } } }
+        "#,
+    );
+    runtime
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
+        .unwrap();
+    assert_eq!(
+        runtime.take_actions(),
+        [
+            Action::ReplyNotification {
+                key: 9,
+                text: "on my way".into(),
+            },
+            Action::ForgetNotification { key: 8 },
+            Action::ClearNotificationHistory,
+        ]
+    );
+    for call in [
+        "services.notifications.reply('9', '')",
+        "services.notifications.reply('9', 'a\\0b')",
+        "services.notifications.reply('x', 'hi')",
+        "services.notifications.forget('0')",
+    ] {
+        let source = format!(
+            "return ui.panel {{ children = {{ ui.button {{ on_click = function() {call} end }} }} }}"
+        );
+        let (_directory, mut rejected) = load_runtime(&source);
+        assert!(
+            rejected
+                .dispatch(rejected.root().unwrap().children[0].id, Event::Click)
+                .is_err(),
+            "accepted {call}"
+        );
+        assert!(rejected.take_actions().is_empty());
+    }
+}
+
+#[test]
+fn history_record_limit_is_validated_before_replacing_the_snapshot() {
+    let (_directory, mut runtime) = load_runtime(
+        "return ui.panel { children = { ui.text { text = function() return tostring(#services.notifications.history:get()) end } } }",
+    );
+    let mut history: Vec<_> = (1..=129)
+        .map(|id| {
+            closed(
+                notification(&id.to_string(), id, "closed"),
+                NotificationCloseReason::Dismissed,
+                50,
+            )
+        })
+        .collect();
+    let extra = history.pop().unwrap();
+    runtime
+        .set_notifications(NotificationSnapshot {
+            owned: true,
+            error: String::new(),
+            active: vec![],
+            history: history.clone(),
+        })
+        .unwrap();
+    assert!(runtime.refresh().unwrap());
+    assert_eq!(runtime.root().unwrap().children[0].text, "128");
+    history.push(extra);
+    assert!(
+        runtime
+            .set_notifications(NotificationSnapshot {
+                owned: true,
+                error: String::new(),
+                active: vec![],
+                history,
+            })
+            .is_err()
+    );
+    assert!(!runtime.refresh().unwrap());
+    assert_eq!(runtime.root().unwrap().children[0].text, "128");
 }

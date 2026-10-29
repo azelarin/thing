@@ -84,6 +84,15 @@ CASES = (
             "Key 'set' not found in table 'ThingSignal<ThingReadonlyArray<ThingDesktopApplication>>'",
         ),
     ),
+    Case("valid-notification-history.luau"),
+    Case(
+        "invalid-notification-history.luau",
+        (
+            "Expected this to be 'number', but got 'number?'",
+            "Function 'services.notifications.reply' expects 2 arguments",
+            "Function 'services.notifications.clear_history' expects 0 arguments",
+        ),
+    ),
     Case(
         "invalid-image-source.luau",
         (

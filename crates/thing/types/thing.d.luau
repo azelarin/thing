@@ -593,6 +593,8 @@ declare extern type ThingNotificationAction with
     read label: string
 end
 
+export type ThingNotificationCloseReason = "expired" | "dismissed" | "closed_by_application"
+
 declare extern type ThingNotification with
     read key: string
     read id: number
@@ -615,6 +617,11 @@ declare extern type ThingNotification with
     read resident: boolean
     read transient: boolean
     read action_icons: boolean
+    read can_reply: boolean
+    read reply_placeholder: string
+    read image: ThingImageSource?
+    read closed_reason: ThingNotificationCloseReason?
+    read closed_at_ms: number?
 end
 
 declare extern type ThingSystemTrayItem with
@@ -787,8 +794,12 @@ declare extern type ThingNotificationService with
     read owned: ThingSignal<boolean>
     read error: ThingSignal<string>
     read active: ThingSignal<ThingReadonlyArray<ThingNotification>>
+    read history: ThingSignal<ThingReadonlyArray<ThingNotification>>
     read dismiss: (key: string) -> ()
     read invoke: (key: string, action: string) -> ()
+    read reply: (key: string, text: string) -> ()
+    read forget: (key: string) -> ()
+    read clear_history: () -> ()
 end
 
 declare extern type ThingSystemTrayService with
