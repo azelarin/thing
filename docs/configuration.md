@@ -1381,10 +1381,70 @@ action. the service tracks players joining and leaving the session bus,
 reconnects after the bus is restarted, and does not replay commands across a
 disconnection.
 
+### playback position
+
+each record also has `can_seek`, `length_ms`, and `rate`, and the service has
+matching signals for the selection. `length_ms` is the track length, or `nil`
+when the player does not report one. `rate` is the playback speed, where 1 is
+normal and negative values play backwards.
+
+`position(id)` returns the estimated position in milliseconds, or `nil` when
+the player reports none. without an id, it uses the selection. players report
+their position when their state changes and when they jump; the service does
+not poll them in between. the estimate advances at `rate` while the player is
+playing and stays within `length_ms`. a property function that calls
+`position()` updates when a new report arrives, not as time passes, so drive a
+moving timeline from a repeating timer:
+
+```luau
+local media = services.media
+local elapsed = ui.state(0)
+
+ui.timer {
+    interval = 250,
+    repeating = true,
+    autostart = true,
+    on_timeout = function()
+        elapsed:set(math.floor((media.position() or 0) / 1000))
+    end,
+}
+
+local function clock(seconds)
+    return string.format('%d:%02d', seconds // 60, seconds % 60)
+end
+
+ui.button {
+    enabled = function() return media.can_seek:get() end,
+    on_click = function() media.seek(10000) end,
+    children = { ui.text {
+        text = function()
+            local length = media.length_ms:get()
+            local total = if length then clock(math.floor(length / 1000)) else '--:--'
+            return clock(elapsed:get()) .. ' / ' .. total
+        end,
+    } },
+}
+```
+
+assigning an unchanged whole-second value does not refresh the layout, so the
+label above changes once per second.
+
+`seek(offset_ms, id)` moves by a signed offset, and `set_position(position_ms,
+id)` moves to a position from the start of the track. both are event-handler
+actions, and both are tied to the player and track the configuration observed
+when the handler ran. a later change in the selected player does not redirect
+the request. if that player has changed tracks by the time the request is sent,
+the service discards it. this relies on the player's track id: firefox, for
+example, reuses one id for every track, so a change there cannot be detected.
+`set_position` needs the player to report a track id; a player without one can
+still use `seek`. offsets and positions must be finite and within about 31 years, and a
+position cannot be negative. like the other controls, the reported position
+changes only after the player confirms the jump.
+
 `art_url` is mpris metadata, not an image path. it may contain a `file:` url or a
 remote url. `ui.image` currently accepts local filesystem paths and does not fetch
-urls, so passing `art_url` directly to `source` is not supported. playback
-position, seeking, and remote artwork loading are not part of this api yet.
+urls, so passing `art_url` directly to `source` is not supported. remote
+artwork loading is not part of this api yet.
 
 ## power
 

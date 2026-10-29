@@ -61,6 +61,15 @@ CASES = (
             "Key 'set' not found in table 'ThingSignal<string?>'",
         ),
     ),
+    Case("valid-media-timeline.luau"),
+    Case(
+        "invalid-media-timeline.luau",
+        (
+            "Expected this to be 'number', but got 'string'",
+            "Function 'services.media.set_position' expects 1 to 2 arguments",
+            "Expected this to be 'number', but got 'number?'",
+        ),
+    ),
     Case(
         "invalid-image-source.luau",
         (

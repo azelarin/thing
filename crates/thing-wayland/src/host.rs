@@ -2660,7 +2660,7 @@ impl App {
                 Action::Niri(action) => self.niri.send(action),
                 Action::Media { action, player } => self
                     .media
-                    .send(action, player.as_deref())
+                    .send(&action, player.as_deref())
                     .map_err(str::to_owned),
                 Action::SystemTray { action, item } => {
                     send_system_tray_action(self.system_tray.as_ref(), action, &item)

@@ -8,6 +8,7 @@ use std::{
     mem::size_of,
     rc::Rc,
     sync::Arc,
+    time::Instant,
 };
 use thing_core::ImageSource;
 
@@ -165,13 +166,29 @@ pub struct ManagedProcessSnapshot {
 }
 
 /// a media playback control request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MediaAction {
     PlayPause,
     Next,
     Previous,
     Stop,
+    /// move the position by a signed offset. `track` is the track id the
+    /// configuration observed, or empty when the player reported none.
+    Seek {
+        offset_us: i64,
+        track: String,
+    },
+    /// move to an absolute position in the track the configuration observed.
+    SetPosition {
+        position_us: i64,
+        track: String,
+    },
 }
+
+/// the largest media position, length, or seek offset, about 31 years.
+pub const MAX_MEDIA_TIME_US: i64 = 1_000_000_000_000_000;
+/// the largest absolute playback rate accepted from a media player.
+pub const MAX_MEDIA_RATE: f64 = 1000.0;
 
 /// an action requested from one status notifier item lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,7 +275,7 @@ pub struct AudioSnapshot {
 }
 
 /// one media player ownership lifetime and its current state.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MediaPlayer {
     pub id: String,
     pub name: String,
@@ -272,6 +289,35 @@ pub struct MediaPlayer {
     pub can_next: bool,
     pub can_previous: bool,
     pub can_stop: bool,
+    pub can_seek: bool,
+    /// the mpris track id, or empty when the player reports none.
+    pub track_id: String,
+    pub length_us: Option<i64>,
+    /// the playback rate, where 1 is normal speed.
+    pub rate: f64,
+    pub position: Option<MediaPosition>,
+}
+
+/// a reported playback position and the monotonic time it was observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MediaPosition {
+    pub position_us: i64,
+    pub observed_at: Instant,
+}
+
+impl MediaPlayer {
+    /// estimates the position at `now` from the last report, the playback
+    /// state, and the rate. the result stays within the known track length.
+    pub fn position_at(&self, now: Instant) -> Option<i64> {
+        let sample = self.position?;
+        let mut position = sample.position_us as f64;
+        if self.playing {
+            let elapsed = now.saturating_duration_since(sample.observed_at);
+            position += elapsed.as_secs_f64() * 1_000_000.0 * self.rate;
+        }
+        let limit = self.length_us.unwrap_or(MAX_MEDIA_TIME_US) as f64;
+        Some(position.clamp(0.0, limit) as i64)
+    }
 }
 
 /// one status notifier item ownership lifetime and its current properties.
@@ -584,7 +630,7 @@ impl AudioSnapshot {
 }
 
 /// one confirmed generation of media player state.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MediaSnapshot {
     pub available: bool,
     pub selected_id: String,
@@ -598,12 +644,39 @@ pub struct MediaSnapshot {
     pub can_next: bool,
     pub can_previous: bool,
     pub can_stop: bool,
+    pub can_seek: bool,
+    pub length_us: Option<i64>,
+    pub rate: f64,
     pub error: String,
     pub players: Vec<MediaPlayer>,
 }
 
+impl Default for MediaSnapshot {
+    fn default() -> Self {
+        Self {
+            available: false,
+            selected_id: String::new(),
+            playing: false,
+            title: String::new(),
+            artist: String::new(),
+            art_url: String::new(),
+            identity: String::new(),
+            desktop_entry: String::new(),
+            can_play_pause: false,
+            can_next: false,
+            can_previous: false,
+            can_stop: false,
+            can_seek: false,
+            length_us: None,
+            rate: 1.0,
+            error: String::new(),
+            players: Vec::new(),
+        }
+    }
+}
+
 impl MediaSnapshot {
-    fn values(&self) -> [(&'static str, Scalar); 13] {
+    fn values(&self) -> [(&'static str, Scalar); 16] {
         [
             ("media.available", Scalar::Boolean(self.available)),
             (
@@ -623,6 +696,9 @@ impl MediaSnapshot {
             ("media.can_next", Scalar::Boolean(self.can_next)),
             ("media.can_previous", Scalar::Boolean(self.can_previous)),
             ("media.can_stop", Scalar::Boolean(self.can_stop)),
+            ("media.can_seek", Scalar::Boolean(self.can_seek)),
+            ("media.length_ms", media_milliseconds(self.length_us)),
+            ("media.rate", Scalar::Number(self.rate)),
             ("media.error", Scalar::String(self.error.clone())),
         ]
     }
@@ -650,6 +726,9 @@ impl MediaSnapshot {
                     && !self.can_next
                     && !self.can_previous
                     && !self.can_stop
+                    && !self.can_seek
+                    && self.length_us.is_none()
+                    && self.rate == 1.0
             },
             |player| {
                 player.playing == self.playing
@@ -662,6 +741,9 @@ impl MediaSnapshot {
                     && player.can_next == self.can_next
                     && player.can_previous == self.can_previous
                     && player.can_stop == self.can_stop
+                    && player.can_seek == self.can_seek
+                    && player.length_us == self.length_us
+                    && player.rate == self.rate
             },
         );
         if self.available != selected.is_some()
@@ -965,6 +1047,9 @@ impl UserData for MediaPlayerList {
                 item.set("can_next", player.can_next)?;
                 item.set("can_previous", player.can_previous)?;
                 item.set("can_stop", player.can_stop)?;
+                item.set("can_seek", player.can_seek)?;
+                item.set("length_ms", player.length_us.map(|us| us as f64 / 1000.0))?;
+                item.set("rate", player.rate)?;
                 item.set_readonly(true);
                 list.raw_set(index + 1, item)?;
             }
@@ -1411,6 +1496,9 @@ impl Services {
             ("media.can_next", Scalar::Boolean(false)),
             ("media.can_previous", Scalar::Boolean(false)),
             ("media.can_stop", Scalar::Boolean(false)),
+            ("media.can_seek", Scalar::Boolean(false)),
+            ("media.length_ms", Scalar::Nil),
+            ("media.rate", Scalar::Number(1.0)),
             ("media.error", Scalar::String(String::new())),
             ("power.available", Scalar::Boolean(false)),
             ("power.on_battery", Scalar::Boolean(false)),
@@ -1577,10 +1665,86 @@ impl Services {
                 name,
                 lua.create_function(move |_, player: Value| {
                     let player = media_player_id(player)?;
+                    let action = action.clone();
                     enqueue(&actions, &allowed, Action::Media { action, player })
                 })?,
             )?;
         }
+        let selected = result.signals["media.selected_id"];
+        for (name, signed) in [("seek", true), ("set_position", false)] {
+            let actions = result.actions.clone();
+            let allowed = result.allowed.clone();
+            let tracker = result.tracker.clone();
+            let players = result.media_players.clone();
+            media.set(
+                name,
+                lua.create_function(move |_, (milliseconds, player): (f64, Value)| {
+                    let amount = media_microseconds(
+                        milliseconds,
+                        signed,
+                        if signed {
+                            "seek offset"
+                        } else {
+                            "media position"
+                        },
+                    )?;
+                    let player = media_player_id(player)?;
+                    // bind the request to the track this configuration observed, so
+                    // the service can reject it after the player changes tracks.
+                    let id = match &player {
+                        Some(id) => id.clone(),
+                        None => scalar_string(tracker.borrow_mut().read(selected)),
+                    };
+                    let track = players
+                        .borrow()
+                        .iter()
+                        .find(|candidate| candidate.id == id)
+                        .map(|candidate| candidate.track_id.clone())
+                        .unwrap_or_default();
+                    let action = if signed {
+                        MediaAction::Seek {
+                            offset_us: amount,
+                            track,
+                        }
+                    } else {
+                        MediaAction::SetPosition {
+                            position_us: amount,
+                            track,
+                        }
+                    };
+                    enqueue(
+                        &actions,
+                        &allowed,
+                        Action::Media {
+                            action,
+                            player: Some(id),
+                        },
+                    )
+                })?,
+            )?;
+        }
+        let tracker = result.tracker.clone();
+        let players = result.media_players.clone();
+        let revision = result.media_players_revision;
+        media.set(
+            "position",
+            lua.create_function(move |_, player: Value| {
+                let player = media_player_id(player)?;
+                let mut tracker = tracker.borrow_mut();
+                tracker.read(revision);
+                let id = match player {
+                    Some(id) => id,
+                    None => scalar_string(tracker.read(selected)),
+                };
+                drop(tracker);
+                Ok(players
+                    .borrow()
+                    .iter()
+                    .find(|candidate| candidate.id == id)
+                    .and_then(|candidate| candidate.position_at(Instant::now()))
+                    .map(|us| us as f64 / 1000.0))
+            })?,
+        )?;
         media.set_readonly(true);
         for (name, action) in [
             ("activate", SystemTrayAction::Activate),
@@ -2644,6 +2808,7 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "media.can_next"
             | "media.can_previous"
             | "media.can_stop"
+            | "media.can_seek"
             | "power.available"
             | "power.on_battery"
             | "notifications.owned"
@@ -2685,6 +2850,11 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
         ("media.art_url", Scalar::String(value)) => {
             value.len() <= 16 * 1024 && !value.contains('\0')
         }
+        ("media.length_ms", Scalar::Nil) => true,
+        ("media.length_ms", Scalar::Number(value)) => {
+            value.is_finite() && (0.0..=MAX_MEDIA_TIME_US as f64 / 1000.0).contains(value)
+        }
+        ("media.rate", Scalar::Number(value)) => valid_media_rate(*value),
         ("clipboard.text", Scalar::Nil) => true,
         ("clipboard.text", Scalar::String(value)) => validate_clipboard_text(value).is_ok(),
         _ => false,
@@ -2792,12 +2962,48 @@ fn validate_media_players(players: &[MediaPlayer]) -> Result<()> {
                 || invalid_media_text(&player.art_url, 16 * 1024)
                 || invalid_media_text(&player.identity, 4096)
                 || invalid_media_text(&player.desktop_entry, 4096)
+                || invalid_media_text(&player.track_id, 4096)
+                || player
+                    .length_us
+                    .is_some_and(|length| !(0..=MAX_MEDIA_TIME_US).contains(&length))
+                || !valid_media_rate(player.rate)
+                || player.position.is_some_and(|position| {
+                    !(0..=MAX_MEDIA_TIME_US).contains(&position.position_us)
+                })
         });
     if invalid {
         Err(Error::runtime("invalid media player list"))
     } else {
         Ok(())
     }
+}
+
+fn valid_media_rate(rate: f64) -> bool {
+    rate.is_finite() && rate != 0.0 && rate.abs() <= MAX_MEDIA_RATE
+}
+
+fn scalar_string(value: Scalar) -> String {
+    match value {
+        Scalar::String(value) => value,
+        _ => String::new(),
+    }
+}
+
+fn media_milliseconds(microseconds: Option<i64>) -> Scalar {
+    microseconds.map_or(Scalar::Nil, |us| Scalar::Number(us as f64 / 1000.0))
+}
+
+/// converts a luau millisecond count to whole microseconds within the media limit.
+fn media_microseconds(milliseconds: f64, signed: bool, name: &str) -> Result<i64> {
+    let limit = MAX_MEDIA_TIME_US as f64 / 1000.0;
+    let lower = if signed { -limit } else { 0.0 };
+    if !milliseconds.is_finite() || !(lower..=limit).contains(&milliseconds) {
+        return Err(Error::runtime(format!(
+            "{name} must be a finite number of milliseconds within about 31 years{}",
+            if signed { "" } else { " and not negative" }
+        )));
+    }
+    Ok((milliseconds * 1000.0).round() as i64)
 }
 
 fn validate_system_tray_items(items: &[SystemTrayItem]) -> Result<()> {

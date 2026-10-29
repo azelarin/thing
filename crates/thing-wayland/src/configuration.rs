@@ -2605,6 +2605,11 @@ mod tests {
             can_next: true,
             can_previous: true,
             can_stop: true,
+            can_seek: false,
+            track_id: String::new(),
+            length_us: None,
+            rate: 1.0,
+            position: None,
         };
         configurations
             .set_media(MediaSnapshot {
@@ -2620,6 +2625,9 @@ mod tests {
                 can_next: player.can_next,
                 can_previous: player.can_previous,
                 can_stop: player.can_stop,
+                can_seek: player.can_seek,
+                length_us: player.length_us,
+                rate: player.rate,
                 players: vec![player],
                 error: String::new(),
             })
