@@ -510,6 +510,30 @@ declare extern type ThingAudioStream with
     read volume_writable: boolean
 end
 
+declare extern type ThingDesktopAction with
+    read key: string
+    read name: string
+    read icon: string
+    read command: ThingReadonlyArray<string>
+end
+
+declare extern type ThingDesktopApplication with
+    read id: string
+    read name: string
+    read generic_name: string
+    read comment: string
+    read icon: string
+    read keywords: ThingReadonlyArray<string>
+    read categories: ThingReadonlyArray<string>
+    read command: ThingReadonlyArray<string>
+    read working_directory: string?
+    read terminal: boolean
+    read no_display: boolean
+    read startup_wm_class: string
+    read dbus_activatable: boolean
+    read actions: ThingReadonlyArray<ThingDesktopAction>
+end
+
 declare extern type ThingMediaPlayer with
     read id: string
     read name: string
@@ -707,6 +731,12 @@ declare extern type ThingIdleService with
     read inhibit_available: ThingSignal<boolean>
 end
 
+declare extern type ThingApplicationsService with
+    read available: ThingSignal<boolean>
+    read error: ThingSignal<string>
+    read entries: ThingSignal<ThingReadonlyArray<ThingDesktopApplication>>
+end
+
 declare extern type ThingMediaService with
     read available: ThingSignal<boolean>
     read selected_id: ThingSignal<string>
@@ -810,6 +840,7 @@ declare extern type ThingScheduledProcess with
 end
 
 declare extern type ThingServices with
+    read applications: ThingApplicationsService
     read audio: ThingAudioService
     read authentication: ThingAuthenticationService
     read clipboard: ThingClipboardService

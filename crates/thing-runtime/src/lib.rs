@@ -13,14 +13,15 @@ mod timer;
 mod transition;
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
 pub use services::{
-    Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, AuthenticationSnapshot,
-    AuthenticationState, ClipboardSnapshot, MAX_MEDIA_RATE, MAX_MEDIA_TIME_US,
-    ManagedProcessAction, ManagedProcessCommand, ManagedProcessDefinition,
-    ManagedProcessShutdownSignal, ManagedProcessSnapshot, ManagedProcessState,
-    ManagedProcessStatus, MediaAction, MediaPlayer, MediaPosition, MediaSnapshot, Notification,
-    NotificationButton, NotificationSnapshot, NotificationUrgency, PowerDevice, PowerSnapshot,
-    ServiceSnapshot, SystemTrayAction, SystemTrayItem, SystemTrayMenu, SystemTrayMenuAction,
-    SystemTrayMenuItem, SystemTraySnapshot,
+    Action, ApplicationsSnapshot, AudioDevice, AudioSnapshot, AudioSource, AudioStream,
+    AuthenticationSnapshot, AuthenticationState, ClipboardSnapshot, DesktopAction,
+    DesktopApplication, MAX_LAUNCH_ARGUMENT_BYTES, MAX_LAUNCH_ARGUMENTS, MAX_LAUNCH_BYTES,
+    MAX_MEDIA_RATE, MAX_MEDIA_TIME_US, ManagedProcessAction, ManagedProcessCommand,
+    ManagedProcessDefinition, ManagedProcessShutdownSignal, ManagedProcessSnapshot,
+    ManagedProcessState, ManagedProcessStatus, MediaAction, MediaPlayer, MediaPosition,
+    MediaSnapshot, Notification, NotificationButton, NotificationSnapshot, NotificationUrgency,
+    PowerDevice, PowerSnapshot, ServiceSnapshot, SystemTrayAction, SystemTrayItem, SystemTrayMenu,
+    SystemTrayMenuAction, SystemTrayMenuItem, SystemTraySnapshot,
 };
 pub use timer::TimerToken;
 
@@ -455,6 +456,7 @@ impl Runtime {
         services.set_all_sources(snapshot.all_sources)?;
         services.set_streams(snapshot.streams)?;
         services.set_media_players(snapshot.media_players)?;
+        services.set_application_list(snapshot.applications)?;
         services.set_power_devices(snapshot.power_display, snapshot.power_devices)?;
         services.set_notification_records(snapshot.notifications)?;
         services.set_system_tray_items(snapshot.system_tray_items)?;
@@ -645,6 +647,11 @@ impl Runtime {
     /// replaces output and input audio state in one update. call [`Self::refresh`] afterward.
     pub fn set_audio(&mut self, audio: AudioSnapshot) -> Result<()> {
         self.services.set_audio(audio)
+    }
+
+    /// replaces the installed application list. call [`Self::refresh`] afterward.
+    pub fn set_applications(&mut self, applications: ApplicationsSnapshot) -> Result<()> {
+        self.services.set_applications(applications)
     }
 
     /// replaces selected media player state in one update. call [`Self::refresh`] afterward.

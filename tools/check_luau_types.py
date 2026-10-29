@@ -70,6 +70,15 @@ CASES = (
             "Expected this to be 'number', but got 'number?'",
         ),
     ),
+    Case("valid-applications.luau"),
+    Case(
+        "invalid-applications.luau",
+        (
+            "Expected this to be 'string', but got 'string?'",
+            "Expected this to be 'number', but got 'string'",
+            "Key 'set' not found in table 'ThingSignal<ThingReadonlyArray<ThingDesktopApplication>>'",
+        ),
+    ),
     Case(
         "invalid-image-source.luau",
         (

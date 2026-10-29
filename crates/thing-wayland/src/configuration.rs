@@ -6,8 +6,8 @@ use std::{
 
 use thing_core::{Node, NodeId};
 use thing_runtime::{
-    Action, AudioSnapshot, AuthenticationSnapshot, ClipboardSnapshot, Event, KeyInput,
-    ManagedProcessDefinition, ManagedProcessSnapshot, ManagedProcessState, MediaSnapshot,
+    Action, ApplicationsSnapshot, AudioSnapshot, AuthenticationSnapshot, ClipboardSnapshot, Event,
+    KeyInput, ManagedProcessDefinition, ManagedProcessSnapshot, ManagedProcessState, MediaSnapshot,
     NiriState, NotificationSnapshot, OutputContext,
     PointerDispatchOutcome as RuntimePointerOutcome, PointerEvent, PowerSnapshot, Runtime, Scalar,
     ScrollInput, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTraySnapshot, TimerToken,
@@ -604,6 +604,24 @@ impl<K: Clone + Eq> Configurations<K> {
             instance
                 .runtime
                 .set_media(media.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        self.services = services;
+        Ok(())
+    }
+
+    pub(crate) fn set_applications(
+        &mut self,
+        applications: ApplicationsSnapshot,
+    ) -> Result<(), String> {
+        let mut services = self.services.clone();
+        services
+            .set_applications(applications.clone())
+            .map_err(|error| error.to_string())?;
+        for instance in &mut self.instances {
+            instance
+                .runtime
+                .set_applications(applications.clone())
                 .map_err(|error| error.to_string())?;
         }
         self.services = services;

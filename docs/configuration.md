@@ -801,6 +801,75 @@ expose its exit status or terminate it during a reload or normal shutdown. a
 service manager can still apply its own process and cgroup lifetime policy.
 launch failures are reported in the terminal running thing.
 
+### installed applications
+
+`services.applications.entries:get()` returns the installed applications from
+their desktop entries, as an immutable array sorted by id. each record contains:
+
+| field | meaning |
+| --- | --- |
+| `id` | desktop file id, such as `org.gnome.Nautilus.desktop` |
+| `name`, `generic_name`, `comment` | display text, localized for the current locale |
+| `icon` | icon name or path, suitable for `ui.image { icon = ... }` |
+| `keywords`, `categories` | arrays of strings for searching and grouping |
+| `command` | arguments for `services.launch`, or an empty array |
+| `working_directory` | the entry's working directory, or `nil` |
+| `terminal` | whether the program expects to run in a terminal |
+| `no_display` | whether the entry asks to be left out of menus |
+| `startup_wm_class` | the window class the application uses, or an empty string |
+| `dbus_activatable` | whether the entry prefers d-bus activation |
+| `actions` | additional actions, each with `key`, `name`, `icon`, and `command` |
+
+the service reads `$XDG_DATA_HOME/applications`, followed by the `applications`
+subdirectory of each `$XDG_DATA_DIRS` entry, and follows subdirectories. when two
+directories contain the same id, the first one wins; a hidden entry there
+removes the application. it skips entries whose `TryExec` program is missing
+and entries that `OnlyShowIn` or `NotShowIn` exclude for `XDG_CURRENT_DESKTOP`.
+the list updates when these directories change, without polling.
+
+`command` is already expanded for a launch without files: file and url field
+codes are removed, `%c` becomes the name, and `%i` becomes `--icon` and the icon.
+an entry without `Exec` has an empty `command`; such entries usually exist only
+to name a window's app id. d-bus activation is not supported yet, so those
+entries cannot be started either. launching is up to the configuration, which
+also decides the terminal and the search order:
+
+```luau
+local terminal = { 'foot', '-e' }
+
+local function launch(app)
+    local argv = {}
+    if app.terminal then
+        table.move(terminal, 1, #terminal, 1, argv)
+    end
+    table.move(app.command, 1, #app.command, #argv + 1, argv)
+    services.launch(argv, app.working_directory)
+end
+
+ui.column {
+    children = function()
+        local rows = {}
+        for _, app in services.applications.entries:get() do
+            if not app.no_display and #app.command > 0 then
+                table.insert(rows, ui.button {
+                    key = app.id,
+                    on_click = function() launch(app) end,
+                    children = {
+                        ui.image { icon = app.icon },
+                        ui.text { text = app.name },
+                    },
+                })
+            end
+        end
+        return rows
+    end,
+}
+```
+
+`available` is false until the first scan completes, and `error` describes a
+problem watching the directories, such as reaching the system's inotify limit.
+while watching fails, the service rescans every 30 seconds instead.
+
 ## managed processes
 
 use `services.process` when a configuration needs to read a child process or
