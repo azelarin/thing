@@ -928,6 +928,20 @@ rejected on a root panel or popup because wayland surfaces are either given an
 exact size or filled by the compositor. use `width` and `height` for the surface,
 then put the responsive or constrained dimension on an inner container.
 
+set an overlay color to transparent or the focus ring width to `0` to remove that
+part of the built-in interaction appearance. for example, this keeps only a thin
+monochrome keyboard indicator:
+
+```luau
+style = {
+    hover_overlay = '#00000000',
+    pressed_overlay = '#00000000',
+    disabled_opacity = 0.25,
+    focus_ring_color = '#ffffff',
+    focus_ring_width = 1,
+}
+```
+
 ### visual transforms
 
 translation, signed scale, and rotation change how a widget and its descendants
@@ -965,20 +979,6 @@ fractions to `-10` through `10`. each transform property may be reactive. they
 update immediately and are not currently accepted by `ui.transition` or
 `ui.spring`. an update whose nested transform cannot be represented by the
 renderer is rejected, leaving the last valid scene active.
-
-set an overlay color to transparent or the focus ring width to `0` to remove that
-part of the built-in interaction appearance. for example, this keeps only a thin
-monochrome keyboard indicator:
-
-```luau
-style = {
-    hover_overlay = '#00000000',
-    pressed_overlay = '#00000000',
-    disabled_opacity = 0.25,
-    focus_ring_color = '#ffffff',
-    focus_ring_width = 1,
-}
-```
 
 ### transitions and springs
 
