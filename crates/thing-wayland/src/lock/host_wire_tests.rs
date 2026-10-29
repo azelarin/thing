@@ -17,7 +17,7 @@ use smithay_client_toolkit::{
     session_lock::SessionLockState,
 };
 use tempfile::TempDir;
-use thing_runtime::{AuthenticationSnapshot, ServiceSnapshot, SurfaceKey};
+use thing_runtime::{AuthenticationSnapshot, AuthenticationState, ServiceSnapshot, SurfaceKey};
 use thing_ui::Affine;
 use wayland_client::{
     Connection, delegate_noop,
@@ -56,9 +56,18 @@ const LOCK_FIXTURE: &str = r#"
 return ui.lock {
     style = { width = 320, height = 240, background = '#000000' },
     children = {
-        ui.secret_input {
-            autofocus = true,
-            style = { width = 200, height = 40, translate_x = 8, rotation = 3 },
+        ui.column {
+            style = {
+                scale_x = function()
+                    return if services.authentication.state:get() == 'waiting' then 0 else 1
+                end,
+            },
+            children = {
+                ui.secret_input {
+                    autofocus = true,
+                    style = { width = 200, height = 40, translate_x = 8, rotation = 3 },
+                },
+            },
         },
     },
 }
@@ -713,6 +722,53 @@ fn run_host_probe() {
     let locked = record_position(&records, Request::Locked);
     assert!(lock < lock_surface && lock_surface < ack && ack < attach);
     assert!(attach < commit && commit < locked);
+
+    app.set_keyboard_surface(Some(app.surfaces[0].role.wl_surface().clone()));
+    let event = smithay_client_toolkit::seat::keyboard::KeyEvent {
+        time: 1,
+        raw_code: 45,
+        keysym: xkbcommon::xkb::Keysym::x,
+        utf8: Some("x".into()),
+    };
+    assert!(app.secret_input_key(0, &event, true).is_some());
+    app.set_authentication(AuthenticationSnapshot {
+        available: true,
+        state: AuthenticationState::Waiting,
+        prompt: String::new(),
+        message: String::new(),
+    });
+    drive(&mut private, &mut app, true);
+    app.reconcile_surface_focus(0);
+    assert!(
+        app.surfaces[0].secret_guarded,
+        "collapsed secret input must remain private"
+    );
+    assert_eq!(app.surfaces[0].focus_target.as_ref(), Some(&target));
+    assert_eq!(
+        app.surfaces[0].secret_input.as_ref().unwrap().editor.len(),
+        1
+    );
+    assert!(app.secret_input_key(0, &event, true).is_some());
+    assert_eq!(
+        app.surfaces[0].secret_input.as_ref().unwrap().editor.len(),
+        2
+    );
+    assert_eq!(
+        app.surfaces[0].layouts.presented_target(secret),
+        Some(target.clone())
+    );
+    app.set_authentication(AuthenticationSnapshot {
+        available: true,
+        state: AuthenticationState::Idle,
+        prompt: String::new(),
+        message: String::new(),
+    });
+    drive(&mut private, &mut app, true);
+    app.reconcile_surface_focus(0);
+    assert_eq!(
+        app.surfaces[0].secret_input.as_ref().unwrap().editor.len(),
+        2
+    );
 
     let output = &outputs[0].0;
     let consumer = app.configurations.consumer(output).unwrap().to_owned();

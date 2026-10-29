@@ -864,8 +864,8 @@ impl App {
         }
         let surface = self.surfaces.get(index)?;
         let id = target.target.node();
-        let placement = surface.layouts.input()?.get(id)?;
-        if !placement.interactive {
+        let placement = surface.layouts.input()?.semantic_placement(id)?;
+        if !placement.enabled {
             return None;
         }
         let node = self
@@ -1439,9 +1439,15 @@ impl App {
                 surface.secret_input = None;
                 surface.input.focus_from_pointer(None);
             }
-            let presented_ui = configurations
+            let mut presented_ui = configurations
                 .presented_targets(&surface.output, root, &layout)
                 .ok_or("rendered lock output has no configuration consumer")?;
+            // keyboard focus survives clipping and non-invertible transforms.
+            for id in layout.focus_order() {
+                if let Some(target) = configurations.focus_target(&surface.output, id) {
+                    presented_ui.1.insert(id, target);
+                }
+            }
             let wl = surface.role.wl_surface().clone();
             let viewport = surface.viewport.clone();
             let logical = surface.size;
