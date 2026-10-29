@@ -169,6 +169,18 @@ CASES = (
             "Property 'text' is not compatible.",
         ),
     ),
+    Case("valid-idle-and-sleep.luau"),
+    Case(
+        "invalid-idle-and-sleep.luau",
+        (
+            "missing field 'reason'",
+            "Expected this to be exactly 'number', but got 'string'",
+            "Property 'on_idle' is not compatible.",
+            "Function 'inhibitor.start' expects 0 arguments",
+            "Key 'set' not found in table 'ThingSignal<boolean>'",
+            "Property 'text' is not compatible.",
+        ),
+    ),
     Case("valid-container-scroll.luau"),
     Case(
         "invalid-container-scroll.luau",

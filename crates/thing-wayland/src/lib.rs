@@ -13,6 +13,7 @@ mod focused_clipboard;
 mod host;
 mod hover;
 mod idle_inhibit;
+mod idle_notify;
 mod input_method;
 mod keyboard;
 mod launch;
@@ -28,6 +29,7 @@ mod power;
 mod render;
 #[cfg(feature = "vulkan")]
 mod skia_vulkan;
+mod sleep;
 mod system_tray;
 mod text_data;
 mod watch;

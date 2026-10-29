@@ -3,14 +3,17 @@
 //! a [`Runtime`] owns a loaded configuration and its state. it exposes validated
 //! surface trees to the renderer.
 
+mod idle;
 mod modules;
 mod niri;
 mod properties;
 mod reconcile;
 mod services;
+mod sleep;
 mod state;
 mod timer;
 mod transition;
+pub use idle::{IdleWatchDefinition, MAX_IDLE_TIMEOUT_MS, MAX_IDLE_WATCHES, MIN_IDLE_TIMEOUT_MS};
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
 pub use services::{
     Action, ApplicationLaunch, ApplicationsSnapshot, AudioDevice, AudioSnapshot, AudioSource,
@@ -23,6 +26,10 @@ pub use services::{
     NotificationButton, NotificationCloseReason, NotificationSnapshot, NotificationUrgency,
     PowerDevice, PowerSnapshot, ServiceSnapshot, SystemTrayAction, SystemTrayItem, SystemTrayMenu,
     SystemTrayMenuAction, SystemTrayMenuItem, SystemTraySnapshot, is_local_file, uri_scheme,
+};
+pub use sleep::{
+    MAX_SLEEP_INHIBITOR_KEY_BYTES, MAX_SLEEP_INHIBITOR_REASON_BYTES, MAX_SLEEP_INHIBITORS,
+    SleepInhibitorAction, SleepInhibitorDefinition, SleepInhibitorState, SleepInhibitorStatus,
 };
 pub use timer::TimerToken;
 
@@ -465,6 +472,7 @@ impl Runtime {
         services.set_managed_processes(ManagedProcessSnapshot {
             states: snapshot.managed_processes,
         })?;
+        services.set_sleep_inhibitors(snapshot.sleep_inhibitors)?;
         services.set_niri(snapshot.niri)?;
         if let Some(output) = &output {
             services.set_output(output)?;
@@ -485,9 +493,19 @@ impl Runtime {
             ));
         }
         if matches!(mode, ConfigurationMode::Lock) {
+            if !services.idle_watches().borrow().watches.is_empty() {
+                return Err(Error::runtime(
+                    "idle watches are unavailable in lock configurations",
+                ));
+            }
+            if !services.sleep_inhibitor_definitions().is_empty() {
+                return Err(Error::runtime(
+                    "sleep inhibitors are unavailable in lock configurations",
+                ));
+            }
             services.forbid_application_launches();
         }
-        services.freeze_managed_process_declarations();
+        services.freeze_declarations();
         timers.borrow_mut().freeze();
         let mut runtime = Self {
             lua,
@@ -687,6 +705,80 @@ impl Runtime {
     /// the managed process keys declared while this configuration loaded.
     pub fn managed_process_definitions(&self) -> Vec<ManagedProcessDefinition> {
         self.services.managed_process_definitions()
+    }
+
+    /// the sleep inhibitor keys declared while this configuration loaded.
+    pub fn sleep_inhibitor_definitions(&self) -> Vec<SleepInhibitorDefinition> {
+        self.services.sleep_inhibitor_definitions()
+    }
+
+    /// replaces the published sleep inhibitor states. call [`Self::refresh`]
+    /// afterward.
+    pub fn set_sleep_inhibitors(&mut self, states: Vec<SleepInhibitorState>) -> Result<()> {
+        self.services.set_sleep_inhibitors(states)
+    }
+
+    /// the idle watches declared while this configuration loaded, in order.
+    pub fn idle_watches(&self) -> Vec<IdleWatchDefinition> {
+        self.services.idle_watches().borrow().definitions()
+    }
+
+    /// reports that watch `index` became idle or resumed and runs its callback
+    /// through the checked event path. it returns `None` when the watch does
+    /// not exist or already has that state.
+    pub fn dispatch_idle_checked(
+        &mut self,
+        index: usize,
+        idle: bool,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<Option<bool>> {
+        let now = Instant::now();
+        self.with_timer_event(Some(now), |runtime| {
+            let tracker = runtime.services.tracker().clone();
+            let (signal, callback, handle) = {
+                let watches = runtime.services.idle_watches().borrow();
+                let Some(watch) = watches.watches.get(index) else {
+                    return Ok(None);
+                };
+                let callback = if idle {
+                    watch.on_idle.clone()
+                } else {
+                    watch.on_resume.clone()
+                };
+                (watch.signal, callback, watch.handle.clone())
+            };
+            if tracker.borrow_mut().read(signal) == Scalar::Boolean(idle) {
+                return Ok(None);
+            }
+            let checkpoint = runtime.action_checkpoint();
+            runtime.begin_call();
+            // the transition is a fact from the compositor, so the signal keeps
+            // it even when the callback fails.
+            tracker.borrow_mut().write(signal, Scalar::Boolean(idle))?;
+            runtime.allow_actions(true);
+            let result = callback
+                .as_ref()
+                .map_or(Ok(()), |callback| callback.call::<()>(handle));
+            runtime.allow_actions(false);
+            if let Err(error) = result {
+                runtime.truncate_actions(checkpoint);
+                let name = if idle { "on_idle" } else { "on_resume" };
+                return Err(error.context(format!("idle watch {name}")));
+            }
+            let result = (|| {
+                let changed = runtime.refresh_at_checked(now, &validate)?;
+                let cleaned = runtime.cancel_unavailable_presses_checked(now, &validate)?;
+                let pointer = runtime.reconcile_pointer_checked(&validate)?;
+                Ok(changed || cleaned || pointer.changed)
+            })();
+            match result {
+                Ok(changed) => Ok(Some(changed)),
+                Err(error) => {
+                    runtime.truncate_actions(checkpoint);
+                    Err(error)
+                }
+            }
+        })
     }
 
     /// replaces clipboard state in one update. call [`Self::refresh`] afterward.

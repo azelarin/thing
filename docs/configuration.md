@@ -276,7 +276,8 @@ a reactive `margins` property returns the complete margins table.
 `idle_inhibit` is also available on popups. it follows the lifetime of the
 actual panel or popup surface; a closed popup holds no inhibitor. the compositor
 decides whether an occluded or unmapped surface is relevant enough to count.
-this is a compositor idle request, not a system suspend inhibitor.
+this is a compositor idle request, not a system suspend inhibitor; see
+[idle watches and sleep inhibitors](#idle-watches-and-sleep-inhibitors).
 
 setting the property to true requires `zwp_idle_inhibit_manager_v1`. gate
 portable configurations with the read-only availability signal:
@@ -1106,6 +1107,136 @@ configuration. configurations that do not use `services.process` never start
 the worker or perform this check. `thing check` validates declarations but does
 not start children.
 
+## idle watches and sleep inhibitors
+
+thing has three idle tools, and none of them stands in for another:
+
+- `idle_inhibit` on a panel or popup asks the compositor not to treat the user
+  as idle while that surface is relevant. it can hold off screen blanking or an
+  idle daemon's timers. it does not stop the system from suspending.
+- `services.idle.watch` observes idleness. it inhibits nothing.
+- `services.sleep_inhibitor` asks logind to block system sleep: suspend,
+  hibernate, and their hybrids. it does not keep the screen on or stop the
+  compositor from reporting idle.
+
+none of them overrides compositor or administrator policy. the compositor
+decides what counts as activity and which idle inhibitors to honor. logind
+ignores block inhibitors for privileged or forced requests such as
+`systemctl suspend --ignore-inhibitors`, and by default it also ignores them
+for lid switches (`LidSwitchIgnoreInhibited=yes`). polkit may refuse the
+inhibitor itself.
+
+```luau
+local download = services.sleep_inhibitor {
+    key = 'download',
+    reason = 'a download is running',
+}
+
+local away = services.idle.watch {
+    timeout = 10 * 60 * 1000,
+    on_idle = function()
+        -- every output runs this configuration; act from one of them.
+        if services.output.name:get() == 'DP-1' then
+            services.launch({ 'notify-send', 'still downloading' })
+        end
+    end,
+}
+
+return ui.panel { children = {
+    ui.button {
+        on_click = function()
+            if download.state:get() == 'stopped' then
+                download.start()
+            else
+                download.stop()
+            end
+        end,
+        children = { ui.text { text = function()
+            return `{download.state:get()} {if away.idle:get() then 'away' else 'here'}`
+        end } },
+    },
+} }
+```
+
+### idle watches
+
+declare a watch while the configuration loads. `timeout` is a whole number of
+milliseconds from 1,000 through 86,400,000. `on_idle` and `on_resume` are
+optional and receive the watch's handle, whose read-only `idle` signal is
+already updated when they run. a configuration may declare at most 16 watches.
+
+watches use `ext_idle_notifier_v1` notifications that respect idle inhibitors,
+including thing's own `idle_inhibit` surfaces and those of other clients. without
+the protocol, watches stay unarmed and `idle` stays false;
+`services.idle.watch_available` reports whether it is bound, and watches arm
+when the global appears later.
+
+callbacks are event handlers: they may launch programs, start or stop sleep
+inhibitors, and change state. a callback error or a rejected update discards
+every action the callback queued. `idle` still keeps the compositor's report,
+because the transition happened either way.
+
+watches belong to output runtimes. a configuration running on three outputs
+arms three notifications for each watch and runs each callback once per output.
+there is no primary output and no deduplication. to perform a global action
+once, act from one output, as the example does, or use an action that is safe
+to repeat, such as starting a shared sleep inhibitor key.
+
+a watch is armed only after its configuration is accepted. a rejected reload
+keeps the current watches. a successful reload, an output's removal, or
+shutdown retires them, and a retired configuration receives no further
+callbacks. if the seat or the compositor's idle notifier goes away while a
+watch is idle and its configuration is still current, the watch resumes and
+rearms when a seat or notifier returns. lock configurations reject idle
+watches.
+
+thing has no lock or blanking policy of its own. a watch only reports
+transitions; what to do with them belongs to the configuration or an idle
+daemon.
+
+### sleep inhibitors
+
+declare a sleep inhibitor while the configuration loads. its key has 1 to 64
+ascii letters, digits, `-`, `_`, or `.`. its reason is non-blank readable text
+of at most 256 bytes without control characters; `systemd-inhibit --list` shows
+it with `thing` as the requester. a configuration may declare at most 16 keys.
+
+declaring requests nothing. `start()` and `stop()` are actions, so they work
+only in event handlers, including idle watch callbacks. while started, thing
+holds a logind `block` inhibitor for `sleep`. the read-only `state` signal is:
+
+| state | meaning |
+| --- | --- |
+| `stopped` | not started |
+| `requested` | started and waiting for logind |
+| `active` | logind granted the inhibitor and thing holds it |
+| `unavailable` | the service or worker capacity is unavailable; thing retries |
+| `failed` | logind refused the request, or retries ran out |
+
+`error` explains `unavailable` and `failed`. an unavailable request is retried
+after 1 second, then with doubling delays up to 30 seconds, for at most 8
+attempts. logind appearing on the bus retries at once. retries happen only
+while the inhibitor is started. a refusal is not retried. calling `start()`
+again tries again.
+
+a key names one inhibitor across all outputs. repeated declarations must match
+exactly; conflicting declarations reject the candidate configuration. state is
+shared, so starting or stopping the key from one output affects all of them.
+at most 64 keys may hold a lease or have work awaiting completion. requests
+above that limit report `unavailable` and follow the same retry policy.
+
+thing keeps the inhibitor until it is stopped, until no accepted configuration
+declares the key, until a reload changes the key's reason, or until thing
+exits. a reload with an unchanged declaration keeps the same inhibitor without
+a gap, and a rejected reload changes nothing. a changed reason releases the
+inhibitor and requests a new one. if logind is replaced or the bus connection
+drops, the inhibitor is gone, and thing reports `requested` or `unavailable`
+while it asks again.
+
+bus calls run on a worker thread that starts with the first `start()`, so a
+configuration that never starts an inhibitor never connects to the system bus.
+lock configurations reject sleep inhibitors.
+
 ## niri workspaces and windows
 
 `services.niri` provides niri workspace and window state. other widgets and services
@@ -1497,6 +1628,7 @@ read them inside property functions to subscribe to updates.
 | `services.clock.time` | local `HH:MM` time, updated at minute boundaries |
 | `services.clock.date` | local date such as `Wed 28 Oct`, updated with the clock |
 | `services.idle.inhibit_available` | whether the compositor supports per-surface idle inhibition |
+| `services.idle.watch_available` | whether the compositor supports idle notifications for `services.idle.watch` |
 | `services.audio.available` | whether a default output is available |
 | `services.audio.volume` | default output volume; `1` is 100%, server values may exceed it |
 | `services.audio.muted` | default output mute state |

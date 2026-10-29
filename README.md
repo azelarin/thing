@@ -81,7 +81,7 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] system tray
 - [x] session locking
 - [x] surface idle inhibition
-- [ ] idle monitoring and system sleep inhibition
+- [x] idle monitoring and system sleep inhibition
 - [ ] accessibility and complete keyboard navigation
 
 ## license
