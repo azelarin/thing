@@ -98,3 +98,120 @@ jobs:
           SKIA_BINARIES_URL: file://${{ runner.temp }}/skia-vulkan.tar.gz
       - name: run tool tests
         run: python3 -m unittest discover -s tools -p 'test_*.py'
+
+  install-smoke:
+    name: install ${{ matrix.renderer }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - renderer: opengl
+            skia_url: https://github.com/rust-skia/skia-binaries/releases/download/0.156.0/skia-binaries-ce6727ef251518df37bc-x86_64-unknown-linux-gnu-ganesh-gl-jpegd-jpege-pdf.tar.gz
+            skia_sha256: 078ca57ed93d8ff5fa2dba082e5e0b36d7ef3f0a2a9e1c2333e3ab7afe1bac3d
+          - renderer: vulkan
+            skia_url: https://github.com/rust-skia/skia-binaries/releases/download/0.156.0/skia-binaries-ce6727ef251518df37bc-x86_64-unknown-linux-gnu-ganesh-gl-jpegd-jpege-pdf-vulkan.tar.gz
+            skia_sha256: c1399c21ccf93d45b256e840d747dbb4a823edbc304be8c5d7b14eb460d3fc6b
+    steps:
+      - name: check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: install rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.88.0
+      - name: install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            curl \
+            fonts-dejavu-core \
+            libclang-dev \
+            libegl1-mesa-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libgles-dev \
+            libpam0g-dev \
+            libpulse-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            pkg-config
+      - name: prepare locked dependencies
+        env:
+          THING_SKIA_SHA256: ${{ matrix.skia_sha256 }}
+          THING_SKIA_URL: ${{ matrix.skia_url }}
+        run: |
+          thing_skia_archive="$RUNNER_TEMP/thing-skia-${{ matrix.renderer }}.tar.gz"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "$thing_skia_archive" \
+            "$THING_SKIA_URL"
+          printf '%s  %s\n' "$THING_SKIA_SHA256" "$thing_skia_archive" \
+            | sha256sum --check
+          cargo fetch --locked
+      - name: install thing
+        env:
+          THING_RENDERER: ${{ matrix.renderer }}
+        run: |
+          thing_skia_archive="$RUNNER_TEMP/thing-skia-$THING_RENDERER.tar.gz"
+          thing_install_root="$RUNNER_TEMP/thing-install-$THING_RENDERER"
+          thing_target="$RUNNER_TEMP/thing-install-target-$THING_RENDERER"
+          thing_install_features=thing-ui/ci-no-skia-compile
+          if [[ "$THING_RENDERER" == vulkan ]]; then
+            thing_install_features="vulkan,$thing_install_features"
+          fi
+          thing_install_arguments=(
+            --locked
+            --offline
+            --path crates/thing
+            --root "$thing_install_root"
+            --features "$thing_install_features"
+          )
+
+          # use the verified archive and refuse rust-skia's source-build fallback.
+          env -u FORCE_SKIA_BUILD -u SKIA_SOURCE_DIR \
+            CARGO_TARGET_DIR="$thing_target" \
+            SKIA_BINARIES_URL="file://$thing_skia_archive" \
+            cargo install "${thing_install_arguments[@]}"
+      - name: check installed binary
+        env:
+          THING_RENDERER: ${{ matrix.renderer }}
+        run: |
+          thing_install_root="$RUNNER_TEMP/thing-install-$THING_RENDERER"
+          thing_binary="$thing_install_root/bin/thing"
+          thing_types="$RUNNER_TEMP/thing-types-$THING_RENDERER.luau"
+          thing_panel="$RUNNER_TEMP/thing-panel-$THING_RENDERER.luau"
+          thing_ldd="$RUNNER_TEMP/thing-ldd-$THING_RENDERER.txt"
+
+          test -x "$thing_binary"
+          "$thing_binary" --version | grep -E '^thing [0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$'
+          "$thing_binary" --help | grep -F 'thing run'
+          "$thing_binary" types > "$thing_types"
+          cmp crates/thing/types/thing.d.luau "$thing_types"
+
+          echo 'return ui.panel {}' > "$thing_panel"
+          env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u DISPLAY \
+            -u DBUS_SESSION_BUS_ADDRESS \
+            "$thing_binary" check "$thing_panel" | grep -F ': valid (1 file(s))'
+
+          ldd "$thing_binary" | tee "$thing_ldd"
+          if grep -F 'not found' "$thing_ldd"; then
+            exit 1
+          fi
+
+          if [[ "$THING_RENDERER" == opengl ]]; then
+            thing_vulkan_error="$RUNNER_TEMP/thing-vulkan-error.txt"
+            if env -u WAYLAND_DISPLAY -u DISPLAY \
+              "$thing_binary" run --renderer vulkan "$thing_panel" \
+              > "$thing_vulkan_error" 2>&1
+            then
+              echo 'the opengl install unexpectedly enabled vulkan' >&2
+              exit 1
+            fi
+            grep -F 'rebuild with --features vulkan' "$thing_vulkan_error"
+          fi
