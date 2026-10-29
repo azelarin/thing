@@ -3,6 +3,7 @@ use std::{
     io,
     path::Path,
     rc::Rc,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -106,9 +107,12 @@ use xkbcommon::xkb;
 #[cfg(test)]
 use crate::output::{fallback_logical_size, valid_dimensions};
 
+#[cfg(test)]
+mod launch_tests;
+
 use crate::{
     Renderer, RunOptions, SystemTray,
-    applications::Applications,
+    applications::{self, ActivationCall, Activator, Applications, Catalog, Plan},
     audio::Audio,
     clipboard::{Clipboard, OfferData as ClipboardOfferData, SourceData as ClipboardSourceData},
     configuration::{
@@ -227,6 +231,10 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let applications = Applications::start(applications_ping)
         .map_err(|e| format!("cannot start applications worker: {e}"))?;
+    let (activator_ping, activator_source) =
+        calloop::ping::make_ping().map_err(|e| e.to_string())?;
+    let activator = Activator::start(activator_ping)
+        .map_err(|e| format!("cannot start application activation worker: {e}"))?;
     let (power_ping, power_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let power = Power::start(power_ping).map_err(|e| format!("cannot start power worker: {e}"))?;
     let (niri_ping, niri_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
@@ -274,6 +282,8 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         audio,
         media,
         applications,
+        application_catalog: Arc::default(),
+        activator,
         power,
         niri,
         notifications,
@@ -318,62 +328,7 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
     queue
         .roundtrip(&mut app)
         .map_err(|error| error.to_string())?;
-    app.update_clipboard();
-    let outputs: Vec<_> = app
-        .outputs
-        .outputs()
-        .filter_map(|output| app.output_context(&output).map(|context| (output, context)))
-        .collect();
-    let layer_shell_version = app.layer_shell_version;
-    let entries = outputs
-        .iter()
-        .map(|(output, context)| app.layout_validation_entry(output.clone(), context.clone()))
-        .collect();
-    let loop_handle = app.loop_handle.clone();
-    let preflight = LayoutPreflight::new(
-        &mut app.render,
-        layer_shell_version,
-        app.idle_inhibit.active().is_some(),
-        entries,
-    );
-    let mut prepared_configurations = app
-        .configurations
-        .prepare_reload_for_checked(outputs.clone(), |output, runtime| {
-            preflight.validate(output, runtime.surfaces())
-        })?;
-    let process_definitions = prepared_configurations
-        .managed_process_definitions()
-        .to_vec();
-    let projected_processes = project_managed_processes(
-        app.managed_processes.as_ref(),
-        &process_definitions,
-        ManagedProcessScopeChange::Replace,
-    )?;
-    prepared_configurations
-        .set_managed_processes(projected_processes.clone(), |output, runtime| {
-            preflight.validate(output, runtime.surfaces())
-        })?;
-    let activation = prepare_and_commit_managed_processes(
-        &mut app.managed_processes,
-        &loop_handle,
-        &process_definitions,
-        ManagedProcessScopeChange::Replace,
-        projected_processes,
-        |snapshot| {
-            prepared_configurations.set_managed_processes(snapshot, |output, runtime| {
-                preflight.validate(output, runtime.surfaces())
-            })
-        },
-    )?;
-    let prepared = preflight.into_prepared();
-    app.configurations.commit_reload(prepared_configurations);
-    for (output, _) in &outputs {
-        app.sync_output_surfaces(output, false, &qh)?;
-    }
-    app.install_prepared_layouts(prepared);
-    arm_managed_processes(app.managed_processes.as_ref(), activation);
-    app.loading_outputs = false;
-    app.update_watch();
+    app.initialize(&qh)?;
     event_loop
         .handle()
         .insert_source(child_signals, |_, _, app| app.reap_children())
@@ -397,6 +352,12 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
     event_loop
         .handle()
         .insert_source(applications_source, |_, _, app| app.update_applications())
+        .map_err(|e| e.to_string())?;
+    event_loop
+        .handle()
+        .insert_source(activator_source, |_, _, app| {
+            app.start_activation_fallbacks()
+        })
         .map_err(|e| e.to_string())?;
     event_loop
         .handle()
@@ -462,29 +423,108 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         })
         .map_err(|e| e.to_string())?;
     while !app.exit {
-        app.expire_launches();
-        if app
+        app.turn(&mut event_loop, &connection, &qh)?;
+    }
+    Ok(())
+}
+
+impl App {
+    /// loads the configuration for the outputs known after the first
+    /// roundtrip and creates their surfaces.
+    fn initialize(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
+        self.update_clipboard();
+        let outputs: Vec<_> = self
+            .outputs
+            .outputs()
+            .filter_map(|output| {
+                self.output_context(&output)
+                    .map(|context| (output, context))
+            })
+            .collect();
+        let layer_shell_version = self.layer_shell_version;
+        let entries = outputs
+            .iter()
+            .map(|(output, context)| self.layout_validation_entry(output.clone(), context.clone()))
+            .collect();
+        let loop_handle = self.loop_handle.clone();
+        let preflight = LayoutPreflight::new(
+            &mut self.render,
+            layer_shell_version,
+            self.idle_inhibit.active().is_some(),
+            entries,
+        );
+        let mut prepared_configurations = self
+            .configurations
+            .prepare_reload_for_checked(outputs.clone(), |output, runtime| {
+                preflight.validate(output, runtime.surfaces())
+            })?;
+        let process_definitions = prepared_configurations
+            .managed_process_definitions()
+            .to_vec();
+        let projected_processes = project_managed_processes(
+            self.managed_processes.as_ref(),
+            &process_definitions,
+            ManagedProcessScopeChange::Replace,
+        )?;
+        prepared_configurations
+            .set_managed_processes(projected_processes.clone(), |output, runtime| {
+                preflight.validate(output, runtime.surfaces())
+            })?;
+        let activation = prepare_and_commit_managed_processes(
+            &mut self.managed_processes,
+            &loop_handle,
+            &process_definitions,
+            ManagedProcessScopeChange::Replace,
+            projected_processes,
+            |snapshot| {
+                prepared_configurations.set_managed_processes(snapshot, |output, runtime| {
+                    preflight.validate(output, runtime.surfaces())
+                })
+            },
+        )?;
+        let prepared = preflight.into_prepared();
+        self.configurations.commit_reload(prepared_configurations);
+        for (output, _) in &outputs {
+            self.sync_output_surfaces(output, false, qh)?;
+        }
+        self.install_prepared_layouts(prepared);
+        arm_managed_processes(self.managed_processes.as_ref(), activation);
+        self.loading_outputs = false;
+        self.update_watch();
+        Ok(())
+    }
+
+    /// runs one iteration of the event loop: due work, drawing, and then
+    /// waiting for the next event or deadline.
+    fn turn(
+        &mut self,
+        event_loop: &mut EventLoop<'static, App>,
+        connection: &Connection,
+        qh: &QueueHandle<Self>,
+    ) -> Result<(), String> {
+        self.expire_launches();
+        if self
             .reload_at
             .is_some_and(|deadline| deadline <= Instant::now())
         {
-            app.reload_at = None;
-            app.reload(&qh)?;
+            self.reload_at = None;
+            self.reload(qh)?;
         }
-        app.dispatch_due_timers(Instant::now());
-        app.draw(&qh)?;
-        app.process_hover(&qh);
+        self.dispatch_due_timers(Instant::now());
+        self.draw(qh)?;
+        self.process_hover(qh);
         connection.flush().map_err(|error| error.to_string())?;
-        let timeout = app
+        let timeout = self
             .next_deadline()
             .map(|deadline| deadline.saturating_duration_since(Instant::now()));
         event_loop
-            .dispatch(timeout, &mut app)
+            .dispatch(timeout, self)
             .map_err(|error| error.to_string())?;
-        if let Some(error) = app.error.take() {
-            return Err(error);
+        match self.error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
-    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -999,6 +1039,27 @@ impl Drop for Surface {
     }
 }
 
+/// work waiting for an activation token.
+struct PendingLaunch {
+    work: PendingWork,
+    /// the entry id and revision an application launch was planned from.
+    entry: Option<(String, u64)>,
+}
+
+enum PendingWork {
+    Spawn(LaunchRequest),
+    Activate(Box<ActivationCall>),
+}
+
+impl PendingLaunch {
+    fn spawn(request: LaunchRequest) -> Self {
+        Self {
+            work: PendingWork::Spawn(request),
+            entry: None,
+        }
+    }
+}
+
 pub(crate) struct App {
     render: Render,
     image_ping: calloop::ping::Ping,
@@ -1006,6 +1067,9 @@ pub(crate) struct App {
     audio: Audio,
     media: Media,
     applications: Applications,
+    /// launch data for the application list the configurations currently see.
+    application_catalog: Arc<Catalog>,
+    activator: Activator,
     power: Power,
     niri: Niri,
     notifications: Option<NotificationServer>,
@@ -1016,7 +1080,7 @@ pub(crate) struct App {
     input_method: InputMethod,
     launcher: Launcher,
     managed_processes: Option<ProcessManager>,
-    pending_launches: PendingLaunches<XdgActivationTokenV1>,
+    pending_launches: PendingLaunches<XdgActivationTokenV1, PendingLaunch>,
     pending_ui_actions: Vec<PendingUiAction>,
     watch: Rc<Watch>,
     reload_at: Option<Instant>,
@@ -1233,13 +1297,24 @@ impl App {
         self.refresh();
     }
     fn update_applications(&mut self) {
-        let Some(snapshot) = self.applications.take_snapshot() else {
+        let Some(published) = self.applications.take_snapshot() else {
             return;
         };
-        if let Err(error) = self.configurations.set_applications(snapshot) {
-            eprintln!("thing: {error}");
+        // the catalog changes only with the list the configurations accept, so
+        // a launch always resolves against the entries a configuration saw.
+        match self.configurations.set_applications(published.snapshot) {
+            Ok(()) => self.application_catalog = published.catalog,
+            Err(error) => eprintln!("thing: {error}"),
         }
         self.refresh();
+    }
+
+    fn start_activation_fallbacks(&mut self) {
+        for fallback in self.activator.take_fallbacks() {
+            for (request, token) in fallback.into_launches() {
+                self.spawn_launch(request, token.as_deref());
+            }
+        }
     }
     fn update_power(&mut self) {
         let Some(snapshot) = self.power.take_snapshot() else {
@@ -2695,8 +2770,34 @@ impl App {
                     send_managed_process_action(self.managed_processes.as_ref(), &key, action)
                 }
                 Action::Launch { argv, cwd } => {
-                    self.request_launch(LaunchRequest { argv, cwd }, origin.as_ref());
+                    self.request_launch(
+                        PendingLaunch::spawn(LaunchRequest { argv, cwd }),
+                        origin.as_ref(),
+                    );
                     Ok(())
+                }
+                Action::LaunchApplication(launch) => {
+                    applications::plan(&self.application_catalog, &launch).map(|plan| {
+                        let pending = |work| PendingLaunch {
+                            work,
+                            entry: Some((launch.id.clone(), launch.revision)),
+                        };
+                        match plan {
+                            // each process gets its own activation token.
+                            Plan::Spawn(requests) => {
+                                for request in requests {
+                                    self.request_launch(
+                                        pending(PendingWork::Spawn(request)),
+                                        origin.as_ref(),
+                                    );
+                                }
+                            }
+                            Plan::Activate(call) => self.request_launch(
+                                pending(PendingWork::Activate(Box::new(call))),
+                                origin.as_ref(),
+                            ),
+                        }
+                    })
                 }
                 Action::DismissNotification { key } => self
                     .notifications
@@ -2997,9 +3098,9 @@ impl App {
         })
     }
 
-    fn request_launch(&mut self, request: LaunchRequest, origin: Option<&InputOrigin>) {
+    fn request_launch(&mut self, request: PendingLaunch, origin: Option<&InputOrigin>) {
         let (Some(activation), Some(origin)) = (self.activation.clone(), origin) else {
-            self.spawn_launch(request, None);
+            self.finish_launch(request, None);
             return;
         };
         let queue = self.queue.clone();
@@ -3011,7 +3112,28 @@ impl App {
             token.commit();
             token
         }) {
-            self.spawn_launch(request, None);
+            self.finish_launch(request, None);
+        }
+    }
+
+    fn finish_launch(&mut self, request: PendingLaunch, token: Option<&str>) {
+        // the catalog may have been replaced while the token was requested. a
+        // changed or removed entry no longer describes what was planned.
+        if let Some((id, revision)) = &request.entry
+            && self.application_catalog.revision(id) != Some(*revision)
+        {
+            eprintln!(
+                "thing: application {id:?} changed while its launch waited for activation; launch it again"
+            );
+            return;
+        }
+        match request.work {
+            PendingWork::Spawn(request) => self.spawn_launch(request, token),
+            PendingWork::Activate(call) => {
+                if let Err(error) = self.activator.send(*call, token.map(str::to_owned)) {
+                    eprintln!("thing: {error}");
+                }
+            }
         }
     }
 
@@ -3032,7 +3154,7 @@ impl App {
     fn expire_launches(&mut self) {
         for (request, token) in self.pending_launches.expire(Instant::now()) {
             token.destroy();
-            self.spawn_launch(request, None);
+            self.finish_launch(request, None);
         }
     }
 
@@ -8374,7 +8496,7 @@ impl Dispatch<XdgActivationTokenV1, u64> for App {
             return;
         };
         completed.token.destroy();
-        app.spawn_launch(completed.request, completed.fresh.then_some(token.as_str()));
+        app.finish_launch(completed.request, completed.fresh.then_some(token.as_str()));
     }
 }
 

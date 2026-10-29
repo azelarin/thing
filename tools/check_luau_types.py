@@ -76,6 +76,15 @@ CASES = (
         ),
     ),
     Case("valid-applications.luau"),
+    Case("valid-application-launch.luau"),
+    Case(
+        "invalid-application-launch.luau",
+        (
+            "Expected this to be '\"file\" | \"files\"', but got '\"none\"'",
+            "Expected this to be 'string', but got 'ThingDesktopApplication'",
+            "Expected this to be exactly '{string}?', but got 'string'",
+        ),
+    ),
     Case(
         "invalid-applications.luau",
         (

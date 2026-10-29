@@ -818,6 +818,7 @@ their desktop entries, as an immutable array sorted by id. each record contains:
 | `no_display` | whether the entry asks to be left out of menus |
 | `startup_wm_class` | the window class the application uses, or an empty string |
 | `dbus_activatable` | whether the entry prefers d-bus activation |
+| `accepts` | what `launch` can open: `none`, `file`, `files`, `url`, or `urls`, which d-bus activation always allows |
 | `actions` | additional actions, each with `key`, `name`, `icon`, and `command` |
 
 the service reads `$XDG_DATA_HOME/applications`, followed by the `applications`
@@ -827,33 +828,22 @@ removes the application. it skips entries whose `TryExec` program is missing
 and entries that `OnlyShowIn` or `NotShowIn` exclude for `XDG_CURRENT_DESKTOP`.
 the list updates when these directories change, without polling.
 
-`command` is already expanded for a launch without files: file and url field
-codes are removed, `%c` becomes the name, and `%i` becomes `--icon` and the icon.
-an entry without `Exec` has an empty `command`; such entries usually exist only
-to name a window's app id. d-bus activation is not supported yet, so those
-entries cannot be started either. launching is up to the configuration, which
-also decides the terminal and the search order:
+start an entry from an event handler with
+`services.applications.launch(id, options)`:
 
 ```luau
 local terminal = { 'foot', '-e' }
-
-local function launch(app)
-    local argv = {}
-    if app.terminal then
-        table.move(terminal, 1, #terminal, 1, argv)
-    end
-    table.move(app.command, 1, #app.command, #argv + 1, argv)
-    services.launch(argv, app.working_directory)
-end
 
 ui.column {
     children = function()
         local rows = {}
         for _, app in services.applications.entries:get() do
-            if not app.no_display and #app.command > 0 then
+            if not app.no_display then
                 table.insert(rows, ui.button {
                     key = app.id,
-                    on_click = function() launch(app) end,
+                    on_click = function()
+                        services.applications.launch(app.id, { terminal = terminal })
+                    end,
                     children = {
                         ui.image { icon = app.icon },
                         ui.text { text = app.name },
@@ -865,6 +855,64 @@ ui.column {
     end,
 }
 ```
+
+`options` is optional and may contain:
+
+| option | meaning |
+| --- | --- |
+| `action` | a `key` from the record's `actions` |
+| `uris` | absolute paths or uris to open, such as `/home/me/a b.txt` or `https://example.org` |
+| `terminal` | arguments placed before the command when the entry sets `Terminal=true` |
+
+the call checks the id and options against the list the configuration sees and
+remembers which version of the entry that was. if the entry changes or
+disappears before thing handles the request, the launch is refused instead of
+starting something else; rescans that leave the entry unchanged do not affect
+it. launches are event-handler actions, like `services.launch`, and lock
+configurations cannot call them.
+
+entries with `DBusActivatable=true` start through the `org.freedesktop.Application`
+interface: `Activate` without uris, `Open` with them, and `ActivateAction` for an
+action. the bus name is the desktop file id without `.desktop`, and the object
+path replaces its dots with slashes and its dashes with underscores. when the
+id is not a valid bus name, the entry's `Exec` command is used. if the bus
+reports that the call never reached the application, such as an unknown or
+unstartable service, thing runs `Exec` instead. if the outcome is unclear, such
+as a timeout, an application that disconnects without replying, or an
+activated program that exits, nothing is retried, because the application may
+already have acted. the call waits up to 25 seconds and runs off the event
+loop.
+
+other entries run their `Exec` command without a shell, in the entry's
+`Path` directory when it sets one. field codes are expanded for each launch:
+
+- `%f` takes one local file. with several, thing starts one process per file,
+  up to 16.
+- `%F` takes all local files as separate arguments.
+- `%u` takes one uri per process in the same way, and `%U` takes all of them.
+- `%c`, `%i`, and `%k` expand to the name, `--icon` and the icon, and the entry's
+  path. deprecated codes are removed.
+
+paths given for `%u` and `%U` become `file:` uris, and `file:` uris given for
+`%f` and `%F` become paths, with percent escapes decoded. `%f` and `%F` accept
+only local files; thing does not download remote files, so those launches are
+refused. an entry whose command has no file or url code, or more than one,
+accepts no files, and passing `uris` to it is an error rather than being
+ignored. actions accept no uris, because the d-bus method for actions has no
+way to pass them.
+
+an entry with `Terminal=true` needs `options.terminal`, such as
+`{ 'foot', '-e' }`; thing does not choose a terminal. the terminal is ignored for
+other entries and for d-bus activation. each process receives its own
+activation token, as with `services.launch`; d-bus calls pass it as
+`activation-token` and `desktop-startup-id` in the platform data, and a
+fallback `Exec` launch reuses it for its first process only.
+
+`command` in each record remains the expanded command for a launch without
+files, for configurations that call `services.launch` themselves. an entry
+without `Exec` has an empty `command`; such entries usually exist only to name a
+window's app id. errors found when a launch is handled, such as a refused
+entry, are reported in the terminal running thing.
 
 `available` is false until the first scan completes, and `error` describes a
 problem watching the directories, such as reaching the system's inotify limit.

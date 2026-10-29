@@ -57,31 +57,33 @@ pub(crate) struct LaunchRequest {
     pub cwd: Option<String>,
 }
 
-struct PendingLaunch<T> {
-    request: LaunchRequest,
+struct PendingLaunch<T, R> {
+    request: R,
     token: T,
     deadline: Instant,
 }
 
-pub(crate) struct PendingLaunches<T> {
-    launches: BTreeMap<u64, PendingLaunch<T>>,
+/// launches waiting for an activation token. `R` is the work to do once the
+/// token arrives or its wait expires.
+pub(crate) struct PendingLaunches<T, R = LaunchRequest> {
+    launches: BTreeMap<u64, PendingLaunch<T, R>>,
     next_id: u64,
     limit: usize,
     timeout: Duration,
 }
 
-pub(crate) struct PendingCompletion<T> {
-    pub request: LaunchRequest,
+pub(crate) struct PendingCompletion<T, R = LaunchRequest> {
+    pub request: R,
     pub token: T,
     pub fresh: bool,
 }
 
-impl<T> PendingLaunches<T> {
+impl<T, R> PendingLaunches<T, R> {
     pub(crate) fn new() -> Self {
         Self::with_limits(MAX_PENDING_LAUNCHES, ACTIVATION_TIMEOUT)
     }
 
-    fn with_limits(limit: usize, timeout: Duration) -> Self {
+    pub(crate) fn with_limits(limit: usize, timeout: Duration) -> Self {
         Self {
             launches: BTreeMap::new(),
             next_id: 1,
@@ -93,9 +95,9 @@ impl<T> PendingLaunches<T> {
     pub(crate) fn push(
         &mut self,
         now: Instant,
-        request: LaunchRequest,
+        request: R,
         create_token: impl FnOnce(u64) -> T,
-    ) -> Result<u64, LaunchRequest> {
+    ) -> Result<u64, R> {
         if self.launches.len() >= self.limit {
             return Err(request);
         }
@@ -112,7 +114,7 @@ impl<T> PendingLaunches<T> {
         Ok(id)
     }
 
-    pub(crate) fn complete(&mut self, id: u64, now: Instant) -> Option<PendingCompletion<T>> {
+    pub(crate) fn complete(&mut self, id: u64, now: Instant) -> Option<PendingCompletion<T, R>> {
         let pending = self.launches.remove(&id)?;
         Some(PendingCompletion {
             request: pending.request,
@@ -121,7 +123,7 @@ impl<T> PendingLaunches<T> {
         })
     }
 
-    pub(crate) fn expire(&mut self, now: Instant) -> Vec<(LaunchRequest, T)> {
+    pub(crate) fn expire(&mut self, now: Instant) -> Vec<(R, T)> {
         let expired: Vec<_> = self
             .launches
             .iter()
@@ -138,7 +140,7 @@ impl<T> PendingLaunches<T> {
         self.launches.values().map(|pending| pending.deadline).min()
     }
 
-    pub(crate) fn drain(&mut self) -> Vec<(LaunchRequest, T)> {
+    pub(crate) fn drain(&mut self) -> Vec<(R, T)> {
         std::mem::take(&mut self.launches)
             .into_values()
             .map(|pending| (pending.request, pending.token))
@@ -159,6 +161,12 @@ impl<T> PendingLaunches<T> {
 impl Launcher {
     fn new(child_mask: ChildSignalMask) -> Self {
         Self::with_limit(child_mask, MAX_CHILDREN)
+    }
+
+    /// a launcher that keeps the calling thread's signal mask for its children.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self::new(ChildSignalMask::capture().expect("the signal mask is readable"))
     }
 
     fn with_limit(child_mask: ChildSignalMask, limit: usize) -> Self {
@@ -663,6 +671,17 @@ mod tests {
         assert!(pending.complete(id, now + timeout).is_none());
         assert!(pending.expire(now + timeout).is_empty());
         assert_eq!(pending.next_deadline(), None);
+    }
+
+    #[test]
+    fn pending_launches_carry_any_work_until_the_token_arrives() {
+        let now = Instant::now();
+        let mut pending =
+            PendingLaunches::<&str, (&str, u32)>::with_limits(2, Duration::from_secs(1));
+        let id = pending.push(now, ("activate", 7), |_| "proxy").unwrap();
+        let completed = pending.complete(id, now).unwrap();
+        assert_eq!(completed.request, ("activate", 7));
+        assert!(completed.fresh);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! desktop entry parsing and application directory scanning, following the
-//! freedesktop desktop entry specification. d-bus activation is not supported.
+//! freedesktop desktop entry specification.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -10,8 +10,8 @@ use std::{
 };
 
 use thing_runtime::{
-    DesktopAction, DesktopApplication, MAX_LAUNCH_ARGUMENT_BYTES, MAX_LAUNCH_ARGUMENTS,
-    MAX_LAUNCH_BYTES,
+    DesktopAction, DesktopApplication, DesktopArguments, MAX_LAUNCH_ARGUMENT_BYTES,
+    MAX_LAUNCH_ARGUMENTS, MAX_LAUNCH_BYTES,
 };
 
 const MAX_FILE_BYTES: u64 = 64 * 1024;
@@ -107,7 +107,7 @@ pub(super) fn locale_candidates(locale: &str) -> Vec<String> {
 
 /// reads every application directory. the first file with a given desktop file
 /// id wins, including a hidden one, which removes lower-precedence copies.
-pub(super) fn scan(environment: &Environment) -> Vec<DesktopApplication> {
+pub(super) fn scan(environment: &Environment) -> Vec<Entry> {
     let mut seen = BTreeSet::new();
     let mut applications = Vec::new();
     for directory in &environment.directories {
@@ -127,12 +127,12 @@ pub(super) fn scan(environment: &Environment) -> Vec<DesktopApplication> {
             let Ok(source) = fs::read_to_string(&path) else {
                 continue;
             };
-            if let Some(application) = parse(&id, &path, &source, environment) {
-                applications.push(application);
+            if let Some(entry) = parse(&id, &path, &source, environment) {
+                applications.push(entry);
             }
         }
     }
-    applications.sort_by(|left, right| left.id.cmp(&right.id));
+    applications.sort_by(|left, right| left.application.id.cmp(&right.application.id));
     applications
 }
 
@@ -330,62 +330,159 @@ fn split_exec(value: &str) -> Option<Vec<String>> {
     Some(arguments)
 }
 
-/// expands field codes for a launch without files or urls.
-fn expand(arguments: Vec<String>, name: &str, icon: &str, path: &Path) -> Option<Vec<String>> {
-    let mut expanded = Vec::with_capacity(arguments.len());
-    for argument in arguments {
-        match argument.as_str() {
-            "%f" | "%F" | "%u" | "%U" | "%d" | "%D" | "%n" | "%N" | "%v" | "%m" => continue,
-            "%i" => {
-                if !icon.is_empty() {
-                    expanded.push("--icon".to_owned());
-                    expanded.push(icon.to_owned());
-                }
-                continue;
-            }
-            _ => {}
-        }
-        let mut result = String::with_capacity(argument.len());
-        let mut characters = argument.chars();
-        while let Some(character) = characters.next() {
-            if character != '%' {
-                result.push(character);
-                continue;
-            }
-            match characters.next() {
-                Some('%') => result.push('%'),
-                Some('c') => result.push_str(name),
-                Some('k') => result.push_str(path.to_str()?),
-                // multi-argument codes must occupy the whole argument.
-                Some('F' | 'U' | 'i') => return None,
-                Some('f' | 'u' | 'd' | 'D' | 'n' | 'N' | 'v' | 'm') => {}
-                // the specification calls any other code invalid.
-                _ => return None,
-            }
-        }
-        expanded.push(result);
-    }
-    Some(expanded)
+/// the files or urls substituted for one launch.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Files<'a> {
+    None,
+    /// the value for `%f` or `%u`.
+    One(&'a str),
+    /// the values for `%F` or `%U`.
+    All(&'a [String]),
 }
 
+/// an `Exec` command with its quoting undone and its field codes kept, so each
+/// launch can substitute its own files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Template {
+    arguments: Vec<String>,
+    name: String,
+    icon: String,
+    location: Option<String>,
+    accepts: DesktopArguments,
+}
+
+impl Template {
+    fn new(arguments: Vec<String>, name: &str, icon: &str, path: &Path) -> Option<Self> {
+        let mut codes = Vec::new();
+        for argument in &arguments {
+            match argument.as_str() {
+                "%F" => codes.push(DesktopArguments::Files),
+                "%U" => codes.push(DesktopArguments::Urls),
+                "%i" => {}
+                _ => {
+                    let mut characters = argument.chars();
+                    while let Some(character) = characters.next() {
+                        if character != '%' {
+                            continue;
+                        }
+                        match characters.next() {
+                            Some('f') => codes.push(DesktopArguments::File),
+                            Some('u') => codes.push(DesktopArguments::Url),
+                            Some('%' | 'c' | 'k' | 'd' | 'D' | 'n' | 'N' | 'v' | 'm') => {}
+                            // multi-argument codes must occupy the whole argument.
+                            Some('F' | 'U' | 'i') => return None,
+                            // the specification calls any other code invalid.
+                            _ => return None,
+                        }
+                    }
+                }
+            }
+        }
+        // a command line may hold at most one file or url code. with more, the
+        // entry still launches without files but accepts none.
+        let accepts = match codes.as_slice() {
+            [code] => *code,
+            _ => DesktopArguments::None,
+        };
+        Some(Self {
+            arguments,
+            name: name.to_owned(),
+            icon: icon.to_owned(),
+            location: path.to_str().map(str::to_owned),
+            accepts,
+        })
+    }
+
+    pub(crate) fn accepts(&self) -> DesktopArguments {
+        self.accepts
+    }
+
+    /// expands the field codes and checks the result against the launch limits.
+    pub(crate) fn expand(&self, files: Files<'_>) -> Option<Vec<String>> {
+        let mut expanded = Vec::with_capacity(self.arguments.len());
+        for argument in &self.arguments {
+            match argument.as_str() {
+                "%F" | "%U" => {
+                    if let Files::All(values) = files {
+                        expanded.extend(values.iter().cloned());
+                    }
+                    continue;
+                }
+                "%f" | "%u" => {
+                    if let Files::One(value) = files {
+                        expanded.push(value.to_owned());
+                    }
+                    continue;
+                }
+                "%d" | "%D" | "%n" | "%N" | "%v" | "%m" => continue,
+                "%i" => {
+                    if !self.icon.is_empty() {
+                        expanded.push("--icon".to_owned());
+                        expanded.push(self.icon.clone());
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            let mut result = String::with_capacity(argument.len());
+            let mut characters = argument.chars();
+            while let Some(character) = characters.next() {
+                if character != '%' {
+                    result.push(character);
+                    continue;
+                }
+                match characters.next() {
+                    Some('%') => result.push('%'),
+                    Some('c') => result.push_str(&self.name),
+                    Some('k') => result.push_str(self.location.as_deref()?),
+                    Some('f' | 'u') => {
+                        if let Files::One(value) = files {
+                            result.push_str(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            expanded.push(result);
+        }
+        valid_command(&expanded).then_some(expanded)
+    }
+}
+
+/// whether an argument array fits the limits `services.launch` enforces.
+pub(crate) fn valid_command(command: &[String]) -> bool {
+    !command.is_empty()
+        && command.len() <= MAX_LAUNCH_ARGUMENTS
+        && command
+            .iter()
+            .all(|argument| argument.len() <= MAX_LAUNCH_ARGUMENT_BYTES && !argument.contains('\0'))
+        && command.iter().map(String::len).sum::<usize>() <= MAX_LAUNCH_BYTES
+        && !command[0].is_empty()
+}
+
+/// returns the launch template and the command for a launch without files.
+/// an entry without `Exec` yields neither; an invalid `Exec` yields `None`.
 fn exec_command(
     group: &BTreeMap<String, String>,
     name: &str,
     icon: &str,
     path: &Path,
-) -> Option<Vec<String>> {
+) -> Option<Option<(Template, Vec<String>)>> {
     let Some(exec) = string(group, "Exec") else {
-        return Some(Vec::new());
+        return Some(None);
     };
-    let command = expand(split_exec(&exec)?, name, icon, path)?;
-    let valid = !command.is_empty()
-        && command.len() <= MAX_LAUNCH_ARGUMENTS
-        && command.iter().all(|argument| {
-            argument.len() <= MAX_LAUNCH_ARGUMENT_BYTES && !argument.contains('\0')
-        })
-        && command.iter().map(String::len).sum::<usize>() <= MAX_LAUNCH_BYTES
-        && !command[0].is_empty();
-    valid.then_some(command)
+    let template = Template::new(split_exec(&exec)?, name, icon, path)?;
+    let command = template.expand(Files::None)?;
+    Some(Some((template, command)))
+}
+
+/// one parsed entry: the record configurations see, and the templates used to
+/// launch it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Entry {
+    pub application: DesktopApplication,
+    pub exec: Option<Template>,
+    pub actions: BTreeMap<String, Option<Template>>,
 }
 
 fn executable(program: &str, environment: &Environment) -> bool {
@@ -430,13 +527,14 @@ fn bounded_list(mut items: Vec<String>) -> Vec<String> {
 }
 
 /// parses one entry. it returns `None` for hidden, inapplicable, or invalid
-/// entries, and for anything that is not an application.
+/// entries, and for anything that is not an application. the record's
+/// revision is zero until the catalog assigns one.
 pub(super) fn parse(
     id: &str,
     path: &Path,
     source: &str,
     environment: &Environment,
-) -> Option<DesktopApplication> {
+) -> Option<Entry> {
     let groups = Groups::parse(source)?;
     let main = groups.group("Desktop Entry")?;
     if string(main, "Type").as_deref() != Some("Application")
@@ -456,8 +554,9 @@ pub(super) fn parse(
     let dbus_activatable = boolean(main, "DBusActivatable");
     // an entry without `Exec` is kept with an empty command. such entries
     // usually exist only to give a window's app id a name and icon.
-    let command = exec_command(main, &name, &icon, path)?;
+    let (exec, command) = exec_command(main, &name, &icon, path)?.unzip();
     let mut actions = Vec::new();
+    let mut templates = BTreeMap::new();
     for key in list(main, "Actions").into_iter().take(MAX_ACTIONS) {
         let Some(group) = groups.group(&format!("Desktop Action {key}")) else {
             continue;
@@ -469,23 +568,33 @@ pub(super) fn parse(
             continue;
         };
         let action_icon = string(group, "Icon").and_then(bounded).unwrap_or_default();
-        let Some(action_command) = exec_command(group, &name, &action_icon, path) else {
+        let Some(action_exec) = exec_command(group, &name, &action_icon, path) else {
             continue;
         };
-        if action_command.is_empty() && !dbus_activatable {
+        let (action_template, action_command) = action_exec.unzip();
+        if action_command.is_none() && !dbus_activatable {
             continue;
         }
-        if bounded(key.clone()).is_some() {
+        if bounded(key.clone()).is_some() && !templates.contains_key(&key) {
+            templates.insert(key.clone(), action_template);
             actions.push(DesktopAction {
                 key,
                 name: action_name,
                 icon: action_icon,
-                command: action_command,
+                command: action_command.unwrap_or_default(),
             });
         }
     }
-    Some(DesktopApplication {
+    // d-bus activation opens any number of uris; otherwise `Exec` decides.
+    let accepts = if dbus_activatable {
+        DesktopArguments::Urls
+    } else {
+        exec.as_ref()
+            .map_or(DesktopArguments::None, Template::accepts)
+    };
+    let application = DesktopApplication {
         id: bounded(id.to_owned())?,
+        revision: 0,
         name,
         generic_name: localized(main, "GenericName", locales)
             .and_then(bounded)
@@ -496,7 +605,7 @@ pub(super) fn parse(
         icon,
         keywords: bounded_list(localized_list(main, "Keywords", locales)),
         categories: bounded_list(list(main, "Categories")),
-        command,
+        command: command.unwrap_or_default(),
         working_directory: string(main, "Path")
             .filter(|path| !path.is_empty())
             .and_then(bounded),
@@ -506,7 +615,13 @@ pub(super) fn parse(
             .and_then(bounded)
             .unwrap_or_default(),
         dbus_activatable,
+        accepts,
         actions,
+    };
+    Some(Entry {
+        application,
+        exec,
+        actions: templates,
     })
 }
 
@@ -524,6 +639,10 @@ mod tests {
     }
 
     fn parse_one(source: &str) -> Option<DesktopApplication> {
+        parse_entry(source).map(|entry| entry.application)
+    }
+
+    fn parse_entry(source: &str) -> Option<Entry> {
         parse(
             "org.example.App.desktop",
             Path::new("/usr/share/applications/org.example.App.desktop"),
@@ -611,7 +730,8 @@ Exec=example-files %z
             "[Desktop Entry]\nType=Application\nName=A\nExec=a\nKeywords=one;two\\;three;\n",
             &environment,
         )
-        .unwrap();
+        .unwrap()
+        .application;
         assert_eq!(application.keywords, ["one", "two;three"]);
     }
 
@@ -749,7 +869,12 @@ Exec=run %d %D %n %N %v %m "" end
         let applications = scan(&environment);
         let names: Vec<_> = applications
             .iter()
-            .map(|application| (application.id.as_str(), application.name.as_str()))
+            .map(|entry| {
+                (
+                    entry.application.id.as_str(),
+                    entry.application.name.as_str(),
+                )
+            })
             .collect();
         assert_eq!(
             names,

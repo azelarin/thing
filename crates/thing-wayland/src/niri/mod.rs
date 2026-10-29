@@ -50,6 +50,13 @@ impl Niri {
         Self::start_at(std::env::var_os("NIRI_SOCKET").map(PathBuf::from), ping)
     }
 
+    /// a service without a socket or worker, for host tests.
+    #[cfg(test)]
+    pub(crate) fn inert() -> io::Result<Self> {
+        let (ping, _) = calloop::ping::make_ping()?;
+        Self::start_at(None, ping)
+    }
+
     fn start_at(path: Option<PathBuf>, ping: Ping) -> io::Result<Self> {
         let (wake, reader) = UnixStream::pair()?;
         wake.set_nonblocking(true)?;
