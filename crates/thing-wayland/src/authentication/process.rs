@@ -111,6 +111,9 @@ impl ProcessContext {
             child,
             pidfd,
             socket: Some(parent),
+            group_owned: true,
+            #[cfg(test)]
+            signal_group: None,
         })
     }
 }
@@ -124,10 +127,16 @@ pub trait ProcessControl {
     fn try_wait(&mut self) -> io::Result<Option<bool>>;
 }
 
+#[cfg(test)]
+type GroupSignaler = Box<dyn Fn(u32, libc::c_int) -> io::Result<()>>;
+
 pub struct OsProcess {
     child: Child,
     pidfd: Option<OwnedFd>,
     socket: Option<Socket>,
+    group_owned: bool,
+    #[cfg(test)]
+    signal_group: Option<GroupSignaler>,
 }
 
 impl OsProcess {
@@ -136,7 +145,15 @@ impl OsProcess {
     }
 
     fn signal_group(&self, signal: libc::c_int) -> io::Result<()> {
-        let pid = i32::try_from(self.child.id())
+        if !self.group_owned {
+            return Ok(());
+        }
+        let child = self.child.id();
+        #[cfg(test)]
+        if let Some(signal_group) = &self.signal_group {
+            return signal_group(child, signal);
+        }
+        let pid = i32::try_from(child)
             .map_err(|_| io::Error::other("authentication helper pid is out of range"))?;
         // the helper creates a session whose process group id is its pid.
         // SAFETY: pid is positive, so -pid addresses that dedicated process group.
@@ -178,18 +195,64 @@ impl ProcessControl for OsProcess {
     }
 
     fn try_wait(&mut self) -> io::Result<Option<bool>> {
-        self.child
-            .try_wait()
-            .map(|status| status.map(|status| status.success()))
+        if !self.group_owned {
+            return self
+                .child
+                .try_wait()
+                .map(|status| status.map(|status| status.success()));
+        }
+        match exit_observed(self.child.id()) {
+            Ok(false) => return Ok(None),
+            Ok(true) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                self.group_owned = false;
+                return Ok(Some(false));
+            }
+            Err(error) => return Err(error),
+        }
+        self.kill_group()?;
+        let status = match self.child.try_wait() {
+            Ok(status) => status,
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                self.group_owned = false;
+                return Ok(Some(false));
+            }
+            Err(error) => return Err(error),
+        };
+        if status.is_some() {
+            self.group_owned = false;
+        }
+        Ok(status.map(|status| status.success()))
     }
 }
 
 impl Drop for OsProcess {
     fn drop(&mut self) {
         self.close_socket();
-        let _ = self.kill_group();
+        if self.group_owned {
+            let _ = self.kill_group();
+        }
         let _ = self.child.try_wait();
     }
+}
+
+fn exit_observed(pid: u32) -> io::Result<bool> {
+    let mut info = MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: waitid initializes siginfo on success and WNOWAIT leaves the
+    // child unreaped, preserving its process and process-group identity.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: waitid initialized info after returning success.
+    Ok(unsafe { info.assume_init().si_pid() } != 0)
 }
 
 fn normalize_sigchld() -> io::Result<()> {
@@ -279,15 +342,139 @@ fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::RefCell,
         env,
         os::fd::{AsRawFd, FromRawFd, OwnedFd},
-        process::Command,
+        process::{Command, Stdio},
+        rc::Rc,
+        thread,
+        time::{Duration, Instant},
     };
 
     use super::*;
 
     const PROBE: &str = "THING_SIGCHLD_PROBE";
     const FD_PROBE: &str = "THING_AUTH_FD_PROBE";
+
+    type SignalObservations = Rc<RefCell<Vec<(libc::c_int, bool)>>>;
+
+    fn exit_process(signal_group: GroupSignaler) -> OsProcess {
+        let child = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "authentication::process::tests::immediate_exit_probe",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        OsProcess {
+            child,
+            pidfd: None,
+            socket: None,
+            group_owned: true,
+            signal_group: Some(signal_group),
+        }
+    }
+
+    fn observed_exit_process() -> (OsProcess, SignalObservations) {
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        let observed = observations.clone();
+        (
+            exit_process(Box::new(move |pid, signal| {
+                observed
+                    .borrow_mut()
+                    .push((signal, exit_observed(pid).unwrap_or(false)));
+                Ok(())
+            })),
+            observations,
+        )
+    }
+
+    fn wait_for_exit(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if exit_observed(pid).unwrap() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "exit probe did not finish");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn reap(process: &mut OsProcess) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(clean) = process.try_wait().unwrap() {
+                return clean;
+            }
+            assert!(Instant::now() < deadline, "exit probe was not reaped");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn reap_outside_process(pid: u32) {
+        let mut status = 0;
+        // SAFETY: pid names the direct child created by exit_process, and the
+        // status pointer is valid for the duration of waitpid.
+        let waited = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+        assert_eq!(waited, pid as i32);
+    }
+
+    #[test]
+    fn reaped_process_rejects_later_cancellation_and_drop_signals() {
+        let (mut process, observations) = observed_exit_process();
+        wait_for_exit(process.child.id());
+
+        process.terminate_group().unwrap();
+        assert!(reap(&mut process));
+        process.terminate_group().unwrap();
+        process.kill_group().unwrap();
+        drop(process);
+
+        assert_eq!(
+            *observations.borrow(),
+            [(libc::SIGTERM, true), (libc::SIGKILL, true)]
+        );
+    }
+
+    #[test]
+    fn waitid_echild_releases_group_ownership_without_signalling() {
+        let (mut process, observations) = observed_exit_process();
+        wait_for_exit(process.child.id());
+        reap_outside_process(process.child.id());
+
+        assert_eq!(process.try_wait().unwrap(), Some(false));
+        process.terminate_group().unwrap();
+        process.kill_group().unwrap();
+        drop(process);
+
+        assert!(observations.borrow().is_empty());
+    }
+
+    #[test]
+    fn child_wait_echild_releases_group_ownership_after_cleanup() {
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        let observed = observations.clone();
+        let mut process = exit_process(Box::new(move |pid, signal| {
+            observed
+                .borrow_mut()
+                .push((signal, exit_observed(pid).unwrap_or(false)));
+            reap_outside_process(pid);
+            Ok(())
+        }));
+
+        assert!(!reap(&mut process));
+        process.terminate_group().unwrap();
+        process.kill_group().unwrap();
+        drop(process);
+
+        assert_eq!(*observations.borrow(), [(libc::SIGKILL, true)]);
+    }
+
+    #[test]
+    fn immediate_exit_probe() {}
 
     #[test]
     fn normalizes_inherited_ignored_and_auto_reaped_children() {
