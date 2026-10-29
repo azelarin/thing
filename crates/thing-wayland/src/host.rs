@@ -2710,6 +2710,24 @@ impl App {
                     .ok_or("notification server is disabled")
                     .and_then(|server| server.invoke(key, action))
                     .map_err(str::to_owned),
+                Action::ReplyNotification { key, text } => self
+                    .notifications
+                    .as_ref()
+                    .ok_or("notification server is disabled")
+                    .and_then(|server| server.reply(key, text))
+                    .map_err(str::to_owned),
+                Action::ForgetNotification { key } => self
+                    .notifications
+                    .as_ref()
+                    .ok_or("notification server is disabled")
+                    .and_then(|server| server.forget(key))
+                    .map_err(str::to_owned),
+                Action::ClearNotificationHistory => self
+                    .notifications
+                    .as_ref()
+                    .ok_or("notification server is disabled")
+                    .and_then(|server| server.clear_history())
+                    .map_err(str::to_owned),
                 Action::SetClipboardText(text) => self
                     .clipboard
                     .as_mut()

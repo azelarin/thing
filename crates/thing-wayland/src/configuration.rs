@@ -2816,9 +2816,14 @@ mod tests {
             resident: false,
             transient: false,
             action_icons: false,
+            can_reply: false,
+            reply_placeholder: String::new(),
+            image: None,
+            closed: None,
         };
         configurations
             .set_notifications(NotificationSnapshot {
+                history: Vec::new(),
                 owned: true,
                 error: String::new(),
                 active: vec![notification.clone()],
@@ -2832,6 +2837,7 @@ mod tests {
         assert!(
             configurations
                 .set_notifications(NotificationSnapshot {
+                    history: Vec::new(),
                     owned: false,
                     error: "disconnected".into(),
                     active: vec![notification],

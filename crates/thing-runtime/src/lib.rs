@@ -16,12 +16,13 @@ pub use services::{
     Action, ApplicationsSnapshot, AudioDevice, AudioSnapshot, AudioSource, AudioStream,
     AuthenticationSnapshot, AuthenticationState, ClipboardSnapshot, DesktopAction,
     DesktopApplication, MAX_LAUNCH_ARGUMENT_BYTES, MAX_LAUNCH_ARGUMENTS, MAX_LAUNCH_BYTES,
-    MAX_MEDIA_RATE, MAX_MEDIA_TIME_US, ManagedProcessAction, ManagedProcessCommand,
-    ManagedProcessDefinition, ManagedProcessShutdownSignal, ManagedProcessSnapshot,
-    ManagedProcessState, ManagedProcessStatus, MediaAction, MediaPlayer, MediaPosition,
-    MediaSnapshot, Notification, NotificationButton, NotificationSnapshot, NotificationUrgency,
-    PowerDevice, PowerSnapshot, ServiceSnapshot, SystemTrayAction, SystemTrayItem, SystemTrayMenu,
-    SystemTrayMenuAction, SystemTrayMenuItem, SystemTraySnapshot,
+    MAX_MEDIA_RATE, MAX_MEDIA_TIME_US, MAX_NOTIFICATION_HISTORY, ManagedProcessAction,
+    ManagedProcessCommand, ManagedProcessDefinition, ManagedProcessShutdownSignal,
+    ManagedProcessSnapshot, ManagedProcessState, ManagedProcessStatus, MediaAction, MediaPlayer,
+    MediaPosition, MediaSnapshot, Notification, NotificationButton, NotificationCloseReason,
+    NotificationSnapshot, NotificationUrgency, PowerDevice, PowerSnapshot, ServiceSnapshot,
+    SystemTrayAction, SystemTrayItem, SystemTrayMenu, SystemTrayMenuAction, SystemTrayMenuItem,
+    SystemTraySnapshot,
 };
 pub use timer::TimerToken;
 
@@ -459,6 +460,7 @@ impl Runtime {
         services.set_application_list(snapshot.applications)?;
         services.set_power_devices(snapshot.power_display, snapshot.power_devices)?;
         services.set_notification_records(snapshot.notifications)?;
+        services.set_notification_history(snapshot.notification_history)?;
         services.set_system_tray_items(snapshot.system_tray_items)?;
         services.set_managed_processes(ManagedProcessSnapshot {
             states: snapshot.managed_processes,

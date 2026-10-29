@@ -10,14 +10,15 @@ use std::{
 use async_io::{Async, Timer};
 use calloop::ping::Ping;
 use futures_lite::future;
+use thing_core::{ImageCandidate, ImageSource};
 use thing_runtime::{
-    Notification as RuntimeNotification, NotificationButton, NotificationSnapshot,
-    NotificationUrgency,
+    Notification as RuntimeNotification, NotificationButton, NotificationCloseReason,
+    NotificationSnapshot, NotificationUrgency,
 };
 use zbus::object_server::SignalEmitter;
 
 use super::{
-    model::{Notification, TimeoutPolicy, Urgency},
+    model::{CloseReason, MAX_TEXT_BYTES, Notification, TimeoutPolicy, Urgency},
     protocol::{self, ChangeHook, OBJECT_PATH},
 };
 
@@ -36,12 +37,28 @@ enum Command {
         key: u64,
         action: String,
     },
+    Reply {
+        generation: u64,
+        key: u64,
+        text: String,
+    },
+    Forget {
+        generation: u64,
+        key: u64,
+    },
+    ClearHistory {
+        generation: u64,
+    },
 }
 
 impl Command {
     fn generation(&self) -> u64 {
         match self {
-            Self::Dismiss { generation, .. } | Self::Invoke { generation, .. } => *generation,
+            Self::Dismiss { generation, .. }
+            | Self::Invoke { generation, .. }
+            | Self::Reply { generation, .. }
+            | Self::Forget { generation, .. }
+            | Self::ClearHistory { generation } => *generation,
         }
     }
 }
@@ -50,6 +67,8 @@ impl Command {
 struct Shared {
     commands: VecDeque<Command>,
     targets: BTreeMap<u64, BTreeSet<String>>,
+    replyable: BTreeSet<u64>,
+    history: BTreeSet<u64>,
     generation: u64,
     active_generation: Option<u64>,
     stop: bool,
@@ -108,6 +127,42 @@ impl Server {
             key,
             action,
         })
+    }
+
+    pub(crate) fn reply(&self, key: u64, text: String) -> Result<(), &'static str> {
+        if text.is_empty() || text.len() > MAX_TEXT_BYTES {
+            return Err("a reply must be nonempty and at most 64 kib");
+        }
+        let generation = self.target_generation(key, None)?;
+        if !lock(&self.shared).replyable.contains(&key) {
+            return Err("notification does not accept a reply");
+        }
+        self.send(Command::Reply {
+            generation,
+            key,
+            text,
+        })
+    }
+
+    pub(crate) fn forget(&self, key: u64) -> Result<(), &'static str> {
+        let generation = {
+            let shared = lock(&self.shared);
+            let generation = shared
+                .active_generation
+                .ok_or("notification server is unavailable")?;
+            if !shared.history.contains(&key) {
+                return Err("notification is not in the history");
+            }
+            generation
+        };
+        self.send(Command::Forget { generation, key })
+    }
+
+    pub(crate) fn clear_history(&self) -> Result<(), &'static str> {
+        let generation = lock(&self.shared)
+            .active_generation
+            .ok_or("notification server is unavailable")?;
+        self.send(Command::ClearHistory { generation })
     }
 
     fn target_generation(&self, key: u64, action: Option<&str>) -> Result<u64, &'static str> {
@@ -198,6 +253,8 @@ fn worker(
             }
             state.commands.clear();
             state.targets.clear();
+            state.replyable.clear();
+            state.history.clear();
             if state.stop {
                 break;
             }
@@ -265,8 +322,14 @@ async fn session(
         .map_err(|error| Failure::Retry(error.to_string()))?;
     let callback_shared = context.shared.clone();
     let callback_ping = context.ping.clone();
-    let changed: ChangeHook = Arc::new(move |active| {
-        publish_owned(&callback_shared, &callback_ping, generation, active);
+    let changed: ChangeHook = Arc::new(move |active, history| {
+        publish_owned(
+            &callback_shared,
+            &callback_ping,
+            generation,
+            active,
+            history,
+        );
         wake(&callback_stream);
     });
     let built = future::race(
@@ -329,7 +392,13 @@ async fn connection_session(
     if stopping(shared) {
         return Ok(());
     }
-    publish_owned(shared, ping, generation, notifications.active());
+    publish_owned(
+        shared,
+        ping,
+        generation,
+        notifications.active(),
+        notifications.history(),
+    );
     let emitter = SignalEmitter::new(connection, OBJECT_PATH)
         .map_err(|error| Failure::Retry(error.to_string()))?;
 
@@ -377,6 +446,14 @@ async fn connection_session(
                             }
                             Command::Invoke { key, action, .. } => {
                                 notifications.invoke(key, &action, &emitter).await
+                            }
+                            Command::Reply { key, text, .. } => {
+                                notifications.reply(key, &text, &emitter).await
+                            }
+                            Command::Forget { key, .. } => notifications.forget(key),
+                            Command::ClearHistory { .. } => {
+                                notifications.clear_history();
+                                Ok(())
                             }
                         }
                     };
@@ -470,7 +547,22 @@ fn take_commands(shared: &Mutex<Shared>, generation: u64) -> Vec<Command> {
         .collect()
 }
 
-fn publish_owned(shared: &Mutex<Shared>, ping: &Ping, generation: u64, active: Vec<Notification>) {
+fn publish_owned(
+    shared: &Mutex<Shared>,
+    ping: &Ping,
+    generation: u64,
+    active: Vec<Notification>,
+    history: Vec<Notification>,
+) {
+    let replyable = active
+        .iter()
+        .filter(|notification| notification.request.can_reply)
+        .map(|notification| notification.key)
+        .collect();
+    let history_keys = history
+        .iter()
+        .map(|notification| notification.key)
+        .collect();
     let targets = active
         .iter()
         .map(|notification| {
@@ -489,6 +581,7 @@ fn publish_owned(shared: &Mutex<Shared>, ping: &Ping, generation: u64, active: V
         owned: true,
         error: String::new(),
         active: active.into_iter().map(runtime_notification).collect(),
+        history: history.into_iter().map(runtime_notification).collect(),
     };
     let changed = {
         let mut shared = lock(shared);
@@ -496,6 +589,8 @@ fn publish_owned(shared: &Mutex<Shared>, ping: &Ping, generation: u64, active: V
             return;
         }
         shared.targets = targets;
+        shared.replyable = replyable;
+        shared.history = history_keys;
         replace_snapshot(&mut shared, snapshot)
     };
     if changed {
@@ -524,6 +619,18 @@ fn replace_snapshot(shared: &mut Shared, snapshot: NotificationSnapshot) -> bool
 }
 
 fn runtime_notification(notification: Notification) -> RuntimeNotification {
+    // a new revision may carry a different image, so the identity includes it.
+    let image = notification.request.hints.image.clone().and_then(|pixmap| {
+        let candidate = ImageCandidate::new(None, vec![pixmap]).ok()?;
+        ImageSource::new(
+            format!(
+                "notification-image:{}:{}",
+                notification.key, notification.revision
+            ),
+            vec![candidate],
+        )
+        .ok()
+    });
     RuntimeNotification {
         key: notification.key.to_string(),
         id: notification.id,
@@ -557,6 +664,19 @@ fn runtime_notification(notification: Notification) -> RuntimeNotification {
         resident: notification.request.hints.resident,
         transient: notification.request.hints.transient,
         action_icons: notification.request.hints.action_icons,
+        can_reply: notification.request.can_reply,
+        reply_placeholder: notification.request.hints.reply_placeholder,
+        image,
+        closed: notification.closed.map(|closed| {
+            (
+                match closed.reason {
+                    CloseReason::Expired => NotificationCloseReason::Expired,
+                    CloseReason::Dismissed => NotificationCloseReason::Dismissed,
+                    CloseReason::ClosedByCall => NotificationCloseReason::ClosedByApplication,
+                },
+                closed.at_ms,
+            )
+        }),
     }
 }
 
@@ -636,7 +756,69 @@ mod tests {
     use zbus::zvariant::OwnedValue;
 
     use super::*;
-    use crate::notifications::model::CloseReason;
+    use crate::notifications::model::{
+        CloseReason, MAX_ACTIVE_RETAINED_BYTES, MAX_HISTORY_RETAINED_BYTES,
+        MAX_NOTIFICATION_RETAINED_BYTES, Model, NotificationRequest, request_retained_bytes,
+    };
+
+    #[test]
+    fn model_retained_limits_pass_runtime_validation() {
+        // only fields the runtime record also carries are filled, so each side
+        // counts the same text.
+        let largest = || {
+            let mut request = NotificationRequest::default();
+            let mut remaining =
+                MAX_NOTIFICATION_RETAINED_BYTES - request_retained_bytes(&request).unwrap();
+            for field in [
+                &mut request.app_name,
+                &mut request.app_icon,
+                &mut request.summary,
+                &mut request.body,
+                &mut request.hints.category,
+                &mut request.hints.desktop_entry,
+                &mut request.hints.image_path,
+                &mut request.hints.reply_placeholder,
+            ] {
+                let bytes = remaining.min(MAX_TEXT_BYTES);
+                *field = "x".repeat(bytes).into_boxed_str().into_string();
+                remaining -= bytes;
+            }
+            assert_eq!(remaining, 0);
+            request
+        };
+        let mut model = Model::new(TimeoutPolicy::default());
+        let closed = MAX_HISTORY_RETAINED_BYTES / MAX_NOTIFICATION_RETAINED_BYTES;
+        for _ in 0..closed {
+            let published = model.notify(0, largest(), 0).unwrap();
+            model.dismiss(published.key, 1).unwrap();
+        }
+        for _ in 0..MAX_ACTIVE_RETAINED_BYTES / MAX_NOTIFICATION_RETAINED_BYTES {
+            model.notify(0, largest(), 2).unwrap();
+        }
+        // both lists sit exactly at the model's limits.
+        assert_eq!(model.history().len(), closed);
+        assert!(model.notify(0, NotificationRequest::default(), 3).is_err());
+
+        let snapshot = NotificationSnapshot {
+            owned: true,
+            error: String::new(),
+            active: model
+                .active()
+                .iter()
+                .cloned()
+                .map(runtime_notification)
+                .collect(),
+            history: model
+                .history()
+                .iter()
+                .cloned()
+                .map(runtime_notification)
+                .collect(),
+        };
+        thing_runtime::ServiceSnapshot::default()
+            .set_notifications(snapshot)
+            .unwrap();
+    }
 
     #[zbus::proxy(
         interface = "org.freedesktop.Notifications",
@@ -743,6 +925,76 @@ mod tests {
             assert_eq!(*close.id(), id);
             assert_eq!(*close.reason(), CloseReason::Expired.code());
             wait_snapshot(&server, |snapshot| snapshot.active.is_empty());
+        });
+        drop(server);
+        bus.stop();
+    }
+
+    #[test]
+    fn worker_publishes_history_and_routes_replies() {
+        let mut bus = Bus::start();
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let server = Server::start_at(Some(bus.address.clone()), ping).unwrap();
+        wait_snapshot(&server, |snapshot| snapshot.owned);
+
+        async_io::block_on(async {
+            let client = connect(&bus.address).await;
+            let proxy = TestNotificationsProxy::new(&client).await.unwrap();
+            let mut closed = proxy.receive_notification_closed().await.unwrap();
+            notify(&proxy, "plain", Vec::new(), 0).await;
+            let active = wait_snapshot(&server, |snapshot| !snapshot.active.is_empty());
+            let plain: u64 = active.active[0].key.parse().unwrap();
+            assert!(!active.active[0].can_reply);
+            assert_eq!(
+                server.reply(plain, "hi".into()),
+                Err("notification does not accept a reply")
+            );
+            assert_eq!(
+                server.forget(plain),
+                Err("notification is not in the history")
+            );
+
+            notify(
+                &proxy,
+                "chat",
+                vec!["inline-reply".into(), "Reply".into()],
+                0,
+            )
+            .await;
+            let active = wait_snapshot(&server, |snapshot| snapshot.active.len() == 2);
+            let chat: u64 = active.active[0].key.parse().unwrap();
+            assert!(active.active[0].can_reply && active.active[0].actions.is_empty());
+            assert_eq!(
+                server.reply(chat, String::new()),
+                Err("a reply must be nonempty and at most 64 kib")
+            );
+            server.reply(chat, "on my way".into()).unwrap();
+            closed.next().await.unwrap();
+            server.dismiss(plain).unwrap();
+            closed.next().await.unwrap();
+
+            let snapshot = wait_snapshot(&server, |snapshot| {
+                snapshot.active.is_empty() && snapshot.history.len() == 2
+            });
+            let keys: Vec<_> = snapshot
+                .history
+                .iter()
+                .map(|record| record.key.clone())
+                .collect();
+            assert_eq!(keys, [plain.to_string(), chat.to_string()]);
+            assert!(snapshot.history.iter().all(|record| matches!(
+                record.closed,
+                Some((NotificationCloseReason::Dismissed, _))
+            )));
+            assert_eq!(
+                server.reply(chat, "late".into()),
+                Err("notification is no longer active")
+            );
+
+            server.forget(plain).unwrap();
+            wait_snapshot(&server, |snapshot| snapshot.history.len() == 1);
+            server.clear_history().unwrap();
+            wait_snapshot(&server, |snapshot| snapshot.history.is_empty());
         });
         drop(server);
         bus.stop();

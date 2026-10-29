@@ -49,6 +49,14 @@ pub enum Action {
         key: u64,
         action: String,
     },
+    ReplyNotification {
+        key: u64,
+        text: String,
+    },
+    ForgetNotification {
+        key: u64,
+    },
+    ClearNotificationHistory,
     SetClipboardText(String),
     ClearClipboard,
     ManagedProcess {
@@ -440,7 +448,25 @@ impl NotificationUrgency {
     }
 }
 
-/// one active notification, identified by an opaque ownership-lifetime key.
+/// why a notification in the history closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotificationCloseReason {
+    Expired,
+    Dismissed,
+    ClosedByApplication,
+}
+
+impl NotificationCloseReason {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Dismissed => "dismissed",
+            Self::ClosedByApplication => "closed_by_application",
+        }
+    }
+}
+
+/// one notification, identified by an opaque ownership-lifetime key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notification {
     /// pass this opaque key back to notification actions unchanged.
@@ -468,6 +494,13 @@ pub struct Notification {
     pub resident: bool,
     pub transient: bool,
     pub action_icons: bool,
+    /// whether the client accepts an inline reply.
+    pub can_reply: bool,
+    pub reply_placeholder: String,
+    /// raw image data supplied with the notification.
+    pub image: Option<ImageSource>,
+    /// why and when, in server-relative milliseconds, a history record closed.
+    pub closed: Option<(NotificationCloseReason, u64)>,
 }
 
 /// one confirmed generation of notification-server state.
@@ -476,6 +509,8 @@ pub struct NotificationSnapshot {
     pub owned: bool,
     pub error: String,
     pub active: Vec<Notification>,
+    /// closed notifications kept for presentation, newest first.
+    pub history: Vec<Notification>,
 }
 
 /// one confirmed generation of clipboard state.
@@ -588,12 +623,23 @@ impl NotificationSnapshot {
         for (name, value) in self.values() {
             validate_service(name, &value)?;
         }
-        if !self.owned && !self.active.is_empty() {
+        if !self.owned && (!self.active.is_empty() || !self.history.is_empty()) {
             return Err(Error::runtime(
                 "notification records require notification-server ownership",
             ));
         }
-        validate_notifications(&self.active)
+        validate_notifications(&self.active, false)?;
+        validate_notifications(&self.history, true)?;
+        let mut keys = BTreeSet::new();
+        if !self
+            .active
+            .iter()
+            .chain(&self.history)
+            .all(|notification| keys.insert(notification.key.as_str()))
+        {
+            return Err(Error::runtime("notification keys must be unique"));
+        }
+        Ok(())
     }
 }
 
@@ -896,6 +942,7 @@ pub struct ServiceSnapshot {
     pub(crate) power_display: Option<PowerDevice>,
     pub(crate) power_devices: Vec<PowerDevice>,
     pub(crate) notifications: Vec<Notification>,
+    pub(crate) notification_history: Vec<Notification>,
     pub(crate) system_tray_items: Vec<SystemTrayItem>,
     pub(crate) managed_processes: Vec<ManagedProcessState>,
     pub(crate) niri: NiriState,
@@ -972,6 +1019,7 @@ impl ServiceSnapshot {
             self.values.insert(name.into(), value);
         }
         self.notifications = notifications.active;
+        self.notification_history = notifications.history;
         Ok(())
     }
 
@@ -1148,6 +1196,15 @@ impl UserData for NotificationList {
                 item.set("resident", notification.resident)?;
                 item.set("transient", notification.transient)?;
                 item.set("action_icons", notification.action_icons)?;
+                item.set("can_reply", notification.can_reply)?;
+                item.set("reply_placeholder", notification.reply_placeholder.as_str())?;
+                if let Some(image) = &notification.image {
+                    item.set("image", lua.create_userdata(ImageHandle(image.clone()))?)?;
+                }
+                if let Some((reason, at_ms)) = notification.closed {
+                    item.set("closed_reason", reason.name())?;
+                    item.set("closed_at_ms", at_ms as f64)?;
+                }
                 item.set_readonly(true);
                 list.raw_set(index + 1, item)?;
             }
@@ -1462,6 +1519,8 @@ pub(crate) struct Services {
     power_devices_revision: usize,
     notifications: Rc<RefCell<Vec<Notification>>>,
     notifications_revision: usize,
+    notification_history: Rc<RefCell<Vec<Notification>>>,
+    notification_history_revision: usize,
     system_tray_items: Rc<RefCell<Vec<SystemTrayItem>>>,
     system_tray_items_revision: usize,
     managed_processes: Rc<RefCell<BTreeMap<String, ManagedProcessState>>>,
@@ -1481,6 +1540,7 @@ impl Services {
         let power_display_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let power_devices_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let notifications_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
+        let notification_history_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let system_tray_items_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let niri = lua.create_table()?;
         let niri_data = NiriData::install(&niri, tracker.clone())?;
@@ -1507,6 +1567,8 @@ impl Services {
             power_devices_revision,
             notifications: Rc::default(),
             notifications_revision,
+            notification_history: Rc::default(),
+            notification_history_revision,
             system_tray_items: Rc::default(),
             system_tray_items_revision,
             managed_processes: Rc::default(),
@@ -1596,6 +1658,14 @@ impl Services {
                 tracker: result.tracker.clone(),
                 revision: notifications_revision,
                 notifications: result.notifications.clone(),
+            },
+        )?;
+        notifications.set(
+            "history",
+            NotificationList {
+                tracker: result.tracker.clone(),
+                revision: notification_history_revision,
+                notifications: result.notification_history.clone(),
             },
         )?;
         system_tray.set(
@@ -1946,6 +2016,37 @@ impl Services {
                     &allowed,
                     Action::InvokeNotification { key, action },
                 )
+            })?,
+        )?;
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        notifications.set(
+            "reply",
+            lua.create_function(move |_, (key, text): (Value, String)| {
+                let key = notification_key(key)?;
+                if text.is_empty() || invalid_notification_text(&text) {
+                    return Err(Error::runtime(
+                        "a notification reply must be nonempty, contain no NUL, and not exceed 64 kib",
+                    ));
+                }
+                enqueue(&actions, &allowed, Action::ReplyNotification { key, text })
+            })?,
+        )?;
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        notifications.set(
+            "forget",
+            lua.create_function(move |_, key: Value| {
+                let key = notification_key(key)?;
+                enqueue(&actions, &allowed, Action::ForgetNotification { key })
+            })?,
+        )?;
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        notifications.set(
+            "clear_history",
+            lua.create_function(move |_, ()| {
+                enqueue(&actions, &allowed, Action::ClearNotificationHistory)
             })?,
         )?;
         notifications.set_readonly(true);
@@ -2331,7 +2432,9 @@ impl Services {
     pub fn set_notifications(&self, notifications: NotificationSnapshot) -> Result<()> {
         notifications.validate()?;
         let records_changed = *self.notifications.borrow() != notifications.active;
+        let history_changed = *self.notification_history.borrow() != notifications.history;
         let mut records = self.notifications.borrow_mut();
+        let mut history = self.notification_history.borrow_mut();
         let mut tracker = self.tracker.borrow_mut();
         let mut updates = notifications
             .values()
@@ -2345,9 +2448,19 @@ impl Services {
                 Scalar::Boolean(revision != Scalar::Boolean(true)),
             ));
         }
+        if history_changed {
+            let revision = tracker.read(self.notification_history_revision);
+            updates.push((
+                self.notification_history_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            ));
+        }
         tracker.write_batch(updates)?;
         if records_changed {
             *records = notifications.active;
+        }
+        if history_changed {
+            *history = notifications.history;
         }
         Ok(())
     }
@@ -2431,8 +2544,22 @@ impl Services {
         Ok(())
     }
 
+    pub fn set_notification_history(&self, history: Vec<Notification>) -> Result<()> {
+        validate_notifications(&history, true)?;
+        if *self.notification_history.borrow() != history {
+            *self.notification_history.borrow_mut() = history;
+            let mut tracker = self.tracker.borrow_mut();
+            let revision = tracker.read(self.notification_history_revision);
+            tracker.write(
+                self.notification_history_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn set_notification_records(&self, notifications: Vec<Notification>) -> Result<()> {
-        validate_notifications(&notifications)?;
+        validate_notifications(&notifications, false)?;
         if *self.notifications.borrow() != notifications {
             *self.notifications.borrow_mut() = notifications;
             let mut tracker = self.tracker.borrow_mut();
@@ -2478,6 +2605,7 @@ impl Services {
             power_display: self.power_display.borrow().clone(),
             power_devices: self.power_devices.borrow().clone(),
             notifications: self.notifications.borrow().clone(),
+            notification_history: self.notification_history.borrow().clone(),
             system_tray_items: self.system_tray_items.borrow().clone(),
             managed_processes: self.managed_processes.borrow().values().cloned().collect(),
             niri: self.niri.snapshot(),
@@ -3503,14 +3631,23 @@ fn invalid_system_tray_text(value: &str, max: usize) -> bool {
 }
 
 const MAX_SAFE_LUA_INTEGER: u64 = (1_u64 << 53) - 1;
+/// maximum number of closed notifications kept during one bus connection.
+pub const MAX_NOTIFICATION_HISTORY: usize = 128;
 const MAX_NOTIFICATION_RETAINED_BYTES: usize = 512 * 1024;
 const MAX_ACTIVE_NOTIFICATION_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 
-fn validate_notifications(notifications: &[Notification]) -> Result<()> {
+/// validates active records, or closed history records when `closed` is true.
+/// protocol ids may repeat in the history, because a closed id can be reused.
+fn validate_notifications(notifications: &[Notification], closed: bool) -> Result<()> {
     let mut keys = BTreeSet::new();
     let mut ids = BTreeSet::new();
     let mut retained_bytes = 0_usize;
-    let invalid = notifications.len() > 1_024
+    let limit = if closed {
+        MAX_NOTIFICATION_HISTORY
+    } else {
+        1_024
+    };
+    let invalid = notifications.len() > limit
         || notifications.iter().any(|notification| {
             let valid_key = notification
                 .key
@@ -3528,7 +3665,11 @@ fn validate_notifications(notifications: &[Notification]) -> Result<()> {
                 || notification.revision > MAX_SAFE_LUA_INTEGER
                 || !valid_key
                 || !keys.insert(notification.key.as_str())
-                || !ids.insert(notification.id)
+                || (!closed && !ids.insert(notification.id))
+                || notification.closed.is_some() != closed
+                || notification
+                    .closed
+                    .is_some_and(|(_, at_ms)| at_ms > MAX_SAFE_LUA_INTEGER)
                 || notification.actions.len() > 128
                 || notification.raw_expire_timeout_ms < -1
                 || notification.updated_at_ms < notification.created_at_ms
@@ -3559,6 +3700,7 @@ fn validate_notifications(notifications: &[Notification]) -> Result<()> {
                     &notification.category,
                     &notification.desktop_entry,
                     &notification.image_path,
+                    &notification.reply_placeholder,
                 ]
                 .into_iter()
                 .any(|value| invalid_notification_text(value))
@@ -3588,8 +3730,17 @@ fn notification_retained_bytes(notification: &Notification) -> Option<usize> {
         &notification.category,
         &notification.desktop_entry,
         &notification.image_path,
+        &notification.reply_placeholder,
     ];
-    let mut retained = size_of::<Notification>().checked_add(
+    let image = notification.image.as_ref().map_or(0, |image| {
+        image
+            .candidates()
+            .iter()
+            .flat_map(|candidate| candidate.pixmaps())
+            .map(|pixmap| pixmap.rgba().len())
+            .sum()
+    });
+    let mut retained = size_of::<Notification>().checked_add(image)?.checked_add(
         notification
             .actions
             .capacity()
