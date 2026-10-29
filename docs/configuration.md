@@ -681,6 +681,84 @@ those state changes are not rolled back. within one output, widget updates are
 validated together. an invalid update leaves that output's current widgets
 unchanged and retries when another tracked dependency changes.
 
+## timers
+
+use `ui.timer` for delayed callbacks and repeating ui updates. declare it while
+loading the configuration, alongside local state:
+
+```luau
+local message = ui.state('')
+local clear_message = ui.timer {
+    interval = 1500,
+    on_timeout = function() message:set('') end,
+}
+
+return ui.panel {
+    children = {
+        ui.button {
+            on_click = function()
+                message:set('clicked')
+                clear_message:restart()
+            end,
+            children = { ui.text { text = 'try it' } },
+        },
+        ui.text { text = function() return message:get() end },
+    },
+}
+```
+
+`interval` is a whole number of milliseconds from 1 through 31,536,000,000
+(one year).
+`repeating` and `autostart` both default to false. autostart timers begin only
+after the host accepts the configuration; `thing check` never runs a callback.
+for a repeating update, set both options to true. `on_timeout` receives the timer
+handle, so `function(timer) timer:stop() end` can stop its own repetition.
+
+call the handle's methods with a colon, from an input or timer callback:
+
+- `start()` starts a stopped timer and leaves a running timer's deadline alone.
+- `restart()` starts a full interval, replacing any pending deadline.
+- `stop()` cancels the pending callback, including automatic repetition when
+  called inside that timer's callback.
+
+each output has its own timers. hiding a panel or closing a popup does not stop
+its configuration's timers; call `stop()` when your ui needs that behavior.
+a failed reload preserves existing deadlines. a successful reload starts new
+timers and cancels callbacks from the old configuration. removing an output
+cancels its timers too.
+
+timing uses a monotonic clock. a delayed repeating timer runs once, without
+replaying missed ticks, then waits a full interval after its callback finishes.
+callbacks use the same execution limits and checked updates as input handlers.
+a callback error stops that timer and discards its timer controls and queued
+actions. when the callback succeeds but its update is rejected, the controls
+and actions are discarded, while a repeating timer continues at its next
+interval. this lets it recover from an unrelated invalid property. the previous
+widget tree stays visible; ordinary state assignments retain the behavior
+described above.
+
+`start()` and `restart()` measure their interval from the accepted operation's
+completion. inside a one-shot callback, `start()` arms another interval; inside
+a repeating callback, it keeps the automatic next interval. stopping or
+restarting another timer makes its previously collected callback stale, while
+`start()` leaves an already-due callback in place.
+
+desktop actions in an autostart callback run once per output, too. use these
+timers for output-local presentation, rather than a single process-wide policy.
+options are fixed at load time; service changes do not start a timer on their
+own. a repeating callback can inspect service state when needed.
+
+on linux, the monotonic clock pauses during suspend. use `os.time()` for a
+wall-clock deadline and check it from a timer if elapsed suspend time should
+count. do not measure elapsed time by counting callbacks.
+
+there may be up to 128 timers per output configuration and 256 timer controls
+in one event operation. creating timers from callbacks or property functions is
+an error; for a dynamic list, declare a reusable ticker outside its property
+function. a zero delay needs no timer: update the state directly. lock
+configurations may use timers for presentation, but their
+callbacks cannot launch programs or request desktop or local ui actions.
+
 ## launching applications
 
 call `services.launch` from an event handler with the program and its arguments

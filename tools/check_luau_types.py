@@ -28,6 +28,17 @@ class Case:
 
 CASES = (
     Case("valid.luau"),
+    Case("valid-timers.luau"),
+    Case(
+        "invalid-timers.luau",
+        (
+            "Property 'interval' is not compatible.",
+            "Property 'on_timeout' is not compatible.",
+            "missing field 'on_timeout'",
+            "Function 'timer.start' expects 1 argument, but 2 are specified",
+            "Function 'timer.restart' expects 1 argument, but none are specified",
+        ),
+    ),
     Case("valid-lock.luau"),
     Case(
         "invalid-text-input.luau",

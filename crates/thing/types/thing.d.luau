@@ -9,6 +9,19 @@ export type ThingSignal<T> = {
     get: (self: ThingSignal<T>) -> T,
 }
 
+declare extern type ThingTimer with
+    read start: (self: ThingTimer) -> ()
+    read stop: (self: ThingTimer) -> ()
+    read restart: (self: ThingTimer) -> ()
+end
+
+export type ThingTimerOptions = {
+    interval: number,
+    on_timeout: (timer: ThingTimer) -> (),
+    repeating: boolean?,
+    autostart: boolean?,
+}
+
 export type ThingReadonlyArray<T> = { T }
 
 export type ThingReactive<T> = T | (() -> T)
@@ -828,6 +841,7 @@ declare ui: {
     focus: (widget: ThingWidget) -> (),
     reveal: (widget: ThingWidget) -> (),
     state: <T>(initial: T & ThingStateValue) -> ThingState<T>,
+    timer: (options: ThingTimerOptions) -> ThingTimer,
     transition: (
         ((value: () -> number, options: ThingTransitionOptions) -> ThingNumberTransition)
         & ((value: () -> string, options: ThingTransitionOptions) -> ThingColorTransition)

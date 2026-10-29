@@ -53,13 +53,25 @@ const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
 const PROBE_ENV: &str = "THING_LOCK_HOST_WIRE_PROBE";
 const LOCK_FIXTURE: &str = r#"
+local collapsed = ui.state(false)
+local help = ui.button { key = 'help' }
+ui.timer {
+    interval = 24 * 60 * 60 * 1000,
+    autostart = true,
+    on_timeout = function() collapsed:set(true) end,
+}
+ui.timer {
+    interval = 24 * 60 * 60 * 1000 + 10,
+    autostart = true,
+    on_timeout = function() ui.focus(help) end,
+}
 return ui.lock {
     style = { width = 320, height = 240, background = '#000000' },
     children = {
         ui.column {
             style = {
                 scale_x = function()
-                    return if services.authentication.state:get() == 'waiting' then 0 else 1
+                    return if collapsed:get() or services.authentication.state:get() == 'waiting' then 0 else 1
                 end,
             },
             children = {
@@ -69,6 +81,7 @@ return ui.lock {
                 },
             },
         },
+        help,
     },
 }
 "#;
@@ -769,6 +782,31 @@ fn run_host_probe() {
         app.surfaces[0].secret_input.as_ref().unwrap().editor.len(),
         2
     );
+
+    let deadline = app.configurations.next_timer_deadline().unwrap();
+    app.dispatch_due_timers(deadline);
+    drive(&mut private, &mut app, true);
+    assert!(app.surfaces[0].secret_guarded);
+    assert_eq!(app.surfaces[0].focus_target.as_ref(), Some(&target));
+    assert_eq!(
+        app.surfaces[0].secret_input.as_ref().unwrap().editor.len(),
+        2
+    );
+    assert!(app.secret_input_key(0, &event, true).is_some());
+    assert_eq!(
+        app.surfaces[0].secret_input.as_ref().unwrap().editor.len(),
+        3
+    );
+    let deadline = app.configurations.next_timer_deadline().unwrap();
+    app.dispatch_due_timers(deadline);
+    drive(&mut private, &mut app, true);
+    assert!(app.surfaces[0].secret_guarded);
+    assert_eq!(app.surfaces[0].focus_target.as_ref(), Some(&target));
+    assert_eq!(
+        app.surfaces[0].secret_input.as_ref().unwrap().editor.len(),
+        3
+    );
+    assert!(app.configurations.next_timer_deadline().is_none());
 
     let output = &outputs[0].0;
     let consumer = app.configurations.consumer(output).unwrap().to_owned();

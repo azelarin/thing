@@ -319,6 +319,7 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
             app.reload_at = None;
             app.reload();
         }
+        app.dispatch_due_timers(Instant::now());
         app.draw(&qh);
         connection.flush().map_err(|error| error.to_string())?;
         let timeout = app
@@ -511,6 +512,7 @@ impl App {
             .into_iter()
             .chain(self.surfaces.iter().filter_map(|surface| surface.retry_at))
             .chain(authentication)
+            .chain(self.configurations.next_timer_deadline())
             .min()
     }
 
@@ -1140,6 +1142,46 @@ impl App {
             self.focus_next(index);
         }
         false
+    }
+
+    fn dispatch_due_timers(&mut self, now: Instant) {
+        for (output, token) in self.configurations.due_timers(now) {
+            let Some(entry) = self.current_layout_validation_entry(&output) else {
+                continue;
+            };
+            let preflight = LockLayoutPreflight::new(&mut self.render, vec![entry]);
+            let result =
+                self.configurations
+                    .dispatch_timer_checked(&output, &token, now, |surfaces| {
+                        preflight.validate(&output, surfaces)
+                    });
+            let prepared = preflight.into_prepared();
+            self.update_watch();
+            match result {
+                Ok(Some(outcome)) => {
+                    if outcome.changed {
+                        for surface in self
+                            .surfaces
+                            .iter_mut()
+                            .filter(|surface| surface.output == output)
+                        {
+                            surface.dirty = true;
+                        }
+                        self.install_prepared_layouts(prepared);
+                    }
+                    if !outcome.actions.is_empty() || !outcome.ui_actions.is_empty() {
+                        eprintln!("thing: actions are unavailable in lock timer callbacks");
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("thing: {error}"),
+            }
+            for index in 0..self.surfaces.len() {
+                if self.surfaces[index].output == output {
+                    self.reconcile_surface_focus(index);
+                }
+            }
+        }
     }
 
     fn dispatch_root_key(&mut self, index: usize, input: KeyInput) -> RootKeyDispatch {
