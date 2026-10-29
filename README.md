@@ -78,7 +78,9 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] desktop notifications
 - [x] clipboard text service
 - [x] system tray
-- [ ] session locking and idle inhibition
+- [x] session locking
+- [x] surface idle inhibition
+- [ ] idle monitoring and system sleep inhibition
 - [ ] accessibility and complete keyboard navigation
 
 ## license

@@ -11,6 +11,7 @@ mod focus;
 mod focused_clipboard;
 mod host;
 mod hover;
+mod idle_inhibit;
 mod input_method;
 mod keyboard;
 mod launch;

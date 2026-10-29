@@ -604,6 +604,9 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "input_region" if node.kind == Kind::Panel => {
             node.panel.input_region = panel_input_region(value)?
         }
+        "idle_inhibit" if matches!(node.kind, Kind::Panel | Kind::Popup) => {
+            node.idle_inhibit = boolean(value, name)?
+        }
         "style.width" => {
             node.style.width = if value.is_nil() {
                 None

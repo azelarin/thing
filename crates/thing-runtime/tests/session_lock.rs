@@ -88,6 +88,7 @@ fn lock_configuration_rejects_ambiguous_surface_ownership() {
         "return { ui.lock {} }",
         "return ui.lock { key = 'one' }",
         "return ui.lock { namespace = 'custom' }",
+        "return ui.lock { idle_inhibit = true }",
         "return ui.lock { children = { ui.popup {} } }",
         "return ui.lock { children = { ui.secret_input {}, ui.secret_input {} } }",
     ] {
