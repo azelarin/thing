@@ -3753,6 +3753,129 @@ mod transition_tests {
     }
 
     #[test]
+    fn transform_transitions_cross_zero_and_retarget_from_the_displayed_frame() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local flipped = ui.state(false)
+            local function moving(before, after)
+                return ui.transition(function()
+                    return if flipped:get() then after else before
+                end, { duration = 100, easing = 'linear' })
+            end
+            return ui.panel { children = {
+                ui.button { on_click = function() flipped:set(not flipped:get()) end },
+                ui.row { style = {
+                    translate_x = moving(0, 40), translate_y = moving(10, -10),
+                    scale_x = moving(1, -1), scale_y = moving(-1, 1),
+                    rotation = moving(350, 370),
+                } },
+            } }
+            "#,
+        );
+        let button = root(&runtime).children[0].id;
+        let animated = root(&runtime).children[1].id;
+        let start = Instant::now();
+        runtime
+            .dispatch_inner(button, Event::Click, Some(start))
+            .unwrap();
+        runtime.advance(start + Duration::from_millis(50)).unwrap();
+        let style = &root(&runtime).children[1].style;
+        close(style.translate_x, 20.0);
+        close(style.translate_y, 0.0);
+        close(style.scale_x, 0.0);
+        close(style.scale_y, 0.0);
+        close(style.rotation, 360.0);
+
+        runtime
+            .dispatch_inner(
+                button,
+                Event::Click,
+                Some(start + Duration::from_millis(50)),
+            )
+            .unwrap();
+        runtime.advance(start + Duration::from_millis(75)).unwrap();
+        let style = &root(&runtime).children[1].style;
+        close(style.translate_x, 15.0);
+        close(style.translate_y, 2.5);
+        close(style.scale_x, 0.25);
+        close(style.scale_y, -0.25);
+        close(style.rotation, 357.5);
+
+        runtime.advance(start + Duration::from_millis(150)).unwrap();
+        let style = &root(&runtime).children[1].style;
+        close(style.translate_x, 0.0);
+        close(style.translate_y, 10.0);
+        close(style.scale_x, 1.0);
+        close(style.scale_y, -1.0);
+        close(style.rotation, 350.0);
+        assert!(!runtime.is_animating(animated));
+    }
+
+    #[test]
+    fn transform_springs_bound_published_frames_without_losing_momentum() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local moving = ui.state(false)
+            local function spring(before, after)
+                return ui.spring(function()
+                    return if moving:get() then after else before
+                end, { stiffness = 100, damping = 0.1, epsilon = 0.001 })
+            end
+            return ui.panel { children = {
+                ui.button { on_click = function() moving:set(true) end },
+                ui.row { style = {
+                    translate_x = spring(0, 100000), translate_y = spring(0, -100000),
+                    scale_x = spring(1, 100), scale_y = spring(-1, -100),
+                    rotation = spring(0, 1000000),
+                } },
+            } }
+            "#,
+        );
+        let button = root(&runtime).children[0].id;
+        let animated = root(&runtime).children[1].id;
+        let start = Instant::now();
+        runtime
+            .dispatch_inner(button, Event::Click, Some(start))
+            .unwrap();
+        runtime.advance(start + Duration::from_millis(300)).unwrap();
+        let style = &root(&runtime).children[1].style;
+        close(style.translate_x, 100_000.0);
+        close(style.translate_y, -100_000.0);
+        close(style.scale_x, 100.0);
+        close(style.scale_y, -100.0);
+        close(style.rotation, 1_000_000.0);
+        assert!(runtime.is_animating(animated));
+
+        runtime.advance(start + Duration::from_millis(600)).unwrap();
+        let style = &root(&runtime).children[1].style;
+        assert!(style.translate_x < 100_000.0 && style.translate_y > -100_000.0);
+        assert!(style.scale_x < 100.0 && style.scale_y > -100.0);
+        assert!(style.rotation < 1_000_000.0);
+        assert!(runtime.is_animating(animated));
+    }
+
+    #[test]
+    fn transform_animation_rejects_invalid_targets_before_retargeting() {
+        let (_directory, _path, mut runtime) = load(
+            r#"
+            local invalid = ui.state(false)
+            return ui.panel { children = {
+                ui.button { on_click = function() invalid:set(true) end },
+                ui.row { style = {
+                    scale_x = ui.spring(function()
+                        return if invalid:get() then 101 else 1
+                    end, { stiffness = 100, damping = 0.8 }),
+                } },
+            } }
+            "#,
+        );
+        let button = root(&runtime).children[0].id;
+        assert!(runtime.dispatch(button, Event::Click).is_err());
+        close(root(&runtime).children[1].style.scale_x, 1.0);
+        assert!(!runtime.has_active_transitions());
+    }
+
+    #[test]
     fn reactive_transform_properties_publish_together_or_preserve_the_previous_style() {
         let (_directory, _path, mut runtime) = load(
             r#"

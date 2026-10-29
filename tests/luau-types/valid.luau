@@ -172,6 +172,14 @@ local process_button = ui.button {
     },
 }
 
+local _animatedTransforms: ThingStyle = {
+    translate_x = ui.transition(function() return -12 end, { duration = 100 }),
+    translate_y = ui.spring(function() return 8 end, { stiffness = 100, damping = 0.8 }),
+    scale_x = ui.spring(function() return -1 end, { stiffness = 100, damping = 0.8 }),
+    scale_y = ui.transition(function() return 0 end, { duration = 100 }),
+    rotation = ui.transition(function() return 370 end, { duration = 100 }),
+}
+
 return ui.panel {
     on_key = function(event)
         if event.key == "Escape" or (event.ctrl and event.text == "c") then

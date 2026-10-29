@@ -511,6 +511,9 @@ pub(crate) fn apply_animation_frame(node: &mut Node, name: &str, value: Resolved
     let value = match value {
         Resolved::Number(value) => Resolved::Number(match name {
             "style.opacity" => value.clamp(0.0, 1.0),
+            "style.translate_x" | "style.translate_y" => value.clamp(-100_000.0, 100_000.0),
+            "style.scale_x" | "style.scale_y" => value.clamp(-100.0, 100.0),
+            "style.rotation" => value.clamp(-1_000_000.0, 1_000_000.0),
             "style.width" | "style.height" | "style.padding" | "style.padding_x"
             | "style.padding_y" | "style.gap" | "style.grow" | "style.radius"
             | "style.border_width" => value.clamp(0.0, 100_000.0),

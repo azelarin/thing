@@ -551,6 +551,11 @@ fn numeric_property(property: &str) -> bool {
             | "style.radius"
             | "style.border_width"
             | "style.opacity"
+            | "style.translate_x"
+            | "style.translate_y"
+            | "style.scale_x"
+            | "style.scale_y"
+            | "style.rotation"
     )
 }
 

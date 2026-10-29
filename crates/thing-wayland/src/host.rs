@@ -2128,6 +2128,15 @@ impl App {
                 });
             let prepared = preflight.into_prepared();
             if changed? {
+                for surface in self
+                    .surfaces
+                    .iter_mut()
+                    .filter(|surface| surface.output == output)
+                {
+                    // a deferred Vulkan frame may retain the previous animation's geometry.
+                    surface.layouts.invalidate_input();
+                    surface.dirty = true;
+                }
                 // animated panel dimensions must reach layer shell before this
                 // frame is laid out. pointer paths still update after present.
                 let owners: Vec<_> = self
@@ -6289,11 +6298,11 @@ impl PopupHandler for App {
             if surface.size != size {
                 surface.layouts.invalidate_input();
                 surface.size = size;
-                surface.dirty = true;
             }
             surface.prepared = Some(prepared);
             surface.configured = true;
-            surface.dirty |= initial;
+            // position-only configurations also need a commit to move the popup.
+            surface.dirty = true;
         }
     }
     fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &XdgPopup) {
