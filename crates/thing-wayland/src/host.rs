@@ -17,7 +17,7 @@ use smithay_client_toolkit::{
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
     delegate_registry, delegate_seat, delegate_xdg_popup, delegate_xdg_shell,
     output::{OutputHandler, OutputState},
-    registry::{ProvidesRegistryState, RegistryState},
+    registry::{ProvidesRegistryState, RegistryHandler, RegistryState},
     registry_handlers,
     seat::{
         Capability, SeatHandler, SeatState,
@@ -72,6 +72,10 @@ use wayland_protocols::{
         ext_data_control_offer_v1::{self, ExtDataControlOfferV1},
         ext_data_control_source_v1::{self, ExtDataControlSourceV1},
     },
+    wp::idle_inhibit::zv1::client::{
+        zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
+        zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
+    },
     wp::text_input::zv3::client::{
         zwp_text_input_manager_v3::ZwpTextInputManagerV3,
         zwp_text_input_v3::{self, ZwpTextInputV3},
@@ -113,6 +117,7 @@ use crate::{
     focus::{LayoutSnapshot, ScopedUiTarget, SurfaceLayouts},
     focused_clipboard::{FocusedClipboard, PasteId},
     hover::{Command as HoverCommand, HoverKey, HoverStates, HoverTarget},
+    idle_inhibit::{self, Inhibitor, State as IdleInhibitState},
     input_method::{
         ChangeCause as InputMethodChangeCause, CursorRectangle as InputMethodCursorRectangle,
         Done as InputMethodDone, InputMethod, TextState as InputMethodTextState,
@@ -184,6 +189,15 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
             .find(|global| global.interface == "zwlr_layer_shell_v1")
             .map_or(0, |global| global.version.min(4))
     });
+    let registry = RegistryState::new(&globals);
+    let mut idle_inhibit = IdleInhibitState::default();
+    idle_inhibit.bind_next(&registry, &qh)?;
+    services
+        .set_service(
+            "idle.inhibit_available",
+            Scalar::Boolean(idle_inhibit.active().is_some()),
+        )
+        .map_err(|error| error.to_string())?;
     let compositor = CompositorState::bind(&globals, &qh).map_err(|error| error.to_string())?;
     let layer_shell = LayerShell::bind(&globals, &qh)
         .map_err(|error| format!("the compositor must support wlr-layer-shell: {error}"))?;
@@ -268,7 +282,8 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         pending_ui_actions: Vec::new(),
         surfaces: Vec::new(),
         closed_surfaces: Vec::new(),
-        registry: RegistryState::new(&globals),
+        registry,
+        idle_inhibit,
         seats: SeatState::new(&globals, &qh),
         outputs: OutputState::new(&globals, &qh),
         compositor,
@@ -309,7 +324,12 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         .map(|(output, context)| app.layout_validation_entry(output.clone(), context.clone()))
         .collect();
     let loop_handle = app.loop_handle.clone();
-    let preflight = LayoutPreflight::new(&mut app.render, layer_shell_version, entries);
+    let preflight = LayoutPreflight::new(
+        &mut app.render,
+        layer_shell_version,
+        app.idle_inhibit.active().is_some(),
+        entries,
+    );
     let mut prepared_configurations = app
         .configurations
         .prepare_reload_for_checked(outputs.clone(), |output, runtime| {
@@ -667,6 +687,7 @@ struct PreparedOutputLayouts {
 struct LayoutPreflight<'a> {
     render: RefCell<&'a mut Render>,
     layer_shell_version: u32,
+    idle_inhibit_available: bool,
     entries: Vec<LayoutValidationEntry>,
     prepared: RefCell<Vec<PreparedOutputLayouts>>,
 }
@@ -677,7 +698,11 @@ impl LayoutPreflight<'_> {
         output: &wl_output::WlOutput,
         surfaces: &[SurfaceTree],
     ) -> Result<(), String> {
-        validate_surface_capabilities(surfaces, self.layer_shell_version)?;
+        validate_surface_capabilities(
+            surfaces,
+            self.layer_shell_version,
+            self.idle_inhibit_available,
+        )?;
         let entry = self
             .entries
             .iter()
@@ -713,11 +738,13 @@ impl<'a> LayoutPreflight<'a> {
     fn new(
         render: &'a mut Render,
         layer_shell_version: u32,
+        idle_inhibit_available: bool,
         entries: Vec<LayoutValidationEntry>,
     ) -> Self {
         Self {
             render: RefCell::new(render),
             layer_shell_version,
+            idle_inhibit_available,
             entries,
             prepared: RefCell::new(Vec::new()),
         }
@@ -859,6 +886,7 @@ struct Surface {
     // release graphics state before the Wayland role and its underlying surface.
     window: Option<Window>,
     role: Role,
+    idle_inhibitor: Option<Inhibitor>,
     output: wl_output::WlOutput,
     key: SurfaceKey,
     namespace: String,
@@ -950,6 +978,7 @@ impl Surface {
 
 impl Drop for Surface {
     fn drop(&mut self) {
+        self.idle_inhibitor.take();
         if let Some(scale) = self.fractional.take() {
             scale.destroy();
         }
@@ -983,6 +1012,7 @@ pub(crate) struct App {
     surfaces: Vec<Surface>,
     closed_surfaces: Vec<SurfaceOwner>,
     registry: RegistryState,
+    idle_inhibit: IdleInhibitState,
     seats: SeatState,
     outputs: OutputState,
     compositor: CompositorState,
@@ -1021,6 +1051,7 @@ impl Drop for App {
         self.render.prepare_drop();
         // popups are appended after their parents and must be released first.
         while self.surfaces.pop().is_some() {}
+        self.idle_inhibit.take_active();
     }
 }
 
@@ -1100,6 +1131,43 @@ impl App {
                 surface.prepared = prepared.map(|index| output.surfaces.swap_remove(index));
             }
         }
+        self.reconcile_idle_inhibitors();
+    }
+
+    fn reconcile_idle_inhibitors(&mut self) {
+        for surface in &mut self.surfaces {
+            let desired = self
+                .configurations
+                .surface_root(&surface.output, &surface.key)
+                .and_then(|root| root.find(surface.root))
+                .is_some_and(|root| root.idle_inhibit);
+            if let Err(error) = self.idle_inhibit.reconcile(
+                &mut surface.idle_inhibitor,
+                surface.role.surface(),
+                desired,
+                &self.queue,
+            ) {
+                self.error = Some(error);
+                return;
+            }
+        }
+    }
+
+    fn publish_idle_availability(&mut self) -> Result<(), String> {
+        let available = self.idle_inhibit.active().is_some();
+        self.configurations
+            .set_service("idle.inhibit_available", Scalar::Boolean(available))?;
+        self.refresh();
+        // protocol withdrawal cannot roll back with a rejected configuration.
+        if !available
+            && self.configurations.keys().any(|output| {
+                idle_inhibit::requested(self.configurations.surfaces(output).unwrap_or_default())
+            })
+        {
+            return Err("the compositor removed idle-inhibition support while a configuration still requires it".into());
+        }
+        self.reconcile_idle_inhibitors();
+        Ok(())
     }
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -1294,7 +1362,12 @@ impl App {
                     .map(|context| self.layout_validation_entry(output.clone(), context))
             })
             .collect();
-        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, entries);
+        let preflight = LayoutPreflight::new(
+            &mut self.render,
+            layer_shell_version,
+            self.idle_inhibit.active().is_some(),
+            entries,
+        );
         let outputs: Vec<_> = self
             .configurations
             .refresh_checked(|output, surfaces| preflight.validate(output, surfaces));
@@ -1315,6 +1388,7 @@ impl App {
     }
 
     fn reconcile_published_configuration(&mut self) {
+        self.reconcile_idle_inhibitors();
         self.reconcile_focus_targets();
         self.apply_pending_ui_actions_now();
         self.prepare_invalidated_input_layouts_now();
@@ -1342,7 +1416,12 @@ impl App {
         let retired_consumers = self.configurations.consumers();
         let loop_handle = self.loop_handle.clone();
         let replacement = (|| {
-            let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, entries);
+            let preflight = LayoutPreflight::new(
+                &mut self.render,
+                layer_shell_version,
+                self.idle_inhibit.active().is_some(),
+                entries,
+            );
             let mut configurations = self
                 .configurations
                 .prepare_reload_for_checked(outputs, |output, runtime| {
@@ -1449,8 +1528,12 @@ impl App {
             let layer_shell_version = self.layer_shell_version;
             let entry = self.layout_validation_entry(output.clone(), context.clone());
             let loop_handle = self.loop_handle.clone();
-            let preflight =
-                LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
+            let preflight = LayoutPreflight::new(
+                &mut self.render,
+                layer_shell_version,
+                self.idle_inhibit.active().is_some(),
+                vec![entry],
+            );
             let Some(mut configuration) =
                 self.configurations
                     .prepare_add_checked(output.clone(), context, |runtime| {
@@ -1537,14 +1620,27 @@ impl App {
                 scale: context.scale,
             },
             qh,
-        );
+        )?;
         surface.panel = Some(panel);
         surface.role.surface().commit();
         self.surfaces.push(surface);
         Ok(())
     }
 
-    fn make_surface(&self, role: Role, init: SurfaceInit, qh: &QueueHandle<Self>) -> Surface {
+    fn make_surface(
+        &self,
+        role: Role,
+        init: SurfaceInit,
+        qh: &QueueHandle<Self>,
+    ) -> Result<Surface, String> {
+        let desired = self
+            .configurations
+            .surface_root(&init.owner.output, &init.owner.key)
+            .and_then(|root| root.find(init.root))
+            .is_some_and(|root| root.idle_inhibit);
+        let mut idle_inhibitor = None;
+        self.idle_inhibit
+            .reconcile(&mut idle_inhibitor, role.surface(), desired, qh)?;
         let viewport = self
             .viewporter
             .as_ref()
@@ -1556,9 +1652,10 @@ impl App {
         } else {
             None
         };
-        Surface {
+        Ok(Surface {
             window: None,
             role,
+            idle_inhibitor,
             output: init.owner.output,
             key: init.owner.key,
             namespace: init.namespace,
@@ -1587,7 +1684,7 @@ impl App {
             dirty: true,
             waiting: false,
             retry_at: None,
-        }
+        })
     }
 
     fn output_context(&self, output: &wl_output::WlOutput) -> Option<OutputContext> {
@@ -1620,6 +1717,8 @@ impl App {
         force: bool,
         qh: &QueueHandle<Self>,
     ) -> Result<(), String> {
+        // include open popups before panel synchronization commits surface changes.
+        self.reconcile_idle_inhibitors();
         let desired: Vec<_> = self
             .configurations
             .surfaces(output)
@@ -1821,8 +1920,12 @@ impl App {
             context.scale = scale;
             let layer_shell_version = self.layer_shell_version;
             let entry = self.layout_validation_entry(output.clone(), context.clone());
-            let preflight =
-                LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
+            let preflight = LayoutPreflight::new(
+                &mut self.render,
+                layer_shell_version,
+                self.idle_inhibit.active().is_some(),
+                vec![entry],
+            );
             let result = self
                 .configurations
                 .set_output_checked(output, context, |surfaces| {
@@ -2119,8 +2222,12 @@ impl App {
             let entry = self
                 .current_layout_validation_entry(&output)
                 .ok_or("animated output has no layout context")?;
-            let preflight =
-                LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
+            let preflight = LayoutPreflight::new(
+                &mut self.render,
+                layer_shell_version,
+                self.idle_inhibit.active().is_some(),
+                vec![entry],
+            );
             let changed = self
                 .configurations
                 .advance_checked(&output, now, |surfaces| {
@@ -2440,7 +2547,12 @@ impl App {
         let Some(entry) = self.current_layout_validation_entry(&output) else {
             return;
         };
-        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
+        let preflight = LayoutPreflight::new(
+            &mut self.render,
+            layer_shell_version,
+            self.idle_inhibit.active().is_some(),
+            vec![entry],
+        );
         let result = self
             .configurations
             .dispatch_checked(&output, id, event, |surfaces| {
@@ -2459,7 +2571,12 @@ impl App {
         let layer_shell_version = self.layer_shell_version;
         let consumer = Some(target.consumer.clone());
         let entry = self.current_layout_validation_entry(&output)?;
-        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
+        let preflight = LayoutPreflight::new(
+            &mut self.render,
+            layer_shell_version,
+            self.idle_inhibit.active().is_some(),
+            vec![entry],
+        );
         let result = self.configurations.dispatch_scroll_checked(
             &output,
             &target.target,
@@ -3263,7 +3380,12 @@ impl App {
         });
         let layer_shell_version = self.layer_shell_version;
         let entry = self.current_layout_validation_entry(&output)?;
-        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
+        let preflight = LayoutPreflight::new(
+            &mut self.render,
+            layer_shell_version,
+            self.idle_inhibit.active().is_some(),
+            vec![entry],
+        );
         let result =
             self.configurations
                 .begin_pointer_checked(&output, &target.target, event, |surfaces| {
@@ -3297,7 +3419,12 @@ impl App {
         let consumer = Some(capture.target.consumer.clone());
         let layer_shell_version = self.layer_shell_version;
         let entry = self.current_layout_validation_entry(&capture.output)?;
-        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
+        let preflight = LayoutPreflight::new(
+            &mut self.render,
+            layer_shell_version,
+            self.idle_inhibit.active().is_some(),
+            vec![entry],
+        );
         let result =
             self.configurations
                 .dispatch_pointer_checked(&capture.output, event, |surfaces| {
@@ -3324,7 +3451,12 @@ impl App {
         let Some(entry) = self.current_layout_validation_entry(&capture.output) else {
             return;
         };
-        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
+        let preflight = LayoutPreflight::new(
+            &mut self.render,
+            layer_shell_version,
+            self.idle_inhibit.active().is_some(),
+            vec![entry],
+        );
         let result = self
             .configurations
             .cancel_pointer_checked(&capture.output, |surfaces| {
@@ -3367,7 +3499,12 @@ impl App {
         let Some(entry) = self.current_layout_validation_entry(output) else {
             return;
         };
-        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
+        let preflight = LayoutPreflight::new(
+            &mut self.render,
+            layer_shell_version,
+            self.idle_inhibit.active().is_some(),
+            vec![entry],
+        );
         let result = self
             .configurations
             .cancel_pointer_checked(output, |surfaces| preflight.validate(output, surfaces));
@@ -4317,6 +4454,13 @@ impl App {
                     },
                     qh,
                 );
+                let surface = match surface {
+                    Ok(surface) => surface,
+                    Err(error) => {
+                        self.error = Some(error);
+                        return false;
+                    }
+                };
                 surface.role.surface().commit();
                 self.surfaces.push(surface);
                 true
@@ -4861,7 +5005,12 @@ impl App {
         let Some(entry) = self.current_layout_validation_entry(&output) else {
             return RootKeyDispatch::Missing;
         };
-        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
+        let preflight = LayoutPreflight::new(
+            &mut self.render,
+            layer_shell_version,
+            self.idle_inhibit.active().is_some(),
+            vec![entry],
+        );
         let result = self
             .configurations
             .dispatch_key_checked(&output, root, input, |surfaces| {
@@ -5457,7 +5606,9 @@ fn collect_popup_roots<'a>(node: &'a Node, popups: &mut Vec<&'a Node>) {
 fn validate_surface_capabilities(
     surfaces: &[SurfaceTree],
     layer_shell_version: u32,
+    idle_inhibit_available: bool,
 ) -> Result<(), String> {
+    idle_inhibit::validate(surfaces, idle_inhibit_available)?;
     if layer_shell_version < 4
         && surfaces
             .iter()
@@ -5819,10 +5970,10 @@ mod output_tests {
             }]
         };
 
-        assert!(validate_surface_capabilities(&surfaces(root.clone()), 3).is_err());
-        assert!(validate_surface_capabilities(&surfaces(root.clone()), 4).is_ok());
+        assert!(validate_surface_capabilities(&surfaces(root.clone()), 3, false).is_err());
+        assert!(validate_surface_capabilities(&surfaces(root.clone()), 4, false).is_ok());
         root.panel.keyboard_mode = KeyboardMode::None;
-        assert!(validate_surface_capabilities(&surfaces(root), 1).is_ok());
+        assert!(validate_surface_capabilities(&surfaces(root), 1, false).is_ok());
     }
 
     #[test]
@@ -5853,7 +6004,7 @@ mod output_tests {
         let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
         configurations.add(1, output).unwrap();
         let button = configurations.root(&1).unwrap().children[0].id;
-        let validate = |surfaces: &[SurfaceTree]| validate_surface_capabilities(surfaces, 3);
+        let validate = |surfaces: &[SurfaceTree]| validate_surface_capabilities(surfaces, 3, false);
 
         let error = configurations
             .dispatch_checked(&1, button, Event::Click, validate)
@@ -6099,7 +6250,12 @@ impl OutputHandler for App {
         }
         let layer_shell_version = self.layer_shell_version;
         let entry = self.layout_validation_entry(output.clone(), context.clone());
-        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
+        let preflight = LayoutPreflight::new(
+            &mut self.render,
+            layer_shell_version,
+            self.idle_inhibit.active().is_some(),
+            vec![entry],
+        );
         let result = self
             .configurations
             .set_output_checked(&output, context, |surfaces| {
@@ -8408,11 +8564,57 @@ delegate_noop!(App: ignore XdgActivationV1);
 delegate_noop!(App: ignore ExtDataControlManagerV1);
 delegate_noop!(App: ignore ZwlrDataControlManagerV1);
 delegate_noop!(App: ignore ZwpTextInputManagerV3);
+delegate_noop!(App: ignore ZwpIdleInhibitManagerV1);
+delegate_noop!(App: ignore ZwpIdleInhibitorV1);
 delegate_noop!(App: ignore xdg_positioner::XdgPositioner);
+
+impl RegistryHandler<App> for IdleInhibitState {
+    fn new_global(
+        app: &mut App,
+        _: &Connection,
+        qh: &QueueHandle<App>,
+        _: u32,
+        interface: &str,
+        _: u32,
+    ) {
+        if interface != ZwpIdleInhibitManagerV1::interface().name {
+            return;
+        }
+        match app.idle_inhibit.bind_next(&app.registry, qh) {
+            Ok(true) => {
+                if let Err(error) = app.publish_idle_availability() {
+                    app.error = Some(error);
+                }
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!("thing: {error}"),
+        }
+    }
+
+    fn remove_global(app: &mut App, _: &Connection, qh: &QueueHandle<App>, name: u32, _: &str) {
+        if !app.idle_inhibit.retire(
+            name,
+            app.surfaces
+                .iter_mut()
+                .map(|surface| &mut surface.idle_inhibitor),
+        ) {
+            return;
+        }
+        if let Err(error) = app.idle_inhibit.bind_next(&app.registry, qh) {
+            eprintln!("thing: {error}");
+        }
+        if app.idle_inhibit.active().is_some() {
+            // replacement keeps availability true without reevaluating output policy.
+            app.reconcile_idle_inhibitors();
+        } else if let Err(error) = app.publish_idle_availability() {
+            app.error = Some(error);
+        }
+    }
+}
 
 impl ProvidesRegistryState for App {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry
     }
-    registry_handlers![OutputState, SeatState];
+    registry_handlers![OutputState, SeatState, IdleInhibitState];
 }

@@ -181,6 +181,9 @@ local _animatedTransforms: ThingStyle = {
 }
 
 return ui.panel {
+    idle_inhibit = function()
+        return services.idle.inhibit_available:get()
+    end,
     on_key = function(event)
         if event.key == "Escape" or (event.ctrl and event.text == "c") then
             return true
@@ -202,5 +205,8 @@ return ui.panel {
         tray,
         tray_menu_button,
         process_button,
+        ui.popup {
+            idle_inhibit = services.idle.inhibit_available:get(),
+        },
     },
 }

@@ -1300,6 +1300,7 @@ impl Services {
         let authentication = lua.create_table()?;
         let clipboard = lua.create_table()?;
         let clock = lua.create_table()?;
+        let idle = lua.create_table()?;
         let media = lua.create_table()?;
         let notifications = lua.create_table()?;
         let output = lua.create_table()?;
@@ -1397,6 +1398,7 @@ impl Services {
             ("clipboard.error", Scalar::String(String::new())),
             ("clock.time", Scalar::String("--:--".into())),
             ("clock.date", Scalar::String(String::new())),
+            ("idle.inhibit_available", Scalar::Boolean(false)),
             ("media.available", Scalar::Boolean(false)),
             ("media.selected_id", Scalar::String(String::new())),
             ("media.playing", Scalar::Boolean(false)),
@@ -1441,6 +1443,7 @@ impl Services {
                 "authentication" => authentication.set(property, signal)?,
                 "clipboard" => clipboard.set(property, signal)?,
                 "clock" => clock.set(property, signal)?,
+                "idle" => idle.set(property, signal)?,
                 "media" => media.set(property, signal)?,
                 "notifications" => notifications.set(property, signal)?,
                 "niri" => niri.set(property, signal)?,
@@ -1654,6 +1657,7 @@ impl Services {
         }
         niri.set_readonly(true);
         clock.set_readonly(true);
+        idle.set_readonly(true);
         output.set_readonly(true);
         let actions = result.actions.clone();
         let allowed = result.allowed.clone();
@@ -1717,6 +1721,7 @@ impl Services {
         services.set("authentication", authentication)?;
         services.set("clipboard", clipboard)?;
         services.set("clock", clock)?;
+        services.set("idle", idle)?;
         services.set("media", media)?;
         services.set("notifications", notifications)?;
         services.set("niri", niri)?;
@@ -2646,6 +2651,7 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "system_tray.watcher_owned"
             | "clipboard.available"
             | "clipboard.loading"
+            | "idle.inhibit_available"
             | "niri.available",
             Scalar::Boolean(_),
         ) => true,
@@ -3496,6 +3502,36 @@ mod tests {
         tracker.borrow_mut().dirty.clear();
         services.set_streams(vec![stream("stream-1")]).unwrap();
         assert_eq!(tracker.borrow().dirty, BTreeSet::from([4]));
+    }
+
+    #[test]
+    fn idle_inhibitor_availability_is_a_read_only_signal() {
+        let lua = Lua::new();
+        let tracker = Rc::new(RefCell::new(Tracker::default()));
+        let services = Services::install(&lua, tracker.clone()).unwrap();
+
+        tracker.borrow_mut().begin(1);
+        assert!(
+            !lua.load("return services.idle.inhibit_available:get()")
+                .eval::<bool>()
+                .unwrap()
+        );
+        tracker.borrow_mut().finish(1);
+        services
+            .set("idle.inhibit_available", Scalar::Boolean(true))
+            .unwrap();
+
+        assert_eq!(tracker.borrow().dirty, BTreeSet::from([1]));
+        assert!(
+            lua.load("return services.idle.inhibit_available:get()")
+                .eval::<bool>()
+                .unwrap()
+        );
+        assert!(
+            lua.load("services.idle.inhibit_available = false")
+                .exec()
+                .is_err()
+        );
     }
 
     #[test]

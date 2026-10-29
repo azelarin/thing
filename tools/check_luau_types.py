@@ -66,6 +66,14 @@ CASES = (
         ),
     ),
     Case(
+        "invalid-idle-inhibit.luau",
+        (
+            "Property 'idle_inhibit' is not compatible.",
+            "Cannot add property 'idle_inhibit' to table 'ThingLockProperties'",
+            "Expected this to be 'number', but got 'boolean'",
+        ),
+    ),
+    Case(
         "invalid-secret-input.luau",
         (
             "Cannot add property 'value' to table 'ThingSecretInputProperties'",

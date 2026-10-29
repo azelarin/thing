@@ -5,7 +5,7 @@ use thing_core::{
     KeyboardMode, PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins, PanelProperties,
     SurfaceAnchors, SurfaceLayer,
 };
-use thing_runtime::{Event, Runtime};
+use thing_runtime::{Event, Runtime, Scalar};
 
 fn fixture(source: &str) -> (TempDir, PathBuf) {
     let directory = tempfile::tempdir().unwrap();
@@ -272,6 +272,56 @@ fn omitted_panel_properties_preserve_existing_defaults() {
     let (_directory, path) = fixture("return ui.panel {}");
     let runtime = Runtime::load(path).unwrap();
     assert_eq!(runtime.root().unwrap().panel, PanelProperties::default());
+}
+
+#[test]
+fn idle_inhibition_is_reactive_on_panel_and_popup_surfaces() {
+    let (_directory, path) = fixture(
+        r#"
+        local available = services.idle.inhibit_available
+        return ui.panel {
+            idle_inhibit = function() return available:get() end,
+            children = {
+                ui.button { children = {
+                    ui.popup {
+                        idle_inhibit = function() return available:get() end,
+                    },
+                } },
+            },
+        }
+        "#,
+    );
+    let mut runtime = Runtime::load(path).unwrap();
+    assert!(!runtime.root().unwrap().idle_inhibit);
+    assert!(!runtime.root().unwrap().children[0].children[0].idle_inhibit);
+
+    runtime
+        .set_service("idle.inhibit_available", Scalar::Boolean(true))
+        .unwrap();
+    assert!(runtime.refresh().unwrap());
+    assert!(runtime.root().unwrap().idle_inhibit);
+    assert!(runtime.root().unwrap().children[0].children[0].idle_inhibit);
+}
+
+#[test]
+fn idle_inhibition_rejects_invalid_values_and_non_surface_widgets() {
+    for (source, expected) in [
+        (
+            "return ui.panel { idle_inhibit = 'yes' }",
+            "idle_inhibit must be a boolean",
+        ),
+        (
+            "return ui.panel { children = { ui.text { idle_inhibit = true } } }",
+            "unknown property",
+        ),
+    ] {
+        let (_directory, path) = fixture(source);
+        let error = Runtime::load(path).err().unwrap().to_string();
+        assert!(
+            error.contains(expected),
+            "{error:?} did not contain {expected:?}"
+        );
+    }
 }
 
 #[test]

@@ -317,6 +317,7 @@ export type ThingPanelProperties = {
     margins: ThingReactive<ThingMargins>?,
     exclusive_zone: ThingReactive<number?>?,
     input_region: ThingReactive<ThingInputRegion?>?,
+    idle_inhibit: ThingReactive<boolean>?,
     on_key: ((event: ThingKeyEvent) -> boolean)?,
     children: ThingChildren?,
 }
@@ -468,6 +469,7 @@ export type ThingPopupProperties = {
     alignment: ThingReactive<ThingPopupAlignment>?,
     offset: ThingReactive<ThingPopupOffset?>?,
     constraints: ThingReactive<ThingPopupConstraints?>?,
+    idle_inhibit: ThingReactive<boolean>?,
     on_key: ((event: ThingKeyEvent) -> boolean)?,
     on_hover: ((inside: boolean) -> ())?,
     on_close: (() -> ())?,
@@ -685,6 +687,10 @@ declare extern type ThingClockService with
     read date: ThingSignal<string>
 end
 
+declare extern type ThingIdleService with
+    read inhibit_available: ThingSignal<boolean>
+end
+
 declare extern type ThingMediaService with
     read available: ThingSignal<boolean>
     read selected_id: ThingSignal<string>
@@ -786,6 +792,7 @@ declare extern type ThingServices with
     read authentication: ThingAuthenticationService
     read clipboard: ThingClipboardService
     read clock: ThingClockService
+    read idle: ThingIdleService
     read media: ThingMediaService
     read notifications: ThingNotificationService
     read niri: ThingNiriService

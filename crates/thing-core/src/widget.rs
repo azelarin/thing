@@ -768,6 +768,7 @@ pub struct Node {
     pub slider: Slider,
     pub range_inset: f32,
     pub panel: PanelProperties,
+    pub idle_inhibit: bool,
     pub enabled: bool,
     pub visible: bool,
     pub autofocus: bool,
@@ -802,6 +803,7 @@ impl Node {
             slider: Slider::default(),
             range_inset: 0.0,
             panel: PanelProperties::default(),
+            idle_inhibit: false,
             enabled: true,
             visible: true,
             autofocus: false,
@@ -900,6 +902,11 @@ impl Node {
         if self.kind != Kind::Panel && self.panel != PanelProperties::default() {
             return Err(TreeError(
                 "panel surface properties are only valid on a panel".into(),
+            ));
+        }
+        if self.idle_inhibit && !matches!(self.kind, Kind::Panel | Kind::Popup) {
+            return Err(TreeError(
+                "idle_inhibit is available only on panel and popup surfaces".into(),
             ));
         }
         self.panel.validate(&self.style)?;

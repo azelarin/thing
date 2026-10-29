@@ -74,6 +74,9 @@ ui actions are unavailable.
 scheduled process declarations are unavailable in lock configurations. the lock
 host never starts configuration-owned child processes.
 
+lock configurations also reject `idle_inhibit`. the lock host does not bind the
+compositor idle-inhibition protocol.
+
 `services.authentication` is read-only. `state` is one of `idle`,
 `authenticating`, `waiting`, `rejected`, or `unavailable`; `prompt` contains a
 bounded follow-up prompt while waiting, and `message` contains bounded status
@@ -209,6 +212,7 @@ surface properties belong on the root `ui.panel`.
 | `margins` | all zero | `{ top, right, bottom, left }` distances from the output edges |
 | `exclusive_zone` | automatic | workspace space reserved for the surface; `0` reserves nothing and `-1` ignores other exclusive zones |
 | `input_region` | whole surface | pointer and touch input rectangles, or `false` for click-through |
+| `idle_inhibit` | `false` | ask the compositor to suppress idle behavior while this surface is visible and relevant |
 | `on_key` | absent | handles keyboard presses while the surface has keyboard focus |
 
 `edge` is the convenient form for bars. a top or bottom bar fills the output
@@ -267,6 +271,29 @@ keyboard focus.
 surface properties other than `key` and `namespace` may be functions just like
 other reactive properties. the function returns the whole value: for example,
 a reactive `margins` property returns the complete margins table.
+
+`idle_inhibit` is also available on popups. it follows the lifetime of the
+actual panel or popup surface; a closed popup holds no inhibitor. the compositor
+decides whether an occluded or unmapped surface is relevant enough to count.
+this is a compositor idle request, not a system suspend inhibitor.
+
+setting the property to true requires `zwp_idle_inhibit_manager_v1`. gate
+portable configurations with the read-only availability signal:
+
+```luau
+local keep_awake = ui.state(false)
+
+return ui.panel {
+    idle_inhibit = function()
+        return services.idle.inhibit_available:get() and keep_awake:get()
+    end,
+}
+```
+
+a true request is validated even for a currently hidden panel or closed popup,
+so opening it cannot reveal an unsupported request. if the compositor removes
+the protocol while a surface still requires inhibition, thing reports a fatal
+host error rather than pretending that the request remains active.
 
 ## widgets and children
 
@@ -1108,7 +1135,7 @@ each load, event callback, and reactive update batch has a default execution bud
 of 250 ms. the luau heap is limited to 64 mib; this is a ceiling, not preallocated
 memory or a limit on the whole application. the execution budget does not bound native i/o time.
 
-## clock and audio
+## clock, idle, and audio
 
 service values have the same `:get()` interface as local state, but are read-only.
 read them inside property functions to subscribe to updates.
@@ -1117,6 +1144,7 @@ read them inside property functions to subscribe to updates.
 | --- | --- |
 | `services.clock.time` | local `HH:MM` time, updated at minute boundaries |
 | `services.clock.date` | local date such as `Wed 28 Oct`, updated with the clock |
+| `services.idle.inhibit_available` | whether the compositor supports per-surface idle inhibition |
 | `services.audio.available` | whether a default output is available |
 | `services.audio.volume` | default output volume; `1` is 100%, server values may exceed it |
 | `services.audio.muted` | default output mute state |
