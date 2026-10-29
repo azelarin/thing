@@ -6289,11 +6289,11 @@ impl PopupHandler for App {
             if surface.size != size {
                 surface.layouts.invalidate_input();
                 surface.size = size;
-                surface.dirty = true;
             }
             surface.prepared = Some(prepared);
             surface.configured = true;
-            surface.dirty |= initial;
+            // position-only configurations also need a commit to move the popup.
+            surface.dirty = true;
         }
     }
     fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &XdgPopup) {
