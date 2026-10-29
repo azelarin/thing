@@ -14,12 +14,13 @@ mod transition;
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
 pub use services::{
     Action, AudioDevice, AudioSnapshot, AudioSource, AudioStream, AuthenticationSnapshot,
-    AuthenticationState, ClipboardSnapshot, ManagedProcessAction, ManagedProcessCommand,
-    ManagedProcessDefinition, ManagedProcessShutdownSignal, ManagedProcessSnapshot,
-    ManagedProcessState, ManagedProcessStatus, MediaAction, MediaPlayer, MediaSnapshot,
-    Notification, NotificationButton, NotificationSnapshot, NotificationUrgency, PowerDevice,
-    PowerSnapshot, ServiceSnapshot, SystemTrayAction, SystemTrayItem, SystemTrayMenu,
-    SystemTrayMenuAction, SystemTrayMenuItem, SystemTraySnapshot,
+    AuthenticationState, ClipboardSnapshot, MAX_MEDIA_RATE, MAX_MEDIA_TIME_US,
+    ManagedProcessAction, ManagedProcessCommand, ManagedProcessDefinition,
+    ManagedProcessShutdownSignal, ManagedProcessSnapshot, ManagedProcessState,
+    ManagedProcessStatus, MediaAction, MediaPlayer, MediaPosition, MediaSnapshot, Notification,
+    NotificationButton, NotificationSnapshot, NotificationUrgency, PowerDevice, PowerSnapshot,
+    ServiceSnapshot, SystemTrayAction, SystemTrayItem, SystemTrayMenu, SystemTrayMenuAction,
+    SystemTrayMenuItem, SystemTraySnapshot,
 };
 pub use timer::TimerToken;
 

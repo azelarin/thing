@@ -19,16 +19,16 @@ use futures_util::{
     future::LocalBoxFuture,
     stream::{self, FuturesUnordered},
 };
-use thing_runtime::{MediaAction, MediaSnapshot};
+use thing_runtime::{MAX_MEDIA_RATE, MAX_MEDIA_TIME_US, MediaAction, MediaPosition, MediaSnapshot};
 use zbus::{
     Connection, MatchRule, MessageStream,
     fdo::DBusProxy,
     message::{Flags, Message, Type},
     names::BusName,
-    zvariant::OwnedValue,
+    zvariant::{ObjectPath, OwnedObjectPath, OwnedValue},
 };
 
-use model::{Model, PlaybackMethod, Player, Target};
+use model::{Model, PlaybackMethod, Player, Refusal, Target};
 
 const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
@@ -157,7 +157,7 @@ impl Media {
         lock(&self.shared).latest.take()
     }
 
-    pub fn send(&self, action: MediaAction, player: Option<&str>) -> Result<(), &'static str> {
+    pub fn send(&self, action: &MediaAction, player: Option<&str>) -> Result<(), &'static str> {
         let mut shared = lock(&self.shared);
         if !shared.online {
             return Err("media service is disconnected");
@@ -173,12 +173,15 @@ impl Media {
                 .clone()
                 .ok_or("no media player is available")?,
         };
-        let Some(method) = target.method(action) else {
-            return Err(match player {
-                Some(_) => "that media player does not support the action",
-                None => "the selected media player does not support the action",
-            });
-        };
+        let method = target
+            .method(action)
+            .map_err(|refusal| match (refusal, player) {
+                (Refusal::TrackChanged, _) => "the media track changed before the action ran",
+                (Refusal::Unsupported, Some(_)) => "that media player does not support the action",
+                (Refusal::Unsupported, None) => {
+                    "the selected media player does not support the action"
+                }
+            })?;
         if shared.commands.len() >= MAX_COMMANDS {
             return Err("media command queue is full");
         }
@@ -283,7 +286,18 @@ async fn session(
         .add_arg(PLAYER_INTERFACE)
         .map_err(|error| error.to_string())?
         .build();
-    // install both matches before enumeration so arrivals and replacements
+    // position changes are not announced as properties. players report jumps
+    // with seeked and are otherwise expected to advance at their rate.
+    let seeked_rule = MatchRule::builder()
+        .msg_type(Type::Signal)
+        .path(MPRIS_PATH)
+        .map_err(|error| error.to_string())?
+        .interface(PLAYER_INTERFACE)
+        .map_err(|error| error.to_string())?
+        .member("Seeked")
+        .map_err(|error| error.to_string())?
+        .build();
+    // install the matches before enumeration so arrivals and replacements
     // during the initial queries remain queued for the event loop.
     let mut names = MessageStream::for_match_rule(name_rule, &connection, Some(256))
         .await
@@ -292,6 +306,12 @@ async fn session(
         return Ok(());
     }
     let mut properties = MessageStream::for_match_rule(property_rule, &connection, Some(256))
+        .await
+        .map_err(|error| error.to_string())?;
+    if stopping(shared) {
+        return Ok(());
+    }
+    let mut seeks = MessageStream::for_match_rule(seeked_rule, &connection, Some(256))
         .await
         .map_err(|error| error.to_string())?;
     if stopping(shared) {
@@ -368,7 +388,9 @@ async fn session(
         let input = future::race(
             async { Input::Name(names.next().await) },
             future::race(
-                async { Input::Property(properties.next().await) },
+                future::race(async { Input::Property(properties.next().await) }, async {
+                    Input::Property(seeks.next().await)
+                }),
                 future::race(
                     async {
                         let Some(result) = queries.next().await else {
@@ -430,8 +452,14 @@ async fn session(
             Input::Property(Some(Err(error))) => return Err(error.to_string()),
             Input::Property(None) => return Err("media property subscription ended".into()),
             Input::Command(command) => {
+                // playback controls belong to the player; only seeks belong to a track.
                 let current = model.player(&command.target.name).is_some_and(|player| {
-                    player.id == command.target.id && player.owner == command.target.owner
+                    player.id == command.target.id
+                        && player.owner == command.target.owner
+                        && (!matches!(
+                            command.method,
+                            PlaybackMethod::Seek(_) | PlaybackMethod::SetPosition { .. }
+                        ) || player.track_id == command.target.track_id)
                 });
                 if current
                     && !send_action_interruptible(&connection, command, shared, &wake_source)
@@ -692,9 +720,14 @@ async fn query_player(
     .await;
     let mut root = root.unwrap_or_default();
     let mut player = player.map_err(|error| error.to_string())?;
+    let observed_at = Instant::now();
     let mut metadata =
         take::<HashMap<String, OwnedValue>>(&mut player, "Metadata").unwrap_or_default();
     let status = take::<String>(&mut player, "PlaybackStatus").unwrap_or_default();
+    let position = take_time(&mut player, "Position").map(|position_us| MediaPosition {
+        position_us,
+        observed_at,
+    });
     Ok(Player {
         id: id.into(),
         name: name.into(),
@@ -710,7 +743,58 @@ async fn query_player(
         can_next: take::<bool>(&mut player, "CanGoNext").unwrap_or(false),
         can_previous: take::<bool>(&mut player, "CanGoPrevious").unwrap_or(false),
         can_control: take::<bool>(&mut player, "CanControl").unwrap_or(false),
+        can_seek: take::<bool>(&mut player, "CanSeek").unwrap_or(false),
+        track_id: take_track_id(&mut metadata),
+        // a zero length means the player does not know it.
+        length_us: take_time(&mut metadata, "mpris:length").filter(|length| *length > 0),
+        rate: take::<f64>(&mut player, "Rate")
+            .filter(|rate| rate.is_finite() && *rate != 0.0 && rate.abs() <= MAX_MEDIA_RATE)
+            .unwrap_or(1.0),
+        position,
     })
+}
+
+/// reads a microsecond count. players disagree on the integer type, and a
+/// negative or oversized value is treated as missing.
+fn take_time(values: &mut HashMap<String, OwnedValue>, key: &str) -> Option<i64> {
+    let value = values.remove(key)?;
+    let time = i64::try_from(&value)
+        .ok()
+        .or_else(|| {
+            u64::try_from(&value)
+                .ok()
+                .and_then(|v| i64::try_from(v).ok())
+        })
+        .or_else(|| i32::try_from(&value).ok().map(i64::from))
+        .or_else(|| u32::try_from(&value).ok().map(i64::from))?;
+    (0..=MAX_MEDIA_TIME_US).contains(&time).then_some(time)
+}
+
+/// reads the track id that `SetPosition` must name. spotify sends it as a
+/// string rather than an object path, so a string is accepted when it is a
+/// valid path. the spec's sentinel for an absent track and anything else
+/// become empty.
+fn take_track_id(values: &mut HashMap<String, OwnedValue>) -> String {
+    let Some(value) = values.remove("mpris:trackid") else {
+        return String::new();
+    };
+    let path = match value.try_clone() {
+        Ok(copy) => OwnedObjectPath::try_from(copy)
+            .map(|path| path.to_string())
+            .ok(),
+        Err(_) => None,
+    }
+    .or_else(|| {
+        String::try_from(value)
+            .ok()
+            .filter(|text| ObjectPath::try_from(text.as_str()).is_ok())
+    })
+    .unwrap_or_default();
+    if path == "/org/mpris/MediaPlayer2/TrackList/NoTrack" || path.len() > 4096 {
+        String::new()
+    } else {
+        path
+    }
 }
 
 fn allocate_player_id(next: &mut u64) -> Result<String, String> {
@@ -769,14 +853,28 @@ async fn send_action(connection: &Connection, command: Command) -> Result<(), St
         PlaybackMethod::Next => "Next",
         PlaybackMethod::Previous => "Previous",
         PlaybackMethod::Stop => "Stop",
+        PlaybackMethod::Seek(_) => "Seek",
+        PlaybackMethod::SetPosition { .. } => "SetPosition",
     };
-    let message = Message::method_call(MPRIS_PATH, method)
+    let builder = Message::method_call(MPRIS_PATH, method)
         .and_then(|builder| builder.destination(command.target.owner.as_str()))
         .and_then(|builder| builder.interface(PLAYER_INTERFACE))
         .and_then(|builder| builder.with_flags(Flags::NoReplyExpected))
         .and_then(|builder| builder.with_flags(Flags::NoAutoStart))
-        .and_then(|builder| builder.build(&()))
         .map_err(|error| error.to_string())?;
+    let message = match &command.method {
+        PlaybackMethod::Seek(offset_us) => builder.build(&(*offset_us,)),
+        PlaybackMethod::SetPosition {
+            track_id,
+            position_us,
+        } => {
+            let track_id =
+                ObjectPath::try_from(track_id.as_str()).map_err(|error| error.to_string())?;
+            builder.build(&(track_id, *position_us))
+        }
+        _ => builder.build(&()),
+    }
+    .map_err(|error| error.to_string())?;
     // a d-bus frame can require several socket writes. the caller either lets
     // this finish or abandons the entire connection.
     connection
@@ -997,6 +1095,51 @@ mod tests {
     }
 
     #[test]
+    fn timeline_metadata_accepts_the_value_types_real_players_send() {
+        fn values(entries: Vec<(&str, Value<'_>)>) -> HashMap<String, OwnedValue> {
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value.try_into().unwrap()))
+                .collect()
+        }
+
+        // spotify sends a string track id and an unsigned length.
+        let mut spotify = values(vec![
+            ("mpris:trackid", Value::from("/com/spotify/track/7D8Hf")),
+            ("mpris:length", Value::from(133_462_000_u64)),
+        ]);
+        assert_eq!(take_track_id(&mut spotify), "/com/spotify/track/7D8Hf");
+        assert_eq!(take_time(&mut spotify, "mpris:length"), Some(133_462_000));
+
+        let mut firefox = values(vec![
+            (
+                "mpris:trackid",
+                Value::from(ObjectPath::try_from("/org/mpris/MediaPlayer2/firefox").unwrap()),
+            ),
+            ("mpris:length", Value::from(1_347_000_000_i64)),
+        ]);
+        assert_eq!(
+            take_track_id(&mut firefox),
+            "/org/mpris/MediaPlayer2/firefox"
+        );
+        assert_eq!(take_time(&mut firefox, "mpris:length"), Some(1_347_000_000));
+
+        let mut absent = values(vec![
+            (
+                "mpris:trackid",
+                Value::from(
+                    ObjectPath::try_from("/org/mpris/MediaPlayer2/TrackList/NoTrack").unwrap(),
+                ),
+            ),
+            ("mpris:length", Value::from(-5_i64)),
+        ]);
+        assert_eq!(take_track_id(&mut absent), "");
+        assert_eq!(take_time(&mut absent, "mpris:length"), None);
+        let mut not_a_path = values(vec![("mpris:trackid", Value::from("track 7"))]);
+        assert_eq!(take_track_id(&mut not_a_path), "");
+    }
+
+    #[test]
     fn duplicate_acquisition_keeps_the_current_lifetime_id() {
         let mut known = BTreeMap::new();
         let mut next = 1;
@@ -1032,7 +1175,7 @@ mod tests {
             worker: None,
         };
 
-        media.send(MediaAction::PlayPause, None).unwrap();
+        media.send(&MediaAction::PlayPause, None).unwrap();
         lock(&shared).current = Some(target("p2", PLAYER_NAME, ":1.8"));
         assert_eq!(lock(&shared).commands[0].target.owner, ":1.7");
         assert_eq!(lock(&shared).commands[0].method, PlaybackMethod::Pause);
@@ -1059,13 +1202,13 @@ mod tests {
             worker: None,
         };
 
-        media.send(MediaAction::Next, Some("p2")).unwrap();
+        media.send(&MediaAction::Next, Some("p2")).unwrap();
         let shared = lock(&shared);
         assert_eq!(shared.commands[0].target, other);
         assert_eq!(shared.current, Some(selected));
         drop(shared);
         assert_eq!(
-            media.send(MediaAction::Next, Some("retired")),
+            media.send(&MediaAction::Next, Some("retired")),
             Err("media player is no longer available")
         );
     }
@@ -1094,7 +1237,7 @@ mod tests {
         assert_eq!(snapshot.desktop_entry, "thing-test");
         assert!(snapshot.playing);
         assert!(snapshot.can_play_pause);
-        media.send(MediaAction::PlayPause, None).unwrap();
+        media.send(&MediaAction::PlayPause, None).unwrap();
         wait_until(|| first_calls.pause.load(Ordering::Acquire) == 1);
         assert_eq!(first_calls.play.load(Ordering::Acquire), 0);
         assert_eq!(first_calls.play_pause.load(Ordering::Acquire), 0);
@@ -1102,7 +1245,7 @@ mod tests {
         assert!(async_io::block_on(first.release_name(PLAYER_NAME)).unwrap());
         wait_for(&media, |snapshot| !snapshot.available);
         assert_eq!(
-            media.send(MediaAction::Next, Some(&first_id)),
+            media.send(&MediaAction::Next, Some(&first_id)),
             Err("media player is no longer available")
         );
         async_io::block_on(first.request_name(PLAYER_NAME)).unwrap();
@@ -1112,7 +1255,7 @@ mod tests {
         let reacquired_id = snapshot.selected_id.clone();
         assert_eq!(first.unique_name().unwrap().to_string(), first_owner);
         assert_eq!(
-            media.send(MediaAction::Next, Some(&first_id)),
+            media.send(&MediaAction::Next, Some(&first_id)),
             Err("media player is no longer available")
         );
 
@@ -1132,7 +1275,7 @@ mod tests {
         wait_for(&media, |snapshot| {
             snapshot.title == "after malformed signal"
         });
-        media.send(MediaAction::PlayPause, None).unwrap();
+        media.send(&MediaAction::PlayPause, None).unwrap();
         wait_until(|| first_calls.play.load(Ordering::Acquire) == 1);
         assert_eq!(first_calls.pause.load(Ordering::Acquire), 1);
         assert_eq!(first_calls.play_pause.load(Ordering::Acquire), 0);
@@ -1146,7 +1289,7 @@ mod tests {
         let snapshot = wait_for(&media, |snapshot| snapshot.title == "second title");
         assert!(snapshot.available);
         let second_id = snapshot.selected_id.clone();
-        media.send(MediaAction::PlayPause, None).unwrap();
+        media.send(&MediaAction::PlayPause, None).unwrap();
         wait_until(|| second_calls.play.load(Ordering::Acquire) == 1);
         assert_eq!(second_calls.pause.load(Ordering::Acquire), 0);
         assert_eq!(second_calls.play_pause.load(Ordering::Acquire), 0);
@@ -1173,7 +1316,7 @@ mod tests {
         assert_ne!(snapshot.selected_id, reacquired_id);
         assert_ne!(snapshot.selected_id, second_id);
         assert_eq!(
-            media.send(MediaAction::Next, Some(&first_id)),
+            media.send(&MediaAction::Next, Some(&first_id)),
             Err("media player is no longer available")
         );
 
@@ -1214,7 +1357,9 @@ mod tests {
             .unwrap()
             .id
             .clone();
-        media.send(MediaAction::PlayPause, Some(&other_id)).unwrap();
+        media
+            .send(&MediaAction::PlayPause, Some(&other_id))
+            .unwrap();
         wait_until(|| other_calls.play.load(Ordering::Acquire) == 1);
         assert_eq!(selected_calls.play.load(Ordering::Acquire), 0);
         assert_eq!(selected_calls.pause.load(Ordering::Acquire), 0);
@@ -1226,6 +1371,161 @@ mod tests {
         drop(media);
         drop(other);
         drop(selected);
+        bus.stop();
+    }
+
+    #[test]
+    fn private_bus_reports_timelines_and_binds_seeks_to_the_observed_track() {
+        let directory = TempDir::new().unwrap();
+        let socket = directory.path().join("bus");
+        let address = format!("unix:path={}", socket.display());
+        let mut bus = Bus::start(&address);
+        let state = Arc::new(Mutex::new(FakeState::new("first", true)));
+        state.lock().unwrap().rate = 1.5;
+        let calls = Arc::new(FakeCalls::default());
+        let player = fake_player(&address, state.clone(), calls.clone());
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let media = Media::start_at(Some(address), ping).unwrap();
+
+        let snapshot = wait_for(&media, |snapshot| snapshot.available);
+        let record = &snapshot.players[0];
+        assert!(snapshot.can_seek && record.can_seek);
+        assert_eq!(snapshot.length_us, Some(240_000_000));
+        assert_eq!(snapshot.rate, 1.5);
+        assert_eq!(record.track_id, "/org/thing/track/1");
+        let sample = record.position.unwrap();
+        assert_eq!(sample.position_us, 30_000_000);
+        // playing at 1.5x, two seconds after the sample is three seconds later.
+        let later = sample.observed_at + Duration::from_secs(2);
+        assert_eq!(record.position_at(later), Some(33_000_000));
+
+        let track = record.track_id.clone();
+        media
+            .send(
+                &MediaAction::Seek {
+                    offset_us: -5_000_000,
+                    track: track.clone(),
+                },
+                None,
+            )
+            .unwrap();
+        media
+            .send(
+                &MediaAction::SetPosition {
+                    position_us: 90_000_000,
+                    track: track.clone(),
+                },
+                Some(&snapshot.selected_id),
+            )
+            .unwrap();
+        wait_until(|| calls.set_positions.lock().unwrap().len() == 1);
+        assert_eq!(*calls.seeks.lock().unwrap(), [-5_000_000]);
+        assert_eq!(
+            *calls.set_positions.lock().unwrap(),
+            [(track.clone(), 90_000_000)]
+        );
+
+        // a seek reported by the player replaces the position sample and rate.
+        {
+            let mut state = state.lock().unwrap();
+            state.position_us = 90_000_000;
+            state.rate = -2.0;
+        }
+        async_io::block_on(player.emit_signal(
+            None::<&str>,
+            MPRIS_PATH,
+            PLAYER_INTERFACE,
+            "Seeked",
+            &(90_000_000_i64,),
+        ))
+        .unwrap();
+        let snapshot = wait_for(&media, |snapshot| {
+            snapshot.players[0]
+                .position
+                .is_some_and(|position| position.position_us == 90_000_000)
+        });
+        assert_eq!(snapshot.rate, -2.0);
+        let record = &snapshot.players[0];
+        let later = record.position.unwrap().observed_at + Duration::from_secs(2);
+        assert_eq!(record.position_at(later), Some(86_000_000));
+
+        {
+            let mut state = state.lock().unwrap();
+            state.track_id = "/org/thing/track/2".into();
+            state.position_us = 0;
+        }
+        emit_invalidated_properties(&player);
+        wait_for(&media, |snapshot| {
+            snapshot.players[0].track_id == "/org/thing/track/2"
+        });
+        for action in [
+            MediaAction::Seek {
+                offset_us: 1_000_000,
+                track: track.clone(),
+            },
+            MediaAction::SetPosition {
+                position_us: 1_000_000,
+                track: track.clone(),
+            },
+        ] {
+            assert_eq!(
+                media.send(&action, None),
+                Err("the media track changed before the action ran")
+            );
+        }
+        assert_eq!(calls.seeks.lock().unwrap().len(), 1);
+        assert_eq!(calls.set_positions.lock().unwrap().len(), 1);
+
+        drop(media);
+        drop(player);
+        bus.stop();
+    }
+
+    #[test]
+    fn a_queued_pause_survives_a_track_change_in_the_same_player() {
+        let directory = TempDir::new().unwrap();
+        let address = format!("unix:path={}", directory.path().join("bus").display());
+        let mut bus = Bus::start(&address);
+        let state = Arc::new(Mutex::new(FakeState::new("first", true)));
+        let calls = Arc::new(FakeCalls::default());
+        let player = fake_player(&address, state.clone(), calls.clone());
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let media = Media::start_at(Some(address), ping).unwrap();
+        wait_for(&media, |snapshot| snapshot.available);
+        let target = lock(&media.shared).current.clone().unwrap();
+        let methods = [
+            target
+                .method(&MediaAction::Seek {
+                    offset_us: 1_000_000,
+                    track: target.track_id.clone(),
+                })
+                .unwrap(),
+            target
+                .method(&MediaAction::SetPosition {
+                    position_us: 1_000_000,
+                    track: target.track_id.clone(),
+                })
+                .unwrap(),
+            target.method(&MediaAction::PlayPause).unwrap(),
+        ];
+        state.lock().unwrap().track_id = "/org/thing/track/2".into();
+        emit_invalidated_properties(&player);
+        wait_for(&media, |snapshot| {
+            snapshot.players[0].track_id == "/org/thing/track/2"
+        });
+        // resume the command after the worker has learned about the new track.
+        lock(&media.shared)
+            .commands
+            .extend(methods.into_iter().map(|method| Command {
+                target: target.clone(),
+                method,
+            }));
+        wake(&media.wake);
+        wait_until(|| calls.pause.load(Ordering::Acquire) == 1);
+        assert!(calls.seeks.lock().unwrap().is_empty());
+        assert!(calls.set_positions.lock().unwrap().is_empty());
+        drop(media);
+        drop(player);
         bus.stop();
     }
 
@@ -1285,7 +1585,7 @@ mod tests {
 
         assert!(async_io::block_on(player.release_name(PLAYER_NAME)).unwrap());
         async_io::block_on(player.request_name(PLAYER_NAME)).unwrap();
-        let action = media.send(MediaAction::PlayPause, Some(&retired_id));
+        let action = media.send(&MediaAction::PlayPause, Some(&retired_id));
         assert!(
             action.is_ok() || action == Err("media player is no longer available"),
             "unexpected action result: {action:?}"
@@ -1341,7 +1641,7 @@ mod tests {
             replacement_id
         );
         assert_eq!(
-            media.send(MediaAction::Next, Some(&retired_id)),
+            media.send(&MediaAction::Next, Some(&retired_id)),
             Err("media player is no longer available")
         );
 
@@ -1565,7 +1865,7 @@ mod tests {
         let mut accepted = 0_usize;
         let mut last_progress = Instant::now();
         while Instant::now() < deadline {
-            match media.send(MediaAction::PlayPause, Some(&selected)) {
+            match media.send(&MediaAction::PlayPause, Some(&selected)) {
                 Ok(()) => {
                     accepted += 1;
                     last_progress = Instant::now();
@@ -1612,6 +1912,11 @@ mod tests {
             can_next: true,
             can_previous: true,
             can_control: true,
+            can_seek: true,
+            track_id: "/track/1".into(),
+            length_us: None,
+            rate: 1.0,
+            position: None,
         }]);
         model.snapshot().selected.unwrap()
     }
@@ -1662,6 +1967,11 @@ mod tests {
         can_pause: bool,
         stall_metadata: bool,
         metadata_delay: Duration,
+        track_id: String,
+        length_us: i64,
+        position_us: i64,
+        rate: f64,
+        can_seek: bool,
     }
 
     impl FakeState {
@@ -1673,6 +1983,11 @@ mod tests {
                 can_pause: playing,
                 stall_metadata: false,
                 metadata_delay: Duration::ZERO,
+                track_id: "/org/thing/track/1".into(),
+                length_us: 240_000_000,
+                position_us: 30_000_000,
+                rate: 1.0,
+                can_seek: true,
             }
         }
     }
@@ -1683,6 +1998,8 @@ mod tests {
         pause: AtomicUsize,
         play_pause: AtomicUsize,
         metadata_queries: AtomicUsize,
+        seeks: Mutex<Vec<i64>>,
+        set_positions: Mutex<Vec<(String, i64)>>,
     }
 
     struct FakeRoot;
@@ -1725,6 +2042,33 @@ mod tests {
 
         fn stop(&self) {}
 
+        fn seek(&self, offset: i64) {
+            self.calls.seeks.lock().unwrap().push(offset);
+        }
+
+        fn set_position(&self, track_id: ObjectPath<'_>, position: i64) {
+            self.calls
+                .set_positions
+                .lock()
+                .unwrap()
+                .push((track_id.to_string(), position));
+        }
+
+        #[zbus(property)]
+        fn position(&self) -> i64 {
+            self.state.lock().unwrap().position_us
+        }
+
+        #[zbus(property)]
+        fn rate(&self) -> f64 {
+            self.state.lock().unwrap().rate
+        }
+
+        #[zbus(property)]
+        fn can_seek(&self) -> bool {
+            self.state.lock().unwrap().can_seek
+        }
+
         #[zbus(property)]
         fn playback_status(&self) -> &str {
             if self.state.lock().unwrap().playing {
@@ -1736,12 +2080,14 @@ mod tests {
 
         #[zbus(property)]
         async fn metadata(&self) -> HashMap<String, OwnedValue> {
-            let (stall, delay, title) = {
+            let (stall, delay, title, track_id, length_us) = {
                 let state = self.state.lock().unwrap();
                 (
                     state.stall_metadata,
                     state.metadata_delay,
                     state.title.clone(),
+                    state.track_id.clone(),
+                    state.length_us,
                 )
             };
             self.calls.metadata_queries.fetch_add(1, Ordering::Release);
@@ -1765,6 +2111,16 @@ mod tests {
                     Value::from("file:///tmp/test-cover.png")
                         .try_into()
                         .unwrap(),
+                ),
+                (
+                    "mpris:trackid".into(),
+                    Value::from(ObjectPath::try_from(track_id).unwrap())
+                        .try_into()
+                        .unwrap(),
+                ),
+                (
+                    "mpris:length".into(),
+                    Value::from(length_us).try_into().unwrap(),
                 ),
             ])
         }

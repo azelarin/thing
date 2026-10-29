@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
-use thing_runtime::{MediaAction, MediaPlayer, MediaSnapshot};
+use thing_runtime::{MediaAction, MediaPlayer, MediaPosition, MediaSnapshot};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct Player {
     pub id: String,
     pub name: String,
@@ -18,6 +18,11 @@ pub(super) struct Player {
     pub can_next: bool,
     pub can_previous: bool,
     pub can_control: bool,
+    pub can_seek: bool,
+    pub track_id: String,
+    pub length_us: Option<i64>,
+    pub rate: f64,
+    pub position: Option<MediaPosition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,10 +30,12 @@ pub(super) struct Target {
     pub id: String,
     pub name: String,
     pub owner: String,
+    pub track_id: String,
     toggle: Option<PlaybackMethod>,
     can_next: bool,
     can_previous: bool,
     can_stop: bool,
+    can_seek: bool,
 }
 
 pub(super) struct Projection {
@@ -37,22 +44,57 @@ pub(super) struct Projection {
     pub targets: BTreeMap<String, Target>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PlaybackMethod {
     Play,
     Pause,
     Next,
     Previous,
     Stop,
+    Seek(i64),
+    SetPosition { track_id: String, position_us: i64 },
+}
+
+/// why a target cannot perform a requested action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Refusal {
+    Unsupported,
+    TrackChanged,
 }
 
 impl Target {
-    pub fn method(&self, action: MediaAction) -> Option<PlaybackMethod> {
+    pub fn method(&self, action: &MediaAction) -> Result<PlaybackMethod, Refusal> {
+        let supported = |method: Option<PlaybackMethod>| method.ok_or(Refusal::Unsupported);
         match action {
-            MediaAction::PlayPause => self.toggle,
-            MediaAction::Next => self.can_next.then_some(PlaybackMethod::Next),
-            MediaAction::Previous => self.can_previous.then_some(PlaybackMethod::Previous),
-            MediaAction::Stop => self.can_stop.then_some(PlaybackMethod::Stop),
+            MediaAction::PlayPause => supported(self.toggle.clone()),
+            MediaAction::Next => supported(self.can_next.then_some(PlaybackMethod::Next)),
+            MediaAction::Previous => {
+                supported(self.can_previous.then_some(PlaybackMethod::Previous))
+            }
+            MediaAction::Stop => supported(self.can_stop.then_some(PlaybackMethod::Stop)),
+            MediaAction::Seek { offset_us, track } => {
+                if !self.can_seek {
+                    return Err(Refusal::Unsupported);
+                }
+                if *track != self.track_id {
+                    return Err(Refusal::TrackChanged);
+                }
+                Ok(PlaybackMethod::Seek(*offset_us))
+            }
+            MediaAction::SetPosition { position_us, track } => {
+                // absolute positions are addressed to a track id, so a player
+                // that reports none cannot accept one.
+                if !self.can_seek || self.track_id.is_empty() {
+                    return Err(Refusal::Unsupported);
+                }
+                if *track != self.track_id {
+                    return Err(Refusal::TrackChanged);
+                }
+                Ok(PlaybackMethod::SetPosition {
+                    track_id: self.track_id.clone(),
+                    position_us: *position_us,
+                })
+            }
         }
     }
 }
@@ -144,6 +186,9 @@ impl Model {
             can_next: player.can_next,
             can_previous: player.can_previous,
             can_stop: player.can_stop,
+            can_seek: player.can_seek,
+            length_us: player.length_us,
+            rate: player.rate,
             error: String::new(),
             players,
         };
@@ -192,15 +237,22 @@ fn project(player: &Player) -> (MediaPlayer, Target) {
         can_next: player.can_control && player.can_next,
         can_previous: player.can_control && player.can_previous,
         can_stop: player.can_control,
+        can_seek: player.can_control && player.can_seek,
+        track_id: player.track_id.clone(),
+        length_us: player.length_us,
+        rate: player.rate,
+        position: player.position,
     };
     let target = Target {
         id: player.id.clone(),
         name: player.name.clone(),
         owner: player.owner.clone(),
+        track_id: player.track_id.clone(),
         toggle,
         can_next: record.can_next,
         can_previous: record.can_previous,
         can_stop: record.can_stop,
+        can_seek: record.can_seek,
     };
     (record, target)
 }
@@ -250,8 +302,8 @@ mod tests {
         let projection = model.snapshot();
         assert!(projection.snapshot.can_play_pause);
         assert_eq!(
-            projection.selected.unwrap().method(MediaAction::PlayPause),
-            Some(PlaybackMethod::Pause)
+            projection.selected.unwrap().method(&MediaAction::PlayPause),
+            Ok(PlaybackMethod::Pause)
         );
 
         current.playing = false;
@@ -259,8 +311,8 @@ mod tests {
         let projection = model.snapshot();
         assert!(!projection.snapshot.can_play_pause);
         assert_eq!(
-            projection.selected.unwrap().method(MediaAction::PlayPause),
-            None
+            projection.selected.unwrap().method(&MediaAction::PlayPause),
+            Err(Refusal::Unsupported)
         );
     }
 
@@ -283,6 +335,70 @@ mod tests {
         assert_eq!(projection.targets["id-second"].name, "second");
     }
 
+    #[test]
+    fn seeks_require_capability_and_the_observed_track() {
+        let mut model = Model::default();
+        model.initialize([player("player", true)]);
+        let target = model.snapshot().selected.unwrap();
+        let track = target.track_id.clone();
+        assert_eq!(
+            target.method(&MediaAction::Seek {
+                offset_us: 5,
+                track: track.clone(),
+            }),
+            Ok(PlaybackMethod::Seek(5))
+        );
+        assert_eq!(
+            target.method(&MediaAction::SetPosition {
+                position_us: 7,
+                track: track.clone(),
+            }),
+            Ok(PlaybackMethod::SetPosition {
+                track_id: track.clone(),
+                position_us: 7,
+            })
+        );
+        assert_eq!(
+            target.method(&MediaAction::Seek {
+                offset_us: 5,
+                track: "/org/thing/other".into(),
+            }),
+            Err(Refusal::TrackChanged)
+        );
+
+        let mut untracked = player("untracked", true);
+        untracked.track_id.clear();
+        let mut uncontrolled = player("uncontrolled", true);
+        uncontrolled.can_control = false;
+        model.initialize([untracked, uncontrolled]);
+        let projection = model.snapshot();
+        let untracked = &projection.targets["id-untracked"];
+        // a relative seek needs no track id, but an absolute position does.
+        assert_eq!(
+            untracked.method(&MediaAction::Seek {
+                offset_us: 5,
+                track: String::new(),
+            }),
+            Ok(PlaybackMethod::Seek(5))
+        );
+        assert_eq!(
+            untracked.method(&MediaAction::SetPosition {
+                position_us: 5,
+                track: String::new(),
+            }),
+            Err(Refusal::Unsupported)
+        );
+        let uncontrolled = &projection.targets["id-uncontrolled"];
+        assert!(!projection.snapshot.players[0].can_seek);
+        assert_eq!(
+            uncontrolled.method(&MediaAction::Seek {
+                offset_us: 5,
+                track: uncontrolled.track_id.clone(),
+            }),
+            Err(Refusal::Unsupported)
+        );
+    }
+
     fn player(name: &str, playing: bool) -> Player {
         Player {
             id: format!("id-{name}"),
@@ -299,6 +415,11 @@ mod tests {
             can_next: true,
             can_previous: true,
             can_control: true,
+            can_seek: true,
+            track_id: format!("/org/thing/{name}/1"),
+            length_us: Some(180_000_000),
+            rate: 1.0,
+            position: None,
         }
     }
 }

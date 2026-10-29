@@ -523,6 +523,9 @@ declare extern type ThingMediaPlayer with
     read can_next: boolean
     read can_previous: boolean
     read can_stop: boolean
+    read can_seek: boolean
+    read length_ms: number?
+    read rate: number
 end
 
 declare extern type ThingPowerDevice with
@@ -717,12 +720,18 @@ declare extern type ThingMediaService with
     read can_next: ThingSignal<boolean>
     read can_previous: ThingSignal<boolean>
     read can_stop: ThingSignal<boolean>
+    read can_seek: ThingSignal<boolean>
+    read length_ms: ThingSignal<number?>
+    read rate: ThingSignal<number>
     read error: ThingSignal<string>
     read players: ThingSignal<ThingReadonlyArray<ThingMediaPlayer>>
     read play_pause: (player: string?) -> ()
     read next: (player: string?) -> ()
     read previous: (player: string?) -> ()
     read stop: (player: string?) -> ()
+    read seek: (offset_ms: number, player: string?) -> ()
+    read set_position: (position_ms: number, player: string?) -> ()
+    read position: (player: string?) -> number?
 end
 
 declare extern type ThingPowerService with
