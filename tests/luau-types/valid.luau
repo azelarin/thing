@@ -29,6 +29,14 @@ local input = ui.text_input {
         gap = gap,
         background = accent,
         placeholder_color = "#ffffff80",
+        translate_x = function() return 4 end,
+        translate_y = 0,
+        scale_x = -1,
+        scale_y = function() return 1 end,
+        rotation = function() return 15 end,
+        transform_origin = function()
+            return { x = 0.5, y = 1, offset_x = 2, offset_y = -1 }
+        end,
     },
 }
 

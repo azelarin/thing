@@ -3,7 +3,7 @@ use thing_core::{
     Color, CrossAlign, ImageFit, ImageSource, KeyboardMode, Kind, MainAlign, Node, PanelEdge,
     PanelInputRect, PanelInputRegion, PanelMargins, PathFillRule, PathFit, PathStrokeCap,
     PathStrokeJoin, PopupAlignment, PopupAnchor, PopupConstraints, PopupOffset, SurfaceAnchors,
-    SurfaceLayer, TextAlign, TextOverflow, ViewBox,
+    SurfaceLayer, TextAlign, TextOverflow, TransformOrigin, ViewBox,
 };
 
 use crate::services::ImageHandle;
@@ -391,6 +391,29 @@ fn optional_cross_align(value: Value, name: &str) -> Result<Option<CrossAlign>> 
     }
 }
 
+fn transform_origin(value: Value) -> Result<TransformOrigin> {
+    let Value::Table(table) = value else {
+        return Err(Error::runtime("style.transform_origin must be a table"));
+    };
+    let mut origin = TransformOrigin::default();
+    for pair in table.pairs::<String, Value>() {
+        let (name, value) = pair?;
+        let value = number(value, &format!("style.transform_origin.{name}"))? as f32;
+        match name.as_str() {
+            "x" => origin.x = value,
+            "y" => origin.y = value,
+            "offset_x" => origin.offset_x = value,
+            "offset_y" => origin.offset_y = value,
+            _ => {
+                return Err(Error::runtime(format!(
+                    "unknown transform_origin property {name:?}"
+                )));
+            }
+        }
+    }
+    Ok(origin)
+}
+
 fn main_align(value: Value, name: &str) -> Result<MainAlign> {
     match string(value, name)?.as_str() {
         "start" => Ok(MainAlign::Start),
@@ -642,6 +665,12 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "style.opacity" => node.style.opacity = number(value, name)? as f32,
         "style.background" => node.style.background = color(value, name)?,
         "style.foreground" => node.style.foreground = color(value, name)?,
+        "style.translate_x" => node.style.translate_x = number(value, name)? as f32,
+        "style.translate_y" => node.style.translate_y = number(value, name)? as f32,
+        "style.scale_x" => node.style.scale_x = number(value, name)? as f32,
+        "style.scale_y" => node.style.scale_y = number(value, name)? as f32,
+        "style.rotation" => node.style.rotation = number(value, name)? as f32,
+        "style.transform_origin" => node.style.transform_origin = transform_origin(value)?,
         _ => {
             return Err(Error::runtime(format!(
                 "unknown property {name:?} on {:?}",

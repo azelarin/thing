@@ -34,7 +34,7 @@ pub(crate) struct TextState {
     pub(crate) generation: u64,
     pub(crate) revision: u64,
     pub(crate) surrounding: TextInputSurrounding,
-    pub(crate) cursor_rectangle: CursorRectangle,
+    pub(crate) cursor_rectangle: Option<CursorRectangle>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,7 +154,7 @@ struct SentState {
     generation: u64,
     revision: u64,
     surrounding: Option<AdvertisedSurrounding>,
-    cursor_rectangle: CursorRectangle,
+    cursor_rectangle: Option<CursorRectangle>,
 }
 
 impl SentState {
@@ -294,6 +294,7 @@ impl State {
             (Some(current), Some(desired)) => {
                 current.generation != desired.generation
                     || current.surrounding.is_some() != desired.surrounding.is_some()
+                    || current.cursor_rectangle.is_some() != desired.cursor_rectangle.is_some()
             }
             _ => true,
         }
@@ -340,8 +341,10 @@ impl State {
                 requests.push(Request::SetChangeCause(cause));
             }
         }
-        if current.cursor_rectangle != desired.cursor_rectangle {
-            requests.push(Request::SetCursorRectangle(desired.cursor_rectangle));
+        if current.cursor_rectangle != desired.cursor_rectangle
+            && let Some(rectangle) = desired.cursor_rectangle
+        {
+            requests.push(Request::SetCursorRectangle(rectangle));
         }
         if requests.is_empty() {
             self.sent = Some(desired);
@@ -570,7 +573,9 @@ fn append_full_state(state: &SentState, cause: ChangeCause, requests: &mut Vec<R
     if cause == ChangeCause::Other {
         requests.push(Request::SetChangeCause(cause));
     }
-    requests.push(Request::SetCursorRectangle(state.cursor_rectangle));
+    if let Some(rectangle) = state.cursor_rectangle {
+        requests.push(Request::SetCursorRectangle(rectangle));
+    }
 }
 
 fn merge_cause(previous: Option<ChangeCause>, next: ChangeCause) -> ChangeCause {
@@ -992,12 +997,12 @@ mod tests {
                 anchor: cursor,
                 cursor,
             },
-            cursor_rectangle: CursorRectangle {
+            cursor_rectangle: Some(CursorRectangle {
                 x: revision as i32,
                 y: 2,
                 width: 1,
                 height: 18,
-            },
+            }),
         }
     }
 
@@ -1057,7 +1062,7 @@ mod tests {
         let initial = text_state(1, 0, "value", 5);
         state.update(Some(initial.clone()), ChangeCause::InputMethod);
         let mut moved = initial;
-        moved.cursor_rectangle.x += 10;
+        moved.cursor_rectangle.as_mut().unwrap().x += 10;
 
         let requests = state.update(Some(moved), ChangeCause::Other);
         assert_eq!(commit_count(&requests), 1);
@@ -1072,6 +1077,33 @@ mod tests {
                 .any(|request| matches!(request, Request::SetSurrounding { .. }))
         );
         assert!(!requests.contains(&Request::SetChangeCause(ChangeCause::Other)));
+    }
+
+    #[test]
+    fn cursor_availability_restarts_the_protocol_lifecycle_without_stale_geometry() {
+        let mut state = State::default();
+        let initial = text_state(1, 0, "value", 5);
+        state.update(Some(initial.clone()), ChangeCause::InputMethod);
+
+        let mut unavailable = initial.clone();
+        unavailable.cursor_rectangle = None;
+        let requests = state.update(Some(unavailable), ChangeCause::InputMethod);
+        assert_eq!(requests.first(), Some(&Request::Disable));
+        assert!(requests.contains(&Request::Enable));
+        assert_eq!(commit_count(&requests), 2);
+        assert!(
+            !requests
+                .iter()
+                .any(|request| matches!(request, Request::SetCursorRectangle(_)))
+        );
+
+        let requests = state.update(Some(initial.clone()), ChangeCause::InputMethod);
+        assert_eq!(requests.first(), Some(&Request::Disable));
+        assert!(requests.contains(&Request::Enable));
+        assert_eq!(commit_count(&requests), 2);
+        assert!(requests.contains(&Request::SetCursorRectangle(
+            initial.cursor_rectangle.unwrap()
+        )));
     }
 
     #[test]

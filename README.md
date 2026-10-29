@@ -69,6 +69,7 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] text input clipboard shortcuts
 - [x] vulkan rendering alongside opengl
 - [x] custom vector shapes
+- [x] visual translation, scale, and rotation
 - [x] spring animations
 - [ ] drag and drop
 - [x] microphone controls

@@ -841,6 +841,7 @@ impl<K: Clone + Eq> Configurations<K> {
         Ok(PointerHandlerOutcome::collect(runtime, outcome))
     }
 
+    #[cfg(test)]
     pub(crate) fn reconcile_pointer_checked(
         &mut self,
         key: &K,
@@ -1910,6 +1911,100 @@ mod tests {
         assert!(configurations.set_output(&1, output("DP-1", 2560)).unwrap());
         let cancelled = configurations
             .reconcile_pointer_checked(&1, |_| Ok(()))
+            .unwrap();
+        assert!(!cancelled.active);
+        assert!(cancelled.handled);
+        assert!(cancelled.dispatch.changed);
+        assert_eq!(text(&configurations, 1), "cancel");
+    }
+
+    #[test]
+    fn singular_presented_geometry_requires_host_capture_cancellation() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            local collapsed = ui.state(false)
+            local phase = ui.state('none')
+            return ui.panel { children = {
+                ui.pointer_area {
+                    key = 'drag-region',
+                    style = {
+                        width = 100,
+                        height = 40,
+                        scale_x = function() return collapsed:get() and 0 or 1 end,
+                    },
+                    on_pointer = function(event)
+                        phase:set(event.phase)
+                        if event.phase == 'press' then collapsed:set(true) end
+                        return true
+                    end,
+                },
+                ui.text { text = function() return phase:get() end },
+            } }
+            "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        let root = configurations.root(&1).unwrap();
+        let surface_root = root.id;
+        let area = root.children[0].id;
+        let layout = Layout::compute(
+            root,
+            Size {
+                width: 300.0,
+                height: 80.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        let (_, targets) = configurations.presented_targets(&1, root, &layout).unwrap();
+        let target = targets.get(&area).unwrap().clone();
+        let pressed = configurations
+            .begin_pointer_checked(
+                &1,
+                &target,
+                PointerEvent {
+                    phase: PointerPhase::Press,
+                    button: PointerButton::Primary,
+                    x: 50.0,
+                    y: 20.0,
+                    surface_x: 50.0,
+                    surface_y: 20.0,
+                    shift: false,
+                    ctrl: false,
+                    alt: false,
+                    logo: false,
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(pressed.active);
+        assert_eq!(text(&configurations, 1), "press");
+
+        let root = configurations.root(&1).unwrap();
+        let singular = Layout::compute(
+            root,
+            Size {
+                width: 300.0,
+                height: 80.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        assert!(!singular.pointer_targets().any(|id| id == area));
+        let (_, targets) = configurations
+            .presented_targets(&1, root, &singular)
+            .unwrap();
+        assert!(targets.contains_key(&surface_root));
+        assert!(!singular.pointer_target_is_eligible(surface_root));
+        assert!(!targets.contains_key(&area));
+        assert!(configurations.active_pointer_matches(&1, &target));
+
+        let cancelled = configurations
+            .cancel_pointer_checked(&1, |_| Ok(()))
             .unwrap();
         assert!(!cancelled.active);
         assert!(cancelled.handled);

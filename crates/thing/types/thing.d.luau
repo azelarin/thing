@@ -147,6 +147,13 @@ export type ThingPopupConstraints = {
     slide_y: boolean?,
 }
 
+export type ThingTransformOrigin = {
+    x: number?,
+    y: number?,
+    offset_x: number?,
+    offset_y: number?,
+}
+
 type ThingAnimatedNumber = number | (() -> number) | ThingNumberTransition | ThingNumberSpring
 type ThingAnimatedOptionalNumber = number | (() -> number?) | ThingNumberTransition | ThingNumberSpring
 type ThingAnimatedColor = string | (() -> string) | ThingColorTransition
@@ -186,6 +193,12 @@ export type ThingStyle = {
     background: ThingAnimatedColor?,
     foreground: ThingAnimatedColor?,
     opacity: ThingAnimatedNumber?,
+    translate_x: ThingReactive<number>?,
+    translate_y: ThingReactive<number>?,
+    scale_x: ThingReactive<number>?,
+    scale_y: ThingReactive<number>?,
+    rotation: ThingReactive<number>?,
+    transform_origin: ThingReactive<ThingTransformOrigin>?,
 }
 
 export type ThingTextStyle = {
@@ -224,6 +237,12 @@ export type ThingTextStyle = {
     background: ThingAnimatedColor?,
     foreground: ThingAnimatedColor?,
     opacity: ThingAnimatedNumber?,
+    translate_x: ThingReactive<number>?,
+    translate_y: ThingReactive<number>?,
+    scale_x: ThingReactive<number>?,
+    scale_y: ThingReactive<number>?,
+    rotation: ThingReactive<number>?,
+    transform_origin: ThingReactive<ThingTransformOrigin>?,
 }
 
 export type ThingTextInputStyle = {
@@ -265,6 +284,12 @@ export type ThingTextInputStyle = {
     background: ThingAnimatedColor?,
     foreground: ThingAnimatedColor?,
     opacity: ThingAnimatedNumber?,
+    translate_x: ThingReactive<number>?,
+    translate_y: ThingReactive<number>?,
+    scale_x: ThingReactive<number>?,
+    scale_y: ThingReactive<number>?,
+    rotation: ThingReactive<number>?,
+    transform_origin: ThingReactive<ThingTransformOrigin>?,
 }
 
 export type ThingChildren = { ThingWidget } | (() -> { ThingWidget })
