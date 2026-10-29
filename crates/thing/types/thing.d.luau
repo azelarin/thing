@@ -343,6 +343,7 @@ export type ThingPanelProperties = {
     input_region: ThingReactive<ThingInputRegion?>?,
     idle_inhibit: ThingReactive<boolean>?,
     on_key: ((event: ThingKeyEvent) -> boolean)?,
+    on_scroll: ThingScrollHandler?,
     children: ThingChildren?,
 }
 
@@ -360,6 +361,7 @@ export type ThingContainerProperties = {
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
     children: ThingChildren?,
+    on_scroll: ThingScrollHandler?,
 }
 
 export type ThingTextProperties = {
@@ -495,6 +497,7 @@ export type ThingPopupProperties = {
     constraints: ThingReactive<ThingPopupConstraints?>?,
     idle_inhibit: ThingReactive<boolean>?,
     on_key: ((event: ThingKeyEvent) -> boolean)?,
+    on_scroll: ThingScrollHandler?,
     on_hover: ((inside: boolean) -> ())?,
     on_close: (() -> ())?,
 }

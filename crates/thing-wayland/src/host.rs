@@ -52,8 +52,8 @@ use thing_runtime::{
     SystemTrayAction, SystemTrayMenuAction, UiAction,
 };
 use thing_ui::{
-    Interaction, Layout, PaintFrame, ScrollState, SemanticPlacement, Size, TextInputCheckpoint,
-    TextInputEditor,
+    Interaction, Layout, PaintFrame, ScrollState, ScrollStep, SemanticPlacement, Size,
+    TextInputCheckpoint, TextInputEditor,
 };
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop, event_created_child,
@@ -109,6 +109,15 @@ use crate::output::{fallback_logical_size, valid_dimensions};
 
 #[cfg(test)]
 mod launch_tests;
+#[cfg(test)]
+mod wheel_tests;
+
+#[cfg(test)]
+delegate_noop!(App: ignore wayland_client::protocol::wl_shm::WlShm);
+#[cfg(test)]
+delegate_noop!(App: ignore wayland_client::protocol::wl_shm_pool::WlShmPool);
+#[cfg(test)]
+delegate_noop!(App: ignore wayland_client::protocol::wl_buffer::WlBuffer);
 
 use crate::{
     Renderer, RunOptions, SystemTray,
@@ -1058,6 +1067,12 @@ impl PendingLaunch {
             entry: None,
         }
     }
+}
+
+/// one stop on a captured wheel route, bound to its presented identity.
+enum ScrollRouteStep {
+    Handler(ScopedUiTarget, RuntimeScrollInput),
+    Viewport(ScopedUiTarget),
 }
 
 pub(crate) struct App {
@@ -2692,6 +2707,112 @@ impl App {
                 break;
             }
         }
+    }
+
+    /// captures the wheel route under `point` from the presented tree, with
+    /// each handler's local coordinates in its own presented transform. it
+    /// returns `None` when any stop no longer matches the runtime.
+    fn capture_scroll_route(
+        &self,
+        index: usize,
+        point: Point,
+        x: f64,
+        y: f64,
+        position: (f64, f64),
+        source: Option<wl_pointer::AxisSource>,
+    ) -> Option<Vec<ScrollRouteStep>> {
+        let layout = self.surfaces.get(index)?.layouts.presented()?;
+        layout
+            .scroll_route(point)
+            .into_iter()
+            .map(|step| match step {
+                ScrollStep::Handler(id) => {
+                    let target = self.current_presented_scroll_target(index, id)?;
+                    let local = layout.surface_to_local(id, point)?;
+                    let input =
+                        runtime_scroll_input(local, x, y, position, &self.modifiers, source)?;
+                    Some(ScrollRouteStep::Handler(target, input))
+                }
+                ScrollStep::Viewport(id) => self
+                    .current_presented_scroll_view_target(index, id)
+                    .map(ScrollRouteStep::Viewport),
+            })
+            .collect()
+    }
+
+    /// offers one wheel event to each captured stop in order. a handler that
+    /// returns `false` or a viewport at its limit passes it on. callbacks may
+    /// change the tree, so every stop is revalidated before it runs, and the
+    /// route ends at the first one that no longer applies.
+    fn dispatch_scroll_route(
+        &mut self,
+        output: wl_output::WlOutput,
+        event_surface: &wl_surface::WlSurface,
+        route: Vec<ScrollRouteStep>,
+        y: f64,
+    ) {
+        for step in route {
+            let Some(index) = self.index(event_surface) else {
+                return;
+            };
+            match step {
+                ScrollRouteStep::Handler(target, input) => {
+                    if !self.surface_scroll_target_is_current(index, &target) {
+                        return;
+                    }
+                    if self.dispatch_scroll(output.clone(), &target, input) != Some(false) {
+                        return;
+                    }
+                }
+                ScrollRouteStep::Viewport(target) => {
+                    if !self.surface_scroll_view_target_is_current(index, &target) {
+                        return;
+                    }
+                    // viewports scroll vertically; horizontal input passes on.
+                    if let Some(delta) = scroll_distance(y)
+                        && self.scroll_viewport(index, target.target.node(), delta)
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// moves one presented viewport and prepares the surface at the new
+    /// offset. it returns whether the viewport could move.
+    fn scroll_viewport(&mut self, index: usize, id: NodeId, delta: f32) -> bool {
+        let mut scroll = self.surfaces[index].scroll.clone();
+        let moved = self.surfaces[index]
+            .layouts
+            .presented()
+            .is_some_and(|layout| layout.scroll_view_y(id, delta, &mut scroll));
+        if !moved {
+            return false;
+        }
+        let surface = &self.surfaces[index];
+        let key = surface.key.clone();
+        let size = surface.size;
+        let focused = surface.input.keyboard_focused();
+        let Some(root) = self
+            .configurations
+            .surface_root(&surface.output, &surface.key)
+            .and_then(|root| root.find(surface.root))
+            .cloned()
+        else {
+            return true;
+        };
+        match prepare_surface_layout(&mut self.render, key, &root, size, scroll, focused) {
+            Ok(prepared) => {
+                let surface = &mut self.surfaces[index];
+                surface.scroll = prepared.scroll.clone();
+                surface.prepared = Some(prepared);
+                surface.layouts.invalidate_input();
+                surface.dirty = true;
+            }
+            Err(error) => eprintln!("thing: cannot apply scroll position: {error}"),
+        }
+        true
     }
 
     fn dispatch_scroll(
@@ -7031,107 +7152,10 @@ impl PointerHandler for App {
                     }
                     let output = self.surfaces[index].output.clone();
                     let event_surface = self.surfaces[index].role.surface().clone();
-                    let (handler_id, scroll_ids) = self.surfaces[index]
-                        .layouts
-                        .presented()
-                        .map(|layout| {
-                            (
-                                layout.scroll_event_target(point),
-                                layout.scroll_targets(point),
-                            )
-                        })
-                        .unwrap_or_default();
-                    let handler =
-                        handler_id.and_then(|id| self.current_presented_scroll_target(index, id));
-                    if handler_id.is_some() && handler.is_none() {
-                        continue;
-                    }
-                    let Some(scroll_targets) = scroll_ids
-                        .iter()
-                        .map(|id| self.current_presented_scroll_view_target(index, *id))
-                        .collect::<Option<Vec<_>>>()
-                    else {
-                        continue;
-                    };
-                    if let Some(target) = handler.as_ref() {
-                        let Some(local) =
-                            self.surfaces[index].layouts.presented().and_then(|layout| {
-                                layout.surface_to_local(target.target.node(), point)
-                            })
-                        else {
-                            continue;
-                        };
-                        let Some(input) = runtime_scroll_input(
-                            local,
-                            x,
-                            y,
-                            event.position,
-                            &self.modifiers,
-                            source,
-                        ) else {
-                            continue;
-                        };
-                        let Some(consumed) = self.dispatch_scroll(output.clone(), target, input)
-                        else {
-                            continue;
-                        };
-                        if consumed {
-                            continue;
-                        }
-                    }
-                    let Some(index) = self.index(&event_surface) else {
-                        continue;
-                    };
-                    if handler
-                        .as_ref()
-                        .is_some_and(|target| !self.surface_scroll_target_is_current(index, target))
-                        || !scroll_targets
-                            .iter()
-                            .all(|target| self.surface_scroll_view_target_is_current(index, target))
+                    if let Some(route) =
+                        self.capture_scroll_route(index, point, x, y, event.position, source)
                     {
-                        continue;
-                    }
-                    let Some(delta) = scroll_distance(y) else {
-                        continue;
-                    };
-                    let mut scroll = self.surfaces[index].scroll.clone();
-                    let changed = self.surfaces[index]
-                        .layouts
-                        .presented()
-                        .is_some_and(|layout| {
-                            layout.scroll_y_targets(&scroll_ids, delta, &mut scroll)
-                        });
-                    if !changed {
-                        continue;
-                    }
-                    let surface = &self.surfaces[index];
-                    let key = surface.key.clone();
-                    let size = surface.size;
-                    let focused = surface.input.keyboard_focused();
-                    let root = self
-                        .configurations
-                        .surface_root(&surface.output, &surface.key)
-                        .and_then(|root| root.find(surface.root))
-                        .cloned();
-                    let Some(root) = root else {
-                        continue;
-                    };
-                    match prepare_surface_layout(
-                        &mut self.render,
-                        key,
-                        &root,
-                        size,
-                        scroll,
-                        focused,
-                    ) {
-                        Ok(prepared) => {
-                            let surface = &mut self.surfaces[index];
-                            surface.scroll = prepared.scroll.clone();
-                            surface.prepared = Some(prepared);
-                            surface.layouts.invalidate_input();
-                            surface.dirty = true;
-                        }
-                        Err(error) => eprintln!("thing: cannot apply scroll position: {error}"),
+                        self.dispatch_scroll_route(output, &event_surface, route, y);
                     }
                 }
                 _ => {}

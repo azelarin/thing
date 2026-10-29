@@ -604,10 +604,6 @@ impl Drop for PrivateWayland {
     }
 }
 
-delegate_noop!(App: ignore wl_shm::WlShm);
-delegate_noop!(App: ignore wl_shm_pool::WlShmPool);
-delegate_noop!(App: ignore wl_buffer::WlBuffer);
-
 struct SharedBuffer {
     _file: File,
     pool: wl_shm_pool::WlShmPool,

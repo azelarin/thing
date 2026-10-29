@@ -446,6 +446,23 @@ pub enum MainAlign {
 }
 
 impl Kind {
+    /// widgets that may carry `on_scroll`. containers handle the wheel on
+    /// their own geometry without becoming clickable or focusable.
+    pub fn accepts_scroll_handler(self) -> bool {
+        matches!(
+            self,
+            Self::Button
+                | Self::PointerArea
+                | Self::Panel
+                | Self::Popup
+                | Self::Row
+                | Self::Column
+                | Self::CenterBox
+                | Self::Stack
+                | Self::Scroll
+        )
+    }
+
     pub fn is_container(self) -> bool {
         matches!(
             self,
@@ -929,10 +946,11 @@ impl Node {
                 "pointer events are available only on button and pointer_area widgets".into(),
             ));
         }
-        if self.scroll_events && !matches!(self.kind, Kind::Button | Kind::PointerArea) {
-            return Err(TreeError(
-                "scroll events are available only on button and pointer_area widgets".into(),
-            ));
+        if self.scroll_events && !self.kind.accepts_scroll_handler() {
+            return Err(TreeError(format!(
+                "scroll events are not available on {:?} widgets",
+                self.kind
+            )));
         }
         if self.kind == Kind::PointerArea && !(self.pointer_events || self.scroll_events) {
             return Err(TreeError("pointer_area requires an event handler".into()));
@@ -1538,11 +1556,17 @@ mod tests {
             "pointer_area requires an event handler"
         );
 
+        // containers handle the wheel without becoming interactive.
         let mut row = Node::new(NodeId(3), Kind::Row);
         row.scroll_events = true;
+        assert!(row.validate().is_ok());
+        assert!(!row.kind.is_interactive());
+
+        let mut text = Node::new(NodeId(4), Kind::Text);
+        text.scroll_events = true;
         assert_eq!(
-            row.validate().unwrap_err().to_string(),
-            "scroll events are available only on button and pointer_area widgets"
+            text.validate().unwrap_err().to_string(),
+            "scroll events are not available on Text widgets"
         );
     }
 

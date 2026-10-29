@@ -169,6 +169,15 @@ CASES = (
             "Property 'text' is not compatible.",
         ),
     ),
+    Case("valid-container-scroll.luau"),
+    Case(
+        "invalid-container-scroll.luau",
+        (
+            "invalid-container-scroll.luau(5,9): TypeError: Expected this to be 'boolean?', but got 'string'",
+            "Expected this to be exactly 'string', but got 'number'",
+            "invalid-container-scroll.luau(17,9): TypeError: Expected this to be 'string', but got 'number'",
+        ),
+    ),
     Case(
         "invalid-pointer-area.luau",
         (

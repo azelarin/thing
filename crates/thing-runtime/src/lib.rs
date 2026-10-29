@@ -833,7 +833,7 @@ impl Runtime {
         self.is_available(id) && self.handlers.contains_key(&(id, "on_scroll"))
     }
 
-    /// capture an available button or pointer area that has a scroll handler.
+    /// capture an available widget that has a scroll handler.
     pub fn scroll_target(&self, id: NodeId) -> Option<UiTarget> {
         let target = self.ui_target(id)?;
         self.scroll_target_is_current(&target).then_some(target)
@@ -842,9 +842,9 @@ impl Runtime {
     /// whether a captured source and its keyed lineage still identify a scroll handler.
     pub fn scroll_target_is_current(&self, target: &UiTarget) -> bool {
         self.ui_target_is_current(target)
-            && self.find(target.node).is_some_and(|node| {
-                node.scroll_events && matches!(node.kind, Kind::Button | Kind::PointerArea)
-            })
+            && self
+                .find(target.node)
+                .is_some_and(|node| node.scroll_events && node.kind.accepts_scroll_handler())
             && self.handlers.contains_key(&(target.node, "on_scroll"))
     }
 
@@ -2061,7 +2061,7 @@ impl Runtime {
                         key.as_str(),
                         "on_click" | "on_middle_click" | "on_secondary_click"
                     ) && kind != Kind::Button)
-                        || (key == "on_scroll" && !matches!(kind, Kind::Button | Kind::PointerArea))
+                        || (key == "on_scroll" && !kind.accepts_scroll_handler())
                         || (key == "on_change"
                             && !matches!(kind, Kind::Slider | Kind::Range | Kind::TextInput))
                         || (key == "on_pressed" && kind != Kind::Range)
