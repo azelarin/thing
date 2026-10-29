@@ -109,6 +109,31 @@ fn lock_reload_preserves_the_configuration_mode() {
 }
 
 #[test]
+fn lock_configuration_rejects_scheduled_processes() {
+    let directory = tempfile::tempdir().unwrap();
+    let lock = directory.path().join("lock.luau");
+    let marker = directory.path().join("scheduled-process-ran");
+    fs::write(
+        &lock,
+        format!(
+            r#"
+        local query = services.process {{
+            key = 'query',
+            command = {{ '/usr/bin/touch', '{}' }},
+        }}
+        return ui.lock {{ children = {{ ui.text {{ text = query.status:get() }} }} }}
+        "#,
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let error = Runtime::load_lock(lock).err().unwrap().to_string();
+
+    assert!(error.contains("scheduled processes are unavailable"));
+    assert!(!marker.exists());
+}
+
+#[test]
 fn lock_root_key_handlers_receive_non_secret_input() {
     let (_directory, lock) = fixture(
         r#"

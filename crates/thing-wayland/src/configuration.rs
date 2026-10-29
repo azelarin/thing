@@ -262,7 +262,6 @@ impl<K: Clone + Eq> Configurations<K> {
         self.add_checked_with_processes(key, output, validate, |_| Ok(()))
     }
 
-    #[cfg(test)]
     pub(crate) fn add_checked_with_processes(
         &mut self,
         key: K,
@@ -964,7 +963,6 @@ impl<K: Clone + Eq> Configurations<K> {
         self.reload_for_checked_with_processes(outputs, validate, |_| Ok(()))
     }
 
-    #[cfg(test)]
     pub(crate) fn reload_for_checked_with_processes(
         &mut self,
         outputs: Vec<(K, OutputContext)>,
@@ -1215,6 +1213,37 @@ mod tests {
         )
         .unwrap();
         configurations.reload().unwrap();
+        assert_eq!(configurations.root(&1).unwrap().kind, Kind::Lock);
+        assert_eq!(text(&configurations, 1), "new");
+    }
+
+    #[test]
+    fn prepared_lock_candidates_keep_the_lock_loader() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("lock.luau");
+        fs::write(
+            &entry,
+            "return ui.lock { children = { ui.text { text = 'old' } } }",
+        )
+        .unwrap();
+        let mut configurations =
+            Configurations::new_lock(entry.clone(), ServiceSnapshot::default());
+        let candidate = configurations
+            .prepare_add_checked(1, output("DP-1", 1920), |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        configurations.commit_add(candidate);
+        assert_eq!(configurations.root(&1).unwrap().kind, Kind::Lock);
+
+        fs::write(
+            &entry,
+            "return ui.lock { children = { ui.text { text = 'new' } } }",
+        )
+        .unwrap();
+        let replacement = configurations
+            .prepare_reload_for_checked(vec![(1, output("DP-1", 1920))], |_, _| Ok(()))
+            .unwrap();
+        configurations.commit_reload(replacement);
         assert_eq!(configurations.root(&1).unwrap().kind, Kind::Lock);
         assert_eq!(text(&configurations, 1), "new");
     }

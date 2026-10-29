@@ -71,6 +71,9 @@ interaction is keyboard-only: `secret_input`, root `on_key`, and tab focus
 traversal are supported, while pointer input, desktop service actions, and local
 ui actions are unavailable.
 
+scheduled process declarations are unavailable in lock configurations. the lock
+host never starts configuration-owned child processes.
+
 `services.authentication` is read-only. `state` is one of `idle`,
 `authenticating`, `waiting`, `rejected`, or `unavailable`; `prompt` contains a
 bounded follow-up prompt while waiting, and `message` contains bounded status

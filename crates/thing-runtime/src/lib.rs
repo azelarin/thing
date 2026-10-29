@@ -463,6 +463,16 @@ impl Runtime {
         lua.sandbox(true)?;
         let modules = modules::Modules::default();
         let exported = modules.load(&lua, path)?;
+        if matches!(mode, ConfigurationMode::Lock)
+            && services
+                .managed_process_definitions()
+                .iter()
+                .any(|definition| definition.command.is_some())
+        {
+            return Err(Error::runtime(
+                "scheduled processes are unavailable in lock configurations",
+            ));
+        }
         services.freeze_managed_process_declarations();
         let mut runtime = Self {
             lua,
