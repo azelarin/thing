@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     io,
     path::Path,
     rc::Rc,
@@ -50,7 +51,8 @@ use thing_runtime::{
     SystemTrayAction, SystemTrayMenuAction, UiAction,
 };
 use thing_ui::{
-    Interaction, Layout, PaintFrame, ScrollState, Size, TextInputCheckpoint, TextInputEditor,
+    Interaction, Layout, PaintFrame, ScrollState, SemanticPlacement, Size, TextInputCheckpoint,
+    TextInputEditor,
 };
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop, event_created_child,
@@ -302,41 +304,48 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         .filter_map(|output| app.output_context(&output).map(|context| (output, context)))
         .collect();
     let layer_shell_version = app.layer_shell_version;
-    let managed_processes = &mut app.managed_processes;
+    let entries = outputs
+        .iter()
+        .map(|(output, context)| app.layout_validation_entry(output.clone(), context.clone()))
+        .collect();
     let loop_handle = app.loop_handle.clone();
+    let preflight = LayoutPreflight::new(&mut app.render, layer_shell_version, entries);
     let mut prepared_configurations = app
         .configurations
-        .prepare_reload_for_checked(outputs.clone(), |_, runtime| {
-            validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+        .prepare_reload_for_checked(outputs.clone(), |output, runtime| {
+            preflight.validate(output, runtime.surfaces())
         })?;
     let process_definitions = prepared_configurations
         .managed_process_definitions()
         .to_vec();
     let projected_processes = project_managed_processes(
-        managed_processes.as_ref(),
+        app.managed_processes.as_ref(),
         &process_definitions,
         ManagedProcessScopeChange::Replace,
     )?;
-    prepared_configurations.set_managed_processes(projected_processes.clone(), |_, runtime| {
-        validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
-    })?;
+    prepared_configurations
+        .set_managed_processes(projected_processes.clone(), |output, runtime| {
+            preflight.validate(output, runtime.surfaces())
+        })?;
     let activation = prepare_and_commit_managed_processes(
-        managed_processes,
+        &mut app.managed_processes,
         &loop_handle,
         &process_definitions,
         ManagedProcessScopeChange::Replace,
         projected_processes,
         |snapshot| {
-            prepared_configurations.set_managed_processes(snapshot, |_, runtime| {
-                validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+            prepared_configurations.set_managed_processes(snapshot, |output, runtime| {
+                preflight.validate(output, runtime.surfaces())
             })
         },
     )?;
+    let prepared = preflight.into_prepared();
     app.configurations.commit_reload(prepared_configurations);
-    arm_managed_processes(managed_processes.as_ref(), activation);
-    for (output, _) in outputs {
-        app.sync_output_surfaces(&output, false, &qh)?;
+    for (output, _) in &outputs {
+        app.sync_output_surfaces(output, false, &qh)?;
     }
+    app.install_prepared_layouts(prepared);
+    arm_managed_processes(app.managed_processes.as_ref(), activation);
     app.loading_outputs = false;
     app.update_watch();
     event_loop
@@ -618,6 +627,109 @@ struct SurfaceInit {
     scale: Scale,
 }
 
+struct PreparedSurfaceLayout {
+    key: SurfaceKey,
+    root: Node,
+    size: (u32, u32),
+    layout: Layout,
+    scroll: ScrollState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayoutSurfaceRole {
+    Panel,
+    Popup,
+}
+
+struct LayoutSurfaceState {
+    key: SurfaceKey,
+    root: NodeId,
+    role: LayoutSurfaceRole,
+    size: (u32, u32),
+    scroll: ScrollState,
+    focused: Option<NodeId>,
+}
+
+struct LayoutValidationEntry {
+    output: wl_output::WlOutput,
+    context: OutputContext,
+    surfaces: Vec<LayoutSurfaceState>,
+}
+
+struct PreparedOutputLayouts {
+    output: wl_output::WlOutput,
+    surfaces: Vec<PreparedSurfaceLayout>,
+}
+
+// Runtime validates each distinct animation target first and the displayed
+// candidate last. This side channel therefore retains the displayed plans, but
+// callers install them only after the complete checked operation succeeds.
+struct LayoutPreflight<'a> {
+    render: RefCell<&'a mut Render>,
+    layer_shell_version: u32,
+    entries: Vec<LayoutValidationEntry>,
+    prepared: RefCell<Vec<PreparedOutputLayouts>>,
+}
+
+impl LayoutPreflight<'_> {
+    fn validate(
+        &self,
+        output: &wl_output::WlOutput,
+        surfaces: &[SurfaceTree],
+    ) -> Result<(), String> {
+        validate_surface_capabilities(surfaces, self.layer_shell_version)?;
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| &entry.output == output)
+            .ok_or("layout preflight has no output context")?;
+        let prepared = prepare_candidate_layouts(
+            &mut self.render.borrow_mut(),
+            surfaces,
+            &entry.context,
+            &entry.surfaces,
+        )?;
+        let mut outputs = self.prepared.borrow_mut();
+        if let Some(previous) = outputs
+            .iter_mut()
+            .find(|previous| previous.output == *output)
+        {
+            previous.surfaces = prepared;
+        } else {
+            outputs.push(PreparedOutputLayouts {
+                output: output.clone(),
+                surfaces: prepared,
+            });
+        }
+        Ok(())
+    }
+
+    fn into_prepared(self) -> Vec<PreparedOutputLayouts> {
+        self.prepared.into_inner()
+    }
+}
+
+impl<'a> LayoutPreflight<'a> {
+    fn new(
+        render: &'a mut Render,
+        layer_shell_version: u32,
+        entries: Vec<LayoutValidationEntry>,
+    ) -> Self {
+        Self {
+            render: RefCell::new(render),
+            layer_shell_version,
+            entries,
+            prepared: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PopupAnchorLayout {
+    node: Option<NodeId>,
+    snapshot: LayoutSnapshot,
+}
+
 struct InputOrigin {
     seat: wl_seat::WlSeat,
     serial: u32,
@@ -757,6 +869,7 @@ struct Surface {
     viewport: Option<WpViewport>,
     fractional: Option<WpFractionalScaleV1>,
     layouts: SurfaceLayouts,
+    prepared: Option<PreparedSurfaceLayout>,
     scroll: ScrollState,
     input: Interaction,
     focus_target: Option<ScopedUiTarget>,
@@ -780,6 +893,7 @@ struct ActiveTextInput {
     id: NodeId,
     generation: u64,
     editor: TextInputEditor,
+    cursor_available: bool,
 }
 
 #[derive(Clone)]
@@ -825,6 +939,12 @@ impl Surface {
             output: self.output.clone(),
             key: self.key.clone(),
         }
+    }
+
+    fn take_prepared_layout(&mut self, root: &Node) -> Option<PreparedSurfaceLayout> {
+        self.prepared.take().filter(|prepared| {
+            prepared.key == self.key && prepared.size == self.size && prepared.root == *root
+        })
     }
 }
 
@@ -905,6 +1025,83 @@ impl Drop for App {
 }
 
 impl App {
+    fn layout_validation_entry(
+        &self,
+        output: wl_output::WlOutput,
+        context: OutputContext,
+    ) -> LayoutValidationEntry {
+        let surfaces = self
+            .surfaces
+            .iter()
+            .filter(|surface| surface.output == output)
+            .map(|surface| LayoutSurfaceState {
+                key: surface.key.clone(),
+                root: surface.root,
+                role: match surface.role {
+                    Role::Panel(_) => LayoutSurfaceRole::Panel,
+                    Role::Popup(_) => LayoutSurfaceRole::Popup,
+                },
+                size: surface.size,
+                scroll: surface.scroll.clone(),
+                focused: surface.input.keyboard_focused(),
+            })
+            .collect();
+        LayoutValidationEntry {
+            output,
+            context,
+            surfaces,
+        }
+    }
+
+    fn current_layout_validation_entry(
+        &self,
+        output: &wl_output::WlOutput,
+    ) -> Option<LayoutValidationEntry> {
+        self.configurations
+            .output(output)
+            .cloned()
+            .map(|context| self.layout_validation_entry(output.clone(), context))
+    }
+
+    fn replacement_layout_validation_entry(
+        &self,
+        output: wl_output::WlOutput,
+        context: OutputContext,
+    ) -> LayoutValidationEntry {
+        let mut entry = self.layout_validation_entry(output, context);
+        for surface in &mut entry.surfaces {
+            surface.scroll = ScrollState::default();
+            surface.focused = None;
+        }
+        entry
+    }
+
+    fn install_prepared_layouts(&mut self, outputs: Vec<PreparedOutputLayouts>) {
+        for mut output in outputs {
+            for surface in self
+                .surfaces
+                .iter_mut()
+                .filter(|surface| surface.output == output.output)
+            {
+                let root = self
+                    .configurations
+                    .surface_root(&surface.output, &surface.key)
+                    .and_then(|root| root.find(surface.root));
+                let Some(root) = root else {
+                    surface.prepared = None;
+                    continue;
+                };
+                let prepared = output.surfaces.iter().position(|prepared| {
+                    prepared.key == surface.key
+                        && prepared.root.id == surface.root
+                        && prepared.size == surface.size
+                        && prepared.root == *root
+                });
+                surface.prepared = prepared.map(|index| output.surfaces.swap_remove(index));
+            }
+        }
+    }
+
     fn next_deadline(&self) -> Option<Instant> {
         earliest_deadline(
             self.reload_at,
@@ -1088,13 +1285,29 @@ impl App {
     fn refresh(&mut self) {
         let layer_shell_version = self.layer_shell_version;
         let configured_outputs: Vec<_> = self.configurations.keys().cloned().collect();
-        let outputs = self.configurations.refresh_checked(|_, surfaces| {
-            validate_surface_capabilities(surfaces, layer_shell_version)
-        });
+        let entries = configured_outputs
+            .iter()
+            .filter_map(|output| {
+                self.configurations
+                    .output(output)
+                    .cloned()
+                    .map(|context| self.layout_validation_entry(output.clone(), context))
+            })
+            .collect();
+        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, entries);
+        let outputs: Vec<_> = self
+            .configurations
+            .refresh_checked(|output, surfaces| preflight.validate(output, surfaces));
+        let prepared: Vec<_> = preflight
+            .into_prepared()
+            .into_iter()
+            .filter(|prepared| outputs.contains(&prepared.output))
+            .collect();
         self.update_watch();
-        for output in outputs {
-            self.invalidate_output(&output);
+        for output in &outputs {
+            self.invalidate_output(output);
         }
+        self.install_prepared_layouts(prepared);
         for output in configured_outputs {
             self.reconcile_custom_pointer(&output);
         }
@@ -1110,7 +1323,7 @@ impl App {
     }
 
     fn reload(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
-        let outputs = self
+        let outputs: Vec<_> = self
             .outputs
             .outputs()
             .filter_map(|output| {
@@ -1120,44 +1333,54 @@ impl App {
             })
             .collect();
         let layer_shell_version = self.layer_shell_version;
+        let entries = outputs
+            .iter()
+            .map(|(output, context)| {
+                self.replacement_layout_validation_entry(output.clone(), context.clone())
+            })
+            .collect();
         let retired_consumers = self.configurations.consumers();
-        let managed_processes = &mut self.managed_processes;
         let loop_handle = self.loop_handle.clone();
         let replacement = (|| {
+            let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, entries);
             let mut configurations = self
                 .configurations
-                .prepare_reload_for_checked(outputs, |_, runtime| {
-                    validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+                .prepare_reload_for_checked(outputs, |output, runtime| {
+                    preflight.validate(output, runtime.surfaces())
                 })?;
             let process_definitions = configurations.managed_process_definitions().to_vec();
             let projected_processes = project_managed_processes(
-                managed_processes.as_ref(),
+                self.managed_processes.as_ref(),
                 &process_definitions,
                 ManagedProcessScopeChange::Replace,
             )?;
-            configurations.set_managed_processes(projected_processes.clone(), |_, runtime| {
-                validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
-            })?;
+            configurations
+                .set_managed_processes(projected_processes.clone(), |output, runtime| {
+                    preflight.validate(output, runtime.surfaces())
+                })?;
             let activation = prepare_and_commit_managed_processes(
-                managed_processes,
+                &mut self.managed_processes,
                 &loop_handle,
                 &process_definitions,
                 ManagedProcessScopeChange::Replace,
                 projected_processes,
                 |snapshot| {
-                    configurations.set_managed_processes(snapshot, |_, runtime| {
-                        validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+                    configurations.set_managed_processes(snapshot, |output, runtime| {
+                        preflight.validate(output, runtime.surfaces())
                     })
                 },
             )?;
-            self.configurations.commit_reload(configurations);
-            arm_managed_processes(managed_processes.as_ref(), activation);
-            Ok::<(), String>(())
+            let prepared = preflight.into_prepared();
+            Ok::<_, String>((configurations, activation, prepared))
         })();
-        if let Err(error) = replacement {
-            eprintln!("thing: reload failed; keeping the previous surfaces: {error}");
-            return Ok(());
-        }
+        let (configurations, activation, prepared) = match replacement {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                eprintln!("thing: reload failed; keeping the previous surfaces: {error}");
+                return Ok(());
+            }
+        };
+        self.configurations.commit_reload(configurations);
         self.cancel_pending_text_paste();
         // the replacement runtimes never inherit an in-flight pointer sequence.
         if let Some(capture) = self.pointer_capture.take() {
@@ -1195,9 +1418,11 @@ impl App {
             self.remove_panel(&owner, false);
         }
         let outputs: Vec<_> = self.configurations.keys().cloned().collect();
-        for output in outputs {
-            self.sync_output_surfaces(&output, true, qh)?;
+        for output in &outputs {
+            self.sync_output_surfaces(output, true, qh)?;
         }
+        self.install_prepared_layouts(prepared);
+        arm_managed_processes(self.managed_processes.as_ref(), activation);
         if self
             .keyboard_surface
             .as_ref()
@@ -1222,39 +1447,46 @@ impl App {
                 return Ok(());
             };
             let layer_shell_version = self.layer_shell_version;
-            let managed_processes = &mut self.managed_processes;
+            let entry = self.layout_validation_entry(output.clone(), context.clone());
             let loop_handle = self.loop_handle.clone();
+            let preflight =
+                LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
             let Some(mut configuration) =
                 self.configurations
                     .prepare_add_checked(output.clone(), context, |runtime| {
-                        validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+                        preflight.validate(&output, runtime.surfaces())
                     })?
             else {
                 return Ok(());
             };
             let process_definitions = configuration.managed_process_definitions().to_vec();
             let projected_processes = project_managed_processes(
-                managed_processes.as_ref(),
+                self.managed_processes.as_ref(),
                 &process_definitions,
                 ManagedProcessScopeChange::Reconcile,
             )?;
             configuration.set_managed_processes(projected_processes.clone(), |runtime| {
-                validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+                preflight.validate(&output, runtime.surfaces())
             })?;
             let activation = prepare_and_commit_managed_processes(
-                managed_processes,
+                &mut self.managed_processes,
                 &loop_handle,
                 &process_definitions,
                 ManagedProcessScopeChange::Reconcile,
                 projected_processes,
                 |snapshot| {
                     configuration.set_managed_processes(snapshot, |runtime| {
-                        validate_surface_capabilities(runtime.surfaces(), layer_shell_version)
+                        preflight.validate(&output, runtime.surfaces())
                     })
                 },
             )?;
+            let prepared = preflight.into_prepared();
             self.configurations.commit_add(configuration);
-            arm_managed_processes(managed_processes.as_ref(), activation);
+            self.sync_output_surfaces(&output, false, qh)?;
+            self.install_prepared_layouts(prepared);
+            arm_managed_processes(self.managed_processes.as_ref(), activation);
+            self.update_watch();
+            return Ok(());
         }
         self.sync_output_surfaces(&output, false, qh)?;
         self.update_watch();
@@ -1337,6 +1569,7 @@ impl App {
             viewport,
             fractional,
             layouts: SurfaceLayouts::default(),
+            prepared: None,
             scroll: ScrollState::default(),
             input: Interaction::default(),
             focus_target: None,
@@ -1509,6 +1742,7 @@ impl App {
         surface.panel = Some(next);
         if reset_input {
             surface.layouts = SurfaceLayouts::default();
+            surface.prepared = None;
             surface.scroll = ScrollState::default();
             surface.input = Interaction::default();
             surface.focus_target = None;
@@ -1554,6 +1788,31 @@ impl App {
         Ok(())
     }
 
+    fn prepare_configured_surface_layout(
+        &mut self,
+        index: usize,
+        size: (u32, u32),
+    ) -> Result<PreparedSurfaceLayout, String> {
+        let surface = self
+            .surfaces
+            .get(index)
+            .ok_or("configured surface is unavailable")?;
+        let root = self
+            .configurations
+            .surface_root(&surface.output, &surface.key)
+            .and_then(|root| root.find(surface.root))
+            .cloned()
+            .ok_or("configured surface root is unavailable")?;
+        prepare_surface_layout(
+            &mut self.render,
+            surface.key.clone(),
+            &root,
+            size,
+            surface.scroll.clone(),
+            surface.input.keyboard_focused(),
+        )
+    }
+
     fn set_output_scale(&mut self, output: &wl_output::WlOutput, scale: Scale) {
         let Some(mut context) = self.configurations.output(output).cloned() else {
             return;
@@ -1561,16 +1820,21 @@ impl App {
         if context.scale != scale {
             context.scale = scale;
             let layer_shell_version = self.layer_shell_version;
+            let entry = self.layout_validation_entry(output.clone(), context.clone());
+            let preflight =
+                LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
             let result = self
                 .configurations
                 .set_output_checked(output, context, |surfaces| {
-                    validate_surface_capabilities(surfaces, layer_shell_version)
+                    preflight.validate(output, surfaces)
                 });
+            let prepared = preflight.into_prepared();
             self.update_watch();
             match result {
                 Ok(changed) => {
                     if changed {
                         self.invalidate_output(output);
+                        self.install_prepared_layouts(prepared);
                     } else {
                         self.reconcile_custom_pointer(output);
                     }
@@ -1717,15 +1981,21 @@ impl App {
                 continue;
             };
             let size = self.surfaces[index].size;
-            let mut scroll = self.surfaces[index].scroll.clone();
-            let mut layout = self.render.layout(
-                &root,
-                Size {
-                    width: size.0 as f32,
-                    height: size.1 as f32,
-                },
-                &mut scroll,
-            )?;
+            let prepared = self.surfaces[index].take_prepared_layout(&root);
+            let (mut layout, mut scroll) = if let Some(prepared) = prepared {
+                (prepared.layout, prepared.scroll)
+            } else {
+                let mut scroll = self.surfaces[index].scroll.clone();
+                let layout = self.render.layout(
+                    &root,
+                    Size {
+                        width: size.0 as f32,
+                        height: size.1 as f32,
+                    },
+                    &mut scroll,
+                )?;
+                (layout, scroll)
+            };
             let mut changed = false;
             let mut focus = None;
             for action in active {
@@ -1846,12 +2116,18 @@ impl App {
         }
         for output in ready_outputs {
             let layer_shell_version = self.layer_shell_version;
-            if self
+            let entry = self
+                .current_layout_validation_entry(&output)
+                .ok_or("animated output has no layout context")?;
+            let preflight =
+                LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
+            let changed = self
                 .configurations
                 .advance_checked(&output, now, |surfaces| {
-                    validate_surface_capabilities(surfaces, layer_shell_version)
-                })?
-            {
+                    preflight.validate(&output, surfaces)
+                });
+            let prepared = preflight.into_prepared();
+            if changed? {
                 // animated panel dimensions must reach layer shell before this
                 // frame is laid out. pointer paths still update after present.
                 let owners: Vec<_> = self
@@ -1865,6 +2141,7 @@ impl App {
                 for owner in owners {
                     self.sync_panel(&owner, false)?;
                 }
+                self.install_prepared_layouts(prepared);
             }
         }
         self.apply_pending_ui_actions(MissingSurfacePolicy::Expire)?;
@@ -1902,19 +2179,25 @@ impl App {
                     physical.1,
                 )?);
             }
-            let window = surface
-                .window
-                .as_mut()
-                .ok_or("render surface was not initialized")?;
             let mut scroll = surface.scroll.clone();
-            let layout = self.render.layout(
-                root,
-                Size {
-                    width: surface.size.0 as f32,
-                    height: surface.size.1 as f32,
-                },
-                &mut scroll,
-            )?;
+            let layout = if let Some(layout) = surface.layouts.take_input() {
+                // Input geometry can include focus-driven scroll changes made
+                // after preflight, so it supersedes any remaining cached plan.
+                surface.prepared = None;
+                layout
+            } else if let Some(prepared) = surface.take_prepared_layout(root) {
+                scroll = prepared.scroll;
+                prepared.layout
+            } else {
+                self.render.layout(
+                    root,
+                    Size {
+                        width: surface.size.0 as f32,
+                        height: surface.size.1 as f32,
+                    },
+                    &mut scroll,
+                )?
+            };
             let presented_ui = configurations
                 .presented_targets(&surface.output, root, &layout)
                 .ok_or("rendered output has no configuration consumer")?;
@@ -1940,6 +2223,10 @@ impl App {
                 surface.input,
                 keyboard_surface.as_ref() == Some(surface.role.surface()),
             );
+            let window = surface
+                .window
+                .as_mut()
+                .ok_or("render surface was not initialized")?;
             let result = self.render.draw(
                 window,
                 PaintFrame {
@@ -1982,6 +2269,16 @@ impl App {
                 }
             }
         }
+        let mut presented_outputs = Vec::new();
+        for output in presented
+            .iter()
+            .filter_map(|index| self.surfaces.get(*index))
+            .map(|surface| surface.output.clone())
+        {
+            if !presented_outputs.contains(&output) {
+                presented_outputs.push(output);
+            }
+        }
         self.reconcile_layout_focus();
         let mut owners: Vec<(SurfaceOwner, bool)> = Vec::new();
         for surface in presented
@@ -2002,6 +2299,11 @@ impl App {
             self.sync_popup_placement(&owner, parent_presented, qh);
         }
         self.reconcile_presented_pointers(&presented);
+        for output in &presented_outputs {
+            self.reconcile_custom_pointer(output);
+            self.reconcile_range_presses(output);
+            self.reconcile_presented_pointer_state(output);
+        }
         self.reconcile_input_method(InputMethodChangeCause::Other);
         Ok(())
     }
@@ -2094,8 +2396,8 @@ impl App {
                 parent
                     .layouts
                     .presented()?
-                    .get(anchor)
-                    .map(|placement| placement.bounds)?
+                    .semantic_placement(anchor)
+                    .and_then(placement_anchor)?
             }
             None => Rect {
                 x: 0.0,
@@ -2126,12 +2428,17 @@ impl App {
     ) {
         let layer_shell_version = self.layer_shell_version;
         let consumer = self.configurations.consumer(&output).map(str::to_owned);
+        let Some(entry) = self.current_layout_validation_entry(&output) else {
+            return;
+        };
+        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
         let result = self
             .configurations
             .dispatch_checked(&output, id, event, |surfaces| {
-                validate_surface_capabilities(surfaces, layer_shell_version)
+                preflight.validate(&output, surfaces)
             });
-        self.finish_dispatch(output, consumer, result, origin);
+        let prepared = preflight.into_prepared();
+        self.finish_dispatch(output, consumer, result, origin, prepared);
     }
 
     fn dispatch_scroll(
@@ -2142,19 +2449,22 @@ impl App {
     ) -> Option<bool> {
         let layer_shell_version = self.layer_shell_version;
         let consumer = Some(target.consumer.clone());
+        let entry = self.current_layout_validation_entry(&output)?;
+        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
         let result = self.configurations.dispatch_scroll_checked(
             &output,
             &target.target,
             input,
-            |surfaces| validate_surface_capabilities(surfaces, layer_shell_version),
+            |surfaces| preflight.validate(&output, surfaces),
         );
+        let prepared = preflight.into_prepared();
         match result {
             Ok(Some(ScrollHandlerOutcome { consumed, dispatch })) => self
-                .finish_dispatch(output, consumer, Ok(dispatch), None)
+                .finish_dispatch(output, consumer, Ok(dispatch), None, prepared)
                 .then_some(consumed),
             Ok(None) => None,
             Err(error) => {
-                self.finish_dispatch(output, consumer, Err(error), None);
+                self.finish_dispatch(output, consumer, Err(error), None, prepared);
                 None
             }
         }
@@ -2166,6 +2476,7 @@ impl App {
         consumer: Option<String>,
         result: Result<DispatchOutcome, String>,
         origin: Option<InputOrigin>,
+        prepared: Vec<PreparedOutputLayouts>,
     ) -> bool {
         self.update_watch();
         let outcome = match result {
@@ -2246,6 +2557,7 @@ impl App {
         }
         if outcome.changed {
             self.invalidate_output(&output);
+            self.install_prepared_layouts(prepared);
         }
         self.reconcile_custom_pointer(&output);
         self.reconcile_published_configuration();
@@ -2576,10 +2888,15 @@ impl App {
                 self.surfaces[index].input.hovered = None;
                 self.surfaces[index].dirty = true;
             }
-            let pressed_is_current = self.surfaces[index]
-                .pressed_target
-                .as_ref()
-                .is_none_or(|target| self.surface_target_is_current(index, target));
+            let pressed_is_current =
+                self.surfaces[index]
+                    .pressed_target
+                    .clone()
+                    .is_none_or(|target| {
+                        self.current_presented_press_target(index, target.target.node())
+                            .as_ref()
+                            == Some(&target)
+                    });
             if !pressed_is_current {
                 let surface = &mut self.surfaces[index];
                 surface.input.pressed = None;
@@ -2591,7 +2908,7 @@ impl App {
         }
     }
 
-    fn range_input(&mut self, surface: usize, target: &ScopedUiTarget, x: f32) {
+    fn range_input(&mut self, surface: usize, target: &ScopedUiTarget, point: Point) {
         if !self.surface_target_is_current(surface, target) {
             return;
         }
@@ -2608,11 +2925,15 @@ impl App {
         if !matches!(node.kind, Kind::Slider | Kind::Range) || !node.enabled {
             return;
         }
-        let Some(bounds) = self.surfaces[surface]
+        let Some((bounds, local)) = self.surfaces[surface]
             .layouts
             .presented()
-            .and_then(|layout| layout.get(id))
-            .map(|p| p.bounds)
+            .and_then(|layout| {
+                layout
+                    .get(id)
+                    .zip(layout.surface_to_local(id, point))
+                    .map(|(placement, local)| (placement.local_bounds(), local))
+            })
         else {
             return;
         };
@@ -2621,7 +2942,7 @@ impl App {
             Kind::Range => HorizontalRange::inset(bounds, node.range_inset),
             _ => unreachable!("range kind checked above"),
         };
-        let value = node.slider.value_at(f64::from(span.fraction_at(x)));
+        let value = node.slider.value_at(f64::from(span.fraction_at(local.x)));
         self.dispatch(output, id, Event::Change(value), None);
     }
 
@@ -2634,7 +2955,7 @@ impl App {
             .filter_map(|(index, surface)| {
                 let target = surface.range_press.as_ref()?;
                 let id = target.target.node();
-                (!self.surface_target_is_current(index, target)
+                (self.current_presented_press_target(index, id).as_ref() != Some(target)
                     || !self.configurations.active_press_is_available(output, id))
                 .then(|| (surface.role.surface().clone(), target.clone()))
             })
@@ -2673,8 +2994,30 @@ impl App {
         if node.kind != Kind::TextInput {
             return None;
         }
-        let bounds = surface.layouts.snapshot(snapshot)?.get(id)?.bounds;
+        let bounds = surface
+            .layouts
+            .snapshot(snapshot)?
+            .semantic_placement(id)?
+            .local_bounds();
         Some((node.clone(), bounds))
+    }
+
+    fn text_input_node_and_placement(
+        &self,
+        surface: usize,
+        id: NodeId,
+        snapshot: LayoutSnapshot,
+    ) -> Option<(Node, SemanticPlacement)> {
+        let surface = self.surfaces.get(surface)?;
+        let node = self
+            .configurations
+            .surface_root(&surface.output, &surface.key)?
+            .find(id)?;
+        if node.kind != Kind::TextInput {
+            return None;
+        }
+        let placement = *surface.layouts.snapshot(snapshot)?.semantic_placement(id)?;
+        Some((node.clone(), placement))
     }
 
     fn scoped_focus_target(
@@ -2801,8 +3144,22 @@ impl App {
         surface: usize,
         id: NodeId,
     ) -> Option<ScopedUiTarget> {
-        let target = self.surfaces.get(surface)?.layouts.presented_target(id)?;
+        let target = self
+            .surfaces
+            .get(surface)?
+            .layouts
+            .presented_pointer_target(id)?;
         self.surface_pointer_target_is_current(surface, &target)
+            .then_some(target)
+    }
+
+    fn current_presented_press_target(&self, surface: usize, id: NodeId) -> Option<ScopedUiTarget> {
+        let target = self
+            .surfaces
+            .get(surface)?
+            .layouts
+            .presented_pointer_target(id)?;
+        self.surface_target_is_current(surface, &target)
             .then_some(target)
     }
 
@@ -2837,12 +3194,15 @@ impl App {
         if !self.surface_pointer_target_is_current(surface, target) {
             return None;
         }
-        let bounds = self.surfaces[surface]
-            .layouts
-            .presented()?
-            .get(target.target.node())?
-            .bounds;
-        runtime_pointer_event(bounds, phase, button, position, &self.modifiers)
+        let layout = self.surfaces[surface].layouts.presented()?;
+        let local = layout.surface_to_local(
+            target.target.node(),
+            Point {
+                x: position.0 as f32,
+                y: position.1 as f32,
+            },
+        )?;
+        runtime_pointer_event(local, phase, button, position, &self.modifiers)
     }
 
     fn finish_pointer_dispatch(
@@ -2851,6 +3211,7 @@ impl App {
         consumer: Option<String>,
         result: Result<PointerHandlerOutcome, String>,
         origin: Option<InputOrigin>,
+        prepared: Vec<PreparedOutputLayouts>,
     ) -> Option<(bool, bool)> {
         let outcome = match result {
             Ok(outcome) => outcome,
@@ -2858,7 +3219,7 @@ impl App {
                 if let Some(capture) = self.pointer_capture.take() {
                     self.clear_pressed_for_capture(&capture);
                 }
-                self.finish_dispatch(output, consumer, Err(error), origin);
+                self.finish_dispatch(output, consumer, Err(error), origin, prepared);
                 return None;
             }
         };
@@ -2868,7 +3229,7 @@ impl App {
             self.clear_pressed_for_capture(&capture);
         }
         let result = (outcome.handled, outcome.active);
-        self.finish_dispatch(output, consumer, Ok(outcome.dispatch), origin)
+        self.finish_dispatch(output, consumer, Ok(outcome.dispatch), origin, prepared)
             .then_some(result)
     }
 
@@ -2892,12 +3253,15 @@ impl App {
             button: runtime_pointer_code(event.button),
         });
         let layer_shell_version = self.layer_shell_version;
+        let entry = self.current_layout_validation_entry(&output)?;
+        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
         let result =
             self.configurations
                 .begin_pointer_checked(&output, &target.target, event, |surfaces| {
-                    validate_surface_capabilities(surfaces, layer_shell_version)
+                    preflight.validate(&output, surfaces)
                 });
-        self.finish_pointer_dispatch(output, consumer, result, origin)
+        let prepared = preflight.into_prepared();
+        self.finish_pointer_dispatch(output, consumer, result, origin, prepared)
     }
 
     fn dispatch_custom_pointer(
@@ -2923,12 +3287,15 @@ impl App {
         }
         let consumer = Some(capture.target.consumer.clone());
         let layer_shell_version = self.layer_shell_version;
+        let entry = self.current_layout_validation_entry(&capture.output)?;
+        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
         let result =
             self.configurations
                 .dispatch_pointer_checked(&capture.output, event, |surfaces| {
-                    validate_surface_capabilities(surfaces, layer_shell_version)
+                    preflight.validate(&capture.output, surfaces)
                 });
-        self.finish_pointer_dispatch(capture.output, consumer, result, origin)
+        let prepared = preflight.into_prepared();
+        self.finish_pointer_dispatch(capture.output, consumer, result, origin, prepared)
     }
 
     fn cancel_custom_pointer(&mut self) {
@@ -2945,12 +3312,17 @@ impl App {
         }
         let consumer = Some(capture.target.consumer.clone());
         let layer_shell_version = self.layer_shell_version;
+        let Some(entry) = self.current_layout_validation_entry(&capture.output) else {
+            return;
+        };
+        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
         let result = self
             .configurations
             .cancel_pointer_checked(&capture.output, |surfaces| {
-                validate_surface_capabilities(surfaces, layer_shell_version)
+                preflight.validate(&capture.output, surfaces)
             });
-        self.finish_pointer_dispatch(capture.output, consumer, result, None);
+        let prepared = preflight.into_prepared();
+        self.finish_pointer_dispatch(capture.output, consumer, result, None, prepared);
     }
 
     fn reconcile_custom_pointer(&mut self, output: &wl_output::WlOutput) {
@@ -2971,9 +3343,11 @@ impl App {
             self.clear_pressed_for_capture(&capture);
             return;
         }
-        let current = self
-            .index(&capture.surface)
-            .is_some_and(|index| self.surface_pointer_target_is_current(index, &capture.target));
+        let current = self.index(&capture.surface).is_some_and(|index| {
+            self.current_presented_pointer_target(index, capture.target.target.node())
+                .as_ref()
+                == Some(&capture.target)
+        });
         if current {
             return;
         }
@@ -2981,12 +3355,15 @@ impl App {
         self.clear_pressed_for_capture(&capture);
         let consumer = Some(capture.target.consumer.clone());
         let layer_shell_version = self.layer_shell_version;
+        let Some(entry) = self.current_layout_validation_entry(output) else {
+            return;
+        };
+        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
         let result = self
             .configurations
-            .reconcile_pointer_checked(output, |surfaces| {
-                validate_surface_capabilities(surfaces, layer_shell_version)
-            });
-        self.finish_pointer_dispatch(output.clone(), consumer, result, None);
+            .cancel_pointer_checked(output, |surfaces| preflight.validate(output, surfaces));
+        let prepared = preflight.into_prepared();
+        self.finish_pointer_dispatch(output.clone(), consumer, result, None, prepared);
     }
 
     fn clear_pressed_for_capture(&mut self, capture: &CustomPointerCapture) {
@@ -3087,10 +3464,21 @@ impl App {
         } else {
             LayoutSnapshot::Input
         };
-        let Some((node, bounds)) = self.text_input_node_and_bounds(surface, id, snapshot) else {
+        let local_point = point.and_then(|point| {
+            self.surfaces[surface]
+                .layouts
+                .snapshot(snapshot)?
+                .surface_to_local(id, point)
+        });
+        if point.is_some() && local_point.is_none() {
+            return false;
+        }
+        let Some((node, placement)) = self.text_input_node_and_placement(surface, id, snapshot)
+        else {
             self.surfaces[surface].text_input = None;
             return false;
         };
+        let bounds = placement.local_bounds();
         let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
         let padding_y = node.style.padding_y.unwrap_or(node.style.padding);
         let width = (bounds.width - 2.0 * padding_x).max(0.0);
@@ -3103,10 +3491,20 @@ impl App {
                 self.surfaces[surface].text_input = None;
                 return false;
             };
+            let editor = TextInputEditor::new(&node, width);
+            let cursor_available = input_method_cursor_rectangle(
+                &node,
+                bounds,
+                placement.transform,
+                placement.is_invertible(),
+                &editor,
+            )
+            .is_some();
             self.surfaces[surface].text_input = Some(ActiveTextInput {
                 id,
                 generation,
-                editor: TextInputEditor::new(&node, width),
+                editor,
+                cursor_available,
             });
         }
         let active = self.surfaces[surface]
@@ -3114,11 +3512,11 @@ impl App {
             .as_mut()
             .expect("the focused text input was initialized");
         active.editor.prepare(&node, width);
-        if let Some(point) = point {
-            let x = point.x - bounds.x - padding_x;
+        if let Some(point) = local_point {
+            let x = point.x - padding_x;
             let content_height = (bounds.height - 2.0 * padding_y).max(0.0);
             let offset_y = ((content_height - active.editor.layout().height()) / 2.0).max(0.0);
-            let y = point.y - bounds.y - padding_y - offset_y;
+            let y = point.y - padding_y - offset_y;
             if extend && was_active {
                 active.editor.extend_selection_to_point(x, y);
             } else {
@@ -3134,10 +3532,10 @@ impl App {
             return None;
         }
         let surface_index = self.index(&entered)?;
-        let (id, generation) = self.surfaces[surface_index]
+        let id = self.surfaces[surface_index]
             .text_input
             .as_ref()
-            .map(|active| (active.id, active.generation))?;
+            .map(|active| active.id)?;
         let interactive = active_text_input_is_current(
             self.configurations.surface_root(
                 &self.surfaces[surface_index].output,
@@ -3147,32 +3545,69 @@ impl App {
             self.surfaces[surface_index].input.focused,
             id,
         );
-        let Some((node, bounds)) = interactive
-            .then(|| self.text_input_node_and_bounds(surface_index, id, LayoutSnapshot::Input))
+        let Some((node, placement)) = interactive
+            .then(|| self.text_input_node_and_placement(surface_index, id, LayoutSnapshot::Input))
             .flatten()
         else {
             self.surfaces[surface_index].text_input = None;
             self.surfaces[surface_index].dirty = true;
             return None;
         };
+        let bounds = placement.local_bounds();
         let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
         let width = (bounds.width - 2.0 * padding_x).max(0.0);
-        let (state, composition_cleared) = {
+        let (cursor_rectangle, availability_changed, composition_cleared) = {
             let active = self.surfaces[surface_index]
                 .text_input
                 .as_mut()
                 .expect("the active text input was checked");
             let composing = active.editor.is_composing();
             active.editor.prepare(&node, width);
+            let rectangle = input_method_cursor_rectangle(
+                &node,
+                placement.local_bounds(),
+                placement.transform,
+                placement.is_invertible(),
+                &active.editor,
+            );
+            let available = rectangle.is_some();
+            let availability_changed = active.cursor_available != available;
+            if availability_changed {
+                active.editor.cancel_composition();
+            }
+            active.cursor_available = available;
             (
-                InputMethodTextState {
-                    generation,
-                    revision: active.editor.revision(),
-                    surrounding: active.editor.surrounding(),
-                    cursor_rectangle: input_method_cursor_rectangle(&node, bounds, &active.editor),
-                },
+                rectangle,
+                availability_changed,
                 composing && !active.editor.is_composing(),
             )
+        };
+        if availability_changed {
+            let Some(generation) = self.allocate_text_input_generation() else {
+                self.surfaces[surface_index].text_input = None;
+                return None;
+            };
+            self.surfaces[surface_index]
+                .text_input
+                .as_mut()
+                .expect("the active text input was checked")
+                .generation = generation;
+            self.surfaces[surface_index].dirty = true;
+        }
+        let generation = self.surfaces[surface_index]
+            .text_input
+            .as_ref()
+            .expect("the active text input was checked")
+            .generation;
+        let active = self.surfaces[surface_index]
+            .text_input
+            .as_ref()
+            .expect("the active text input was checked");
+        let state = InputMethodTextState {
+            generation,
+            revision: active.editor.revision(),
+            surrounding: active.editor.surrounding(),
+            cursor_rectangle,
         };
         if composition_cleared {
             self.surfaces[surface_index].dirty = true;
@@ -3661,6 +4096,7 @@ impl App {
         parent: usize,
         serial: u32,
         activated: Option<ScopedUiTarget>,
+        snapshot: LayoutSnapshot,
         qh: &QueueHandle<Self>,
     ) {
         let Some(parent_surface) = self.surfaces.get(parent) else {
@@ -3697,7 +4133,17 @@ impl App {
                 return;
             };
             self.hover.reconcile(owner.clone(), None, Instant::now());
-            self.create_popup(&parent_wl, id, anchor, PopupMode::Manual, Some(serial), qh);
+            self.create_popup(
+                &parent_wl,
+                id,
+                PopupAnchorLayout {
+                    node: anchor,
+                    snapshot,
+                },
+                PopupMode::Manual,
+                Some(serial),
+                qh,
+            );
             return;
         }
 
@@ -3732,7 +4178,7 @@ impl App {
             let Some(parent) = self.index(&parent_wl) else {
                 return;
             };
-            self.sync_popup(parent, serial, None, qh);
+            self.sync_popup(parent, serial, None, snapshot, qh);
             return;
         }
         let Some(target) = self
@@ -3747,7 +4193,10 @@ impl App {
         self.create_popup(
             &parent_wl,
             target.key.popup,
-            Some(target.key.anchor),
+            PopupAnchorLayout {
+                node: Some(target.key.anchor),
+                snapshot,
+            },
             PopupMode::Automatic(target.key),
             Some(serial),
             qh,
@@ -3758,7 +4207,7 @@ impl App {
         &mut self,
         parent_wl: &wl_surface::WlSurface,
         id: NodeId,
-        anchor_id: Option<NodeId>,
+        anchor: PopupAnchorLayout,
         mode: PopupMode,
         serial: Option<u32>,
         qh: &QueueHandle<Self>,
@@ -3773,16 +4222,27 @@ impl App {
         let owner = parent.owner();
         let namespace = parent.namespace.clone();
         let parent_scale = parent.scale;
+        let anchor_id = anchor.node;
         let anchor = match anchor_id {
             Some(id) => {
-                if self.current_presented_target(parent_index, id).is_none() {
+                let current = match anchor.snapshot {
+                    LayoutSnapshot::Presented => {
+                        self.current_presented_target(parent_index, id).is_some()
+                    }
+                    LayoutSnapshot::Input => self
+                        .configurations
+                        .surface_root(&owner.output, &owner.key)
+                        .and_then(|root| root.find(id))
+                        .is_some(),
+                };
+                if !current {
                     return false;
                 }
                 let Some(anchor) = parent
                     .layouts
-                    .presented()
-                    .and_then(|layout| layout.get(id))
-                    .map(|placement| placement.bounds)
+                    .snapshot(anchor.snapshot)
+                    .and_then(|layout| layout.semantic_placement(id))
+                    .and_then(placement_anchor)
                 else {
                     return false;
                 };
@@ -3933,7 +4393,10 @@ impl App {
                     if self.create_popup(
                         &parent_wl,
                         key.popup,
-                        Some(key.anchor),
+                        PopupAnchorLayout {
+                            node: Some(key.anchor),
+                            snapshot: LayoutSnapshot::Presented,
+                        },
                         PopupMode::Hover(key.clone()),
                         None,
                         qh,
@@ -4386,21 +4849,26 @@ impl App {
         let root = self.surfaces[surface].root;
         let consumer = self.configurations.consumer(&output).map(str::to_owned);
         let layer_shell_version = self.layer_shell_version;
+        let Some(entry) = self.current_layout_validation_entry(&output) else {
+            return RootKeyDispatch::Missing;
+        };
+        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
         let result = self
             .configurations
             .dispatch_key_checked(&output, root, input, |surfaces| {
-                validate_surface_capabilities(surfaces, layer_shell_version)
+                preflight.validate(&output, surfaces)
             });
+        let prepared = preflight.into_prepared();
         let outcome = match result {
             Ok(Some(outcome)) => outcome,
             Ok(None) => return RootKeyDispatch::Missing,
             Err(error) => {
-                self.finish_dispatch(output, consumer, Err(error), origin);
+                self.finish_dispatch(output, consumer, Err(error), origin, prepared);
                 return RootKeyDispatch::Failed;
             }
         };
         let handled = outcome.handled;
-        if !self.finish_dispatch(output, consumer, Ok(outcome.dispatch), origin) {
+        if !self.finish_dispatch(output, consumer, Ok(outcome.dispatch), origin, prepared) {
             return RootKeyDispatch::Failed;
         }
         if handled {
@@ -4429,7 +4897,7 @@ impl App {
             )
             && let Some(index) = self.index(&event_surface)
         {
-            self.sync_popup(index, serial, None, qh);
+            self.sync_popup(index, serial, None, LayoutSnapshot::Input, qh);
         }
         match root_dispatch {
             RootKeyDispatch::Handled => return true,
@@ -4528,7 +4996,7 @@ impl App {
                 self.surfaces[index].dirty = true;
                 self.dispatch(output, id, Event::Click, origin);
                 if let Some(index) = self.index(&event_surface) {
-                    self.sync_popup(index, serial, activated, qh);
+                    self.sync_popup(index, serial, activated, LayoutSnapshot::Input, qh);
                 }
             }
             WidgetKeyAction::Slider(action) => {
@@ -4668,25 +5136,47 @@ fn cancel_active_text_input_composition(active: &mut Option<ActiveTextInput>) ->
 fn input_method_cursor_rectangle(
     node: &Node,
     bounds: Rect,
+    transform: thing_ui::Affine,
+    invertible: bool,
     editor: &TextInputEditor,
-) -> InputMethodCursorRectangle {
+) -> Option<InputMethodCursorRectangle> {
+    if !invertible {
+        return None;
+    }
     let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
     let padding_y = node.style.padding_y.unwrap_or(node.style.padding);
     let content_height = (bounds.height - 2.0 * padding_y).max(0.0);
     let offset_y = ((content_height - editor.layout().height()) / 2.0).max(0.0);
     let area = editor.ime_cursor_area();
-    let x0 = bounds.x + padding_x + editor.text_offset_x() + area.x0 as f32;
-    let y0 = bounds.y + padding_y + offset_y + area.y0 as f32;
-    let x1 = bounds.x + padding_x + editor.text_offset_x() + area.x1 as f32;
-    let y1 = bounds.y + padding_y + offset_y + area.y1 as f32;
-    let x = floor_i32(x0);
-    let y = floor_i32(y0);
-    InputMethodCursorRectangle {
+    let local = Rect {
+        x: padding_x + editor.text_offset_x() + area.x0 as f32,
+        y: padding_y + offset_y + area.y0 as f32,
+        width: (area.x1 - area.x0) as f32,
+        height: (area.y1 - area.y0) as f32,
+    };
+    if local.width <= 0.0 || local.height <= 0.0 {
+        return None;
+    }
+    let surface = transform.rect_aabb(local).ok()?;
+    if surface.width <= 0.0 || surface.height <= 0.0 {
+        return None;
+    }
+    let right = surface.x + surface.width;
+    let bottom = surface.y + surface.height;
+    if [surface.x, surface.y, right, bottom]
+        .into_iter()
+        .any(|value| !value.is_finite() || value < i32::MIN as f32 || value > i32::MAX as f32)
+    {
+        return None;
+    }
+    let x = floor_i32(surface.x);
+    let y = floor_i32(surface.y);
+    Some(InputMethodCursorRectangle {
         x,
         y,
-        width: ceil_i32(x1).saturating_sub(x).max(1),
-        height: ceil_i32(y1).saturating_sub(y).max(1),
-    }
+        width: ceil_i32(right).saturating_sub(x).max(1),
+        height: ceil_i32(bottom).saturating_sub(y).max(1),
+    })
 }
 
 fn floor_i32(value: f32) -> i32 {
@@ -4751,9 +5241,17 @@ fn reveal_text_input_focus(input: &mut Interaction, dirty: &mut bool) {
 }
 
 fn focused_widget_is_interactive(layout: Option<&Layout>, id: NodeId) -> bool {
-    layout
-        .and_then(|layout| layout.get(id))
-        .is_some_and(|placement| placement.interactive)
+    layout.is_some_and(|layout| layout.focus_order().any(|candidate| candidate == id))
+}
+
+fn placement_anchor(placement: &SemanticPlacement) -> Option<Rect> {
+    let anchor = placement.border_aabb;
+    (placement.is_invertible()
+        && anchor.width.is_finite()
+        && anchor.height.is_finite()
+        && anchor.width > 0.0
+        && anchor.height > 0.0)
+        .then_some(anchor)
 }
 
 fn active_text_input_is_current(
@@ -4830,6 +5328,120 @@ fn wayland_layer(layer: SurfaceLayer) -> Layer {
         SurfaceLayer::Bottom => Layer::Bottom,
         SurfaceLayer::Top => Layer::Top,
         SurfaceLayer::Overlay => Layer::Overlay,
+    }
+}
+
+fn prepare_candidate_layouts(
+    render: &mut Render,
+    surfaces: &[SurfaceTree],
+    output: &OutputContext,
+    current: &[LayoutSurfaceState],
+) -> Result<Vec<PreparedSurfaceLayout>, String> {
+    let mut prepared = Vec::new();
+    for surface in surfaces {
+        let panel = current.iter().find(|candidate| {
+            candidate.key == surface.key
+                && candidate.role == LayoutSurfaceRole::Panel
+                && candidate.root == surface.root.id
+        });
+        let prospective = panel_size(
+            panel::geometry(&surface.root, None),
+            (output.width, output.height),
+        );
+        let (size, scroll, focused) = panel.map_or_else(
+            || (prospective, ScrollState::default(), None),
+            |panel| (panel.size, panel.scroll.clone(), panel.focused),
+        );
+        prepared.push(prepare_surface_layout(
+            render,
+            surface.key.clone(),
+            &surface.root,
+            size,
+            scroll,
+            focused,
+        )?);
+        if size != prospective {
+            prepare_surface_layout(
+                render,
+                surface.key.clone(),
+                &surface.root,
+                prospective,
+                ScrollState::default(),
+                None,
+            )?;
+        }
+
+        let mut popups = Vec::new();
+        collect_popup_roots(&surface.root, &mut popups);
+        for popup_root in popups {
+            let existing = current.iter().find(|candidate| {
+                candidate.key == surface.key
+                    && candidate.role == LayoutSurfaceRole::Popup
+                    && candidate.root == popup_root.id
+            });
+            let prospective = popup::logical_size(popup_root);
+            let (size, scroll, focused) = existing.map_or_else(
+                || (prospective, ScrollState::default(), None),
+                |popup| (popup.size, popup.scroll.clone(), popup.focused),
+            );
+            prepared.push(prepare_surface_layout(
+                render,
+                surface.key.clone(),
+                popup_root,
+                size,
+                scroll,
+                focused,
+            )?);
+            if size != prospective {
+                prepare_surface_layout(
+                    render,
+                    surface.key.clone(),
+                    popup_root,
+                    prospective,
+                    ScrollState::default(),
+                    None,
+                )?;
+            }
+        }
+    }
+    Ok(prepared)
+}
+
+fn prepare_surface_layout(
+    render: &mut Render,
+    key: SurfaceKey,
+    root: &Node,
+    size: (u32, u32),
+    mut scroll: ScrollState,
+    focused: Option<NodeId>,
+) -> Result<PreparedSurfaceLayout, String> {
+    let logical_size = Size {
+        width: size.0 as f32,
+        height: size.1 as f32,
+    };
+    let mut layout = render
+        .layout(root, logical_size, &mut scroll)
+        .map_err(|error| format!("cannot lay out surface {:?}: {error}", root.id))?;
+    if focused.is_some_and(|id| layout.reveal_y(id, &mut scroll)) {
+        layout = render
+            .layout(root, logical_size, &mut scroll)
+            .map_err(|error| format!("cannot reveal focused widget: {error}"))?;
+    }
+    Ok(PreparedSurfaceLayout {
+        key,
+        root: root.clone(),
+        size,
+        layout,
+        scroll,
+    })
+}
+
+fn collect_popup_roots<'a>(node: &'a Node, popups: &mut Vec<&'a Node>) {
+    if node.kind == Kind::Popup {
+        popups.push(node);
+    }
+    for child in &node.children {
+        collect_popup_roots(child, popups);
     }
 }
 
@@ -5477,16 +6089,20 @@ impl OutputHandler for App {
             return;
         }
         let layer_shell_version = self.layer_shell_version;
+        let entry = self.layout_validation_entry(output.clone(), context.clone());
+        let preflight = LayoutPreflight::new(&mut self.render, layer_shell_version, vec![entry]);
         let result = self
             .configurations
             .set_output_checked(&output, context, |surfaces| {
-                validate_surface_capabilities(surfaces, layer_shell_version)
+                preflight.validate(&output, surfaces)
             });
+        let prepared = preflight.into_prepared();
         self.update_watch();
         match result {
             Ok(changed) => {
                 if changed {
                     self.invalidate_output(&output);
+                    self.install_prepared_layouts(prepared);
                 } else {
                     self.reconcile_custom_pointer(&output);
                 }
@@ -5586,9 +6202,9 @@ impl LayerShellHandler for App {
                     })
                 })
             };
-            {
-                let surface = &mut self.surfaces[index];
-                surface.size = match resolved_size {
+            let size = {
+                let surface = &self.surfaces[index];
+                match resolved_size {
                     Some(size) => size,
                     None => (
                         if config.new_size.0 == 0 {
@@ -5602,7 +6218,27 @@ impl LayerShellHandler for App {
                             config.new_size.1
                         },
                     ),
-                };
+                }
+            };
+            let initial = !self.surfaces[index].configured;
+            let prepared = match self.prepare_configured_surface_layout(index, size) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    eprintln!("thing: cannot apply panel configuration: {error}");
+                    if initial {
+                        let owner = self.surfaces[index].owner();
+                        self.remove_panel(&owner, false);
+                    }
+                    return;
+                }
+            };
+            {
+                let surface = &mut self.surfaces[index];
+                if surface.size != size {
+                    surface.layouts.invalidate_input();
+                }
+                surface.size = size;
+                surface.prepared = Some(prepared);
                 surface.configured = true;
                 surface.dirty = true;
             }
@@ -5637,13 +6273,25 @@ impl PopupHandler for App {
         config: PopupConfigure,
     ) {
         if let Some(index) = self.index(popup.wl_surface()) {
-            let surface = &mut self.surfaces[index];
             let size = (config.width.max(1) as u32, config.height.max(1) as u32);
-            let initial = !surface.configured;
+            let initial = !self.surfaces[index].configured;
+            let prepared = match self.prepare_configured_surface_layout(index, size) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    eprintln!("thing: cannot apply popup configuration: {error}");
+                    if initial {
+                        self.remove_popup(index, false, false);
+                    }
+                    return;
+                }
+            };
+            let surface = &mut self.surfaces[index];
             if surface.size != size {
+                surface.layouts.invalidate_input();
                 surface.size = size;
                 surface.dirty = true;
             }
+            surface.prepared = Some(prepared);
             surface.configured = true;
             surface.dirty |= initial;
         }
@@ -5830,7 +6478,7 @@ impl PointerHandler for App {
                     {
                         let output = self.surfaces[index].output.clone();
                         let id = target.target.node();
-                        self.range_input(index, &target, point.x);
+                        self.range_input(index, &target, point);
                         self.reconcile_range_presses(&output);
                         if let Some(index) = self.index(&event_surface)
                             && self.surface_target_is_current(index, &target)
@@ -5902,7 +6550,7 @@ impl PointerHandler for App {
                                 && self.configurations.has_active_press(&output, id)))
                             && let Some(index) = self.index(&event_surface)
                         {
-                            self.range_input(index, &target, point.x);
+                            self.range_input(index, &target, point);
                             self.reconcile_range_presses(&output);
                         }
                         if let Some(index) = self.index(&event_surface)
@@ -5997,7 +6645,13 @@ impl PointerHandler for App {
                         );
                         if let Some((index, serial)) = self.index(&event_surface).zip(popup_serial)
                         {
-                            self.sync_popup(index, serial, (button == 0x110).then_some(target), qh);
+                            self.sync_popup(
+                                index,
+                                serial,
+                                (button == 0x110).then_some(target),
+                                LayoutSnapshot::Presented,
+                                qh,
+                            );
                         }
                     }
                 }
@@ -6038,16 +6692,15 @@ impl PointerHandler for App {
                         continue;
                     };
                     if let Some(target) = handler.as_ref() {
-                        let Some(bounds) = self.surfaces[index]
-                            .layouts
-                            .presented()
-                            .and_then(|layout| layout.get(target.target.node()))
-                            .map(|placement| placement.bounds)
+                        let Some(local) =
+                            self.surfaces[index].layouts.presented().and_then(|layout| {
+                                layout.surface_to_local(target.target.node(), point)
+                            })
                         else {
                             continue;
                         };
                         let Some(input) = runtime_scroll_input(
-                            bounds,
+                            local,
                             x,
                             y,
                             event.position,
@@ -6079,12 +6732,44 @@ impl PointerHandler for App {
                     let Some(delta) = scroll_distance(y) else {
                         continue;
                     };
-                    let surface = &mut self.surfaces[index];
-                    let changed = surface.layouts.presented().is_some_and(|layout| {
-                        layout.scroll_y_targets(&scroll_ids, delta, &mut surface.scroll)
-                    });
-                    if changed {
-                        surface.dirty = true;
+                    let mut scroll = self.surfaces[index].scroll.clone();
+                    let changed = self.surfaces[index]
+                        .layouts
+                        .presented()
+                        .is_some_and(|layout| {
+                            layout.scroll_y_targets(&scroll_ids, delta, &mut scroll)
+                        });
+                    if !changed {
+                        continue;
+                    }
+                    let surface = &self.surfaces[index];
+                    let key = surface.key.clone();
+                    let size = surface.size;
+                    let focused = surface.input.keyboard_focused();
+                    let root = self
+                        .configurations
+                        .surface_root(&surface.output, &surface.key)
+                        .and_then(|root| root.find(surface.root))
+                        .cloned();
+                    let Some(root) = root else {
+                        continue;
+                    };
+                    match prepare_surface_layout(
+                        &mut self.render,
+                        key,
+                        &root,
+                        size,
+                        scroll,
+                        focused,
+                    ) {
+                        Ok(prepared) => {
+                            let surface = &mut self.surfaces[index];
+                            surface.scroll = prepared.scroll.clone();
+                            surface.prepared = Some(prepared);
+                            surface.layouts.invalidate_input();
+                            surface.dirty = true;
+                        }
+                        Err(error) => eprintln!("thing: cannot apply scroll position: {error}"),
                     }
                 }
                 _ => {}
@@ -6106,7 +6791,7 @@ fn scroll_steps(axis: AxisScroll) -> f64 {
 }
 
 fn runtime_scroll_input(
-    bounds: Rect,
+    local: Point,
     x: f64,
     y: f64,
     position: (f64, f64),
@@ -6116,8 +6801,8 @@ fn runtime_scroll_input(
     let input = RuntimeScrollInput {
         x,
         y,
-        local_x: position.0 - f64::from(bounds.x),
-        local_y: position.1 - f64::from(bounds.y),
+        local_x: f64::from(local.x),
+        local_y: f64::from(local.y),
         surface_x: position.0,
         surface_y: position.1,
         shift: modifiers.shift,
@@ -6155,7 +6840,7 @@ fn runtime_pointer_button(button: u32) -> Option<RuntimePointerButton> {
 }
 
 fn runtime_pointer_event(
-    bounds: Rect,
+    local: Point,
     phase: PointerPhase,
     button: u32,
     position: (f64, f64),
@@ -6164,8 +6849,8 @@ fn runtime_pointer_event(
     Some(RuntimePointerEvent {
         phase,
         button: runtime_pointer_button(button)?,
-        x: position.0 - f64::from(bounds.x),
-        y: position.1 - f64::from(bounds.y),
+        x: f64::from(local.x),
+        y: f64::from(local.y),
         surface_x: position.0,
         surface_y: position.1,
         shift: modifiers.shift,
@@ -6201,7 +6886,7 @@ mod input_tests {
         keyboard::{KeyEvent, Keysym, Modifiers, RepeatInfo},
         pointer::AxisScroll,
     };
-    use thing_core::{Kind, Node, NodeId, Rect};
+    use thing_core::{Kind, Node, NodeId, Point, Rect};
     use thing_ui::{Layout, Measurer, Size, TextInputEditor};
     use wayland_client::protocol::wl_pointer;
 
@@ -6249,12 +6934,7 @@ mod input_tests {
             ..Modifiers::default()
         };
         let event = runtime_pointer_event(
-            Rect {
-                x: 40.0,
-                y: 25.0,
-                width: 100.0,
-                height: 50.0,
-            },
+            Point { x: 130.5, y: -15.0 },
             PointerPhase::Move,
             0x110,
             (170.5, 10.0),
@@ -6271,7 +6951,7 @@ mod input_tests {
         assert!(!event.alt);
         assert!(
             runtime_pointer_event(
-                Rect::default(),
+                Point::default(),
                 PointerPhase::Press,
                 0x113,
                 (0.0, 0.0),
@@ -6432,13 +7112,15 @@ mod input_tests {
         let rectangle = input_method_cursor_rectangle(
             &node,
             Rect {
-                x: 20.0,
-                y: 10.0,
                 width: 120.0,
                 height: 32.0,
+                ..Rect::default()
             },
+            thing_ui::Affine::translation(20.0, 10.0),
+            true,
             &editor,
-        );
+        )
+        .unwrap();
 
         assert!(rectangle.x >= 24);
         assert!(rectangle.y >= 14);
@@ -6464,18 +7146,66 @@ mod input_tests {
         let rectangle = input_method_cursor_rectangle(
             &node,
             Rect {
-                x: 50.0,
-                y: 12.0,
                 width: 40.0,
                 height: 32.0,
+                ..Rect::default()
             },
+            thing_ui::Affine::translation(50.0, 12.0),
+            true,
             &editor,
-        );
+        )
+        .unwrap();
 
         assert!((54..=86).contains(&rectangle.x));
         assert!(rectangle.y >= 16);
         assert!(rectangle.width >= 1);
         assert!(rectangle.height >= 1);
+    }
+
+    #[test]
+    fn input_method_cursor_geometry_rotates_outward_and_singular_geometry_is_unavailable() {
+        let mut node = Node::new(NodeId(1), Kind::TextInput);
+        node.text = "hello".into();
+        node.style.padding = 4.0;
+        let editor = TextInputEditor::new(&node, 112.0);
+        let mut style = thing_core::Style {
+            rotation: 90.0,
+            translate_x: 40.0,
+            ..thing_core::Style::default()
+        };
+        style.transform_origin.x = 0.0;
+        style.transform_origin.y = 0.0;
+        let transform = thing_ui::Affine::widget(&style, 120.0, 32.0).unwrap();
+        let rectangle = input_method_cursor_rectangle(
+            &node,
+            Rect {
+                width: 120.0,
+                height: 32.0,
+                ..Rect::default()
+            },
+            transform,
+            true,
+            &editor,
+        )
+        .unwrap();
+        assert!(rectangle.x <= 36);
+        assert!(rectangle.width >= 1);
+        assert!(rectangle.height >= 1);
+
+        assert!(
+            input_method_cursor_rectangle(
+                &node,
+                Rect {
+                    width: 120.0,
+                    height: 32.0,
+                    ..Rect::default()
+                },
+                transform,
+                false,
+                &editor,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -6505,6 +7235,38 @@ mod input_tests {
             Some(NodeId(3)),
             NodeId(3)
         ));
+
+        let mut singular = root.clone();
+        singular.children[0].style.scale_x = 0.0;
+        let singular_layout = Layout::compute(
+            &singular,
+            Size {
+                width: 200.0,
+                height: 50.0,
+            },
+            &mut FixedMeasurer,
+        )
+        .unwrap();
+        assert!(singular_layout.get(NodeId(3)).is_none());
+        let semantic = *singular_layout.semantic_placement(NodeId(3)).unwrap();
+        assert!(active_text_input_is_current(
+            Some(&singular),
+            Some(&singular_layout),
+            Some(NodeId(3)),
+            NodeId(3)
+        ));
+        let node = singular.find(NodeId(3)).unwrap();
+        let editor = TextInputEditor::new(node, semantic.local_bounds().width);
+        assert!(
+            input_method_cursor_rectangle(
+                node,
+                semantic.local_bounds(),
+                semantic.transform,
+                semantic.is_invertible(),
+                &editor,
+            )
+            .is_none()
+        );
 
         let mut hidden = root.clone();
         hidden.children[0].visible = false;
@@ -6623,12 +7385,7 @@ mod input_tests {
             ..Modifiers::default()
         };
         let input = runtime_scroll_input(
-            Rect {
-                x: 10.0,
-                y: 20.0,
-                width: 100.0,
-                height: 40.0,
-            },
+            Point { x: 4.0, y: 5.0 },
             0.25,
             -0.5,
             (14.0, 25.0),
@@ -6650,12 +7407,7 @@ mod input_tests {
 
         assert!(
             runtime_scroll_input(
-                Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 1.0,
-                    height: 1.0,
-                },
+                Point::default(),
                 f64::NAN,
                 0.0,
                 (0.0, 0.0),
@@ -6977,6 +7729,7 @@ mod input_tests {
             id,
             generation: 1,
             editor: TextInputEditor::new(&node, 100.0),
+            cursor_available: true,
         });
         let mut next = 2;
 
@@ -7052,6 +7805,7 @@ mod input_tests {
             id,
             generation: 1,
             editor: TextInputEditor::new(&node, 100.0),
+            cursor_available: true,
         });
         active
             .as_mut()

@@ -47,12 +47,23 @@ impl SurfaceLayouts {
         self.input_invalidated = false;
     }
 
+    pub(crate) fn take_input(&mut self) -> Option<Layout> {
+        self.input_invalidated = false;
+        self.input.take()
+    }
+
     pub(crate) fn presented_target(&self, id: NodeId) -> Option<ScopedUiTarget> {
         let presented = self.presented.as_ref()?;
         Some(ScopedUiTarget {
             consumer: presented.consumer.clone(),
             target: presented.targets.get(&id)?.clone(),
         })
+    }
+
+    pub(crate) fn presented_pointer_target(&self, id: NodeId) -> Option<ScopedUiTarget> {
+        self.presented()?
+            .pointer_target_is_eligible(id)
+            .then(|| self.presented_target(id))?
     }
 
     pub(crate) fn presented_path(&self, id: NodeId) -> Vec<ScopedUiTarget> {

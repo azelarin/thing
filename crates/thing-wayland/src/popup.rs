@@ -105,6 +105,13 @@ pub(crate) fn resolve_for_surface(
     })
 }
 
+pub(crate) fn logical_size(node: &Node) -> (u32, u32) {
+    (
+        dimension(node.style.width, DEFAULT_WIDTH) as u32,
+        dimension(node.style.height, DEFAULT_HEIGHT) as u32,
+    )
+}
+
 pub(crate) fn configure(positioner: &XdgPositioner, position: Position, reactive: bool) {
     positioner.set_size(position.size.0, position.size.1);
     positioner.set_anchor_rect(
@@ -206,19 +213,20 @@ fn anchor_rect(rect: Rect, parent_size: (u32, u32)) -> AnchorRect {
 }
 
 fn clipped_axis(origin: f32, length: f32, parent_length: i64) -> (i32, i32) {
-    let origin = rounded(origin);
-    let length = rounded(length).max(1);
-    let start = origin.clamp(0, parent_length - 1);
-    let end = (origin.saturating_add(length)).clamp(start + 1, parent_length);
-    (start as i32, (end - start) as i32)
-}
-
-fn rounded(value: f32) -> i64 {
-    if value.is_finite() {
-        value.round() as i64
+    let end = origin + length;
+    let start = if origin.is_finite() {
+        origin.floor() as i64
     } else {
         0
-    }
+    };
+    let end = if end.is_finite() {
+        end.ceil() as i64
+    } else {
+        start.saturating_add(1)
+    };
+    let start = start.clamp(0, parent_length - 1);
+    let end = end.clamp(start + 1, parent_length);
+    (start as i32, (end - start) as i32)
 }
 
 #[cfg(test)]
@@ -257,6 +265,13 @@ mod tests {
                 slide_y: false,
             }
         );
+    }
+
+    #[test]
+    fn transformed_fractional_anchor_bounds_round_outward() {
+        assert_eq!(clipped_axis(10.75, 20.5, 100), (10, 22));
+        assert_eq!(clipped_axis(-2.25, 5.5, 100), (0, 4));
+        assert_eq!(clipped_axis(98.5, 10.0, 100), (98, 2));
     }
 
     #[test]
