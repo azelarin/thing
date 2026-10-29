@@ -71,6 +71,7 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] custom vector shapes
 - [x] visual translation, scale, and rotation
 - [x] spring animations
+- [x] ui timers
 - [ ] drag and drop
 - [x] microphone controls
 - [x] per-application audio controls

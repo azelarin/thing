@@ -10,7 +10,8 @@ use thing_runtime::{
     ManagedProcessDefinition, ManagedProcessSnapshot, ManagedProcessState, MediaSnapshot,
     NiriState, NotificationSnapshot, OutputContext,
     PointerDispatchOutcome as RuntimePointerOutcome, PointerEvent, PowerSnapshot, Runtime, Scalar,
-    ScrollInput, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTraySnapshot, UiAction, UiTarget,
+    ScrollInput, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTraySnapshot, TimerToken,
+    UiAction, UiTarget,
 };
 use thing_ui::Layout;
 
@@ -242,7 +243,8 @@ impl<K: Clone + Eq> Configurations<K> {
         }))
     }
 
-    pub(crate) fn commit_add(&mut self, prepared: PreparedOutput<K>) {
+    pub(crate) fn commit_add(&mut self, mut prepared: PreparedOutput<K>) {
+        prepared.instance.runtime.activate_timers(Instant::now());
         self.services = prepared.services;
         self.next_consumer = prepared.next_consumer;
         self.instances.push(prepared.instance);
@@ -296,6 +298,7 @@ impl<K: Clone + Eq> Configurations<K> {
         reconcile(&definitions)?;
         self.services = services;
         self.next_consumer = next_consumer;
+        runtime.activate_timers(Instant::now());
         self.instances.push(Instance {
             key,
             consumer,
@@ -784,6 +787,54 @@ impl<K: Clone + Eq> Configurations<K> {
         })
     }
 
+    pub(crate) fn next_timer_deadline(&self) -> Option<Instant> {
+        self.instances
+            .iter()
+            .filter_map(|instance| instance.runtime.next_timer_deadline())
+            .min()
+    }
+
+    pub(crate) fn due_timers(&self, now: Instant) -> Vec<(K, TimerToken)> {
+        let mut due = self
+            .instances
+            .iter()
+            .flat_map(|instance| {
+                instance
+                    .runtime
+                    .due_timers(now)
+                    .into_iter()
+                    .map(|token| (instance.key.clone(), token))
+            })
+            .collect::<Vec<_>>();
+        due.sort_by_key(|(_, token)| token.deadline());
+        // leave input and rendering a turn even when many timers become due together.
+        due.truncate(8);
+        due
+    }
+
+    pub(crate) fn dispatch_timer_checked(
+        &mut self,
+        key: &K,
+        token: &TimerToken,
+        now: Instant,
+        validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
+    ) -> Result<Option<DispatchOutcome>, String> {
+        let Some(runtime) = self.runtime_mut(key) else {
+            return Ok(None);
+        };
+        let Some(changed) = runtime
+            .dispatch_timer_checked(token, now, validate)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(DispatchOutcome {
+            changed,
+            actions: runtime.take_actions(),
+            ui_actions: runtime.take_ui_actions(),
+        }))
+    }
+
     pub(crate) fn dispatch_key_checked(
         &mut self,
         key: &K,
@@ -935,7 +986,11 @@ impl<K: Clone + Eq> Configurations<K> {
         })
     }
 
-    pub(crate) fn commit_reload(&mut self, prepared: PreparedConfigurations<K>) {
+    pub(crate) fn commit_reload(&mut self, mut prepared: PreparedConfigurations<K>) {
+        let now = Instant::now();
+        for instance in &mut prepared.instances {
+            instance.runtime.activate_timers(now);
+        }
         self.services = prepared.services;
         self.next_consumer = prepared.next_consumer;
         self.instances = prepared.instances;
@@ -1014,6 +1069,10 @@ impl<K: Clone + Eq> Configurations<K> {
         replace(&definitions)?;
         self.services = services;
         self.next_consumer = next_consumer;
+        let now = Instant::now();
+        for instance in &mut candidates {
+            instance.runtime.activate_timers(now);
+        }
         self.instances = candidates;
         Ok(())
     }
@@ -1116,6 +1175,146 @@ mod tests {
             height: 1080,
             scale: Scale::default(),
         }
+    }
+
+    #[test]
+    fn timers_belong_to_accepted_output_runtimes_and_reject_retired_tokens() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("panel.luau");
+        let source = r#"
+            local count = ui.state(0)
+            ui.timer { interval = 1000, autostart = true,
+                on_timeout = function() count:set(count:get() + 1) end }
+            return ui.panel { children = { ui.text { text = function()
+                return services.output.name:get() .. ':' .. tostring(count:get())
+            end } } }
+        "#;
+        fs::write(&path, source).unwrap();
+        let mut configurations = Configurations::new(path.clone(), ServiceSnapshot::default());
+        let outputs = vec![(1, output("DP-1", 1920)), (2, output("DP-2", 1920))];
+        let prepared = configurations
+            .prepare_reload_for_checked(outputs.clone(), |_, runtime| {
+                assert!(runtime.next_timer_deadline().is_none());
+                Ok(())
+            })
+            .unwrap();
+        assert!(configurations.next_timer_deadline().is_none());
+        configurations.commit_reload(prepared);
+        let now = Instant::now() + Duration::from_secs(5);
+        let tokens = configurations.due_timers(now);
+        assert_eq!(tokens.len(), 2);
+        assert!(
+            configurations
+                .dispatch_timer_checked(&2, &tokens[0].1, now, |_| Ok(()))
+                .unwrap()
+                .is_none()
+        );
+        configurations
+            .dispatch_timer_checked(&tokens[0].0, &tokens[0].1, now, |_| Ok(()))
+            .unwrap();
+        assert_eq!(configurations.root(&1).unwrap().children[0].text, "DP-1:1");
+        assert_eq!(configurations.root(&2).unwrap().children[0].text, "DP-2:0");
+        let deadline = configurations.next_timer_deadline();
+        fs::write(&path, "return ui.panel {").unwrap();
+        assert!(
+            configurations
+                .prepare_reload_for_checked(outputs.clone(), |_, _| Ok(()))
+                .is_err()
+        );
+        assert_eq!(configurations.next_timer_deadline(), deadline);
+        fs::write(&path, source).unwrap();
+        let prepared = configurations
+            .prepare_reload_for_checked(outputs, |_, _| Ok(()))
+            .unwrap();
+        configurations.commit_reload(prepared);
+        assert!(
+            configurations
+                .dispatch_timer_checked(&tokens[1].0, &tokens[1].1, now, |_| Ok(()))
+                .unwrap()
+                .is_none()
+        );
+        let due = configurations.due_timers(now);
+        configurations.remove(&2).unwrap();
+        let removed = due.iter().find(|(key, _)| *key == 2).unwrap();
+        assert!(
+            configurations
+                .dispatch_timer_checked(&removed.0, &removed.1, now, |_| Ok(()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            configurations
+                .due_timers(now)
+                .iter()
+                .all(|(key, _)| *key == 1)
+        );
+    }
+
+    #[test]
+    fn autostart_timer_actions_run_once_per_output_and_resize_keeps_deadlines() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("panel.luau");
+        fs::write(
+            &path,
+            r#"
+            ui.timer { interval = 1000, autostart = true,
+                on_timeout = function() services.launch({ 'must-not-run' }) end }
+            return ui.panel {}
+        "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(path, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        configurations.add(2, output("DP-2", 1920)).unwrap();
+        let deadline = configurations.next_timer_deadline();
+        configurations.set_output(&1, output("DP-1", 1280)).unwrap();
+        assert_eq!(configurations.next_timer_deadline(), deadline);
+        let now = Instant::now() + Duration::from_secs(5);
+        let due = configurations.due_timers(now);
+        assert_eq!(due.len(), 2);
+        for (output, token) in due {
+            let outcome = configurations
+                .dispatch_timer_checked(&output, &token, now, |_| Ok(()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(outcome.actions.len(), 1);
+            assert!(
+                matches!(&outcome.actions[0], Action::Launch { argv, .. } if argv == &["must-not-run"])
+            );
+        }
+        assert!(configurations.next_timer_deadline().is_none());
+    }
+
+    #[test]
+    fn due_timer_batches_are_bounded_and_do_not_replay_completed_callbacks() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("panel.luau");
+        fs::write(
+            &path,
+            r#"
+            for index = 1, 12 do
+                ui.timer { interval = index * 1000, autostart = true, on_timeout = function() end }
+            end
+            return ui.panel {}
+        "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(path, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        let now = Instant::now() + Duration::from_secs(60);
+        let first = configurations.due_timers(now);
+        assert_eq!(first.len(), 8);
+        assert!(
+            first
+                .windows(2)
+                .all(|pair| pair[0].1.deadline() <= pair[1].1.deadline())
+        );
+        for (key, token) in first {
+            configurations
+                .dispatch_timer_checked(&key, &token, now, |_| Ok(()))
+                .unwrap();
+        }
+        assert_eq!(configurations.due_timers(now).len(), 4);
     }
 
     fn system_tray_item(id: &str) -> SystemTrayItem {

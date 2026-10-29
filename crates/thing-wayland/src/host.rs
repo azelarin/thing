@@ -460,6 +460,7 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
             app.reload_at = None;
             app.reload(&qh)?;
         }
+        app.dispatch_due_timers(Instant::now());
         app.draw(&qh)?;
         app.process_hover(&qh);
         connection.flush().map_err(|error| error.to_string())?;
@@ -1177,6 +1178,9 @@ impl App {
             self.pending_launches.next_deadline(),
             self.surfaces.iter().filter_map(|surface| surface.retry_at),
         )
+        .into_iter()
+        .chain(self.configurations.next_timer_deadline())
+        .min()
     }
 
     fn update_niri(&mut self) {
@@ -2560,6 +2564,39 @@ impl App {
             });
         let prepared = preflight.into_prepared();
         self.finish_dispatch(output, consumer, result, origin, prepared);
+    }
+
+    fn dispatch_due_timers(&mut self, now: Instant) {
+        for (output, token) in self.configurations.due_timers(now) {
+            let consumer = self.configurations.consumer(&output).map(str::to_owned);
+            let Some(entry) = self.current_layout_validation_entry(&output) else {
+                continue;
+            };
+            let preflight = LayoutPreflight::new(
+                &mut self.render,
+                self.layer_shell_version,
+                self.idle_inhibit.active().is_some(),
+                vec![entry],
+            );
+            let result =
+                self.configurations
+                    .dispatch_timer_checked(&output, &token, now, |surfaces| {
+                        preflight.validate(&output, surfaces)
+                    });
+            let prepared = preflight.into_prepared();
+            match result {
+                Ok(Some(outcome)) => {
+                    self.finish_dispatch(output, consumer, Ok(outcome), None, prepared);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.finish_dispatch(output, consumer, Err(error), None, prepared);
+                }
+            }
+            if self.error.is_some() {
+                break;
+            }
+        }
     }
 
     fn dispatch_scroll(

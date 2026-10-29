@@ -9,6 +9,7 @@ mod properties;
 mod reconcile;
 mod services;
 mod state;
+mod timer;
 mod transition;
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
 pub use services::{
@@ -20,8 +21,9 @@ pub use services::{
     PowerSnapshot, ServiceSnapshot, SystemTrayAction, SystemTrayItem, SystemTrayMenu,
     SystemTrayMenuAction, SystemTrayMenuItem, SystemTraySnapshot,
 };
+pub use timer::TimerToken;
 
-use mlua::{Error, Function, Lua, Result, Table, Value, VmState};
+use mlua::{Error, ErrorContext, Function, Lua, Result, Table, Value, VmState};
 pub use state::Scalar;
 use state::{Signal, Tracker};
 use std::{
@@ -305,6 +307,7 @@ impl UiContext {
 struct ActionCheckpoint {
     services: usize,
     ui: usize,
+    timers: usize,
 }
 
 struct Binding {
@@ -355,6 +358,8 @@ pub struct Runtime {
     modules: modules::Modules,
     services: services::Services,
     ui: Rc<RefCell<UiContext>>,
+    timers: Rc<RefCell<timer::Timers>>,
+    timer_event_depth: usize,
     output: Option<OutputContext>,
     mode: ConfigurationMode,
 }
@@ -459,7 +464,8 @@ impl Runtime {
         if let Some(output) = &output {
             services.set_output(output)?;
         }
-        let ui = install_ui(&lua, tracker.clone())?;
+        let timers = Rc::new(RefCell::new(timer::Timers::default()));
+        let ui = install_ui(&lua, tracker.clone(), &timers)?;
         lua.sandbox(true)?;
         let modules = modules::Modules::default();
         let exported = modules.load(&lua, path)?;
@@ -474,6 +480,7 @@ impl Runtime {
             ));
         }
         services.freeze_managed_process_declarations();
+        timers.borrow_mut().freeze();
         let mut runtime = Self {
             lua,
             surfaces: Vec::new(),
@@ -492,12 +499,104 @@ impl Runtime {
             modules,
             services,
             ui,
+            timers,
+            timer_event_depth: 0,
             output,
             mode,
         };
         runtime.surfaces = runtime.parse_surfaces(exported)?;
         let _ = runtime.sync_ui_targets();
         Ok(runtime)
+    }
+
+    /// arm autostart timers after the host accepts this runtime.
+    pub fn activate_timers(&mut self, now: Instant) {
+        self.timers.borrow_mut().activate(now);
+    }
+
+    pub fn next_timer_deadline(&self) -> Option<Instant> {
+        self.timers.borrow().next_deadline()
+    }
+
+    /// snapshot pending callbacks; rescheduling invalidates an older token.
+    pub fn due_timers(&self, now: Instant) -> Vec<TimerToken> {
+        self.timers.borrow().due(now)
+    }
+
+    /// run one due callback and validate its candidate surfaces before publication.
+    pub fn dispatch_timer_checked(
+        &mut self,
+        token: &TimerToken,
+        now: Instant,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<Option<bool>> {
+        self.with_timer_event(Some(now), |runtime| {
+            let handler = runtime.timers.borrow_mut().claim(token, now);
+            let Some(handler) = handler else {
+                return Ok(None);
+            };
+            let checkpoint = runtime.action_checkpoint();
+            runtime.begin_call();
+            runtime.allow_actions(true);
+            if matches!(runtime.mode, ConfigurationMode::Lock) {
+                runtime.services.allow_actions(false);
+                runtime.ui.borrow_mut().action_start = None;
+            }
+            let handle = timer::Timers::handle(&runtime.timers, token);
+            let result = handler.call::<()>(handle);
+            runtime.allow_actions(false);
+            let annotate = |error: Error| {
+                let info = handler.info();
+                error.context(format!(
+                    "timer callback at {}:{}",
+                    info.short_src.as_deref().unwrap_or("<unknown>"),
+                    info.line_defined.unwrap_or(0)
+                ))
+            };
+            if let Err(error) = result {
+                runtime.truncate_actions(checkpoint);
+                return Err(annotate(error));
+            }
+            let result = (|| {
+                let changed = runtime.refresh_at_checked(now, &validate)?;
+                let cleaned = runtime.cancel_unavailable_presses_checked(now, &validate)?;
+                let pointer = runtime.reconcile_pointer_checked(&validate)?;
+                Ok(changed || cleaned || pointer.changed)
+            })();
+            match result {
+                Ok(changed) => {
+                    runtime.timers.borrow_mut().repeat(token);
+                    Ok(Some(changed))
+                }
+                Err(error) => {
+                    runtime.truncate_actions(checkpoint);
+                    runtime
+                        .timers
+                        .borrow_mut()
+                        .repeat_after_rejection(token, now.max(Instant::now()));
+                    Err(annotate(error))
+                }
+            }
+        })
+    }
+
+    fn with_timer_event<T>(
+        &mut self,
+        now: Option<Instant>,
+        callback: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let checkpoint = self.timers.borrow().checkpoint();
+        self.timer_event_depth += 1;
+        let result = callback(self);
+        self.timer_event_depth -= 1;
+        if result.is_err() {
+            self.timers.borrow_mut().truncate(checkpoint);
+        } else if self.timer_event_depth == 0 {
+            self.timers
+                .borrow_mut()
+                .commit(now.map_or_else(Instant::now, |now| now.max(Instant::now())));
+        }
+        result
     }
 
     /// the first root, retained for callers that support one surface only.
@@ -776,6 +875,15 @@ impl Runtime {
         &mut self,
         validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<PointerDispatchOutcome> {
+        self.with_timer_event(None, |runtime| {
+            runtime.reconcile_pointer_checked_inner(validate)
+        })
+    }
+
+    fn reconcile_pointer_checked_inner(
+        &mut self,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<PointerDispatchOutcome> {
         let Some(sequence) = &self.active_pointer else {
             return Ok(PointerDispatchOutcome::default());
         };
@@ -791,6 +899,17 @@ impl Runtime {
 
     /// start an implicitly captured custom pointer sequence.
     pub fn begin_pointer_checked(
+        &mut self,
+        target: &UiTarget,
+        event: PointerEvent,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<PointerDispatchOutcome> {
+        self.with_timer_event(None, |runtime| {
+            runtime.begin_pointer_checked_inner(target, event, validate)
+        })
+    }
+
+    fn begin_pointer_checked_inner(
         &mut self,
         target: &UiTarget,
         event: PointerEvent,
@@ -855,6 +974,16 @@ impl Runtime {
         event: PointerEvent,
         validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<PointerDispatchOutcome> {
+        self.with_timer_event(None, |runtime| {
+            runtime.dispatch_pointer_checked_inner(event, validate)
+        })
+    }
+
+    fn dispatch_pointer_checked_inner(
+        &mut self,
+        event: PointerEvent,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<PointerDispatchOutcome> {
         validate_pointer_event(event)?;
         if !matches!(event.phase, PointerPhase::Move | PointerPhase::Release) {
             return Err(Error::runtime(
@@ -910,6 +1039,15 @@ impl Runtime {
         &mut self,
         validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<PointerDispatchOutcome> {
+        self.with_timer_event(None, |runtime| {
+            runtime.cancel_pointer_checked_inner(validate)
+        })
+    }
+
+    fn cancel_pointer_checked_inner(
+        &mut self,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<PointerDispatchOutcome> {
         let Some(sequence) = self.active_pointer.take() else {
             return Ok(PointerDispatchOutcome::default());
         };
@@ -961,6 +1099,17 @@ impl Runtime {
 
     /// run a custom scroll handler captured from the presented widget tree.
     pub fn dispatch_scroll_checked(
+        &mut self,
+        target: &UiTarget,
+        input: ScrollInput,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<Option<ScrollDispatchOutcome>> {
+        self.with_timer_event(None, |runtime| {
+            runtime.dispatch_scroll_checked_inner(target, input, validate)
+        })
+    }
+
+    fn dispatch_scroll_checked_inner(
         &mut self,
         target: &UiTarget,
         input: ScrollInput,
@@ -1043,6 +1192,17 @@ impl Runtime {
         event: Event,
         validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<bool> {
+        self.with_timer_event(None, |runtime| {
+            runtime.dispatch_checked_inner(id, event, validate)
+        })
+    }
+
+    fn dispatch_checked_inner(
+        &mut self,
+        id: NodeId,
+        event: Event,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<bool> {
         self.dispatch_inner_checked(id, event, None, &validate)
     }
 
@@ -1053,6 +1213,17 @@ impl Runtime {
 
     /// run a surface-root keyboard handler and validate its candidate trees.
     pub fn dispatch_key_checked(
+        &mut self,
+        id: NodeId,
+        input: KeyInput,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<Option<KeyDispatch>> {
+        self.with_timer_event(None, |runtime| {
+            runtime.dispatch_key_checked_inner(id, input, validate)
+        })
+    }
+
+    fn dispatch_key_checked_inner(
         &mut self,
         id: NodeId,
         input: KeyInput,
@@ -1650,7 +1821,11 @@ impl Runtime {
 
     /// reload the configuration, preserving it if loading or validation fails.
     pub fn reload(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        *self = self.load_replacement(path)?;
+        let mut replacement = self.load_replacement(path)?;
+        if self.timers.borrow().is_activated() {
+            replacement.activate_timers(Instant::now());
+        }
+        *self = replacement;
         Ok(())
     }
 
@@ -1663,11 +1838,13 @@ impl Runtime {
         ActionCheckpoint {
             services: self.services.action_count(),
             ui: self.ui.borrow().actions.len(),
+            timers: self.timers.borrow().checkpoint(),
         }
     }
 
     fn allow_actions(&self, allowed: bool) {
         self.services.allow_actions(allowed);
+        self.timers.borrow_mut().allow_controls(allowed);
         let mut ui = self.ui.borrow_mut();
         ui.action_start = allowed.then_some(ui.actions.len());
     }
@@ -1675,6 +1852,7 @@ impl Runtime {
     fn truncate_actions(&self, checkpoint: ActionCheckpoint) {
         self.services.truncate_actions(checkpoint.services);
         self.ui.borrow_mut().actions.truncate(checkpoint.ui);
+        self.timers.borrow_mut().truncate(checkpoint.timers);
     }
 
     fn sync_ui_targets(&self) -> bool {
@@ -2212,8 +2390,13 @@ fn kind(name: &str) -> Result<Kind> {
     }
 }
 
-fn install_ui(lua: &Lua, tracker: Rc<RefCell<Tracker>>) -> Result<Rc<RefCell<UiContext>>> {
+fn install_ui(
+    lua: &Lua,
+    tracker: Rc<RefCell<Tracker>>,
+    timers: &Rc<RefCell<timer::Timers>>,
+) -> Result<Rc<RefCell<UiContext>>> {
     let ui = lua.create_table()?;
+    timer::Timers::install(timers, lua, &ui)?;
     let context = Rc::new(RefCell::new(UiContext::default()));
     let next_id = Rc::new(Cell::new(1_u64));
     for name in [
@@ -3910,3 +4093,6 @@ mod transition_tests {
         close(style.transform_origin.x, 0.0);
     }
 }
+
+#[cfg(test)]
+mod timer_tests;
