@@ -3,7 +3,7 @@ use thing_core::{
     ClipMode, Color, CrossAlign, ImageFit, ImageSource, KeyboardMode, Kind, MainAlign, Node,
     PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins, PathFillRule, PathFit,
     PathStrokeCap, PathStrokeJoin, PopupAlignment, PopupAnchor, PopupConstraints, PopupOffset,
-    SurfaceAnchors, SurfaceLayer, TextAlign, TextOverflow, TransformOrigin, ViewBox,
+    ScrollAxis, SurfaceAnchors, SurfaceLayer, TextAlign, TextOverflow, TransformOrigin, ViewBox,
 };
 
 use crate::services::ImageHandle;
@@ -498,6 +498,16 @@ fn text_align(value: Value, name: &str) -> Result<TextAlign> {
     }
 }
 
+fn scroll_axis(value: Value, name: &str) -> Result<ScrollAxis> {
+    match string(value, name)?.as_str() {
+        "horizontal" => Ok(ScrollAxis::Horizontal),
+        "vertical" => Ok(ScrollAxis::Vertical),
+        _ => Err(Error::runtime(format!(
+            "{name} must be \"horizontal\" or \"vertical\""
+        ))),
+    }
+}
+
 fn clip_mode(value: Value, name: &str) -> Result<ClipMode> {
     match string(value, name)?.as_str() {
         "bounds" => Ok(ClipMode::Bounds),
@@ -684,6 +694,7 @@ pub(crate) fn apply_animation_frame(node: &mut Node, name: &str, value: Resolved
 
 pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
     match name {
+        "axis" if node.kind == Kind::Scroll => node.scroll_axis = scroll_axis(value, name)?,
         "text" if node.kind == Kind::Text => node.text = string(value, name)?,
         "value" if node.kind == Kind::TextInput => node.text = string(value, name)?,
         "placeholder" if matches!(node.kind, Kind::TextInput | Kind::SecretInput) => {

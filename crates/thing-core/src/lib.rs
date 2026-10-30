@@ -15,7 +15,7 @@ pub use widget::{
     ClipMode, CrossAlign, Image, ImageCandidate, ImageFit, ImagePixmap, ImageSource, KeyboardMode,
     Kind, MainAlign, Node, NodeId, PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins,
     PanelProperties, PathFillRule, PathFit, PathStrokeCap, PathStrokeJoin, PopupAlignment,
-    PopupAnchor, PopupConstraints, PopupOffset, PopupOptions, Slider, Style, SurfaceAnchors,
-    SurfaceLayer, TextAlign, TextOverflow, TransformOrigin, TreeError, VectorPath, VectorSegment,
-    ViewBox,
+    PopupAnchor, PopupConstraints, PopupOffset, PopupOptions, ScrollAxis, Slider, Style,
+    SurfaceAnchors, SurfaceLayer, TextAlign, TextOverflow, TransformOrigin, TreeError, VectorPath,
+    VectorSegment, ViewBox,
 };

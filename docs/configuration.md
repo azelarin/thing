@@ -339,6 +339,7 @@ widget kind; unkeyed children match by position and kind.
 | `slider` | `min`, `max`, `value`, `step`, `on_change`, `on_hover` |
 | `range` | `children`, `min`, `max`, `value`, `step`, `inset`, `on_change`, `on_hover`, `on_pressed` |
 | `popup` | `visible`, `open_on_hover`, `open_on_click`, `open_delay`, `close_delay`, `anchor`, `alignment`, `offset`, `constraints`, `on_key`, `on_scroll`, `on_hover`, `on_close` |
+| `scroll` | `axis`: `vertical` (default) or `horizontal`; also accepts container properties |
 | containers | `children`: array of widgets, or a function returning one; optional `on_scroll` |
 
 use a positive `max_lines` to limit a text widget. omitted lines are clipped by
@@ -409,23 +410,40 @@ same layer position. use `align` and `justify` on the stack, or `align_self` on 
 child, to place overlays within it. min and max dimensions still constrain each
 overlay. stack children never wrap.
 
-`scroll` lays out its children vertically and clips them to its bounds. give it
-an explicit height, or use `grow = 1` inside a column whose height is already
-bounded. otherwise it grows to fit its children and has nowhere to scroll. one
-wheel step moves 40 logical pixels; high-resolution input keeps fractional
-movement. nested viewports keep the event until they reach the limit in that
-direction, then the next event moves the outer viewport. handlers and viewports
-share one route from the widget under the pointer outward, described in
-[wheel events](#wheel-events).
+`scroll` lays out its children vertically by default. set `axis = 'horizontal'`
+to arrange them in a row and scroll sideways. give the viewport a bounded size:
+an explicit height for a vertical view or width for a horizontal view, or
+`grow = 1` inside an appropriately sized parent. otherwise it grows to fit its
+children and has nowhere to scroll.
+
+```lua
+ui.scroll {
+    axis = 'horizontal',
+    style = { width = 240, height = 48, gap = 8 },
+    children = {
+        ui.text { text = 'first', style = { width = 160 } },
+        ui.text { text = 'second', style = { width = 160 } },
+    },
+}
+```
+
+views use wheel and touchpad movement along their own axis. Shift with vertical
+wheel input moves horizontally; handlers still receive the original deltas and
+modifiers. ordinary vertical input passes through a horizontal view to its
+ancestors. one wheel step moves 40 logical pixels; high-resolution input keeps
+fractional movement. nested viewports keep the event until they reach the limit
+in that direction, then the next event moves an enclosing view on that axis.
+handlers and viewports share one route from the widget under the pointer
+outward, described in [wheel events](#wheel-events).
 
 the offset stays with the scroll widget while reactive updates preserve its
 identity, including while it is hidden, and is clamped when its content shrinks.
-a successful configuration reload and closing a popup reset their offsets.
-`ui.reveal(widget)` can move the enclosing vertical scroll views from an event
-handler. scrollbars, horizontal scrolling, and touch dragging are not available
-yet. scroll children stay in one column, so `wrap` is not available.
-when centered or end-justified content becomes taller than its viewport, it
-falls back to the start edge so the beginning remains reachable.
+changing `axis`, a successful configuration reload, and closing a popup reset
+the offset. `ui.reveal(widget)` and keyboard focus can move enclosing views on
+both axes. scrollbars and touch dragging are not available yet. scroll children
+stay in one row or column, so `wrap` is not available.
+when centered or end-justified content exceeds its viewport along the scroll
+axis, it falls back to the start edge so the beginning remains reachable.
 
 slider defaults are 0–1, value 0, and step 0.01. a step of zero means continuous
 input. the range must be finite and increasing. pointer input clamps to the range;
@@ -1310,7 +1328,8 @@ not inherit implicitly.
 individual style values can be functions, just like widget properties.
 
 rows, panels, popups, buttons, pointer areas, and stacks have a horizontal main
-axis and a vertical cross axis. columns and scrolls swap those axes. `justify`
+axis and a vertical cross axis. columns and vertical scrolls swap those axes.
+`justify`
 places or distributes children on the main axis and accepts `start`, `center`,
 `end`, `space_between`, `space_around`, or `space_evenly`. `align` places
 children on the cross axis and accepts `start`, `center`, `end`, or `stretch`;
@@ -2511,7 +2530,7 @@ when its panel or popup has keyboard focus; otherwise the request waits for that
 surface's next keyboard entry. a popup created by the same event can claim the
 request. if that popup is still closed when the next frame is prepared, the
 request expires instead of carrying into a later opening. `ui.reveal(widget)`
-moves every enclosing vertical scroll view by the smallest amount needed. both
+moves every enclosing scroll view by the smallest amount needed. both
 functions are available only inside event handlers and take effect after the
 handler's reactive update passes validation. hidden, disabled, and zero-sized
 targets are ignored. if an updated list recreates the target, give it a stable

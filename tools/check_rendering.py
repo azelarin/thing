@@ -24,11 +24,11 @@ FIXTURES = ROOT / "tests/rendering"
 ARTIFACTS = ROOT / "target/render-tests"
 CASES = (
     "image-fit", "stencil", "gradients", "radial-gradients", "shadows", "shared-motion",
-    "widget-bounds", "rounded-clips",
+    "widget-bounds", "rounded-clips", "horizontal-scroll",
 )
 # these accept a state only after the same passing frame is captured twice.
 STABLE_FRAMES = {
-    "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2, "rounded-clips": 2,
+    "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2, "rounded-clips": 2, "horizontal-scroll": 2,
 }
 RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
 # the runtime error each panel-invalid.luau must produce, in thing check and in
@@ -424,6 +424,19 @@ def verify_rounded_clips(image, stage, scale):
         expect_color(image, point, scale, color, label, tolerance=3)
 
 
+def verify_horizontal_scroll(image, stage, scale):
+    last = (224, 164, 81) if stage == "reload" else (196, 112, 210)
+    for point, color, label in (
+        ((24, 24), (13, 17, 23), "rounded viewport corner"),
+        ((40, 50), (71, 209, 108), "partly visible middle item"),
+        ((100, 50), last, "revealed horizontal item"),
+        ((184, 50), (13, 17, 23), "stationary viewport edge"),
+        ((40, 130), (71, 209, 108), "nested horizontal offset"),
+        ((100, 130), last, "nested reveal across both axes"),
+    ):
+        expect_color(image, point, scale, color, label, tolerance=3)
+
+
 def verify_capture(case, image, stage, scale):
     if case == "image-fit":
         verify_image_fit(image, stage, scale)
@@ -441,6 +454,8 @@ def verify_capture(case, image, stage, scale):
         verify_widget_bounds(image, stage, scale)
     elif case == "rounded-clips":
         verify_rounded_clips(image, stage, scale)
+    elif case == "horizontal-scroll":
+        verify_horizontal_scroll(image, stage, scale)
     else:
         raise FixtureError(f"unknown renderer fixture: {case}")
 

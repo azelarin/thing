@@ -58,6 +58,7 @@ export type ThingMainAlign =
     | "space_evenly"
 export type ThingTextAlign = "start" | "center" | "end"
 export type ThingTextOverflow = "clip" | "ellipsis"
+export type ThingScrollAxis = "horizontal" | "vertical"
 export type ThingClipMode = "bounds" | "rounded"
 export type ThingImageFit = "contain" | "cover" | "fill"
 export type ThingPathFit = "contain" | "cover" | "fill"
@@ -410,6 +411,16 @@ export type ThingLockProperties = {
 }
 
 export type ThingContainerProperties = {
+    key: string?,
+    visible: ThingReactive<boolean>?,
+    enabled: ThingReactive<boolean>?,
+    style: ThingStyle?,
+    children: ThingChildren?,
+    on_scroll: ThingScrollHandler?,
+}
+
+export type ThingScrollProperties = {
+    axis: ThingReactive<ThingScrollAxis>?,
     key: string?,
     visible: ThingReactive<boolean>?,
     enabled: ThingReactive<boolean>?,
@@ -986,7 +997,7 @@ declare ui: {
     centerbox: (properties: ThingContainerProperties) -> ThingWidget,
     column: (properties: ThingContainerProperties) -> ThingWidget,
     stack: (properties: ThingContainerProperties) -> ThingWidget,
-    scroll: (properties: ThingContainerProperties) -> ThingWidget,
+    scroll: (properties: ThingScrollProperties) -> ThingWidget,
     text: (properties: ThingTextProperties) -> ThingWidget,
     text_input: (properties: ThingTextInputProperties) -> ThingWidget,
     secret_input: (properties: ThingSecretInputProperties) -> ThingWidget,

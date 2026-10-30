@@ -788,6 +788,14 @@ impl Slider {
     }
 }
 
+/// the content direction of a scroll viewport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScrollAxis {
+    Horizontal,
+    #[default]
+    Vertical,
+}
+
 /// a widget and its resolved properties. script functions stay in the runtime.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
@@ -798,6 +806,7 @@ pub struct Node {
     pub placeholder: String,
     pub max_lines: Option<u32>,
     pub text_overflow: TextOverflow,
+    pub scroll_axis: ScrollAxis,
     pub image: Image,
     pub image_fit: ImageFit,
     pub path: VectorPath,
@@ -833,6 +842,7 @@ impl Node {
             placeholder: String::new(),
             max_lines: None,
             text_overflow: TextOverflow::Clip,
+            scroll_axis: ScrollAxis::Vertical,
             image: Image::default(),
             image_fit: ImageFit::Contain,
             path: VectorPath::default(),
@@ -945,6 +955,9 @@ impl Node {
             return Err(TreeError(
                 "idle_inhibit is available only on panel and popup surfaces".into(),
             ));
+        }
+        if self.kind != Kind::Scroll && self.scroll_axis != ScrollAxis::Vertical {
+            return Err(TreeError("axis is available only on scroll widgets".into()));
         }
         self.panel.validate(&self.style)?;
         if !self.kind.is_container() && !self.children.is_empty() {
