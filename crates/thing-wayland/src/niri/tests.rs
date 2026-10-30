@@ -435,3 +435,191 @@ fn keyboard_and_overview_state_clear_on_disconnect_and_can_reconnect_without_new
     drop(niri);
     server.join().unwrap();
 }
+
+fn cast(id: u64) -> Value {
+    json!({"stream_id":id,"session_id":u64::MAX,"kind":"PipeWire",
+        "target":{"Window":{"id":u64::MAX}},"is_dynamic_target":true,
+        "is_active":true,"pid":null,"pw_node_id":42})
+}
+
+#[test]
+fn cast_snapshots_and_deltas_keep_paused_and_unknown_streams() {
+    use thing_runtime::{NiriCastKind, NiriCastTarget};
+    let mut model = Model::default();
+    apply(&mut model, workspaces(1));
+    apply(&mut model, json!({"WindowsChanged":{"windows":[]}}));
+    assert!(model.is_initialized());
+    assert_eq!(model.snapshot().casts, None);
+    apply(&mut model, json!({"CastStartedOrChanged":{"cast":cast(7)}}));
+    assert_eq!(model.snapshot().casts, None);
+    apply(
+        &mut model,
+        json!({"CastsChanged":{"casts":[cast(u64::MAX),cast(1)]}}),
+    );
+    let casts = model.snapshot().casts.unwrap();
+    assert_eq!(
+        casts.iter().map(|c| c.stream_id).collect::<Vec<_>>(),
+        vec![1, u64::MAX]
+    );
+    assert_eq!(casts[0].session_id, u64::MAX);
+    assert_eq!(casts[0].target, NiriCastTarget::Window(u64::MAX));
+    assert_eq!(casts[0].pipewire_node_id, Some(42));
+    let mut paused = cast(1);
+    paused["kind"] = json!("WlrScreencopy");
+    paused["target"] = json!({"Output":{"name":"DP-1"}});
+    paused["is_active"] = json!(false);
+    paused["pid"] = json!(1234);
+    paused["pw_node_id"] = Value::Null;
+    apply(&mut model, json!({"CastStartedOrChanged":{"cast":paused}}));
+    let stream = model.snapshot().casts.unwrap().remove(0);
+    assert!(!stream.active);
+    assert_eq!(stream.kind, NiriCastKind::WlrScreencopy);
+    assert_eq!(stream.target, NiriCastTarget::Output("DP-1".into()));
+    assert_eq!(stream.pid, Some(1234));
+    assert_eq!(stream.pipewire_node_id, None);
+    let mut future = cast(2);
+    future["kind"] = json!("FutureProtocol");
+    future["target"] = json!({"Region":{"future_data":[1,2]}});
+    apply(&mut model, json!({"CastStartedOrChanged":{"cast":future}}));
+    let stream = model.snapshot().casts.unwrap().remove(1);
+    assert!(stream.active);
+    assert_eq!(stream.kind, NiriCastKind::Unknown("FutureProtocol".into()));
+    assert_eq!(stream.target, NiriCastTarget::Unknown("Region".into()));
+    let mut no_target = cast(1);
+    no_target["target"] = json!({"Nothing":{}});
+    apply(
+        &mut model,
+        json!({"CastStartedOrChanged":{"cast":no_target}}),
+    );
+    assert_eq!(
+        model.snapshot().casts.unwrap()[0].target,
+        NiriCastTarget::Nothing
+    );
+    apply(&mut model, json!({"CastStopped":{"stream_id":u64::MAX}}));
+    apply(&mut model, json!({"CastStopped":{"stream_id":123}}));
+    assert_eq!(model.snapshot().casts.unwrap().len(), 2);
+    apply(&mut model, json!({"CastsChanged":{"casts":[]}}));
+    assert_eq!(model.snapshot().casts, Some(vec![]));
+}
+
+#[test]
+fn malformed_cast_updates_leave_the_previous_snapshot_intact() {
+    let mut model = Model::default();
+    apply(&mut model, json!({"CastsChanged":{"casts":[cast(1)]}}));
+    let before = model.snapshot();
+    let mut malformed = cast(2);
+    malformed["target"] = json!({"Output":{"name":"bad\0output"}});
+    let mut malformed_target = cast(3);
+    malformed_target["target"] = json!({"Window":{"id":"not an id"}});
+    for event in [
+        json!({"CastsChanged":{"casts":[cast(2),malformed.clone()]}}),
+        json!({"CastsChanged":{"casts":[cast(2),cast(2)]}}),
+        json!({"CastStartedOrChanged":{"cast":malformed}}),
+        json!({"CastStartedOrChanged":{"cast":malformed_target}}),
+    ] {
+        assert!(model.apply(&serde_json::to_vec(&event).unwrap()).is_err());
+        assert_eq!(model.snapshot(), before);
+    }
+    apply(
+        &mut model,
+        json!({"CastsChanged":{"casts":(0..10000).map(cast).collect::<Vec<_>>()}}),
+    );
+    assert!(
+        model
+            .apply(
+                &serde_json::to_vec(&json!({"CastStartedOrChanged":{"cast":cast(10000)}})).unwrap()
+            )
+            .is_err()
+    );
+    assert_eq!(model.snapshot().casts.unwrap().len(), 10000);
+}
+
+#[test]
+fn casts_and_moves_use_the_worker_and_clear_on_disconnect() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("niri.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (disconnect, disconnect_rx) = mpsc::channel();
+    let (reconnect, reconnect_rx) = mpsc::channel();
+    let (done, finish) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let events = accept(&listener);
+        assert_eq!(read(&mut BufReader::new(&events)), json!("EventStream"));
+        send(&events, json!({"Ok":"Handled"}));
+        initial_state(&events, 1);
+        send(&events, json!({"CastsChanged":{"casts":[cast(u64::MAX)]}}));
+        let commands = accept(&listener);
+        let mut reader = BufReader::new(&commands);
+        for expected in [
+            json!({"MoveWindowToWorkspace":{"window_id":u64::MAX,"reference":{"Id":2},"focus":false}}),
+            json!({"MoveWindowToMonitor":{"id":u64::MAX,"output":"DP-2"}}),
+            json!({"MoveWorkspaceToMonitor":{"reference":{"Id":u64::MAX},"output":"DP-2"}}),
+        ] {
+            assert_eq!(read(&mut reader), json!({"Action":expected}));
+            send(&commands, json!({"Ok":"Handled"}));
+        }
+        let mut paused = cast(u64::MAX);
+        paused["is_active"] = json!(false);
+        send(&events, json!({"CastStartedOrChanged":{"cast":paused}}));
+        disconnect_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(reader);
+        drop(commands);
+        drop(events);
+        reconnect_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let events = accept(&listener);
+        assert_eq!(read(&mut BufReader::new(&events)), json!("EventStream"));
+        send(&events, json!({"Ok":"Handled"}));
+        initial_state(&events, 2);
+        finish.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    let (ping, _source) = calloop::ping::make_ping().unwrap();
+    let niri = Niri::start_at(Some(path), ping).unwrap();
+    wait_for(&niri, |s| {
+        s.available
+            && s.state
+                .casts
+                .as_ref()
+                .is_some_and(|c| c.len() == 1 && c[0].active)
+    });
+    niri.send(NiriAction::MoveWindowToWorkspace {
+        window_id: u64::MAX,
+        workspace_id: 2,
+        focus: false,
+    })
+    .unwrap();
+    niri.send(NiriAction::MoveWindowToOutput {
+        window_id: u64::MAX,
+        output: "DP-2".into(),
+    })
+    .unwrap();
+    niri.send(NiriAction::MoveWorkspaceToOutput {
+        workspace_id: u64::MAX,
+        output: "DP-2".into(),
+    })
+    .unwrap();
+    wait_for(&niri, |s| {
+        s.state
+            .casts
+            .as_ref()
+            .is_some_and(|c| c.len() == 1 && !c[0].active)
+    });
+    disconnect.send(()).unwrap();
+    let offline = wait_for(&niri, |s| !s.available);
+    assert_eq!(offline.state.casts, None);
+    assert!(
+        niri.send(NiriAction::MoveWindowToOutput {
+            window_id: 1,
+            output: "DP-1".into()
+        })
+        .is_err()
+    );
+    reconnect.send(()).unwrap();
+    let restored = wait_for(&niri, |s| {
+        s.available && s.state.workspaces.first().is_some_and(|w| w.id == 2)
+    });
+    assert_eq!(restored.state.casts, None);
+    done.send(()).unwrap();
+    drop(niri);
+    server.join().unwrap();
+}

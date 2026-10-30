@@ -767,6 +767,25 @@ declare extern type ThingNiriKeyboardLayouts with
     read current_index: number?
 end
 
+declare extern type ThingNiriCastTarget with
+    read kind: "none" | "output" | "window" | "unknown"
+    read output: string?
+    read window_id: string?
+    read protocol_kind: string?
+end
+
+declare extern type ThingNiriCast with
+    read stream_id: string
+    read session_id: string
+    read kind: "pipewire" | "wlr_screencopy" | "unknown"
+    read protocol_kind: string?
+    read target: ThingNiriCastTarget
+    read dynamic_target: boolean
+    read active: boolean
+    read pid: number?
+    read pipewire_node_id: number?
+end
+
 declare extern type ThingNiriWindow with
     read id: string
     read workspace_id: string?
@@ -934,12 +953,16 @@ declare extern type ThingNiriService with
     read windows: ThingSignal<ThingReadonlyArray<ThingNiriWindow>>
     read overview_open: ThingSignal<boolean?>
     read keyboard_layouts: ThingSignal<ThingNiriKeyboardLayouts?>
+    read casts: ThingSignal<ThingReadonlyArray<ThingNiriCast>?>
     read set_overview: (open: boolean) -> ()
     read toggle_overview: () -> ()
     read switch_layout: (layout: number | "next" | "prev") -> ()
     read focus_workspace: (id: string) -> ()
     read focus_window: (id: string) -> ()
     read close_window: (id: string) -> ()
+    read move_window_to_workspace: (window_id: string, workspace_id: string, focus: boolean?) -> ()
+    read move_window_to_output: (window_id: string, output: string) -> ()
+    read move_workspace_to_output: (workspace_id: string, output: string) -> ()
 end
 
 declare extern type ThingOutputService with

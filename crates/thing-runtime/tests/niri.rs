@@ -404,3 +404,216 @@ fn invalid_layout_snapshots_leave_the_previous_value_intact() {
         assert_eq!(runtime.root().unwrap().children[0].text, "empty");
     }
 }
+
+fn cast(id: u64) -> thing_runtime::NiriCast {
+    use thing_runtime::{NiriCast, NiriCastKind, NiriCastTarget};
+    NiriCast {
+        stream_id: id,
+        session_id: u64::MAX,
+        kind: NiriCastKind::PipeWire,
+        target: NiriCastTarget::Window(u64::MAX),
+        dynamic_target: true,
+        active: true,
+        pid: None,
+        pipewire_node_id: Some(u32::MAX),
+    }
+}
+
+#[test]
+fn casts_preserve_ids_and_paused_streams_with_independent_reactive_updates() {
+    use thing_runtime::{NiriCastKind, NiriCastTarget};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("panel.luau");
+    fs::write(
+        &path,
+        r#"
+        local niri = services.niri
+        local reads = 0
+        return ui.panel { children = {
+            ui.text { text = function()
+                local casts = niri.casts:get()
+                if not casts then return 'unknown' end
+                assert(not pcall(function() casts[1] = nil end))
+                if #casts == 0 then return 'empty' end
+                local cast = casts[1]
+                assert(not pcall(function() cast.active = false end))
+                assert(not pcall(function() cast.target.kind = 'none' end))
+                assert(cast.stream_id == '18446744073709551615')
+                assert(cast.session_id == '18446744073709551615')
+                if cast.kind == 'pipewire' then
+                    assert(cast.target.window_id == '18446744073709551615')
+                    assert(cast.pipewire_node_id == 4294967295 and cast.pid == nil)
+                end
+                return cast.kind .. ':' .. cast.target.kind .. ':' .. tostring(cast.active)
+                    .. ':' .. tostring(cast.target.output or cast.protocol_kind or '')
+            end },
+            ui.text { text = function()
+                niri.windows:get(); niri.workspaces:get(); niri.keyboard_layouts:get()
+                niri.overview_open:get(); reads += 1; return tostring(reads)
+            end },
+        } }
+    "#,
+    )
+    .unwrap();
+    let mut runtime = Runtime::load(&path).unwrap();
+    assert_eq!(runtime.root().unwrap().children[0].text, "unknown");
+    let mut state = NiriState {
+        casts: Some(vec![cast(u64::MAX)]),
+        ..NiriState::default()
+    };
+    runtime.set_niri(state.clone()).unwrap();
+    runtime.refresh().unwrap();
+    assert_eq!(
+        runtime.root().unwrap().children[0].text,
+        "pipewire:window:true:"
+    );
+    state.casts.as_mut().unwrap()[0].active = false;
+    state.casts.as_mut().unwrap()[0].kind = NiriCastKind::WlrScreencopy;
+    state.casts.as_mut().unwrap()[0].target = NiriCastTarget::Output("DP-1".into());
+    runtime.set_niri(state.clone()).unwrap();
+    runtime.refresh().unwrap();
+    assert_eq!(
+        runtime.root().unwrap().children[0].text,
+        "wlr_screencopy:output:false:DP-1"
+    );
+    assert_eq!(runtime.root().unwrap().children[1].text, "1");
+    runtime.set_niri(state.clone()).unwrap();
+    assert!(!runtime.refresh().unwrap());
+    runtime.reload(&path).unwrap();
+    assert_eq!(
+        runtime.root().unwrap().children[0].text,
+        "wlr_screencopy:output:false:DP-1"
+    );
+    state.casts.as_mut().unwrap()[0].kind = NiriCastKind::Unknown("FutureProtocol".into());
+    state.casts.as_mut().unwrap()[0].target = NiriCastTarget::Unknown("Region".into());
+    runtime.set_niri(state).unwrap();
+    runtime.refresh().unwrap();
+    assert_eq!(
+        runtime.root().unwrap().children[0].text,
+        "unknown:unknown:false:FutureProtocol"
+    );
+    runtime
+        .set_niri(NiriState {
+            casts: Some(vec![]),
+            ..NiriState::default()
+        })
+        .unwrap();
+    runtime.refresh().unwrap();
+    assert_eq!(runtime.root().unwrap().children[0].text, "empty");
+    runtime.set_niri(NiriState::default()).unwrap();
+    runtime.refresh().unwrap();
+    assert_eq!(runtime.root().unwrap().children[0].text, "unknown");
+}
+
+#[test]
+fn invalid_cast_snapshots_do_not_replace_accepted_state() {
+    use thing_runtime::NiriCastTarget;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("panel.luau");
+    fs::write(&path, "return ui.panel {children={ui.text {text=function() local c=services.niri.casts:get(); return if c then tostring(#c) else 'unknown' end}}}").unwrap();
+    let mut runtime = Runtime::load(path).unwrap();
+    runtime
+        .set_niri(NiriState {
+            casts: Some(vec![cast(1)]),
+            ..NiriState::default()
+        })
+        .unwrap();
+    runtime.refresh().unwrap();
+    let mut bad_text = cast(2);
+    bad_text.target = NiriCastTarget::Output("bad\0output".into());
+    for casts in [
+        vec![cast(1), cast(1)],
+        vec![bad_text],
+        (0..10001).map(cast).collect(),
+    ] {
+        assert!(
+            runtime
+                .set_niri(NiriState {
+                    casts: Some(casts),
+                    ..NiriState::default()
+                })
+                .is_err()
+        );
+        assert!(!runtime.refresh().unwrap());
+        assert_eq!(runtime.root().unwrap().children[0].text, "1");
+    }
+}
+
+#[test]
+fn moves_use_explicit_ids_and_validate_arguments_before_queuing() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("panel.luau");
+    fs::write(
+        &path,
+        r#"
+        local niri = services.niri
+        return ui.panel { children = { ui.button { on_click = function()
+            niri.move_window_to_workspace('18446744073709551615', '2')
+            niri.move_window_to_workspace('3', '18446744073709551615', false)
+            niri.move_window_to_output('4', 'DP-1')
+            niri.move_workspace_to_output('5', 'מסך 2')
+            assert(#niri.windows:get() == 0 and #niri.workspaces:get() == 0)
+        end } } }
+    "#,
+    )
+    .unwrap();
+    let mut runtime = Runtime::load(&path).unwrap();
+    runtime
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
+        .unwrap();
+    assert_eq!(
+        runtime.take_actions(),
+        vec![
+            Action::Niri(NiriAction::MoveWindowToWorkspace {
+                window_id: u64::MAX,
+                workspace_id: 2,
+                focus: true
+            }),
+            Action::Niri(NiriAction::MoveWindowToWorkspace {
+                window_id: 3,
+                workspace_id: u64::MAX,
+                focus: false
+            }),
+            Action::Niri(NiriAction::MoveWindowToOutput {
+                window_id: 4,
+                output: "DP-1".into()
+            }),
+            Action::Niri(NiriAction::MoveWorkspaceToOutput {
+                workspace_id: 5,
+                output: "מסך 2".into()
+            }),
+        ]
+    );
+    for action in [
+        "niri.move_window_to_workspace(1, '2')",
+        "niri.move_window_to_workspace('1', '18446744073709551616')",
+        "niri.move_window_to_workspace('1', '2', 1)",
+        "niri.move_window_to_output('1', 3)",
+        "niri.move_window_to_output('1', '')",
+        "niri.move_window_to_output('1', 'DP\\0-1')",
+        "niri.move_workspace_to_output('1', string.rep('a', 4097))",
+        "niri.move_workspace_to_output('-1', 'DP-1')",
+        "niri.move_window_to_output('1', 'DP-1'); error('failed callback')",
+    ] {
+        fs::write(&path, format!("local niri=services.niri; return ui.panel {{ children = {{ ui.button {{ on_click = function() {action} end }} }} }}")).unwrap();
+        let mut runtime = Runtime::load(&path).unwrap();
+        assert!(
+            runtime
+                .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
+                .is_err(),
+            "{action}"
+        );
+        assert!(runtime.take_actions().is_empty());
+    }
+    for action in [
+        "services.niri.move_window_to_workspace('1', '2')",
+        "services.niri.move_window_to_output('1', 'DP-1')",
+        "services.niri.move_workspace_to_output('1', 'DP-1')",
+    ] {
+        fs::write(&path, format!("{action}; return ui.panel {{}}")).unwrap();
+        assert!(
+            Runtime::load(&path).is_err(),
+            "accepted {action} while loading"
+        );
+    }
+}

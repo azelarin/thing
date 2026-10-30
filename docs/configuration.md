@@ -1257,9 +1257,9 @@ lock configurations reject sleep inhibitors.
 
 ## niri
 
-`services.niri` provides niri workspace, window, overview, and keyboard-layout
-state. other widgets and services
-work without niri; `available:get()` is false when no niri connection exists.
+`services.niri` provides workspace, window, screencast, overview, and keyboard
+layout state. other widgets and services work without niri; `available:get()` is
+false when no niri connection exists.
 `error:get()` reports connection failures or the latest rejected action.
 
 `workspaces:get()` returns an immutable array sorted by output and workspace
@@ -1277,6 +1277,44 @@ ids are decimal **strings**, preserving all 64 bits. pass them unchanged to
 `focus_workspace(id)`, `focus_window(id)`, or `close_window(id)` in event handlers.
 actions run in order; displayed state follows niri's event stream. closing a window asks the
 application to close normally; it does not kill its process.
+
+`move_window_to_workspace(window_id, workspace_id, focus?)` moves the specified
+window. focus follows a moved window when it was focused; pass `false` to stay
+on the original workspace. `move_window_to_output(window_id, output)` and
+`move_workspace_to_output(workspace_id, output)` move to a named output, such as
+`'DP-1'`. output names must be nonempty strings without NUL, at most 4 kib long.
+these actions use explicit ids so a focus change cannot redirect a queued move.
+niri reports invalid or unavailable destinations through `error:get()`.
+
+`casts:get()` returns nil until niri reports its screencasts, or while offline.
+an empty array means no streams were reported. otherwise it returns an immutable
+array sorted by `stream_id`, including paused streams. each entry contains:
+
+- `stream_id` and `session_id`: decimal strings. a session can contain several streams.
+- `kind`: `'pipewire'` or `'wlr_screencopy'`.
+- `target`: an immutable record with `kind` equal to `'none'`, `'output'`, or
+  `'window'`. output targets have `output`; window targets have `window_id`.
+- `active`: whether frames are currently streaming. a paused stream remains in the list.
+- `dynamic_target`: whether niri's dynamic capture controls apply to this stream.
+  targets can still change when this is false.
+- `pid` and `pipewire_node_id`: numbers when niri knows them, otherwise nil.
+
+unrecognized protocol or target types use `kind = 'unknown'` and preserve the
+original tag in `protocol_kind`. the stream stays visible. niri reports pipewire
+streams and wlr-screencopy with damage tracking; ordinary screenshots and
+screencopy without damage tracking do not appear here.
+
+```luau
+ui.text { text = function()
+    local casts = services.niri.casts:get()
+    if not casts then return 'capture state unavailable' end
+    local active = 0
+    for _, cast in casts do
+        if cast.active then active += 1 end
+    end
+    return tostring(active) .. ' active streams'
+end }
+```
 
 `overview_open:get()` is true while the overview is open. it is nil until niri
 reports its state, and becomes nil on disconnection. `set_overview(true)` opens
@@ -1306,8 +1344,8 @@ ui.button {
 choose indexed targets from the reported names. these controls queue actions
 from event handlers, just like window and workspace controls. reported values
 change when niri sends events. older niri versions that do
-not send the new events leave those fields nil while workspaces and windows
-continue to work.
+not send optional events leave the corresponding fields nil. workspaces and
+windows continue to work.
 
 the adapter uses `$NIRI_SOCKET`, reconnects after a disconnection, and clears
 compositor state while offline. disconnection discards pending commands so they cannot run

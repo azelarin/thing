@@ -15,6 +15,19 @@ pub enum NiriAction {
     SetOverview(bool),
     ToggleOverview,
     SwitchLayout(NiriLayoutTarget),
+    MoveWindowToWorkspace {
+        window_id: u64,
+        workspace_id: u64,
+        focus: bool,
+    },
+    MoveWindowToOutput {
+        window_id: u64,
+        output: String,
+    },
+    MoveWorkspaceToOutput {
+        workspace_id: u64,
+        output: String,
+    },
 }
 
 /// a keyboard layout selected by direction or zero-based compositor index.
@@ -31,6 +44,49 @@ pub enum NiriLayoutTarget {
 pub struct NiriKeyboardLayouts {
     pub names: Vec<String>,
     pub current_index: usize,
+}
+
+/// the capture protocol reported by niri. unknown protocols retain their tag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NiriCastKind {
+    PipeWire,
+    WlrScreencopy,
+    Unknown(String),
+}
+
+/// the current capture target; it can change while a stream remains open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NiriCastTarget {
+    Nothing,
+    Output(String),
+    Window(u64),
+    Unknown(String),
+}
+
+/// a reported screencast stream, including paused streams.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NiriCast {
+    pub stream_id: u64,
+    pub session_id: u64,
+    pub kind: NiriCastKind,
+    pub target: NiriCastTarget,
+    pub dynamic_target: bool,
+    pub active: bool,
+    pub pid: Option<i32>,
+    pub pipewire_node_id: Option<u32>,
+}
+
+impl NiriCast {
+    fn is_valid(&self) -> bool {
+        let valid_text = |text: &str| text.len() <= 65536 && !text.contains('\0');
+        (match &self.kind {
+            NiriCastKind::Unknown(tag) => valid_text(tag),
+            _ => true,
+        }) && match &self.target {
+            NiriCastTarget::Output(name) | NiriCastTarget::Unknown(name) => valid_text(name),
+            _ => true,
+        }
+    }
 }
 
 /// one workspace in compositor order, identified independently of its index.
@@ -67,6 +123,7 @@ pub struct NiriState {
     pub windows: Vec<NiriWindow>,
     pub overview_open: Option<bool>,
     pub keyboard_layouts: Option<NiriKeyboardLayouts>,
+    pub casts: Option<Vec<NiriCast>>,
 }
 
 impl NiriState {
@@ -77,6 +134,7 @@ impl NiriState {
         };
         let mut workspaces = BTreeSet::new();
         let mut windows = BTreeSet::new();
+        let mut casts = BTreeSet::new();
         if self.workspaces.len() > 10000
             || self.windows.len() > 10000
             || self
@@ -91,6 +149,12 @@ impl NiriState {
                         .names
                         .iter()
                         .any(|name| name.len() > 65536 || name.contains('\0'))
+            })
+            || self.casts.as_ref().is_some_and(|items| {
+                items.len() > 10000
+                    || items
+                        .iter()
+                        .any(|cast| !casts.insert(cast.stream_id) || !cast.is_valid())
             })
             || self.windows.iter().any(|w| {
                 !windows.insert(w.id)
@@ -111,7 +175,7 @@ impl NiriState {
 pub(crate) struct NiriData {
     state: Rc<RefCell<NiriState>>,
     tracker: Rc<RefCell<Tracker>>,
-    revisions: [usize; 3],
+    revisions: [usize; 4],
     overview: usize,
 }
 
@@ -120,8 +184,9 @@ impl NiriData {
         let workspaces = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let windows = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let layouts = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
+        let casts = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let overview = tracker.borrow_mut().insert(Scalar::Nil)?;
-        let revisions = [workspaces, windows, layouts];
+        let revisions = [workspaces, windows, layouts, casts];
         let state = Rc::new(RefCell::new(NiriState::default()));
         for (index, name) in ["workspaces", "windows"].into_iter().enumerate() {
             table.set(
@@ -150,6 +215,14 @@ impl NiriData {
                 revision: layouts,
             },
         )?;
+        table.set(
+            "casts",
+            Casts {
+                tracker: tracker.clone(),
+                state: state.clone(),
+                revision: casts,
+            },
+        )?;
         Ok(Self {
             state,
             tracker,
@@ -170,6 +243,7 @@ impl NiriData {
             old.workspaces != current.workspaces,
             old.windows != current.windows,
             old.keyboard_layouts != current.keyboard_layouts,
+            old.casts != current.casts,
         ]
         .into_iter()
         .enumerate()
@@ -213,6 +287,63 @@ impl UserData for Layouts {
             )?;
             value.set_readonly(true);
             Ok(Some(value))
+        });
+    }
+}
+
+struct Casts {
+    tracker: Rc<RefCell<Tracker>>,
+    state: Rc<RefCell<NiriState>>,
+    revision: usize,
+}
+
+impl UserData for Casts {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |lua, this, ()| {
+            this.tracker.borrow_mut().read(this.revision);
+            let state = this.state.borrow();
+            let Some(casts) = &state.casts else {
+                return Ok(None);
+            };
+            let list = lua.create_table()?;
+            for (index, cast) in casts.iter().enumerate() {
+                let item = lua.create_table()?;
+                item.set("stream_id", cast.stream_id.to_string())?;
+                item.set("session_id", cast.session_id.to_string())?;
+                let (kind, protocol_kind) = match &cast.kind {
+                    NiriCastKind::PipeWire => ("pipewire", None),
+                    NiriCastKind::WlrScreencopy => ("wlr_screencopy", None),
+                    NiriCastKind::Unknown(tag) => ("unknown", Some(tag.as_str())),
+                };
+                item.set("kind", kind)?;
+                item.set("protocol_kind", protocol_kind)?;
+                let target = lua.create_table()?;
+                match &cast.target {
+                    NiriCastTarget::Nothing => target.set("kind", "none")?,
+                    NiriCastTarget::Output(name) => {
+                        target.set("kind", "output")?;
+                        target.set("output", name.as_str())?;
+                    }
+                    NiriCastTarget::Window(id) => {
+                        target.set("kind", "window")?;
+                        target.set("window_id", id.to_string())?;
+                    }
+                    NiriCastTarget::Unknown(tag) => {
+                        target.set("kind", "unknown")?;
+                        target.set("protocol_kind", tag.as_str())?;
+                    }
+                }
+                target.set_readonly(true);
+                item.set("target", target)?;
+                item.set("dynamic_target", cast.dynamic_target)?;
+                item.set("active", cast.active)?;
+                item.set("pid", cast.pid)?;
+                item.set("pipewire_node_id", cast.pipewire_node_id)?;
+                item.set_readonly(true);
+                list.raw_set(index + 1, item)?;
+            }
+            list.set_readonly(true);
+            Ok(Some(list))
         });
     }
 }
@@ -307,4 +438,17 @@ pub(crate) fn parse_layout_target(value: mlua::Value) -> Result<NiriLayoutTarget
         ));
     }
     Ok(NiriLayoutTarget::Index((index - 1.0) as u8))
+}
+
+pub(crate) fn parse_output(value: mlua::Value) -> Result<String> {
+    let mlua::Value::String(value) = value else {
+        return Err(Error::runtime("output name must be a string"));
+    };
+    let name = value.to_str()?;
+    if name.is_empty() || name.len() > 4096 || name.contains('\0') {
+        return Err(Error::runtime(
+            "output name must be nonempty, contain no NUL, and not exceed 4 kib",
+        ));
+    }
+    Ok(name.to_owned())
 }

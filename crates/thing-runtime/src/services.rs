@@ -1,5 +1,5 @@
 use crate::OutputContext;
-use crate::niri::{NiriAction, NiriData, NiriState, parse_id, parse_layout_target};
+use crate::niri::{NiriAction, NiriData, NiriState, parse_id, parse_layout_target, parse_output};
 use crate::state::{Scalar, Signal, Tracker};
 use mlua::{Error, Lua, Result, Table, UserData, UserDataMethods, Value};
 use std::{
@@ -2199,6 +2199,56 @@ impl Services {
                 )
             })?,
         )?;
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        niri.set(
+            "move_window_to_workspace",
+            lua.create_function(
+                move |_, (window, workspace, focus): (Value, Value, Value)| {
+                    let focus = match focus {
+                        Value::Nil => true,
+                        Value::Boolean(focus) => focus,
+                        _ => return Err(Error::runtime("focus must be a boolean")),
+                    };
+                    enqueue(
+                        &actions,
+                        &allowed,
+                        Action::Niri(NiriAction::MoveWindowToWorkspace {
+                            window_id: parse_id(window)?,
+                            workspace_id: parse_id(workspace)?,
+                            focus,
+                        }),
+                    )
+                },
+            )?,
+        )?;
+        for workspace in [false, true] {
+            let actions = result.actions.clone();
+            let allowed = result.allowed.clone();
+            niri.set(
+                if workspace {
+                    "move_workspace_to_output"
+                } else {
+                    "move_window_to_output"
+                },
+                lua.create_function(move |_, (id, output): (Value, Value)| {
+                    let id = parse_id(id)?;
+                    let output = parse_output(output)?;
+                    let action = if workspace {
+                        NiriAction::MoveWorkspaceToOutput {
+                            workspace_id: id,
+                            output,
+                        }
+                    } else {
+                        NiriAction::MoveWindowToOutput {
+                            window_id: id,
+                            output,
+                        }
+                    };
+                    enqueue(&actions, &allowed, Action::Niri(action))
+                })?,
+            )?;
+        }
         niri.set_readonly(true);
         clock.set_readonly(true);
         crate::idle::install(

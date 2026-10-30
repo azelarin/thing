@@ -18,7 +18,8 @@ mod transition;
 pub use bounds::{BoundsProvider, BoundsRect, PresentedBounds, WidgetBounds};
 pub use idle::{IdleWatchDefinition, MAX_IDLE_TIMEOUT_MS, MAX_IDLE_WATCHES, MIN_IDLE_TIMEOUT_MS};
 pub use niri::{
-    NiriAction, NiriKeyboardLayouts, NiriLayoutTarget, NiriState, NiriWindow, Workspace,
+    NiriAction, NiriCast, NiriCastKind, NiriCastTarget, NiriKeyboardLayouts, NiriLayoutTarget,
+    NiriState, NiriWindow, Workspace,
 };
 pub use services::{
     Action, ApplicationLaunch, ApplicationsSnapshot, AudioDevice, AudioSnapshot, AudioSource,
