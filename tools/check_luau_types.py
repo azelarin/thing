@@ -33,6 +33,11 @@ CASES = (
     Case("valid-bounds.luau"),
     Case("valid-clipping.luau"),
     Case("valid-scroll-axis.luau"),
+    Case("valid-niri-controls.luau"),
+    Case("invalid-niri-controls.luau", (
+        "Expected this to be 'boolean', but got 'string'",
+        "Expected this to be 'number', but got 'string'",
+    )),
     Case("invalid-scroll-axis.luau", ("Property 'axis' is not compatible.",)),
     Case("invalid-clipping.luau", ("Property 'clip' is not compatible.",)),
     Case(

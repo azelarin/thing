@@ -304,3 +304,134 @@ fn reads_live_compositor_state_without_sending_actions() {
         snapshot.state.windows.len()
     );
 }
+
+#[test]
+fn optional_overview_and_keyboard_events_project_without_blocking_older_streams() {
+    let mut model = Model::default();
+    apply(&mut model, workspaces(1));
+    apply(&mut model, json!({"WindowsChanged":{"windows":[]}}));
+    assert!(model.is_initialized());
+    assert_eq!(model.snapshot().overview_open, None);
+    assert_eq!(model.snapshot().keyboard_layouts, None);
+    apply(
+        &mut model,
+        json!({"OverviewOpenedOrClosed":{"is_open":true}}),
+    );
+    apply(
+        &mut model,
+        json!({"KeyboardLayoutsChanged":{"keyboard_layouts":{"names":["English","Hebrew"],"current_idx":0}}}),
+    );
+    apply(&mut model, json!({"KeyboardLayoutSwitched":{"idx":1}}));
+    assert_eq!(model.snapshot().overview_open, Some(true));
+    assert_eq!(model.snapshot().keyboard_layouts.unwrap().current_index, 1);
+    let before = model.snapshot();
+    for event in [
+        json!({"KeyboardLayoutSwitched":{"idx":2}}),
+        json!({"KeyboardLayoutsChanged":{"keyboard_layouts":{"names":["English"],"current_idx":1}}}),
+        json!({"KeyboardLayoutsChanged":{"keyboard_layouts":{"names":["bad\0name"],"current_idx":0}}}),
+    ] {
+        assert!(model.apply(&serde_json::to_vec(&event).unwrap()).is_err());
+        assert_eq!(model.snapshot(), before);
+    }
+    apply(
+        &mut model,
+        json!({"KeyboardLayoutsChanged":{"keyboard_layouts":{"names":[],"current_idx":0}}}),
+    );
+    assert!(model.snapshot().keyboard_layouts.unwrap().names.is_empty());
+}
+
+#[test]
+fn overview_and_layout_requests_match_the_compositor_protocol() {
+    use thing_runtime::NiriLayoutTarget;
+    for (action, expected) in [
+        (NiriAction::SetOverview(true), json!({"OpenOverview":{}})),
+        (NiriAction::SetOverview(false), json!({"CloseOverview":{}})),
+        (NiriAction::ToggleOverview, json!({"ToggleOverview":{}})),
+        (
+            NiriAction::SwitchLayout(NiriLayoutTarget::Next),
+            json!({"SwitchLayout":{"layout":"Next"}}),
+        ),
+        (
+            NiriAction::SwitchLayout(NiriLayoutTarget::Previous),
+            json!({"SwitchLayout":{"layout":"Prev"}}),
+        ),
+        (
+            NiriAction::SwitchLayout(NiriLayoutTarget::Index(255)),
+            json!({"SwitchLayout":{"layout":{"Index":255}}}),
+        ),
+    ] {
+        assert_eq!(model::request(action), json!({"Action":expected}));
+    }
+}
+
+#[test]
+fn keyboard_and_overview_state_clear_on_disconnect_and_can_reconnect_without_new_events() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("niri.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (disconnect, disconnect_rx) = mpsc::channel();
+    let (reconnect, reconnect_rx) = mpsc::channel();
+    let (done, finish) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let events = accept(&listener);
+        assert_eq!(read(&mut BufReader::new(&events)), json!("EventStream"));
+        send(&events, json!({"Ok":"Handled"}));
+        initial_state(&events, 1);
+        send(&events, json!({"OverviewOpenedOrClosed":{"is_open":true}}));
+        send(
+            &events,
+            json!({"KeyboardLayoutsChanged":{"keyboard_layouts":{"names":["English","Hebrew"],"current_idx":1}}}),
+        );
+        let commands = accept(&listener);
+        assert_eq!(
+            read(&mut BufReader::new(&commands)),
+            json!({"Action":{"SwitchLayout":{"layout":{"Index":0}}}})
+        );
+        send(&commands, json!({"Ok":"Handled"}));
+        send(&events, json!({"KeyboardLayoutSwitched":{"idx":0}}));
+        disconnect_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(commands);
+        drop(events);
+        reconnect_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let events = accept(&listener);
+        assert_eq!(read(&mut BufReader::new(&events)), json!("EventStream"));
+        send(&events, json!({"Ok":"Handled"}));
+        initial_state(&events, 2);
+        finish.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    let (ping, _source) = calloop::ping::make_ping().unwrap();
+    let niri = Niri::start_at(Some(path), ping).unwrap();
+    wait_for(&niri, |s| {
+        s.available
+            && s.state.overview_open == Some(true)
+            && s.state
+                .keyboard_layouts
+                .as_ref()
+                .is_some_and(|l| l.current_index == 1)
+    });
+    niri.send(NiriAction::SwitchLayout(
+        thing_runtime::NiriLayoutTarget::Index(0),
+    ))
+    .unwrap();
+    wait_for(&niri, |s| {
+        s.state
+            .keyboard_layouts
+            .as_ref()
+            .is_some_and(|l| l.current_index == 0)
+    });
+    disconnect.send(()).unwrap();
+    let offline = wait_for(&niri, |s| !s.available);
+    assert_eq!(offline.state.overview_open, None);
+    assert_eq!(offline.state.keyboard_layouts, None);
+    assert!(niri.send(NiriAction::ToggleOverview).is_err());
+    reconnect.send(()).unwrap();
+    let restored = wait_for(&niri, |s| {
+        s.available && s.state.workspaces.first().is_some_and(|w| w.id == 2)
+    });
+    assert_eq!(restored.state.keyboard_layouts, None);
+    assert_eq!(restored.state.overview_open, None);
+    done.send(()).unwrap();
+    drop(niri);
+    server.join().unwrap();
+}

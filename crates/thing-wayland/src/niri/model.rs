@@ -5,7 +5,9 @@ use std::{collections::BTreeMap, io};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use thing_runtime::{NiriAction, NiriState, NiriWindow, Workspace};
+use thing_runtime::{
+    NiriAction, NiriKeyboardLayouts, NiriLayoutTarget, NiriState, NiriWindow, Workspace,
+};
 
 #[derive(Default)]
 pub(super) struct Model {
@@ -13,6 +15,8 @@ pub(super) struct Model {
     windows: BTreeMap<u64, NiriWindow>,
     workspaces_initialized: bool,
     windows_initialized: bool,
+    overview_open: Option<bool>,
+    keyboard_layouts: Option<NiriKeyboardLayouts>,
 }
 
 impl Model {
@@ -26,6 +30,8 @@ impl Model {
         NiriState {
             workspaces,
             windows: self.windows.values().cloned().collect(),
+            overview_open: self.overview_open,
+            keyboard_layouts: self.keyboard_layouts.clone(),
         }
     }
 
@@ -47,6 +53,9 @@ impl Model {
                 | "WindowClosed"
                 | "WindowLayoutsChanged"
                 | "WindowUrgencyChanged"
+                | "OverviewOpenedOrClosed"
+                | "KeyboardLayoutsChanged"
+                | "KeyboardLayoutSwitched"
         ) {
             return Ok(false);
         }
@@ -76,6 +85,35 @@ impl Model {
                 if let Some(w) = self.workspaces.get_mut(&id) {
                     w.urgent = urgent;
                 }
+            }
+            Event::OverviewOpenedOrClosed { is_open } => self.overview_open = Some(is_open),
+            Event::KeyboardLayoutsChanged { keyboard_layouts } => {
+                let count = keyboard_layouts.names.len();
+                let index = usize::from(keyboard_layouts.current_idx);
+                if count > 256
+                    || (count == 0 && index != 0)
+                    || (count != 0 && index >= count)
+                    || keyboard_layouts
+                        .names
+                        .iter()
+                        .any(|name| name.len() > 65536 || name.contains('\0'))
+                {
+                    return Err(io::Error::other("invalid niri keyboard layouts"));
+                }
+                self.keyboard_layouts = Some(NiriKeyboardLayouts {
+                    names: keyboard_layouts.names,
+                    current_index: index,
+                });
+            }
+            Event::KeyboardLayoutSwitched { idx } => {
+                let layouts = self
+                    .keyboard_layouts
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("niri switched an unknown keyboard layout"))?;
+                if usize::from(idx) >= layouts.names.len() {
+                    return Err(io::Error::other("niri switched an unknown keyboard layout"));
+                }
+                layouts.current_index = usize::from(idx);
             }
             Event::WindowsChanged { windows } => {
                 check_count(windows.len())?;
@@ -126,15 +164,51 @@ fn check_count(count: usize) -> io::Result<()> {
 
 #[derive(Deserialize)]
 enum Event {
-    WorkspacesChanged { workspaces: Vec<WireWorkspace> },
-    WorkspaceActivated { id: u64, focused: bool },
-    WorkspaceUrgencyChanged { id: u64, urgent: bool },
-    WindowsChanged { windows: Vec<WireWindow> },
-    WindowOpenedOrChanged { window: WireWindow },
-    WindowFocusChanged { id: Option<u64> },
-    WindowClosed { id: u64 },
-    WindowLayoutsChanged { changes: Vec<(u64, WireLayout)> },
-    WindowUrgencyChanged { id: u64, urgent: bool },
+    WorkspacesChanged {
+        workspaces: Vec<WireWorkspace>,
+    },
+    WorkspaceActivated {
+        id: u64,
+        focused: bool,
+    },
+    WorkspaceUrgencyChanged {
+        id: u64,
+        urgent: bool,
+    },
+    WindowsChanged {
+        windows: Vec<WireWindow>,
+    },
+    WindowOpenedOrChanged {
+        window: WireWindow,
+    },
+    WindowFocusChanged {
+        id: Option<u64>,
+    },
+    WindowClosed {
+        id: u64,
+    },
+    WindowLayoutsChanged {
+        changes: Vec<(u64, WireLayout)>,
+    },
+    WindowUrgencyChanged {
+        id: u64,
+        urgent: bool,
+    },
+    OverviewOpenedOrClosed {
+        is_open: bool,
+    },
+    KeyboardLayoutsChanged {
+        keyboard_layouts: WireKeyboardLayouts,
+    },
+    KeyboardLayoutSwitched {
+        idx: u8,
+    },
+}
+
+#[derive(Deserialize)]
+struct WireKeyboardLayouts {
+    names: Vec<String>,
+    current_idx: u8,
 }
 
 #[derive(Deserialize)]
@@ -216,6 +290,14 @@ pub(super) fn request(action: NiriAction) -> Value {
         NiriAction::FocusWorkspace(id) => json!({"FocusWorkspace": {"reference": {"Id": id}}}),
         NiriAction::FocusWindow(id) => json!({"FocusWindow": {"id": id}}),
         NiriAction::CloseWindow(id) => json!({"CloseWindow": {"id": id}}),
+        NiriAction::SetOverview(true) => json!({"OpenOverview": {}}),
+        NiriAction::SetOverview(false) => json!({"CloseOverview": {}}),
+        NiriAction::ToggleOverview => json!({"ToggleOverview": {}}),
+        NiriAction::SwitchLayout(layout) => json!({"SwitchLayout": {"layout": match layout {
+            NiriLayoutTarget::Next => json!("Next"),
+            NiriLayoutTarget::Previous => json!("Prev"),
+            NiriLayoutTarget::Index(index) => json!({"Index": index}),
+        }}}),
     }})
 }
 

@@ -1255,9 +1255,10 @@ bus calls run on a worker thread that starts with the first `start()`, so a
 configuration that never starts an inhibitor never connects to the system bus.
 lock configurations reject sleep inhibitors.
 
-## niri workspaces and windows
+## niri
 
-`services.niri` provides niri workspace and window state. other widgets and services
+`services.niri` provides niri workspace, window, overview, and keyboard-layout
+state. other widgets and services
 work without niri; `available:get()` is false when no niri connection exists.
 `error:get()` reports connection failures or the latest rejected action.
 
@@ -1277,8 +1278,39 @@ ids are decimal **strings**, preserving all 64 bits. pass them unchanged to
 actions run in order; displayed state follows niri's event stream. closing a window asks the
 application to close normally; it does not kill its process.
 
-the adapter uses `$NIRI_SOCKET`, reconnects after a disconnection, and clears its
-lists while offline. disconnection discards pending commands so they cannot run
+`overview_open:get()` is true while the overview is open. it is nil until niri
+reports its state, and becomes nil on disconnection. `set_overview(true)` opens
+it, `set_overview(false)` closes it, and `toggle_overview()` toggles it.
+
+`keyboard_layouts:get()` returns nil until the first layout report. otherwise it
+returns an immutable record with `names`, an immutable array of xkb layout names,
+and `current_index`, a one-based index into that array. the index is nil when
+the array is empty. use the reported names for layout labels:
+
+```luau
+local niri = services.niri
+
+ui.button {
+    on_click = function() niri.switch_layout('next') end,
+    children = { ui.text { text = function()
+        local layouts = niri.keyboard_layouts:get()
+        if layouts and layouts.current_index then
+            return layouts.names[layouts.current_index]
+        end
+        return 'no layout'
+    end } },
+}
+```
+
+`switch_layout` accepts `'next'`, `'prev'`, or a one-based index from 1 to 256.
+choose indexed targets from the reported names. these controls queue actions
+from event handlers, just like window and workspace controls. reported values
+change when niri sends events. older niri versions that do
+not send the new events leave those fields nil while workspaces and windows
+continue to work.
+
+the adapter uses `$NIRI_SOCKET`, reconnects after a disconnection, and clears
+compositor state while offline. disconnection discards pending commands so they cannot run
 unexpectedly after a reconnect. an action already sent may have taken effect
 even if its acknowledgement was lost. reloading scripts preserves service data.
 

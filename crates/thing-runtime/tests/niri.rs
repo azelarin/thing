@@ -41,6 +41,7 @@ fn lists_preserve_full_ids_are_immutable_and_survive_reload() {
     let snapshot = NiriState {
         workspaces: vec![workspace(u64::MAX)],
         windows: Vec::new(),
+        ..NiriState::default()
     };
     runtime.set_niri(snapshot.clone()).unwrap();
     runtime.refresh().unwrap();
@@ -61,7 +62,8 @@ fn lists_preserve_full_ids_are_immutable_and_survive_reload() {
         runtime
             .set_niri(NiriState {
                 workspaces: vec![workspace(1), workspace(1)],
-                windows: vec![]
+                windows: vec![],
+                ..NiriState::default()
             })
             .is_err()
     );
@@ -160,6 +162,7 @@ fn routes_window_clicks_volume_scroll_and_popup_controls() {
             width: 960.0,
             height: 1000.0,
         }],
+        ..NiriState::default()
     };
     runtime.set_niri(snapshot).unwrap();
     runtime
@@ -226,4 +229,178 @@ fn key(node: &thing_core::Node, key: &str) -> Option<thing_core::NodeId> {
         return Some(node.id);
     }
     node.children.iter().find_map(|child| self::key(child, key))
+}
+
+#[test]
+fn overview_and_keyboard_layouts_are_reactive_immutable_and_preserved_on_reload() {
+    use thing_runtime::NiriKeyboardLayouts;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("panel.luau");
+    fs::write(&path, r#"
+        local niri = services.niri
+        local reads = 0
+        return ui.panel { children = {
+            ui.text { key = 'overview', text = function() return tostring(niri.overview_open:get()) end },
+            ui.text { key = 'layout', text = function()
+                local layouts = niri.keyboard_layouts:get()
+                if not layouts then return 'unknown' end
+                assert(not pcall(function() layouts.current_index = 100 end))
+                assert(not pcall(function() layouts.names[1] = 'changed' end))
+                return if layouts.current_index then layouts.names[layouts.current_index] else 'empty'
+            end },
+            ui.text { key = 'reads', text = function()
+                niri.workspaces:get(); reads += 1; return tostring(reads)
+            end },
+        } }
+    "#).unwrap();
+    let mut runtime = Runtime::load(&path).unwrap();
+    assert_eq!(runtime.root().unwrap().children[0].text, "nil");
+    assert_eq!(runtime.root().unwrap().children[1].text, "unknown");
+    let mut state = NiriState {
+        overview_open: Some(false),
+        keyboard_layouts: Some(NiriKeyboardLayouts {
+            names: vec!["English".into(), "עברית".into()],
+            current_index: 1,
+        }),
+        ..NiriState::default()
+    };
+    runtime.set_niri(state.clone()).unwrap();
+    runtime.refresh().unwrap();
+    assert_eq!(runtime.root().unwrap().children[0].text, "false");
+    assert_eq!(runtime.root().unwrap().children[1].text, "עברית");
+    assert_eq!(runtime.root().unwrap().children[2].text, "1");
+    state.overview_open = Some(true);
+    state.keyboard_layouts.as_mut().unwrap().current_index = 0;
+    runtime.set_niri(state.clone()).unwrap();
+    runtime.refresh().unwrap();
+    assert_eq!(runtime.root().unwrap().children[0].text, "true");
+    assert_eq!(runtime.root().unwrap().children[1].text, "English");
+    assert_eq!(runtime.root().unwrap().children[2].text, "1");
+    runtime.set_niri(state).unwrap();
+    assert!(!runtime.refresh().unwrap());
+    runtime.reload(&path).unwrap();
+    assert_eq!(runtime.root().unwrap().children[1].text, "English");
+    runtime.set_niri(NiriState::default()).unwrap();
+    runtime.refresh().unwrap();
+    assert_eq!(runtime.root().unwrap().children[0].text, "nil");
+    assert_eq!(runtime.root().unwrap().children[1].text, "unknown");
+}
+
+#[test]
+fn overview_and_layout_actions_are_checked_and_do_not_change_reported_state() {
+    use thing_runtime::NiriLayoutTarget;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("panel.luau");
+    fs::write(
+        &path,
+        r#"
+        local niri = services.niri
+        return ui.panel { children = {
+            ui.button { on_click = function()
+                niri.set_overview(true); niri.toggle_overview(); niri.set_overview(false)
+                niri.switch_layout('next'); niri.switch_layout('prev')
+                niri.switch_layout(1); niri.switch_layout(256)
+                assert(niri.overview_open:get() == nil)
+            end },
+        } }
+    "#,
+    )
+    .unwrap();
+    let mut runtime = Runtime::load(&path).unwrap();
+    runtime
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
+        .unwrap();
+    assert_eq!(
+        runtime.take_actions(),
+        vec![
+            Action::Niri(NiriAction::SetOverview(true)),
+            Action::Niri(NiriAction::ToggleOverview),
+            Action::Niri(NiriAction::SetOverview(false)),
+            Action::Niri(NiriAction::SwitchLayout(NiriLayoutTarget::Next)),
+            Action::Niri(NiriAction::SwitchLayout(NiriLayoutTarget::Previous)),
+            Action::Niri(NiriAction::SwitchLayout(NiriLayoutTarget::Index(0))),
+            Action::Niri(NiriAction::SwitchLayout(NiriLayoutTarget::Index(255))),
+        ]
+    );
+    for action in [
+        "niri.switch_layout(0)",
+        "niri.switch_layout(257)",
+        "niri.switch_layout(1.5)",
+        "niri.switch_layout(0/0)",
+        "niri.switch_layout('previous')",
+        "niri.switch_layout(false)",
+        "niri.set_overview(1)",
+        "niri.overview_open:set(true)",
+        "niri.toggle_overview(); error('callback failed')",
+    ] {
+        fs::write(&path, format!("local niri=services.niri; return ui.panel {{ children = {{ ui.button {{ on_click = function() {action} end }} }} }}")).unwrap();
+        let mut runtime = Runtime::load(&path).unwrap();
+        assert!(
+            runtime
+                .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
+                .is_err(),
+            "{action}"
+        );
+        assert!(runtime.take_actions().is_empty());
+    }
+    for action in [
+        "services.niri.toggle_overview()",
+        "services.niri.switch_layout('next')",
+        "services.niri.set_overview(true)",
+    ] {
+        fs::write(&path, format!("{action}; return ui.panel {{}}")).unwrap();
+        assert!(
+            Runtime::load(&path).is_err(),
+            "accepted {action} while loading"
+        );
+    }
+}
+
+#[test]
+fn invalid_layout_snapshots_leave_the_previous_value_intact() {
+    use thing_runtime::NiriKeyboardLayouts;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("panel.luau");
+    fs::write(&path, "return ui.panel {children={ui.text {text=function() local x=services.niri.keyboard_layouts:get(); return if not x then 'unknown' elseif not x.current_index then 'empty' else x.names[x.current_index] end}}}").unwrap();
+    let mut runtime = Runtime::load(path).unwrap();
+    runtime
+        .set_niri(NiriState {
+            keyboard_layouts: Some(NiriKeyboardLayouts {
+                names: vec![],
+                current_index: 0,
+            }),
+            ..NiriState::default()
+        })
+        .unwrap();
+    runtime.refresh().unwrap();
+    assert_eq!(runtime.root().unwrap().children[0].text, "empty");
+    for layouts in [
+        NiriKeyboardLayouts {
+            names: vec![],
+            current_index: 1,
+        },
+        NiriKeyboardLayouts {
+            names: vec!["English".into()],
+            current_index: 1,
+        },
+        NiriKeyboardLayouts {
+            names: vec!["English".into(); 257],
+            current_index: 0,
+        },
+        NiriKeyboardLayouts {
+            names: vec!["bad\0name".into()],
+            current_index: 0,
+        },
+    ] {
+        assert!(
+            runtime
+                .set_niri(NiriState {
+                    keyboard_layouts: Some(layouts),
+                    ..NiriState::default()
+                })
+                .is_err()
+        );
+        assert!(!runtime.refresh().unwrap());
+        assert_eq!(runtime.root().unwrap().children[0].text, "empty");
+    }
 }
