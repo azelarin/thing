@@ -1280,6 +1280,7 @@ put layout and paint values in `style`. dimensions use logical pixels.
 | `align_content` | `start` |
 | `justify` | `start` |
 | `wrap` | `false` |
+| `clip` | `bounds`; use `rounded` to clip contents and children to `radius` |
 | `border_width`, `border_color` | `0`, transparent; border paints inside the box |
 | `padding_x`, `padding_y` | unspecified; override `padding` on that axis |
 | `hover_overlay`, `pressed_overlay` | `#ffffff14`, `#ffffff28`; interactive control feedback |
@@ -1416,6 +1417,30 @@ stop in a plain table does not trigger a refresh. color transitions still work
 with solid backgrounds. to animate a gradient, animate state used by the
 function that returns it; gradient tables do not interpolate automatically.
 
+### clipping
+
+`radius` rounds a widget's background and border. add `clip = 'rounded'` when
+its contents and children should stay inside the same shape:
+
+```lua
+ui.stack {
+    style = { width = 160, height = 48, radius = 24, clip = 'rounded' },
+    children = {
+        ui.row { style = { width = 160, height = 48, background = '#89b4fa' } },
+    },
+}
+```
+
+the radius cannot exceed half the box's width or height. clips follow transforms
+and animated radii; a scroll view's clip stays at the viewport as its contents
+move. pointer and wheel input respect the same boundary. layout and keyboard
+focus order do not change.
+
+a widget's own shadow and focus ring can extend past its clip. descendants,
+including their shadows and focus rings, stay inside it. the default `bounds`
+keeps rectangular clipping for children. neither mode changes the wayland
+surface's input region; use `panel.input_region` to control that separately.
+
 ### shadows
 
 `style.box_shadow` casts a shadow from a widget's rounded border box. a path's
@@ -1471,8 +1496,8 @@ and a transparent fill still casts it. inherited opacity and disabled opacity
 apply to a shadow once.
 
 a shadow does not change layout, enlarge the surface, or widen a panel's input
-region. the surface edge and scroll viewports clip it. other ancestors currently
-do not, so a shadow can extend past a tight container.
+region. the surface edge, scroll viewports, and ancestors with `clip = 'rounded'`
+clip it. a shadow can extend past other containers.
 
 a layout is rejected when a shadow is too costly to draw: its blur grows too
 large through transforms and output scale, too much blurred area accumulates

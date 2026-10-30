@@ -506,6 +506,14 @@ impl Kind {
     }
 }
 
+/// the boundary used for widget contents and pointer input.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClipMode {
+    #[default]
+    Bounds,
+    Rounded,
+}
+
 /// layout and paint values in logical pixels. colors do not inherit implicitly.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Style {
@@ -529,6 +537,7 @@ pub struct Style {
     pub justify: MainAlign,
     pub wrap: bool,
     pub radius: f32,
+    pub clip: ClipMode,
     pub border_width: f32,
     pub border_color: Color,
     pub hover_overlay: Color,
@@ -579,6 +588,7 @@ impl Default for Style {
             justify: MainAlign::Start,
             wrap: false,
             radius: 0.0,
+            clip: ClipMode::Bounds,
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
             hover_overlay: Color([255, 255, 255, 20]),

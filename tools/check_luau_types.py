@@ -31,6 +31,8 @@ CASES = (
     Case("valid-timers.luau"),
     Case("valid-motion.luau"),
     Case("valid-bounds.luau"),
+    Case("valid-clipping.luau"),
+    Case("invalid-clipping.luau", ("Property 'clip' is not compatible.",)),
     Case(
         "invalid-bounds.luau",
         (

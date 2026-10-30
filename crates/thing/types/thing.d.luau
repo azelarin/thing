@@ -58,6 +58,7 @@ export type ThingMainAlign =
     | "space_evenly"
 export type ThingTextAlign = "start" | "center" | "end"
 export type ThingTextOverflow = "clip" | "ellipsis"
+export type ThingClipMode = "bounds" | "rounded"
 export type ThingImageFit = "contain" | "cover" | "fill"
 export type ThingPathFit = "contain" | "cover" | "fill"
 export type ThingPathFillRule = "nonzero" | "evenodd"
@@ -251,6 +252,7 @@ export type ThingStyle = {
     justify: ThingReactive<ThingMainAlign>?,
     wrap: ThingReactive<boolean>?,
     radius: ThingAnimatedNumber?,
+    clip: ThingReactive<ThingClipMode>?,
     border_width: ThingAnimatedNumber?,
     border_color: ThingAnimatedColor?,
     hover_overlay: ThingAnimatedColor?,
@@ -294,6 +296,7 @@ export type ThingTextStyle = {
     justify: ThingReactive<ThingMainAlign>?,
     wrap: ThingReactive<boolean>?,
     radius: ThingAnimatedNumber?,
+    clip: ThingReactive<ThingClipMode>?,
     border_width: ThingAnimatedNumber?,
     border_color: ThingAnimatedColor?,
     hover_overlay: ThingAnimatedColor?,
@@ -339,6 +342,7 @@ export type ThingTextInputStyle = {
     justify: ThingReactive<ThingMainAlign>?,
     wrap: ThingReactive<boolean>?,
     radius: ThingAnimatedNumber?,
+    clip: ThingReactive<ThingClipMode>?,
     border_width: ThingAnimatedNumber?,
     border_color: ThingAnimatedColor?,
     hover_overlay: ThingAnimatedColor?,

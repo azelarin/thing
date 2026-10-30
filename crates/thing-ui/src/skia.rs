@@ -401,7 +401,7 @@ impl Scene<'_> {
             sync_clip_chain(
                 canvas,
                 layout,
-                placement.clip_chain,
+                placement.decoration_clip_chain,
                 &surface_matrix,
                 &mut active_clips,
             )?;
@@ -448,14 +448,14 @@ impl Scene<'_> {
                     &surface_matrix,
                     &mut active_clips,
                 )?;
-                sync_clip_chain(
-                    canvas,
-                    layout,
-                    placement.clip_chain,
-                    &surface_matrix,
-                    &mut active_clips,
-                )?;
             }
+            sync_clip_chain(
+                canvas,
+                layout,
+                placement.clip_chain,
+                &surface_matrix,
+                &mut active_clips,
+            )?;
             let saved = canvas.save();
             set_surface_transform(canvas, &surface_matrix, placement.transform)?;
             let drawn = match node.kind {
@@ -730,7 +730,15 @@ fn sync_clip_chain(
             .ok_or("layout refers to a missing clip region")?;
         canvas.save();
         set_surface_transform(canvas, surface_matrix, region.transform)?;
-        canvas.clip_rect(to_skia_rect(region.bounds), ClipOp::Intersect, false);
+        if region.radius > 0.0 {
+            canvas.clip_rrect(
+                rounded_rect(region.bounds, region.radius),
+                ClipOp::Intersect,
+                true,
+            );
+        } else {
+            canvas.clip_rect(to_skia_rect(region.bounds), ClipOp::Intersect, false);
+        }
         canvas.set_matrix(surface_matrix);
         active.push(index);
     }
@@ -1314,6 +1322,16 @@ mod tests {
         height: i32,
         scale: f32,
     ) -> Result<skia_safe::Surface, String> {
+        raster_scene_with_input(root, width, height, scale, Interaction::default())
+    }
+
+    fn raster_scene_with_input(
+        root: &Node,
+        width: i32,
+        height: i32,
+        scale: f32,
+        input: Interaction,
+    ) -> Result<skia_safe::Surface, String> {
         let mut text = TextSystem::default();
         let layout = Layout::compute(
             root,
@@ -1337,12 +1355,119 @@ mod tests {
                 layout: &layout,
                 physical: (width as u32, height as u32),
                 scale,
-                input: Interaction::default(),
+                input,
                 text_input: None,
                 secret_input: None,
             },
         )?;
         Ok(surface)
+    }
+
+    #[test]
+    fn rounded_child_clips_follow_radius_and_fractional_scale() {
+        for scale in [1.0, 1.25] {
+            for mode in [thing_core::ClipMode::Bounds, thing_core::ClipMode::Rounded] {
+                let mut root = Node::new(NodeId(1), Kind::Stack);
+                root.style.width = Some(80.0);
+                root.style.height = Some(80.0);
+                root.style.radius = 40.0;
+                root.style.clip = mode;
+                let mut child = Node::new(NodeId(2), Kind::Row);
+                child.style.width = Some(80.0);
+                child.style.height = Some(80.0);
+                child.style.background = thing_core::Color::WHITE.into();
+                root.children.push(child);
+                let size = (80.0 * scale) as i32;
+                let mut surface = raster_scene(&root, size, size, scale).unwrap();
+                let pixels = surface.peek_pixels().unwrap();
+                assert_eq!(
+                    pixels.get_color((2, 2)).a(),
+                    if mode == thing_core::ClipMode::Rounded {
+                        0
+                    } else {
+                        255
+                    }
+                );
+                assert_eq!(pixels.get_color((size / 2, size / 2)), SkiaColor::WHITE);
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_ancestors_clip_descendant_shadows_but_keep_their_own_shadow() {
+        let mut root = shadow_card(false);
+        let group = &mut root.children[0];
+        group.style.width = Some(80.0);
+        group.style.height = Some(80.0);
+        group.style.radius = 40.0;
+        group.style.clip = thing_core::ClipMode::Rounded;
+        group.children[0].style.box_shadow = Some(hard_shadow(0.0, 10.0, 0.0));
+        group.children[0].style.width = Some(20.0);
+        group.children[0].style.height = Some(20.0);
+        group.style.align = thing_core::CrossAlign::Start;
+        group.style.justify = thing_core::MainAlign::Start;
+        let mut unclipped = root.clone();
+        unclipped.children[0].style.clip = thing_core::ClipMode::Bounds;
+        let mut surface = raster_scene(&unclipped, 120, 120, 1.0).unwrap();
+        assert_eq!(
+            surface.peek_pixels().unwrap().get_color((22, 42)),
+            SkiaColor::BLACK
+        );
+        let mut surface = raster_scene(&root, 120, 120, 1.0).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        assert_eq!(pixels.get_color((22, 42)), SkiaColor::WHITE);
+        assert_eq!(pixels.get_color((38, 48)), SkiaColor::BLACK);
+        root.children[0].style.box_shadow = Some(hard_shadow(0.0, 12.0, 0.0));
+        let mut surface = raster_scene(&root, 120, 120, 1.0).unwrap();
+        assert_eq!(
+            surface.peek_pixels().unwrap().get_color((60, 105)),
+            SkiaColor::BLACK
+        );
+    }
+
+    #[test]
+    fn a_rounded_widgets_focus_ring_still_extends_outside_its_box() {
+        let mut root = shadow_card(false);
+        root.children[0].children.clear();
+        let button = &mut root.children[0];
+        button.kind = Kind::Button;
+        button.style.radius = 20.0;
+        button.style.clip = thing_core::ClipMode::Rounded;
+        button.style.focus_ring_color = thing_core::Color([255, 0, 0, 255]);
+        button.style.focus_ring_width = 4.0;
+        let mut input = Interaction::default();
+        input.focus_from_keyboard(button.id);
+        let mut surface = raster_scene_with_input(&root, 120, 120, 1.0, input).unwrap();
+        assert_eq!(
+            surface.peek_pixels().unwrap().get_color((50, 18)),
+            SkiaColor::RED
+        );
+    }
+
+    #[test]
+    fn rounded_clipping_applies_to_a_widgets_own_text() {
+        let mut root = Node::new(NodeId(1), Kind::Text);
+        root.text = "MMMM".into();
+        root.style.width = Some(80.0);
+        root.style.height = Some(80.0);
+        root.style.font_size = 80.0;
+        root.style.radius = 40.0;
+        let mut bounds = raster_scene(&root, 80, 80, 1.0).unwrap();
+        root.style.clip = thing_core::ClipMode::Rounded;
+        let mut rounded = raster_scene(&root, 80, 80, 1.0).unwrap();
+        let before = bounds.peek_pixels().unwrap();
+        let after = rounded.peek_pixels().unwrap();
+        let mut clipped_ink = 0;
+        for y in 0..80 {
+            for x in 0..80 {
+                let distance = (x as f32 + 0.5 - 40.0).hypot(y as f32 + 0.5 - 40.0);
+                if distance > 42.0 && before.get_color((x, y)).a() > 0 {
+                    assert_eq!(after.get_color((x, y)).a(), 0);
+                    clipped_ink += 1;
+                }
+            }
+        }
+        assert!(clipped_ink > 20, "text must exercise the clipped corners");
     }
 
     fn shadow_card(scroll: bool) -> Node {

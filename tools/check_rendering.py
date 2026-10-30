@@ -24,11 +24,11 @@ FIXTURES = ROOT / "tests/rendering"
 ARTIFACTS = ROOT / "target/render-tests"
 CASES = (
     "image-fit", "stencil", "gradients", "radial-gradients", "shadows", "shared-motion",
-    "widget-bounds",
+    "widget-bounds", "rounded-clips",
 )
 # these accept a state only after the same passing frame is captured twice.
 STABLE_FRAMES = {
-    "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2,
+    "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2, "rounded-clips": 2,
 }
 RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
 # the runtime error each panel-invalid.luau must produce, in thing check and in
@@ -401,6 +401,29 @@ def verify_widget_bounds(image, stage, scale):
             raise FixtureError("measurement marker has an unexpected width")
 
 
+def verify_rounded_clips(image, stage, scale):
+    background = (13, 17, 23)
+    fill = (121, 151, 255) if stage == "reload" else (40, 179, 161)
+    probes = (
+        ((24, 24), background, "animated rounded corner"),
+        ((60, 24), fill, "rounded top edge"),
+        ((60, 60), fill, "rounded interior"),
+        ((144, 24), fill, "default clip keeps square corners"),
+        ((264, 24), background, "oversized radius is clamped"),
+        ((310, 24), fill, "capsule top edge"),
+        ((406, 26), background, "transformed rounded corner"),
+        ((440, 60), fill, "transformed rounded interior"),
+        ((24, 144), background, "outer nested clip"),
+        ((43, 163), (224, 164, 81), "inner nested clip"),
+        ((90, 190), fill, "nested interior"),
+        ((162, 162), background, "descendant shadow clipped at the corner"),
+        ((178, 168), (0, 0, 0), "descendant shadow inside the clip"),
+        ((200, 228), (0, 0, 0), "own shadow extends outside the clip"),
+    )
+    for point, color, label in probes:
+        expect_color(image, point, scale, color, label, tolerance=3)
+
+
 def verify_capture(case, image, stage, scale):
     if case == "image-fit":
         verify_image_fit(image, stage, scale)
@@ -416,6 +439,8 @@ def verify_capture(case, image, stage, scale):
         verify_shared_motion(image, stage, scale)
     elif case == "widget-bounds":
         verify_widget_bounds(image, stage, scale)
+    elif case == "rounded-clips":
+        verify_rounded_clips(image, stage, scale)
     else:
         raise FixtureError(f"unknown renderer fixture: {case}")
 

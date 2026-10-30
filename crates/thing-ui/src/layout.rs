@@ -5,7 +5,7 @@ use taffy::{
     prelude as tf,
     style::{Overflow, Position},
 };
-use thing_core::{CrossAlign, Kind, MainAlign, Node, NodeId, Point, Rect};
+use thing_core::{ClipMode, CrossAlign, Kind, MainAlign, Node, NodeId, Point, Rect};
 
 use crate::Affine;
 
@@ -39,6 +39,7 @@ pub struct Placement {
     pub(crate) disabled_opacity: f32,
     pub(crate) inverse: Option<Affine>,
     pub(crate) clip_chain: usize,
+    pub(crate) decoration_clip_chain: usize,
 }
 
 impl Placement {
@@ -171,11 +172,45 @@ pub enum ScrollStep {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ClipRegion {
     pub(crate) bounds: Rect,
+    pub(crate) radius: f32,
     pub(crate) transform: Affine,
     pub(crate) inverse: Option<Affine>,
     pub(crate) aabb: Rect,
     pub(crate) parent: Option<usize>,
     pub(crate) depth: usize,
+}
+
+impl ClipRegion {
+    fn contains(self, point: Point) -> bool {
+        if !self.bounds.contains(point) {
+            return false;
+        }
+        if self.radius == 0.0 {
+            return true;
+        }
+        let x = point.x.clamp(
+            self.bounds.x + self.radius,
+            self.bounds.x + self.bounds.width - self.radius,
+        );
+        let y = point.y.clamp(
+            self.bounds.y + self.radius,
+            self.bounds.y + self.bounds.height - self.radius,
+        );
+        let dx = f64::from(point.x) - f64::from(x);
+        let dy = f64::from(point.y) - f64::from(y);
+        dx * dx + dy * dy <= f64::from(self.radius).powi(2)
+    }
+}
+
+fn clip_radius(node: &Node, bounds: Rect) -> f32 {
+    if node.style.clip == ClipMode::Rounded {
+        node.style
+            .radius
+            .min(bounds.width / 2.0)
+            .min(bounds.height / 2.0)
+    } else {
+        0.0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -309,6 +344,7 @@ impl Layout {
         let mut result = Self::default();
         result.clip_regions.push(ClipRegion {
             bounds: clip,
+            radius: 0.0,
             transform: Affine::IDENTITY,
             inverse: Some(Affine::IDENTITY),
             aabb: clip,
@@ -553,7 +589,7 @@ impl Layout {
                 || region
                     .inverse
                     .and_then(|inverse| inverse.point(point))
-                    .is_none_or(|local| !region.bounds.contains(local))
+                    .is_none_or(|local| !region.contains(local))
             {
                 return false;
             }
@@ -681,26 +717,28 @@ impl Layout {
                 child_transform.compose(Affine::translation(0.0, -f64::from(offset)))?;
         }
 
-        let (shadow_clip_chain, shadow_clip) = if node.kind == Kind::Scroll {
-            let index = self.clip_regions.len();
-            self.clip_regions.push(ClipRegion {
-                bounds: local_bounds,
-                transform,
-                inverse,
-                aabb: border_aabb,
-                parent: Some(inherited.shadow_clip_chain),
-                depth: self.clip_regions[inherited.shadow_clip_chain].depth + 1,
-            });
-            (
-                index,
-                inherited
-                    .shadow_clip
-                    .intersection(border_aabb)
-                    .unwrap_or_default(),
-            )
-        } else {
-            (inherited.shadow_clip_chain, inherited.shadow_clip)
-        };
+        let (shadow_clip_chain, shadow_clip) =
+            if node.kind == Kind::Scroll || node.style.clip == ClipMode::Rounded {
+                let index = self.clip_regions.len();
+                self.clip_regions.push(ClipRegion {
+                    bounds: local_bounds,
+                    radius: clip_radius(node, local_bounds),
+                    transform,
+                    inverse,
+                    aabb: border_aabb,
+                    parent: Some(inherited.shadow_clip_chain),
+                    depth: self.clip_regions[inherited.shadow_clip_chain].depth + 1,
+                });
+                (
+                    index,
+                    inherited
+                        .shadow_clip
+                        .intersection(border_aabb)
+                        .unwrap_or_default(),
+                )
+            } else {
+                (inherited.shadow_clip_chain, inherited.shadow_clip)
+            };
         for child in &node.children {
             if child.kind != Kind::Popup {
                 self.collect_semantic_regions(
@@ -766,6 +804,21 @@ impl Layout {
         let opacity = semantic.opacity;
         let disabled_opacity = semantic.disabled_opacity;
         crate::brush::validate(node, local_bounds)?;
+        let child_clip_chain = self.clip_regions.len();
+        self.clip_regions.push(ClipRegion {
+            bounds: local_bounds,
+            radius: clip_radius(node, local_bounds),
+            transform,
+            inverse,
+            aabb: border_aabb,
+            parent: Some(clip_chain),
+            depth: self.clip_regions[clip_chain].depth + 1,
+        });
+        let own_clip_chain = if node.style.clip == ClipMode::Rounded {
+            child_clip_chain
+        } else {
+            clip_chain
+        };
         let index = self.placements.len();
         self.placement_indices.insert(node.id, index);
         self.placements.push(Placement {
@@ -781,7 +834,8 @@ impl Layout {
             opacity,
             disabled_opacity,
             inverse,
-            clip_chain,
+            clip_chain: own_clip_chain,
+            decoration_clip_chain: clip_chain,
         });
         self.pointer_regions.push(PointerRegion {
             parent,
@@ -790,15 +844,6 @@ impl Layout {
         let Some(child_clip_aabb) = border_aabb.intersection(clip_aabb) else {
             return Ok(());
         };
-        let child_clip_chain = self.clip_regions.len();
-        self.clip_regions.push(ClipRegion {
-            bounds: local_bounds,
-            transform,
-            inverse,
-            aabb: border_aabb,
-            parent: Some(clip_chain),
-            depth: self.clip_regions[clip_chain].depth + 1,
-        });
         let mut child_origin = Point {
             x: bounds.x,
             y: bounds.y,
@@ -1071,6 +1116,112 @@ mod tests {
 
     fn scrolled(root: &Node, size: Size, state: &mut ScrollState) -> Layout {
         Layout::compute_with_scroll(root, size, state, &mut FixedText).unwrap()
+    }
+
+    #[test]
+    fn rounded_clips_cover_own_input_and_children_without_changing_default_corners() {
+        let size = Size {
+            width: 100.0,
+            height: 100.0,
+        };
+        for child in [false, true] {
+            let mut root = fixed(
+                1,
+                if child { Kind::Stack } else { Kind::Button },
+                100.0,
+                100.0,
+            );
+            root.style.radius = 1000.0;
+            if child {
+                root.children.push(fixed(2, Kind::Button, 100.0, 100.0));
+            }
+            let target = if child { NodeId(2) } else { NodeId(1) };
+            for mode in [ClipMode::Bounds, ClipMode::Rounded] {
+                root.style.clip = mode;
+                let layout = Layout::compute(&root, size, &mut FixedText).unwrap();
+                assert_eq!(
+                    layout.hit_test(Point { x: 5.0, y: 5.0 }),
+                    (mode == ClipMode::Bounds).then_some(target)
+                );
+                assert_eq!(layout.hit_test(Point { x: 50.0, y: 5.0 }), Some(target));
+                assert_eq!(layout.hit_test(Point { x: 50.0, y: 50.0 }), Some(target));
+                assert_eq!(layout.focus_order().collect::<Vec<_>>(), [target]);
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_clips_follow_nested_mirrored_transforms() {
+        let mut root = fixed(1, Kind::Panel, 240.0, 240.0);
+        let mut group = fixed(2, Kind::Stack, 100.0, 100.0);
+        group.style.radius = 50.0;
+        group.style.clip = ClipMode::Rounded;
+        group.style.rotation = 25.0;
+        group.style.scale_x = -0.8;
+        group.style.scale_y = 1.2;
+        group.children.push(fixed(3, Kind::Button, 100.0, 100.0));
+        root.children.push(group);
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 240.0,
+                height: 240.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        let transform = layout.semantic_placement(NodeId(2)).unwrap().transform;
+        let corner = transform.point(Point { x: 5.0, y: 5.0 }).unwrap();
+        let center = transform.point(Point { x: 50.0, y: 50.0 }).unwrap();
+        assert_eq!(layout.hit_test(corner), None);
+        assert_eq!(layout.hit_test(center), Some(NodeId(3)));
+    }
+
+    #[test]
+    fn rounded_scroll_clip_stays_at_the_viewport_during_scrolling() {
+        let mut root = fixed(1, Kind::Scroll, 100.0, 40.0);
+        root.style.radius = 20.0;
+        root.style.clip = ClipMode::Rounded;
+        root.children.push(fixed(2, Kind::Button, 100.0, 120.0));
+        let mut state = ScrollState::default();
+        let size = Size {
+            width: 100.0,
+            height: 40.0,
+        };
+        let corner = Point { x: 1.0, y: 1.0 };
+        let center = Point { x: 50.0, y: 20.0 };
+        let layout = scrolled(&root, size, &mut state);
+        assert!(!layout.scroll_y(corner, 20.0, &mut state));
+        assert!(layout.scroll_y(center, 20.0, &mut state));
+        let layout = scrolled(&root, size, &mut state);
+        assert_eq!(layout.get(NodeId(2)).unwrap().bounds.y, -20.0);
+        assert_eq!(layout.hit_test(corner), None);
+        assert!(layout.scroll_route(corner).is_empty());
+        assert_eq!(layout.hit_test(center), Some(NodeId(2)));
+    }
+
+    #[test]
+    fn subnormal_rounded_clip_does_not_underflow_to_a_rectangle() {
+        let radius = f32::from_bits(16);
+        let region = ClipRegion {
+            bounds: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: radius * 2.0,
+                height: radius * 2.0,
+            },
+            radius,
+            transform: Affine::IDENTITY,
+            inverse: Some(Affine::IDENTITY),
+            aabb: Rect::default(),
+            parent: None,
+            depth: 0,
+        };
+        assert!(!region.contains(Point { x: 0.0, y: 0.0 }));
+        assert!(region.contains(Point {
+            x: radius,
+            y: radius
+        }));
     }
 
     #[test]

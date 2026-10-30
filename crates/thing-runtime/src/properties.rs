@@ -1,9 +1,9 @@
 use mlua::{Error, Result, Table, Value};
 use thing_core::{
-    Color, CrossAlign, ImageFit, ImageSource, KeyboardMode, Kind, MainAlign, Node, PanelEdge,
-    PanelInputRect, PanelInputRegion, PanelMargins, PathFillRule, PathFit, PathStrokeCap,
-    PathStrokeJoin, PopupAlignment, PopupAnchor, PopupConstraints, PopupOffset, SurfaceAnchors,
-    SurfaceLayer, TextAlign, TextOverflow, TransformOrigin, ViewBox,
+    ClipMode, Color, CrossAlign, ImageFit, ImageSource, KeyboardMode, Kind, MainAlign, Node,
+    PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins, PathFillRule, PathFit,
+    PathStrokeCap, PathStrokeJoin, PopupAlignment, PopupAnchor, PopupConstraints, PopupOffset,
+    SurfaceAnchors, SurfaceLayer, TextAlign, TextOverflow, TransformOrigin, ViewBox,
 };
 
 use crate::services::ImageHandle;
@@ -498,6 +498,16 @@ fn text_align(value: Value, name: &str) -> Result<TextAlign> {
     }
 }
 
+fn clip_mode(value: Value, name: &str) -> Result<ClipMode> {
+    match string(value, name)?.as_str() {
+        "bounds" => Ok(ClipMode::Bounds),
+        "rounded" => Ok(ClipMode::Rounded),
+        _ => Err(Error::runtime(format!(
+            "{name} must be \"bounds\" or \"rounded\""
+        ))),
+    }
+}
+
 fn text_overflow(value: Value, name: &str) -> Result<TextOverflow> {
     match string(value, name)?.as_str() {
         "clip" => Ok(TextOverflow::Clip),
@@ -788,6 +798,7 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "style.justify" => node.style.justify = main_align(value, name)?,
         "style.wrap" => node.style.wrap = boolean(value, name)?,
         "style.radius" => node.style.radius = number(value, name)? as f32,
+        "style.clip" => node.style.clip = clip_mode(value, name)?,
         "style.border_width" => node.style.border_width = number(value, name)? as f32,
         "style.border_color" => node.style.border_color = color(value, name)?,
         "style.hover_overlay" => node.style.hover_overlay = color(value, name)?,
