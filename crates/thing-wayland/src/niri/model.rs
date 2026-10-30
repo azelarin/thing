@@ -6,7 +6,8 @@ use std::{collections::BTreeMap, io};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thing_runtime::{
-    NiriAction, NiriKeyboardLayouts, NiriLayoutTarget, NiriState, NiriWindow, Workspace,
+    NiriAction, NiriCast, NiriCastKind, NiriCastTarget, NiriKeyboardLayouts, NiriLayoutTarget,
+    NiriState, NiriWindow, Workspace,
 };
 
 #[derive(Default)]
@@ -17,6 +18,7 @@ pub(super) struct Model {
     windows_initialized: bool,
     overview_open: Option<bool>,
     keyboard_layouts: Option<NiriKeyboardLayouts>,
+    casts: Option<BTreeMap<u64, NiriCast>>,
 }
 
 impl Model {
@@ -32,6 +34,10 @@ impl Model {
             windows: self.windows.values().cloned().collect(),
             overview_open: self.overview_open,
             keyboard_layouts: self.keyboard_layouts.clone(),
+            casts: self
+                .casts
+                .as_ref()
+                .map(|casts| casts.values().cloned().collect()),
         }
     }
 
@@ -56,6 +62,9 @@ impl Model {
                 | "OverviewOpenedOrClosed"
                 | "KeyboardLayoutsChanged"
                 | "KeyboardLayoutSwitched"
+                | "CastsChanged"
+                | "CastStartedOrChanged"
+                | "CastStopped"
         ) {
             return Ok(false);
         }
@@ -114,6 +123,32 @@ impl Model {
                     return Err(io::Error::other("niri switched an unknown keyboard layout"));
                 }
                 layouts.current_index = usize::from(idx);
+            }
+            Event::CastsChanged { casts } => {
+                check_count(casts.len())?;
+                let mut replacement = BTreeMap::new();
+                for cast in casts {
+                    let cast = NiriCast::try_from(cast)?;
+                    if replacement.insert(cast.stream_id, cast).is_some() {
+                        return Err(io::Error::other("duplicate niri cast stream id"));
+                    }
+                }
+                self.casts = Some(replacement);
+            }
+            Event::CastStartedOrChanged { cast } => {
+                let cast = NiriCast::try_from(cast)?;
+                let Some(casts) = self.casts.as_mut() else {
+                    // a delta cannot establish a complete list without its initial snapshot.
+                    return Ok(false);
+                };
+                check_count(casts.len() + usize::from(!casts.contains_key(&cast.stream_id)))?;
+                casts.insert(cast.stream_id, cast);
+            }
+            Event::CastStopped { stream_id } => {
+                let Some(casts) = self.casts.as_mut() else {
+                    return Ok(false);
+                };
+                casts.remove(&stream_id);
             }
             Event::WindowsChanged { windows } => {
                 check_count(windows.len())?;
@@ -203,6 +238,79 @@ enum Event {
     KeyboardLayoutSwitched {
         idx: u8,
     },
+    CastsChanged {
+        casts: Vec<WireCast>,
+    },
+    CastStartedOrChanged {
+        cast: WireCast,
+    },
+    CastStopped {
+        stream_id: u64,
+    },
+}
+
+#[derive(Deserialize)]
+struct WireCast {
+    stream_id: u64,
+    session_id: u64,
+    kind: String,
+    target: Value,
+    is_dynamic_target: bool,
+    is_active: bool,
+    pid: Option<i32>,
+    pw_node_id: Option<u32>,
+}
+
+#[derive(Deserialize)]
+enum WireCastTarget {
+    Nothing {},
+    Output { name: String },
+    Window { id: u64 },
+}
+
+impl TryFrom<WireCast> for NiriCast {
+    type Error = io::Error;
+
+    fn try_from(cast: WireCast) -> io::Result<Self> {
+        let checked_text = |text: String| {
+            if text.len() > 65536 || text.contains('\0') {
+                Err(io::Error::other("invalid niri cast text"))
+            } else {
+                Ok(text)
+            }
+        };
+        let kind = match cast.kind.as_str() {
+            "PipeWire" => NiriCastKind::PipeWire,
+            "WlrScreencopy" => NiriCastKind::WlrScreencopy,
+            _ => NiriCastKind::Unknown(checked_text(cast.kind)?),
+        };
+        let tag = cast
+            .target
+            .as_object()
+            .filter(|object| object.len() == 1)
+            .and_then(|object| object.keys().next())
+            .ok_or_else(|| io::Error::other("invalid niri cast target"))?;
+        let target = if matches!(tag.as_str(), "Nothing" | "Output" | "Window") {
+            match serde_json::from_value::<WireCastTarget>(cast.target)? {
+                WireCastTarget::Nothing {} => NiriCastTarget::Nothing,
+                WireCastTarget::Output { name } => NiriCastTarget::Output(checked_text(name)?),
+                WireCastTarget::Window { id } => NiriCastTarget::Window(id),
+            }
+        } else {
+            // preserve the stream when a newer compositor adds a target type.
+            NiriCastTarget::Unknown(checked_text(tag.clone())?)
+        };
+        Ok(Self {
+            stream_id: cast.stream_id,
+            session_id: cast.session_id,
+            kind,
+            target,
+            dynamic_target: cast.is_dynamic_target,
+            active: cast.is_active,
+            pid: cast.pid,
+            pipewire_node_id: cast.pw_node_id,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -293,6 +401,15 @@ pub(super) fn request(action: NiriAction) -> Value {
         NiriAction::SetOverview(true) => json!({"OpenOverview": {}}),
         NiriAction::SetOverview(false) => json!({"CloseOverview": {}}),
         NiriAction::ToggleOverview => json!({"ToggleOverview": {}}),
+        NiriAction::MoveWindowToWorkspace { window_id, workspace_id, focus } => {
+            json!({"MoveWindowToWorkspace": {"window_id": window_id, "reference": {"Id": workspace_id}, "focus": focus}})
+        },
+        NiriAction::MoveWindowToOutput { window_id, output } => {
+            json!({"MoveWindowToMonitor": {"id": window_id, "output": output}})
+        },
+        NiriAction::MoveWorkspaceToOutput { workspace_id, output } => {
+            json!({"MoveWorkspaceToMonitor": {"reference": {"Id": workspace_id}, "output": output}})
+        },
         NiriAction::SwitchLayout(layout) => json!({"SwitchLayout": {"layout": match layout {
             NiriLayoutTarget::Next => json!("Next"),
             NiriLayoutTarget::Previous => json!("Prev"),

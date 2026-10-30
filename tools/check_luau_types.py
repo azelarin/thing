@@ -34,6 +34,13 @@ CASES = (
     Case("valid-clipping.luau"),
     Case("valid-scroll-axis.luau"),
     Case("valid-niri-controls.luau"),
+    Case("valid-niri-casts-and-moves.luau"),
+    Case("invalid-niri-casts-and-moves.luau", (
+        "Expected this to be 'string', but got 'number'",
+        "Expected this to be 'boolean?', but got 'string'",
+        "Expected this to be 'string', but got 'boolean'",
+        "Expected this to be 'number', but got 'string'",
+    )),
     Case("invalid-niri-controls.luau", (
         "Expected this to be 'boolean', but got 'string'",
         "Expected this to be 'number', but got 'string'",
