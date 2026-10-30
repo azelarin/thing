@@ -1615,6 +1615,7 @@ local depth = ui.motion(0, {
 })
 
 return ui.panel {
+    style = { height = 120, gap = 12 },
     children = {
         ui.button {
             on_click = function()
