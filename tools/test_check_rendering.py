@@ -760,5 +760,15 @@ class HorizontalScrollProbes(unittest.TestCase):
                 check_rendering.verify_capture("horizontal-scroll", canvas.image(), "scale-1", scale)
 
 
+class MotionLifecycleProbes(unittest.TestCase):
+    def test_invisible_retained_content_cannot_pass_as_removed(self):
+        for scale in (1.0, 1.25):
+            canvas = Canvas(scale).rect(0, 0, 640, 220, (13, 17, 23))
+            for y in (20, 100):
+                canvas.rect(108, y, 124, y + 40, (71, 209, 108))
+            with self.assertRaisesRegex(FixtureError, "transition content removed"):
+                check_rendering.verify_capture("motion-lifecycle", canvas.image(), "scale-1", scale)
+
+
 if __name__ == "__main__":
     unittest.main()

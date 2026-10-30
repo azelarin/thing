@@ -9,4 +9,6 @@ motion:to("ten")
 local position: string = motion:get()
 local velocity: string = motion:velocity()
 
+local stillRunning: string = ui.motion(0, { kind = "transition", duration = 100 }):running()
+
 return ui.panel {}

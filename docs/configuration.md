@@ -1685,8 +1685,9 @@ same `stiffness`, `damping`, and optional `epsilon` as `ui.spring`.
 options are fixed at load time. the initial value and each target must fit in a
 finite 32-bit number.
 
-`get()` returns the position and `velocity()` its rate of change in units per
-second. both read the latest accepted animation sample. reads in property
+`get()` returns the position, `velocity()` its rate of change in units per
+second, and `running()` whether that sample is still animating. all three read
+the latest accepted animation sample. reads in property
 functions subscribe to updates, so all readers use the same sample within a
 frame. reading a handle does not advance time. a settled motion has zero
 velocity and stops requesting frames. subscribed properties keep their surface
@@ -1718,9 +1719,55 @@ failed callbacks and rejected event updates discard their queued targets.
 failed reloads preserve existing motions; successful reloads replace them with
 the new declarations' initial values. motions belong to each output's runtime
 and are also available in lock configurations. there may be up to 128 motions
-and 256 queued controls in one event. each motion uses two of the configuration's
+and 256 queued controls in one event. each motion uses three of the configuration's
 10,000 reactive state slots. targets are explicit; changing ordinary state or a
 service signal does not retarget a motion automatically.
+
+### keeping content through an exit animation
+
+keep the outgoing widget in its child list until the motion settles at its
+closing value. `running()` matters for springs: they may cross the endpoint
+several times before settling. clamp opacity while keeping the unclamped motion
+for the rest of the animation.
+
+```luau
+local opened = ui.state(true)
+local fade = ui.motion(0, { kind = 'spring', stiffness = 170, damping = 0.8 })
+
+ui.timer { interval = 1, autostart = true, on_timeout = function() fade:to(1) end }
+
+return ui.panel {
+    children = {
+        ui.button {
+            on_click = function()
+                opened:set(not opened:get())
+                fade:to(if opened:get() then 1 else 0)
+            end,
+            children = { ui.text { text = 'toggle' } },
+        },
+        ui.row { children = function()
+            if not opened:get() and not fade:running() and fade:get() == 0 then
+                return {}
+            end
+            return { ui.text {
+                key = 'content', text = 'hello',
+                style = { opacity = function() return math.clamp(fade:get(), 0, 1) end },
+            } }
+        end },
+    },
+}
+```
+
+the initial timer starts the entrance from zero. closing keeps the same keyed
+widget through its fade; reopening before it finishes reverses the existing
+motion. after a completed exit, reopening creates fresh content. keep any state
+that should survive removal outside the child-list function.
+
+`running()` becomes false on the accepted settled sample. `stop()` and `jump()`
+also publish false on their next sample, so check the closing value as well.
+a rejected frame preserves the previous position, velocity, and running sample;
+it does not announce a successful completion. as with other shared-motion
+readers, this signal needs a mapped surface to advance.
 
 ### theme modules
 

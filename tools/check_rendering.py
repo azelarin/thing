@@ -24,11 +24,11 @@ FIXTURES = ROOT / "tests/rendering"
 ARTIFACTS = ROOT / "target/render-tests"
 CASES = (
     "image-fit", "stencil", "gradients", "radial-gradients", "shadows", "shared-motion",
-    "widget-bounds", "rounded-clips", "horizontal-scroll",
+    "widget-bounds", "rounded-clips", "horizontal-scroll", "motion-lifecycle",
 )
 # these accept a state only after the same passing frame is captured twice.
 STABLE_FRAMES = {
-    "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2, "rounded-clips": 2, "horizontal-scroll": 2,
+    "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2, "rounded-clips": 2, "horizontal-scroll": 2, "motion-lifecycle": 2,
 }
 RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
 # the runtime error each panel-invalid.luau must produce, in thing check and in
@@ -437,6 +437,19 @@ def verify_horizontal_scroll(image, stage, scale):
         expect_color(image, point, scale, color, label, tolerance=3)
 
 
+def verify_motion_lifecycle(image, stage, scale):
+    done = (224, 164, 81) if stage == "reload" else (71, 209, 108)
+    for point, color, label in (
+        ((28, 40), done, "transition content removed"),
+        ((60, 40), (13, 17, 23), "transition left no layout slot"),
+        ((28, 120), done, "interrupted spring content removed"),
+        ((60, 120), (13, 17, 23), "spring left no layout slot"),
+        ((240, 40), done, "running-only reader reaches completion"),
+        ((240, 120), done, "spring overshoot was retained"),
+    ):
+        expect_color(image, point, scale, color, label, tolerance=3)
+
+
 def verify_capture(case, image, stage, scale):
     if case == "image-fit":
         verify_image_fit(image, stage, scale)
@@ -456,6 +469,8 @@ def verify_capture(case, image, stage, scale):
         verify_rounded_clips(image, stage, scale)
     elif case == "horizontal-scroll":
         verify_horizontal_scroll(image, stage, scale)
+    elif case == "motion-lifecycle":
+        verify_motion_lifecycle(image, stage, scale)
     else:
         raise FixtureError(f"unknown renderer fixture: {case}")
 
