@@ -732,5 +732,21 @@ class WidgetBoundsProbes(unittest.TestCase):
             )
 
 
+class RoundedClipProbes(unittest.TestCase):
+    def test_blank_frames_cannot_pass_for_either_configuration(self):
+        for scale in (1.0, 1.25):
+            for stage in ("scale-1", "reload"):
+                with self.subTest(scale=scale, stage=stage):
+                    with self.assertRaises(FixtureError):
+                        check_rendering.verify_capture(
+                            "rounded-clips", Canvas(scale).image(), stage, scale
+                        )
+
+    def test_square_corners_cannot_pass_as_a_finished_animation(self):
+        canvas = Canvas(1.25).rect(20, 20, 100, 100, (40, 179, 161))
+        with self.assertRaisesRegex(FixtureError, "animated rounded corner"):
+            check_rendering.verify_capture("rounded-clips", canvas.image(), "scale-1", 1.25)
+
+
 if __name__ == "__main__":
     unittest.main()
