@@ -7,9 +7,11 @@ use crate::{Color, ParseColorError, TreeError};
 pub enum Brush {
     Solid(Color),
     Linear(LinearGradient),
+    Radial(RadialGradient),
 }
 
-/// a position relative to the paint box, where (0, 0) and (1, 1) are its corners.
+/// paint-box fractions used for positions and radii. for positions, (0, 0)
+/// and (1, 1) are the box's corners.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GradientPoint {
     pub x: f64,
@@ -20,6 +22,16 @@ pub struct GradientPoint {
 pub struct LinearGradient {
     pub from: GradientPoint,
     pub to: GradientPoint,
+    pub stops: Vec<GradientStop>,
+}
+
+/// an elliptical gradient. `center` is a paint box position and `radius`
+/// holds the horizontal and vertical radii as fractions of the box's width and
+/// height, so equal values form an ellipse on a rectangular box.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RadialGradient {
+    pub center: GradientPoint,
+    pub radius: GradientPoint,
     pub stops: Vec<GradientStop>,
 }
 
@@ -54,13 +66,15 @@ impl Brush {
         match self {
             Self::Solid(_) => Ok(()),
             Self::Linear(gradient) => gradient.validate(),
+            Self::Radial(gradient) => gradient.validate(),
         }
     }
 
     pub fn is_transparent(&self) -> bool {
         match self {
             Self::Solid(color) => color.0[3] == 0,
-            Self::Linear(gradient) => gradient.stops.iter().all(|stop| stop.color.0[3] == 0),
+            Self::Linear(gradient) => transparent(&gradient.stops),
+            Self::Radial(gradient) => transparent(&gradient.stops),
         }
     }
 }
@@ -76,24 +90,47 @@ impl LinearGradient {
                 "gradient endpoints must be finite and different".into(),
             ));
         }
-        if !(2..=16).contains(&self.stops.len()) {
-            return Err(TreeError("a gradient needs 2 through 16 stops".into()));
+        validate_stops(&self.stops)
+    }
+}
+
+impl RadialGradient {
+    pub fn validate(&self) -> Result<(), TreeError> {
+        if !(self.center.x.is_finite() && self.center.y.is_finite()) {
+            return Err(TreeError("gradient center must be finite".into()));
         }
-        if self
-            .stops
-            .iter()
-            .any(|stop| !stop.position.is_finite() || !(0.0..=1.0).contains(&stop.position))
-            || self
-                .stops
-                .windows(2)
-                .any(|stops| stops[0].position > stops[1].position)
+        if !([self.radius.x, self.radius.y]
+            .into_iter()
+            .all(|radius| radius.is_finite() && radius > 0.0))
         {
             return Err(TreeError(
-                "gradient stop positions must be finite, ordered, and between 0 and 1".into(),
+                "gradient radii must be finite and positive".into(),
             ));
         }
-        Ok(())
+        validate_stops(&self.stops)
     }
+}
+
+fn validate_stops(stops: &[GradientStop]) -> Result<(), TreeError> {
+    if !(2..=16).contains(&stops.len()) {
+        return Err(TreeError("a gradient needs 2 through 16 stops".into()));
+    }
+    if stops
+        .iter()
+        .any(|stop| !stop.position.is_finite() || !(0.0..=1.0).contains(&stop.position))
+        || stops
+            .windows(2)
+            .any(|stops| stops[0].position > stops[1].position)
+    {
+        return Err(TreeError(
+            "gradient stop positions must be finite, ordered, and between 0 and 1".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn transparent(stops: &[GradientStop]) -> bool {
+    stops.iter().all(|stop| stop.color.0[3] == 0)
 }
 
 #[cfg(test)]
@@ -153,6 +190,43 @@ mod tests {
             4
         ];
         assert!(hard_stop.validate().is_ok());
+    }
+
+    #[test]
+    fn radial_gradients_need_finite_positive_radii_and_valid_stops() {
+        let valid = RadialGradient {
+            center: GradientPoint { x: -3.0, y: 0.5 },
+            radius: GradientPoint {
+                x: 4.0,
+                y: 0.000_001,
+            },
+            stops: gradient().stops,
+        };
+        assert!(valid.validate().is_ok());
+        for (center, radius) in [
+            ((f64::NAN, 0.5), (0.5, 0.5)),
+            ((0.5, f64::INFINITY), (0.5, 0.5)),
+            ((0.5, 0.5), (0.0, 0.5)),
+            ((0.5, 0.5), (0.5, -0.5)),
+            ((0.5, 0.5), (f64::INFINITY, 0.5)),
+            ((0.5, 0.5), (0.5, f64::NAN)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid.center = GradientPoint {
+                x: center.0,
+                y: center.1,
+            };
+            invalid.radius = GradientPoint {
+                x: radius.0,
+                y: radius.1,
+            };
+            assert!(invalid.validate().is_err(), "{center:?} {radius:?}");
+        }
+        let mut invalid = valid;
+        invalid.stops.reverse();
+        invalid.stops[0].position = 1.0;
+        invalid.stops[1].position = 0.0;
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

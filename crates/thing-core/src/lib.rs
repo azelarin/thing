@@ -7,7 +7,7 @@ mod shadow;
 mod vector;
 mod widget;
 
-pub use brush::{Brush, GradientPoint, GradientStop, LinearGradient};
+pub use brush::{Brush, GradientPoint, GradientStop, LinearGradient, RadialGradient};
 pub use color::{Color, ParseColorError};
 pub use geometry::{HorizontalRange, Point, Rect, Scale};
 pub use shadow::{MAX_SHADOW_BLUR, MAX_SHADOW_OFFSET, MAX_SHADOW_SPREAD, Shadow};

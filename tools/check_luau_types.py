@@ -32,7 +32,12 @@ CASES = (
     Case("valid-brushes.luau"),
     Case(
         "invalid-brushes.luau",
-        ("Property 'kind' is not compatible.", "Property 'position' is not compatible."),
+        (
+            "Property 'kind' is not compatible.",
+            "Property 'position' is not compatible.",
+            "missing field 'radius'",
+            "Property 'radius' is not compatible.",
+        ),
     ),
     Case(
         "invalid-timers.luau",

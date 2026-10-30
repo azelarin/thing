@@ -177,7 +177,14 @@ export type ThingLinearGradient = {
     to: ThingGradientPoint,
     stops: { ThingGradientStop },
 }
-export type ThingBrush = string | ThingLinearGradient
+-- center is a paint box position; radius holds fractions of its width and height.
+export type ThingRadialGradient = {
+    kind: "radial",
+    center: ThingGradientPoint,
+    radius: ThingGradientPoint,
+    stops: { ThingGradientStop },
+}
+export type ThingBrush = string | ThingLinearGradient | ThingRadialGradient
 
 export type ThingShadow = {
     color: string,

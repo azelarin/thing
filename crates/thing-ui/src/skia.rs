@@ -1086,11 +1086,10 @@ fn to_skia_rect(bounds: Rect) -> SkiaRect {
 }
 
 fn brush_paint(brush: &thing_core::Brush, bounds: Rect, opacity: f32) -> Result<Paint, String> {
-    let gradient = match brush {
-        thing_core::Brush::Solid(value) => return Ok(fill(color(*value), opacity)),
-        thing_core::Brush::Linear(gradient) => gradient,
-    };
-    let Some(resolved) = crate::brush::resolve(gradient, bounds)? else {
+    if let thing_core::Brush::Solid(value) = brush {
+        return Ok(fill(color(*value), opacity));
+    }
+    let Some(resolved) = crate::brush::resolve(brush, bounds)? else {
         return Ok(fill(SkiaColor::TRANSPARENT, opacity));
     };
     let colors = resolved
@@ -1111,11 +1110,18 @@ fn brush_paint(brush: &thing_core::Brush, bounds: Rect, opacity: f32) -> Result<
             ..Interpolation::default()
         },
     );
-    let shader = gradient::shaders::linear_gradient(
-        ((0.0, 0.0), (1.0, 0.0)),
-        &specification,
-        &resolved.local_matrix,
-    )
+    let shader = match resolved.shape {
+        crate::brush::GradientShape::Linear => gradient::shaders::linear_gradient(
+            ((0.0, 0.0), (1.0, 0.0)),
+            &specification,
+            &resolved.local_matrix,
+        ),
+        crate::brush::GradientShape::Radial => gradient::shaders::radial_gradient(
+            ((0.0, 0.0), 1.0),
+            &specification,
+            &resolved.local_matrix,
+        ),
+    }
     .ok_or("gradient cannot be represented by the renderer")?;
     let mut paint = fill(SkiaColor::WHITE, opacity);
     paint.set_shader(shader);
@@ -1801,6 +1807,381 @@ mod tests {
         let inside = pixels.get_color((50, 22));
         assert!((199..=205).contains(&inside.a()), "{inside:?}");
         assert!(inside.r() >= 250);
+    }
+
+    fn radial_brush(
+        center: (f64, f64),
+        radius: (f64, f64),
+        stops: &[(f64, &str)],
+    ) -> thing_core::Brush {
+        use thing_core::{Brush, GradientPoint, GradientStop, RadialGradient};
+        Brush::Radial(RadialGradient {
+            center: GradientPoint {
+                x: center.0,
+                y: center.1,
+            },
+            radius: GradientPoint {
+                x: radius.0,
+                y: radius.1,
+            },
+            stops: stops
+                .iter()
+                .map(|(position, color)| GradientStop {
+                    position: *position,
+                    color: color.parse().unwrap(),
+                })
+                .collect(),
+        })
+    }
+
+    const WHITE_TO_BLACK: &[(f64, &str)] = &[(0.0, "#ffffff"), (1.0, "#000000")];
+
+    /// a panel with a `background` color and one card of `size` at (20, 20)
+    /// inside a column, so tests can set inherited state on the column.
+    fn radial_card(background: &str, size: (f32, f32), brush: thing_core::Brush) -> Node {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        root.style.padding = 20.0;
+        root.style.align = thing_core::CrossAlign::Start;
+        root.style.justify = thing_core::MainAlign::Start;
+        root.style.background = background.parse::<thing_core::Color>().unwrap().into();
+        let mut parent = Node::new(NodeId(2), Kind::Column);
+        parent.style.align = thing_core::CrossAlign::Start;
+        let mut card = Node::new(NodeId(3), Kind::Row);
+        card.style.width = Some(size.0);
+        card.style.height = Some(size.1);
+        card.style.background = brush;
+        parent.children.push(card);
+        root.children.push(parent);
+        root
+    }
+
+    fn card(root: &mut Node) -> &mut Node {
+        &mut root.children[0].children[0]
+    }
+
+    /// the srgb gray a white-to-black falloff has at normalized distance `t`
+    /// when it interpolates in linear light.
+    fn falloff_gray(t: f64) -> f64 {
+        let linear = 1.0 - t.clamp(0.0, 1.0);
+        let encoded = if linear <= 0.003_130_8 {
+            12.92 * linear
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        };
+        encoded * 255.0
+    }
+
+    /// checks physical pixels against a white-to-black ellipse with
+    /// `center` and `radii` in logical surface pixels. `local` maps a logical
+    /// surface point back into the card's untransformed space.
+    fn assert_falloff(
+        surface: &mut skia_safe::Surface,
+        scale: f32,
+        center: (f64, f64),
+        radii: (f64, f64),
+        pixels: &[(i32, i32)],
+        local: impl Fn(f64, f64) -> (f64, f64),
+    ) {
+        let image = surface.peek_pixels().unwrap();
+        for &(x, y) in pixels {
+            let logical = (
+                (f64::from(x) + 0.5) / f64::from(scale),
+                (f64::from(y) + 0.5) / f64::from(scale),
+            );
+            let (lx, ly) = local(logical.0, logical.1);
+            let t = ((lx - center.0) / radii.0).hypot((ly - center.1) / radii.1);
+            let expected = falloff_gray(t);
+            let actual = image.get_color((x, y));
+            assert!(
+                (f64::from(actual.r()) - expected).abs() <= 3.0
+                    && actual.r() == actual.g()
+                    && actual.g() == actual.b(),
+                "pixel ({x}, {y}) at distance {t:.3} was {actual:?}; expected gray {expected:.1}"
+            );
+        }
+    }
+
+    fn untransformed(x: f64, y: f64) -> (f64, f64) {
+        (x, y)
+    }
+
+    #[test]
+    fn radial_raster_draws_ellipses_and_circles_in_the_paint_box() {
+        // equal proportions on a 200 by 100 box form a 100 by 50 ellipse.
+        let root = radial_card(
+            "#000000",
+            (200.0, 100.0),
+            radial_brush((0.5, 0.5), (0.5, 0.5), WHITE_TO_BLACK),
+        );
+        let mut surface = raster_scene(&root, 260, 160, 1.0).unwrap();
+        let ring = [
+            (120, 70),
+            (145, 70),
+            (170, 70),
+            (120, 82),
+            (120, 95),
+            (210, 115),
+        ];
+        assert_falloff(
+            &mut surface,
+            1.0,
+            (120.0, 70.0),
+            (100.0, 50.0),
+            &ring,
+            untransformed,
+        );
+        // half the horizontal proportion makes a circle on the same box.
+        let root = radial_card(
+            "#000000",
+            (200.0, 100.0),
+            radial_brush((0.5, 0.5), (0.25, 0.5), WHITE_TO_BLACK),
+        );
+        let mut surface = raster_scene(&root, 260, 160, 1.0).unwrap();
+        assert_falloff(
+            &mut surface,
+            1.0,
+            (120.0, 70.0),
+            (50.0, 50.0),
+            &ring,
+            untransformed,
+        );
+        let pixels = surface.peek_pixels().unwrap();
+        assert_eq!(pixels.get_color((145, 70)), pixels.get_color((120, 95)));
+    }
+
+    #[test]
+    fn radial_raster_keeps_off_box_centers_large_radii_and_fractional_scale() {
+        // the center sits half a box left of the card, and the horizontal
+        // radius reaches past its right edge.
+        let root = radial_card(
+            "#000000",
+            (200.0, 100.0),
+            radial_brush((-0.5, 0.5), (1.5, 1.0), WHITE_TO_BLACK),
+        );
+        for (scale, size) in [(1.0, (260, 160)), (1.25, (325, 200))] {
+            let mut surface = raster_scene(&root, size.0, size.1, scale).unwrap();
+            let points = [(25, 70), (120, 70), (215, 70), (120, 25), (200, 115)]
+                .map(|(x, y)| ((x as f32 * scale) as i32, (y as f32 * scale) as i32));
+            assert_falloff(
+                &mut surface,
+                scale,
+                (-80.0, 70.0),
+                (300.0, 100.0),
+                &points,
+                untransformed,
+            );
+        }
+    }
+
+    #[test]
+    fn radial_raster_keeps_coincident_hard_stops() {
+        let brush = radial_brush(
+            (0.5, 0.5),
+            (0.5, 0.5),
+            &[
+                (0.0, "#ff0000"),
+                (0.5, "#ff0000"),
+                (0.5, "#00ff00"),
+                (0.5, "#0000ff"),
+                (1.0, "#0000ff"),
+            ],
+        );
+        let mut surface = raster_scene(
+            &radial_card("#000000", (100.0, 100.0), brush),
+            160,
+            160,
+            1.0,
+        )
+        .unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        // the card spans 20 to 120 with its center at 70 and a 50 pixel radius.
+        assert_eq!(pixels.get_color((90, 70)), SkiaColor::RED);
+        assert_eq!(pixels.get_color((70, 96)), SkiaColor::BLUE);
+        assert_eq!(pixels.get_color((100, 70)), SkiaColor::BLUE);
+        for x in 70..120 {
+            assert!(pixels.get_color((x, 70)).g() < 128, "green ring at x {x}");
+        }
+    }
+
+    #[test]
+    fn radial_raster_interpolates_premultiplied_alpha_and_applies_opacity_once() {
+        let brush = radial_brush(
+            (0.5, 0.5),
+            (0.5, 0.5),
+            &[(0.0, "#ffffff"), (1.0, "#00000000")],
+        );
+        for disabled in [false, true] {
+            let mut root = radial_card("#ff0000", (100.0, 100.0), brush.clone());
+            if disabled {
+                card(&mut root).enabled = false;
+                card(&mut root).style.disabled_opacity = 0.5;
+            } else {
+                root.children[0].style.opacity = 0.5;
+            }
+            let mut surface = raster_scene(&root, 160, 160, 1.0).unwrap();
+            // halfway out the gradient is white at half alpha, then the
+            // inherited or disabled opacity halves it once more.
+            let pixel = surface.peek_pixels().unwrap().get_color((95, 70));
+            assert_eq!(pixel.r(), 255, "{pixel:?}");
+            assert!((60..=68).contains(&pixel.g()), "{disabled}: {pixel:?}");
+            assert_eq!(pixel.g(), pixel.b());
+        }
+    }
+
+    #[test]
+    fn radial_raster_rounds_backgrounds_and_fills_paths_in_their_padded_box() {
+        let mut root = radial_card(
+            "#000000",
+            (100.0, 100.0),
+            radial_brush(
+                (0.5, 0.5),
+                (0.5, 0.5),
+                &[(0.0, "#ffffff"), (1.0, "#808080")],
+            ),
+        );
+        card(&mut root).style.radius = 30.0;
+        let mut surface = raster_scene(&root, 160, 160, 1.0).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        // outside the rounded corner the panel shows, although the clamped
+        // gradient would paint its gray outer stop there. the straight edge
+        // is painted.
+        assert_eq!(pixels.get_color((22, 22)), SkiaColor::BLACK);
+        assert_eq!(pixels.get_color((117, 22)), SkiaColor::BLACK);
+        let edge = pixels.get_color((21, 70));
+        assert!(
+            (128..=150).contains(&edge.r()) && edge.r() == edge.b(),
+            "{edge:?}"
+        );
+
+        // an even-odd ring in a padded path box: the 80 pixel content box at
+        // (30, 30) holds the ellipse, the hole stays clear, and so does the
+        // padding.
+        let mut root = radial_card(
+            "#ff0000",
+            (100.0, 100.0),
+            thing_core::Color::TRANSPARENT.into(),
+        );
+        let path = card(&mut root);
+        path.kind = Kind::Path;
+        path.style.padding = 10.0;
+        path.path
+            .set_data("M0 0H80V80H0Z M20 20H60V60H20Z".into())
+            .unwrap();
+        path.path.view_box = Some(ViewBox {
+            x: 0.0,
+            y: 0.0,
+            width: 80.0,
+            height: 80.0,
+        });
+        path.path.fill_rule = thing_core::PathFillRule::EvenOdd;
+        path.path.fill = Some(radial_brush((0.5, 0.5), (0.5, 0.5), WHITE_TO_BLACK));
+        let mut surface = raster_scene(&root, 160, 160, 1.0).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        assert_eq!(pixels.get_color((70, 70)), SkiaColor::RED);
+        assert_eq!(pixels.get_color((25, 70)), SkiaColor::RED);
+        assert_eq!(pixels.get_color((70, 115)), SkiaColor::RED);
+        assert_falloff(
+            &mut surface,
+            1.0,
+            (70.0, 70.0),
+            (40.0, 40.0),
+            &[(35, 70), (45, 45), (70, 103), (104, 70)],
+            untransformed,
+        );
+    }
+
+    #[test]
+    fn radial_raster_follows_mirrors_and_nonuniform_transforms() {
+        // the bright spot sits a quarter of the way across the card; a mirror
+        // around the card's center moves it to three quarters.
+        let mut root = radial_card(
+            "#000000",
+            (200.0, 100.0),
+            radial_brush((0.25, 0.5), (0.25, 0.5), WHITE_TO_BLACK),
+        );
+        card(&mut root).style.scale_x = -1.0;
+        let mut surface = raster_scene(&root, 260, 160, 1.0).unwrap();
+        assert_falloff(
+            &mut surface,
+            1.0,
+            (70.0, 70.0),
+            (50.0, 50.0),
+            &[(170, 70), (150, 70), (195, 90), (70, 70)],
+            |x, y| (240.0 - x, y),
+        );
+
+        // squashing a circle vertically and rotating it a quarter turn makes a
+        // tall ellipse around the card's center.
+        let mut root = radial_card(
+            "#000000",
+            (100.0, 100.0),
+            radial_brush((0.5, 0.5), (0.5, 0.5), WHITE_TO_BLACK),
+        );
+        card(&mut root).style.scale_y = 0.5;
+        card(&mut root).style.rotation = 90.0;
+        let mut surface = raster_scene(&root, 160, 160, 1.0).unwrap();
+        assert_falloff(
+            &mut surface,
+            1.0,
+            (70.0, 70.0),
+            (50.0, 50.0),
+            &[(70, 70), (80, 70), (70, 95), (70, 110)],
+            // undo the rotation, then the vertical scale, around (70, 70).
+            |x, y| {
+                let (dx, dy) = (x - 70.0, y - 70.0);
+                let (ux, uy) = (dy, -dx);
+                (70.0 + ux, 70.0 + uy / 0.5)
+            },
+        );
+        let pixels = surface.peek_pixels().unwrap();
+        assert!(pixels.get_color((70, 95)).r() > pixels.get_color((95, 70)).r());
+    }
+
+    #[test]
+    fn radial_raster_survives_magnification_of_a_small_widget() {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((100, 100)).unwrap();
+        let bounds = Rect {
+            width: 0.000_001,
+            height: 0.000_001,
+            ..Rect::default()
+        };
+        let brush = radial_brush((0.5, 0.5), (0.5, 0.5), WHITE_TO_BLACK);
+        surface.canvas().scale((100_000_000.0, 100_000_000.0));
+        surface.canvas().draw_rect(
+            to_skia_rect(bounds),
+            &brush_paint(&brush, bounds, 1.0).unwrap(),
+        );
+        assert_falloff(
+            &mut surface,
+            1.0,
+            (50.0, 50.0),
+            (50.0, 50.0),
+            &[(50, 50), (75, 50), (50, 90)],
+            untransformed,
+        );
+    }
+
+    #[test]
+    fn unrepresentable_radial_geometry_fails_candidate_layout() {
+        let far = radial_brush(
+            (-10_000_000.0, 0.5),
+            (10_000_000.5, 10_000_000.5),
+            WHITE_TO_BLACK,
+        );
+        let error = raster_scene(&radial_card("#000000", (100.0, 100.0), far), 160, 160, 1.0)
+            .err()
+            .unwrap();
+        assert!(error.contains("gradient on widget 3"), "{error}");
+        assert!(error.contains("too far from its paint box"), "{error}");
+        // the same distant center with a ring that never reaches the box
+        // draws the outer color.
+        let past = radial_brush((-10_000_000.0, 0.5), (0.5, 0.5), WHITE_TO_BLACK);
+        let mut surface =
+            raster_scene(&radial_card("#ffffff", (100.0, 100.0), past), 160, 160, 1.0).unwrap();
+        assert_eq!(
+            surface.peek_pixels().unwrap().get_color((70, 70)),
+            SkiaColor::BLACK
+        );
     }
 
     #[test]
