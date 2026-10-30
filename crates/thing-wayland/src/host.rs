@@ -42,7 +42,7 @@ use smithay_client_toolkit::{
 };
 use thing_core::{
     HorizontalRange, KeyboardMode, Kind, Node, NodeId, PanelInputRegion, Point, Rect, Scale,
-    SurfaceLayer,
+    ScrollAxis, SurfaceLayer,
 };
 use thing_runtime::{
     Action, Event, KeyInput, ManagedProcessAction, ManagedProcessDefinition,
@@ -1115,7 +1115,7 @@ impl PendingLaunch {
 /// one stop on a captured wheel route, bound to its presented identity.
 enum ScrollRouteStep {
     Handler(ScopedUiTarget, RuntimeScrollInput),
-    Viewport(ScopedUiTarget),
+    Viewport(ScopedUiTarget, ScrollAxis),
 }
 
 pub(crate) struct App {
@@ -2414,12 +2414,12 @@ impl App {
                 match action {
                     HostUiAction::Focus(_) => {
                         if layout.focus_order().any(|candidate| candidate == id) {
-                            changed |= layout.reveal_y(id, &mut scroll);
+                            changed |= layout.reveal(id, &mut scroll);
                             focus = Some(target);
                         }
                     }
                     HostUiAction::Reveal(_) => {
-                        changed |= layout.reveal_y(id, &mut scroll);
+                        changed |= layout.reveal(id, &mut scroll);
                     }
                 }
             }
@@ -2486,7 +2486,7 @@ impl App {
                 &mut scroll,
             )?;
             let focused = self.surfaces[index].input.keyboard_focused();
-            if focused.is_some_and(|id| layout.reveal_y(id, &mut scroll)) {
+            if focused.is_some_and(|id| layout.reveal(id, &mut scroll)) {
                 layout = self.render.layout(
                     &root,
                     Size {
@@ -2941,9 +2941,17 @@ impl App {
                         runtime_scroll_input(local, x, y, position, &self.modifiers, source)?;
                     Some(ScrollRouteStep::Handler(target, input))
                 }
-                ScrollStep::Viewport(id) => self
-                    .current_presented_scroll_view_target(index, id)
-                    .map(ScrollRouteStep::Viewport),
+                ScrollStep::Viewport(id) => {
+                    let axis = layout.scroll_axis(id)?;
+                    let target = self.current_presented_scroll_view_target(index, id)?;
+                    let surface = self.surfaces.get(index)?;
+                    let current = self
+                        .configurations
+                        .surface_root(&surface.output, &surface.key)?
+                        .find(id)?;
+                    scroll_view_axis_matches(layout, current, axis)
+                        .then_some(ScrollRouteStep::Viewport(target, axis))
+                }
             })
             .collect()
     }
@@ -2957,7 +2965,7 @@ impl App {
         output: wl_output::WlOutput,
         event_surface: &wl_surface::WlSurface,
         route: Vec<ScrollRouteStep>,
-        y: f64,
+        delta: Point,
     ) {
         for step in route {
             let Some(index) = self.index(event_surface) else {
@@ -2972,14 +2980,24 @@ impl App {
                         return;
                     }
                 }
-                ScrollRouteStep::Viewport(target) => {
+                ScrollRouteStep::Viewport(target, axis) => {
                     if !self.surface_scroll_view_target_is_current(index, &target) {
                         return;
                     }
-                    // viewports scroll vertically; horizontal input passes on.
-                    if let Some(delta) = scroll_distance(y)
-                        && self.scroll_viewport(index, target.target.node(), delta)
-                    {
+                    let surface = &self.surfaces[index];
+                    let matches = surface
+                        .layouts
+                        .presented()
+                        .zip(
+                            self.configurations
+                                .surface_root(&surface.output, &surface.key)
+                                .and_then(|root| root.find(target.target.node())),
+                        )
+                        .is_some_and(|(layout, node)| scroll_view_axis_matches(layout, node, axis));
+                    if !matches {
+                        return;
+                    }
+                    if self.scroll_viewport(index, target.target.node(), delta) {
                         return;
                     }
                 }
@@ -2989,12 +3007,12 @@ impl App {
 
     /// moves one presented viewport and prepares the surface at the new
     /// offset. it returns whether the viewport could move.
-    fn scroll_viewport(&mut self, index: usize, id: NodeId, delta: f32) -> bool {
+    fn scroll_viewport(&mut self, index: usize, id: NodeId, delta: Point) -> bool {
         let mut scroll = self.surfaces[index].scroll.clone();
         let moved = self.surfaces[index]
             .layouts
             .presented()
-            .is_some_and(|layout| layout.scroll_view_y(id, delta, &mut scroll));
+            .is_some_and(|layout| layout.scroll_view(id, delta, &mut scroll));
         if !moved {
             return false;
         }
@@ -6104,7 +6122,7 @@ fn prepare_surface_layout(
     let mut layout = render
         .layout(root, logical_size, &mut scroll)
         .map_err(|error| format!("cannot lay out surface {:?}: {error}", root.id))?;
-    if focused.is_some_and(|id| layout.reveal_y(id, &mut scroll)) {
+    if focused.is_some_and(|id| layout.reveal(id, &mut scroll)) {
         layout = render
             .layout(root, logical_size, &mut scroll)
             .map_err(|error| format!("cannot reveal focused widget: {error}"))?;
@@ -7370,7 +7388,8 @@ impl PointerHandler for App {
                     if let Some(route) =
                         self.capture_scroll_route(index, point, x, y, event.position, source)
                     {
-                        self.dispatch_scroll_route(output, &event_surface, route, y);
+                        let delta = viewport_scroll_delta(x, y, self.modifiers.shift);
+                        self.dispatch_scroll_route(output, &event_surface, route, delta);
                     }
                 }
                 _ => {}
@@ -7473,6 +7492,20 @@ fn runtime_pointer_code(button: RuntimePointerButton) -> u32 {
     }
 }
 
+fn scroll_view_axis_matches(layout: &Layout, node: &Node, axis: ScrollAxis) -> bool {
+    node.kind == Kind::Scroll
+        && node.scroll_axis == axis
+        && layout.scroll_axis(node.id) == Some(axis)
+}
+
+fn viewport_scroll_delta(x: f64, y: f64, shift: bool) -> Point {
+    let (x, y) = if shift && x == 0.0 { (y, 0.0) } else { (x, y) };
+    Point {
+        x: scroll_distance(x).unwrap_or(0.0),
+        y: scroll_distance(y).unwrap_or(0.0),
+    }
+}
+
 fn scroll_distance(steps: f64) -> Option<f32> {
     const PIXELS_PER_STEP: f64 = 40.0;
     let distance = (steps * PIXELS_PER_STEP) as f32;
@@ -7487,7 +7520,7 @@ mod input_tests {
         keyboard::{KeyEvent, Keysym, Modifiers, RepeatInfo},
         pointer::AxisScroll,
     };
-    use thing_core::{Kind, Node, NodeId, Point, Rect};
+    use thing_core::{Kind, Node, NodeId, Point, Rect, ScrollAxis};
     use thing_ui::{Layout, Measurer, Size, TextInputEditor};
     use wayland_client::protocol::wl_pointer;
 
@@ -7503,8 +7536,9 @@ mod input_tests {
         pending_paste_is_current, prepare_text_input_submit, reconcile_controlled_text_edit,
         repeat_action_is_current, reset_active_text_input_generation, retain_non_focus_actions,
         reveal_text_input_focus, root_key_input, runtime_pointer_event, runtime_scroll_input,
-        scroll_distance, scroll_steps, semantic_pointer_target, surface_action_route,
-        text_clipboard_action, text_key_action, widget_key_action,
+        scroll_distance, scroll_steps, scroll_view_axis_matches, semantic_pointer_target,
+        surface_action_route, text_clipboard_action, text_key_action, viewport_scroll_delta,
+        widget_key_action,
     };
 
     struct FixedMeasurer;
@@ -7943,6 +7977,64 @@ mod input_tests {
             rate: NonZeroU32::new(25).unwrap(),
             delay: 600,
         }
+    }
+
+    #[test]
+    fn viewport_wheel_deltas_preserve_axes_and_shift_only_vertical_input() {
+        assert_eq!(
+            viewport_scroll_delta(0.25, 0.5, false),
+            Point { x: 10.0, y: 20.0 }
+        );
+        assert_eq!(
+            viewport_scroll_delta(0.0, -0.5, true),
+            Point { x: -20.0, y: 0.0 }
+        );
+        assert_eq!(
+            viewport_scroll_delta(0.25, 0.5, true),
+            Point { x: 10.0, y: 20.0 }
+        );
+        assert_eq!(
+            viewport_scroll_delta(f64::MAX, 0.5, false),
+            Point { x: 0.0, y: 20.0 }
+        );
+    }
+
+    #[test]
+    fn viewport_axis_changes_cannot_reuse_a_captured_wheel_route() {
+        struct Fixed;
+        impl Measurer for Fixed {
+            fn measure(&mut self, _: &Node, _: Option<f32>) -> Size {
+                Size::default()
+            }
+        }
+        let mut node = Node::new(NodeId(1), Kind::Scroll);
+        let size = Size {
+            width: 100.0,
+            height: 40.0,
+        };
+        let layout = Layout::compute(&node, size, &mut Fixed).unwrap();
+        assert!(scroll_view_axis_matches(
+            &layout,
+            &node,
+            ScrollAxis::Vertical
+        ));
+        node.scroll_axis = ScrollAxis::Horizontal;
+        assert!(!scroll_view_axis_matches(
+            &layout,
+            &node,
+            ScrollAxis::Vertical
+        ));
+        assert!(!scroll_view_axis_matches(
+            &layout,
+            &node,
+            ScrollAxis::Horizontal
+        ));
+        let layout = Layout::compute(&node, size, &mut Fixed).unwrap();
+        assert!(scroll_view_axis_matches(
+            &layout,
+            &node,
+            ScrollAxis::Horizontal
+        ));
     }
 
     #[test]

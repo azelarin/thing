@@ -32,6 +32,8 @@ CASES = (
     Case("valid-motion.luau"),
     Case("valid-bounds.luau"),
     Case("valid-clipping.luau"),
+    Case("valid-scroll-axis.luau"),
+    Case("invalid-scroll-axis.luau", ("Property 'axis' is not compatible.",)),
     Case("invalid-clipping.luau", ("Property 'clip' is not compatible.",)),
     Case(
         "invalid-bounds.luau",

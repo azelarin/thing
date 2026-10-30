@@ -748,5 +748,17 @@ class RoundedClipProbes(unittest.TestCase):
             check_rendering.verify_capture("rounded-clips", canvas.image(), "scale-1", 1.25)
 
 
+class HorizontalScrollProbes(unittest.TestCase):
+    def test_an_unscrolled_nested_view_cannot_pass_as_revealed(self):
+        for scale in (1.0, 1.25):
+            canvas = Canvas(scale).rect(0, 0, 640, 240, (13, 17, 23))
+            canvas.rect(20, 20, 180, 80, (71, 209, 108))
+            canvas.rect(80, 20, 180, 80, (196, 112, 210))
+            canvas.rect(20, 20, 28, 28, (13, 17, 23))
+            canvas.rect(20, 100, 180, 160, (232, 75, 181))
+            with self.assertRaisesRegex(FixtureError, "nested horizontal offset"):
+                check_rendering.verify_capture("horizontal-scroll", canvas.image(), "scale-1", scale)
+
+
 if __name__ == "__main__":
     unittest.main()
