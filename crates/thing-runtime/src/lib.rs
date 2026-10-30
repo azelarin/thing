@@ -4290,4 +4290,7 @@ mod transition_tests {
 }
 
 #[cfg(test)]
+mod content_transition_tests;
+
+#[cfg(test)]
 mod timer_tests;

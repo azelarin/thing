@@ -24,11 +24,11 @@ FIXTURES = ROOT / "tests/rendering"
 ARTIFACTS = ROOT / "target/render-tests"
 CASES = (
     "image-fit", "stencil", "gradients", "radial-gradients", "shadows", "shared-motion",
-    "widget-bounds", "rounded-clips", "horizontal-scroll", "motion-lifecycle",
+    "widget-bounds", "rounded-clips", "horizontal-scroll", "motion-lifecycle", "content-transitions",
 )
 # these accept a state only after the same passing frame is captured twice.
 STABLE_FRAMES = {
-    "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2, "rounded-clips": 2, "horizontal-scroll": 2, "motion-lifecycle": 2,
+    "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2, "rounded-clips": 2, "horizontal-scroll": 2, "motion-lifecycle": 2, "content-transitions": 2,
 }
 RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
 # the runtime error each panel-invalid.luau must produce, in thing check and in
@@ -450,6 +450,18 @@ def verify_motion_lifecycle(image, stage, scale):
         expect_color(image, point, scale, color, label, tolerance=3)
 
 
+def verify_content_transitions(image, stage, scale):
+    replacement = (40, 179, 161) if stage == "reload" else (121, 151, 255)
+    blend = (232, 75, 181) if stage == "reload" else (40, 179, 161)
+    for point, color, label in (
+        ((60, 50), replacement, "latest replacement fully opened"),
+        ((180, 50), blend, "reversed crossfade reaches its endpoint"),
+        ((300, 50), (136, 127, 171), "opaque midpoint keeps the backdrop out"),
+        ((130, 50), (13, 17, 23), "replacement stays inside its box"),
+    ):
+        expect_color(image, point, scale, color, label, tolerance=3)
+
+
 def verify_capture(case, image, stage, scale):
     if case == "image-fit":
         verify_image_fit(image, stage, scale)
@@ -471,6 +483,8 @@ def verify_capture(case, image, stage, scale):
         verify_horizontal_scroll(image, stage, scale)
     elif case == "motion-lifecycle":
         verify_motion_lifecycle(image, stage, scale)
+    elif case == "content-transitions":
+        verify_content_transitions(image, stage, scale)
     else:
         raise FixtureError(f"unknown renderer fixture: {case}")
 

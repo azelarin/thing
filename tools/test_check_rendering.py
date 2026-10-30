@@ -770,5 +770,24 @@ class MotionLifecycleProbes(unittest.TestCase):
                 check_rendering.verify_capture("motion-lifecycle", canvas.image(), "scale-1", scale)
 
 
+class ContentTransitionProbes(unittest.TestCase):
+    def frame(self, scale, *, reload=False, midpoint=(136, 127, 171)):
+        canvas = Canvas(scale).rect(0, 0, 640, 240, (13, 17, 23))
+        canvas.rect(20, 20, 120, 80, (40, 179, 161) if reload else (121, 151, 255))
+        canvas.rect(140, 20, 240, 80, (232, 75, 181) if reload else (40, 179, 161))
+        return canvas.rect(260, 20, 360, 80, midpoint)
+
+    def test_accepts_both_final_selections_at_both_scales(self):
+        for scale in (1.0, 1.25):
+            for reload in (False, True):
+                canvas = self.frame(scale, reload=reload)
+                check_rendering.verify_capture("content-transitions", canvas.image(), "reload" if reload else "scale-1", scale)
+
+    def test_fading_both_layers_does_not_pass_as_an_opaque_crossfade(self):
+        canvas = self.frame(1, midpoint=(81, 112, 132))
+        with self.assertRaisesRegex(FixtureError, "opaque midpoint"):
+            check_rendering.verify_capture("content-transitions", canvas.image(), "scale-1", 1)
+
+
 if __name__ == "__main__":
     unittest.main()
