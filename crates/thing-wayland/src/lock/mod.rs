@@ -1441,8 +1441,15 @@ impl App {
                 .configurations
                 .advance_checked(&output, now, |surfaces| {
                     preflight.validate(&output, surfaces)
-                })?;
+                });
             let prepared = preflight.into_prepared();
+            let changed = match changed {
+                Ok(changed) => changed,
+                Err(error) => {
+                    eprintln!("thing: lock animation frame rejected: {error}");
+                    continue;
+                }
+            };
             if changed {
                 self.install_prepared_layouts(prepared);
                 if let Some(surface) = self

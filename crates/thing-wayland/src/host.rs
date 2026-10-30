@@ -2541,7 +2541,14 @@ impl App {
                     preflight.validate(&output, surfaces)
                 });
             let prepared = preflight.into_prepared();
-            if changed? {
+            let changed = match changed {
+                Ok(changed) => changed,
+                Err(error) => {
+                    eprintln!("thing: animation frame rejected: {error}");
+                    continue;
+                }
+            };
+            if changed {
                 for surface in self
                     .surfaces
                     .iter_mut()

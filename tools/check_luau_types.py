@@ -29,6 +29,16 @@ class Case:
 CASES = (
     Case("valid.luau"),
     Case("valid-timers.luau"),
+    Case("valid-motion.luau"),
+    Case(
+        "invalid-motion.luau",
+        (
+            "Expected this to be 'number', but got 'string'",
+            "Property 'duration' is not compatible.",
+            "missing field 'damping'",
+            "Expected this to be 'string', but got 'number'",
+        ),
+    ),
     Case("valid-brushes.luau"),
     Case(
         "invalid-brushes.luau",

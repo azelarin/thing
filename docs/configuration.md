@@ -1603,6 +1603,82 @@ result without animating. a failed reload leaves existing motion running.
 visibility changes remain immediate, so hiding a widget does not create an exit
 fade.
 
+### shared motion values
+
+use `ui.motion` when several properties need the same animated value. unlike a
+style transition, a motion can drive path geometry and values derived from it:
+
+```luau
+local expanded = ui.state(false)
+local depth = ui.motion(0, {
+    kind = 'spring', stiffness = 170, damping = 0.8,
+})
+
+return ui.panel {
+    children = {
+        ui.button {
+            on_click = function()
+                expanded:set(not expanded:get())
+                depth:to(expanded:get() and 80 or 0)
+            end,
+            children = { ui.text { text = 'toggle' } },
+        },
+        ui.path {
+            data = function()
+                return string.format('M0 0 L100 0 L100 %f Z', depth:get())
+            end,
+            view_box = { x = 0, y = 0, width = 100, height = 100 },
+            style = { width = 100, height = 100, foreground = '#c4a7e7' },
+        },
+    },
+}
+```
+
+declare motions while loading the configuration. `kind = 'spring'` takes the
+same `stiffness`, `damping`, and optional `epsilon` as `ui.spring`.
+`kind = 'transition'` takes `duration` and optional `easing` as `ui.transition`.
+options are fixed at load time. the initial value and each target must fit in a
+finite 32-bit number.
+
+`get()` returns the position and `velocity()` its rate of change in units per
+second. both read the latest accepted animation sample. reads in property
+functions subscribe to updates, so all readers use the same sample within a
+frame. reading a handle does not advance time. a settled motion has zero
+velocity and stops requesting frames. subscribed properties keep their surface
+animating even when a child currently has no painted area. without subscribers,
+a motion does not request frames of its own. when a frame is next needed, its
+value catches up to elapsed time. unmapped surfaces do not supply a frame clock;
+keep entering and leaving content mapped while animating it.
+
+call `to(target)` inside an event handler or timer callback. it queues a target
+change, applied after the enclosing event succeeds. reads within that callback
+still see the last accepted sample. changing direction preserves a spring's
+momentum; repeating its current target does not restart it. transitions retarget
+from the value calculated when the change is accepted. a zero duration updates
+on the next sample without further animation.
+
+`stop()` keeps the position calculated when the control is accepted and clears
+its velocity. `jump(value)` replaces the position and clears its velocity
+without interpolating. both publish on the next sample and follow the same
+checked event rules as `to`.
+
+spring values can overshoot. clamp derived values when their destination has a
+range, such as opacity or a nonnegative size. generated properties are checked
+at each frame, rather than inferred from a target number. a rejected frame
+preserves the previous tree and sample and cancels active shared motions for
+that output. a new `to` resumes from the retained position with zero velocity.
+the host reports the error without closing the shell or lock surface.
+
+failed callbacks and rejected event updates discard their queued targets.
+failed reloads preserve existing motions; successful reloads replace them with
+the new declarations' initial values. motions belong to each output's runtime
+and are also available in lock configurations. there may be up to 128 motions
+and 256 queued controls in one event. each motion uses two of the configuration's
+10,000 reactive state slots. targets are explicit; changing ordinary state or a
+service signal does not retarget a motion automatically.
+
+### theme modules
+
 a theme is an ordinary table returned from a module. for example, save this as
 `theme.luau` next to your panel:
 

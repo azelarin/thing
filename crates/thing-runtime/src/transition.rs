@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use mlua::{Error, Function, Result, Table, UserData, Value as LuaValue};
+use mlua::{Error, Function, Lua, Result, Table, UserData, Value as LuaValue};
 use thing_core::Color;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +34,16 @@ impl Easing {
             Self::OutCubic => 1.0 - (1.0 - progress).powi(3),
             Self::InOutCubic if progress < 0.5 => 4.0 * progress * progress * progress,
             Self::InOutCubic => 1.0 - (-2.0 * progress + 2.0).powi(3) / 2.0,
+        }
+    }
+
+    fn slope(self, progress: f64) -> f64 {
+        match self {
+            Self::Linear => 1.0,
+            Self::InCubic => 3.0 * progress * progress,
+            Self::OutCubic => 3.0 * (1.0 - progress).powi(2),
+            Self::InOutCubic if progress < 0.5 => 12.0 * progress * progress,
+            Self::InOutCubic => 3.0 * (-2.0 * progress + 2.0).powi(2),
         }
     }
 }
@@ -133,6 +143,24 @@ enum SpecKind {
 pub(crate) struct Spec(SpecKind);
 
 impl Spec {
+    pub(crate) fn motion(lua: &Lua, options: Table) -> Result<Self> {
+        let kind = options.raw_get::<String>("kind")?;
+        let parameters = lua.create_table()?;
+        for pair in options.pairs::<String, LuaValue>() {
+            let (name, value) = pair?;
+            if name != "kind" {
+                parameters.raw_set(name, value)?;
+            }
+        }
+        match kind.as_str() {
+            "transition" => Self::transition(parameters),
+            "spring" => Self::spring(parameters),
+            _ => Err(Error::runtime(
+                "motion kind must be 'transition' or 'spring'",
+            )),
+        }
+    }
+
     fn transition(options: Table) -> Result<Self> {
         Ok(Self(SpecKind::Transition(TransitionSpec::parse(options)?)))
     }
@@ -198,7 +226,9 @@ impl Resolved {
             return target;
         }
         match (self, target) {
-            (Self::Number(from), Self::Number(to)) => Self::Number(from + (to - from) * progress),
+            (Self::Number(from), Self::Number(to)) => Self::Number(
+                (f64::from(from) + (f64::from(to) - f64::from(from)) * f64::from(progress)) as f32,
+            ),
             (Self::Color(from), Self::Color(to)) => {
                 Self::Color(interpolate_color(from, to, progress))
             }
@@ -346,6 +376,33 @@ impl State {
         match self.motion {
             Motion::Transition(segment) => segment.is_some(),
             Motion::Spring(motion) => motion.active,
+        }
+    }
+
+    pub(crate) fn reset(&mut self, value: Resolved) {
+        *self = Self::new(self.spec, value);
+    }
+
+    pub(crate) fn velocity(&self, now: Instant) -> f64 {
+        match (self.spec.0, self.motion) {
+            (_, Motion::Spring(motion)) => motion.velocity,
+            (SpecKind::Transition(spec), Motion::Transition(Some(segment))) => {
+                let (Resolved::Number(from), Resolved::Number(to)) = (segment.from, self.target)
+                else {
+                    return 0.0;
+                };
+                let progress = now
+                    .saturating_duration_since(segment.started_at)
+                    .as_secs_f64()
+                    / spec.duration.as_secs_f64();
+                if progress >= 1.0 {
+                    0.0
+                } else {
+                    (f64::from(to) - f64::from(from)) * spec.easing.slope(progress)
+                        / spec.duration.as_secs_f64()
+                }
+            }
+            _ => 0.0,
         }
     }
 }

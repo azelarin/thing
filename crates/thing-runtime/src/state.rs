@@ -47,6 +47,18 @@ pub(crate) struct Tracker {
 }
 
 impl Tracker {
+    pub(crate) fn remaining_values(&self) -> usize {
+        10_000 - self.values.len()
+    }
+
+    pub(crate) fn peek(&self, id: usize) -> Scalar {
+        self.values[id].clone()
+    }
+
+    pub(crate) fn subscribers(&self, id: usize) -> impl Iterator<Item = usize> + '_ {
+        self.subscribers.get(&id).into_iter().flatten().copied()
+    }
+
     pub fn insert(&mut self, value: Scalar) -> Result<usize> {
         if self.evaluating.is_some() {
             return Err(Error::runtime(

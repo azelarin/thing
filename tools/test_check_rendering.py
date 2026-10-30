@@ -663,5 +663,40 @@ class StageTest(unittest.TestCase):
         self.assertNotIn("rejected_reload", result)
 
 
+class SharedMotionProbes(unittest.TestCase):
+    def frame(self, scale, *, reload=False, marker_offset=0, moving=False):
+        canvas = Canvas(scale)
+        canvas.rect(0, 0, 640, 260, (13, 17, 23))
+        fill = (121, 151, 255) if reload else (40, 179, 161)
+        targets = (180, 140, 20) if reload else (120, 80, 20)
+        for top, target in zip((25, 95, 165), targets):
+            canvas.rect(160, top, 160 + target, top + 40, fill)
+            left = 160 + target + 8 + marker_offset
+            color = (232, 75, 181) if moving else (71, 209, 108)
+            canvas.rect(left, top, left + 8, top + 40, color)
+        return canvas.image()
+
+    def test_settled_samples_pass_at_both_scales_and_after_reload(self):
+        for scale in (1.0, 1.25):
+            for reload in (False, True):
+                with self.subTest(scale=scale, reload=reload):
+                    check_rendering.verify_capture(
+                        "shared-motion", self.frame(scale, reload=reload),
+                        "reload" if reload else "scale-1", scale
+                    )
+
+    def test_a_marker_from_another_sample_is_rejected(self):
+        with self.assertRaises(check_rendering.FixtureError):
+            check_rendering.verify_capture(
+                "shared-motion", self.frame(1, marker_offset=8), "scale-1", 1
+            )
+
+    def test_a_nonzero_velocity_is_not_a_settled_frame(self):
+        with self.assertRaises(check_rendering.FixtureError):
+            check_rendering.verify_capture(
+                "shared-motion", self.frame(1, moving=True), "scale-1", 1
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
