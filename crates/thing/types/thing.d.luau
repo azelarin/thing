@@ -762,6 +762,11 @@ declare extern type ThingNiriWorkspace with
     read urgent: boolean
 end
 
+declare extern type ThingNiriKeyboardLayouts with
+    read names: ThingReadonlyArray<string>
+    read current_index: number?
+end
+
 declare extern type ThingNiriWindow with
     read id: string
     read workspace_id: string?
@@ -927,6 +932,11 @@ declare extern type ThingNiriService with
     read error: ThingSignal<string>
     read workspaces: ThingSignal<ThingReadonlyArray<ThingNiriWorkspace>>
     read windows: ThingSignal<ThingReadonlyArray<ThingNiriWindow>>
+    read overview_open: ThingSignal<boolean?>
+    read keyboard_layouts: ThingSignal<ThingNiriKeyboardLayouts?>
+    read set_overview: (open: boolean) -> ()
+    read toggle_overview: () -> ()
+    read switch_layout: (layout: number | "next" | "prev") -> ()
     read focus_workspace: (id: string) -> ()
     read focus_window: (id: string) -> ()
     read close_window: (id: string) -> ()

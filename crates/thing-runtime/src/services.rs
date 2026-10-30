@@ -1,5 +1,5 @@
 use crate::OutputContext;
-use crate::niri::{NiriAction, NiriData, NiriState, parse_id};
+use crate::niri::{NiriAction, NiriData, NiriState, parse_id, parse_layout_target};
 use crate::state::{Scalar, Signal, Tracker};
 use mlua::{Error, Lua, Result, Table, UserData, UserDataMethods, Value};
 use std::{
@@ -2164,6 +2164,41 @@ impl Services {
                 })?,
             )?;
         }
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        niri.set(
+            "set_overview",
+            lua.create_function(move |_, value: Value| {
+                let Value::Boolean(open) = value else {
+                    return Err(Error::runtime("overview state must be a boolean"));
+                };
+                enqueue(
+                    &actions,
+                    &allowed,
+                    Action::Niri(NiriAction::SetOverview(open)),
+                )
+            })?,
+        )?;
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        niri.set(
+            "toggle_overview",
+            lua.create_function(move |_, ()| {
+                enqueue(&actions, &allowed, Action::Niri(NiriAction::ToggleOverview))
+            })?,
+        )?;
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        niri.set(
+            "switch_layout",
+            lua.create_function(move |_, value: Value| {
+                enqueue(
+                    &actions,
+                    &allowed,
+                    Action::Niri(NiriAction::SwitchLayout(parse_layout_target(value)?)),
+                )
+            })?,
+        )?;
         niri.set_readonly(true);
         clock.set_readonly(true);
         crate::idle::install(

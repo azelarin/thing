@@ -4,14 +4,33 @@ use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
 
 use mlua::{Error, Result, Table, UserData, UserDataMethods};
 
-use crate::state::{Scalar, Tracker};
+use crate::state::{Scalar, Signal, Tracker};
 
-/// a niri action addressed by a stable compositor id.
+/// a compositor action queued by a configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NiriAction {
     FocusWorkspace(u64),
     FocusWindow(u64),
     CloseWindow(u64),
+    SetOverview(bool),
+    ToggleOverview,
+    SwitchLayout(NiriLayoutTarget),
+}
+
+/// a keyboard layout selected by direction or zero-based compositor index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NiriLayoutTarget {
+    Next,
+    Previous,
+    Index(u8),
+}
+
+/// configured keyboard layouts and their zero-based active index. an empty
+/// configuration uses index zero.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NiriKeyboardLayouts {
+    pub names: Vec<String>,
+    pub current_index: usize,
 }
 
 /// one workspace in compositor order, identified independently of its index.
@@ -46,6 +65,8 @@ pub struct NiriWindow {
 pub struct NiriState {
     pub workspaces: Vec<Workspace>,
     pub windows: Vec<NiriWindow>,
+    pub overview_open: Option<bool>,
+    pub keyboard_layouts: Option<NiriKeyboardLayouts>,
 }
 
 impl NiriState {
@@ -62,6 +83,15 @@ impl NiriState {
                 .workspaces
                 .iter()
                 .any(|w| !workspaces.insert(w.id) || !valid_text(&w.name) || !valid_text(&w.output))
+            || self.keyboard_layouts.as_ref().is_some_and(|layouts| {
+                layouts.names.len() > 256
+                    || (layouts.names.is_empty() && layouts.current_index != 0)
+                    || (!layouts.names.is_empty() && layouts.current_index >= layouts.names.len())
+                    || layouts
+                        .names
+                        .iter()
+                        .any(|name| name.len() > 65536 || name.contains('\0'))
+            })
             || self.windows.iter().any(|w| {
                 !windows.insert(w.id)
                     || !valid_text(&w.title)
@@ -81,14 +111,17 @@ impl NiriState {
 pub(crate) struct NiriData {
     state: Rc<RefCell<NiriState>>,
     tracker: Rc<RefCell<Tracker>>,
-    revisions: [usize; 2],
+    revisions: [usize; 3],
+    overview: usize,
 }
 
 impl NiriData {
     pub fn install(table: &Table, tracker: Rc<RefCell<Tracker>>) -> Result<Self> {
         let workspaces = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let windows = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
-        let revisions = [workspaces, windows];
+        let layouts = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
+        let overview = tracker.borrow_mut().insert(Scalar::Nil)?;
+        let revisions = [workspaces, windows, layouts];
         let state = Rc::new(RefCell::new(NiriState::default()));
         for (index, name) in ["workspaces", "windows"].into_iter().enumerate() {
             table.set(
@@ -101,10 +134,27 @@ impl NiriData {
                 },
             )?;
         }
+        table.set(
+            "overview_open",
+            Signal {
+                id: overview,
+                tracker: tracker.clone(),
+                readonly: true,
+            },
+        )?;
+        table.set(
+            "keyboard_layouts",
+            Layouts {
+                tracker: tracker.clone(),
+                state: state.clone(),
+                revision: layouts,
+            },
+        )?;
         Ok(Self {
             state,
             tracker,
             revisions,
+            overview,
         })
     }
 
@@ -119,6 +169,7 @@ impl NiriData {
         for (index, changed) in [
             old.workspaces != current.workspaces,
             old.windows != current.windows,
+            old.keyboard_layouts != current.keyboard_layouts,
         ]
         .into_iter()
         .enumerate()
@@ -130,7 +181,39 @@ impl NiriData {
                 tracker.write(revision, Scalar::Boolean(value))?;
             }
         }
+        self.tracker.borrow_mut().write(
+            self.overview,
+            current.overview_open.map_or(Scalar::Nil, Scalar::Boolean),
+        )?;
         Ok(())
+    }
+}
+
+struct Layouts {
+    tracker: Rc<RefCell<Tracker>>,
+    state: Rc<RefCell<NiriState>>,
+    revision: usize,
+}
+
+impl UserData for Layouts {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |lua, this, ()| {
+            this.tracker.borrow_mut().read(this.revision);
+            let state = this.state.borrow();
+            let Some(layouts) = &state.keyboard_layouts else {
+                return Ok(None);
+            };
+            let names = lua.create_sequence_from(layouts.names.iter().cloned())?;
+            names.set_readonly(true);
+            let value = lua.create_table()?;
+            value.set("names", names)?;
+            value.set(
+                "current_index",
+                (!layouts.names.is_empty()).then_some(layouts.current_index + 1),
+            )?;
+            value.set_readonly(true);
+            Ok(Some(value))
+        });
     }
 }
 
@@ -197,4 +280,31 @@ pub(crate) fn parse_id(value: mlua::Value) -> Result<u64> {
     value
         .parse()
         .map_err(|_| Error::runtime("niri ID exceeds 64 bits"))
+}
+
+pub(crate) fn parse_layout_target(value: mlua::Value) -> Result<NiriLayoutTarget> {
+    let index = match value {
+        mlua::Value::String(value) => {
+            return match value.to_str()?.as_ref() {
+                "next" => Ok(NiriLayoutTarget::Next),
+                "prev" => Ok(NiriLayoutTarget::Previous),
+                _ => Err(Error::runtime(
+                    "layout must be 'next', 'prev', or an index from 1 to 256",
+                )),
+            };
+        }
+        mlua::Value::Integer(index) => index as f64,
+        mlua::Value::Number(index) => index,
+        _ => {
+            return Err(Error::runtime(
+                "layout must be 'next', 'prev', or an index from 1 to 256",
+            ));
+        }
+    };
+    if !index.is_finite() || index.fract() != 0.0 || !(1.0..=256.0).contains(&index) {
+        return Err(Error::runtime(
+            "layout index must be a whole number from 1 to 256",
+        ));
+    }
+    Ok(NiriLayoutTarget::Index((index - 1.0) as u8))
 }
