@@ -261,6 +261,7 @@ fn service_snapshot_rejects_invalid_replacements_atomically() {
                 row: None,
                 width: 800.0,
                 height: 600.0,
+                window_size: None,
             }],
             ..NiriState::default()
         })
@@ -277,6 +278,7 @@ fn service_snapshot_rejects_invalid_replacements_atomically() {
         row: None,
         width: 800.0,
         height: 600.0,
+        window_size: None,
     };
     assert!(
         snapshot

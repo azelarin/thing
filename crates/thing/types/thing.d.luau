@@ -798,6 +798,8 @@ declare extern type ThingNiriWindow with
     read row: number?
     read width: number
     read height: number
+    read window_width: number?
+    read window_height: number?
 end
 
 declare extern type ThingAudioService with

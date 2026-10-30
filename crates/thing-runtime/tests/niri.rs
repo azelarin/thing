@@ -161,6 +161,7 @@ fn routes_window_clicks_volume_scroll_and_popup_controls() {
             row: Some(1),
             width: 960.0,
             height: 1000.0,
+            window_size: None,
         }],
         ..NiriState::default()
     };
@@ -616,4 +617,67 @@ fn moves_use_explicit_ids_and_validate_arguments_before_queuing() {
             "accepted {action} while loading"
         );
     }
+}
+
+#[test]
+fn window_geometry_is_optional_reactive_and_validated_before_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("panel.luau");
+    fs::write(
+        &path,
+        r#"
+        return ui.panel { children = { ui.text { text = function()
+            local window = services.niri.windows:get()[1]
+            if not window then return 'no window' end
+            return tostring(window.width) .. ':' .. tostring(window.height) .. ':'
+                .. tostring(window.window_width) .. ':' .. tostring(window.window_height)
+        end } } }
+    "#,
+    )
+    .unwrap();
+    let mut runtime = Runtime::load(&path).unwrap();
+    let mut state = NiriState {
+        windows: vec![NiriWindow {
+            id: 1,
+            workspace_id: Some(1),
+            title: None,
+            app_id: None,
+            focused: true,
+            urgent: false,
+            floating: true,
+            column: None,
+            row: None,
+            width: 960.0,
+            height: 1000.0,
+            window_size: Some((928, 968)),
+        }],
+        ..NiriState::default()
+    };
+    runtime.set_niri(state.clone()).unwrap();
+    runtime.refresh().unwrap();
+    assert_eq!(runtime.root().unwrap().children[0].text, "960:1000:928:968");
+    state.windows[0].window_size = Some((1200, 800));
+    runtime.set_niri(state.clone()).unwrap();
+    runtime.refresh().unwrap();
+    assert_eq!(
+        runtime.root().unwrap().children[0].text,
+        "960:1000:1200:800"
+    );
+    runtime.reload(&path).unwrap();
+    assert_eq!(
+        runtime.root().unwrap().children[0].text,
+        "960:1000:1200:800"
+    );
+    let mut invalid = state.clone();
+    invalid.windows[0].window_size = Some((-1, 800));
+    assert!(runtime.set_niri(invalid).is_err());
+    assert!(!runtime.refresh().unwrap());
+    assert_eq!(
+        runtime.root().unwrap().children[0].text,
+        "960:1000:1200:800"
+    );
+    state.windows[0].window_size = None;
+    runtime.set_niri(state).unwrap();
+    runtime.refresh().unwrap();
+    assert_eq!(runtime.root().unwrap().children[0].text, "960:1000:nil:nil");
 }

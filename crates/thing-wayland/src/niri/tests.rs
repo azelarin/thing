@@ -623,3 +623,57 @@ fn casts_and_moves_use_the_worker_and_clear_on_disconnect() {
     drop(niri);
     server.join().unwrap();
 }
+
+#[test]
+fn visual_window_geometry_updates_independently_of_tile_size() {
+    let mut model = Model::default();
+    apply(
+        &mut model,
+        json!({"WindowsChanged":{"windows":[window(1,true)]}}),
+    );
+    assert_eq!(model.snapshot().windows[0].window_size, None);
+    let mut first = window(1, true);
+    first["layout"]["window_size"] = json!([928, 968]);
+    let mut second = window(2, false);
+    second["is_floating"] = json!(true);
+    second["layout"]["window_size"] = json!([480, 320]);
+    apply(
+        &mut model,
+        json!({"WindowsChanged":{"windows":[first.clone(),second.clone()]}}),
+    );
+    assert_eq!(model.snapshot().windows[0].window_size, Some((928, 968)));
+    assert_eq!(model.snapshot().windows[1].window_size, Some((480, 320)));
+    let before = model.snapshot();
+    let layout = json!({"pos_in_scrolling_layout":[2,3],"tile_size":[1280.0,900.0],"window_size":[1248,868]});
+    let mut bad = layout.clone();
+    bad["window_size"] = json!([480, -1]);
+    let mut bad_window = second;
+    bad_window["layout"] = bad.clone();
+    bad_window["is_focused"] = json!(true);
+    for event in [
+        json!({"WindowLayoutsChanged":{"changes":[[1,layout.clone()],[2,bad]]}}),
+        json!({"WindowOpenedOrChanged":{"window":bad_window.clone()}}),
+        json!({"WindowsChanged":{"windows":[first,bad_window]}}),
+    ] {
+        assert!(model.apply(&serde_json::to_vec(&event).unwrap()).is_err());
+        assert_eq!(model.snapshot(), before);
+    }
+    apply(
+        &mut model,
+        json!({"WindowLayoutsChanged":{"changes":[[1,layout]]}}),
+    );
+    let projected = model.snapshot().windows.remove(0);
+    assert_eq!((projected.width, projected.height), (1280.0, 900.0));
+    assert_eq!(projected.window_size, Some((1248, 868)));
+    assert_eq!((projected.column, projected.row), (Some(2), Some(3)));
+    let mut resized = window(1, true);
+    resized["is_floating"] = json!(true);
+    resized["layout"]["window_size"] = json!([640, 480]);
+    apply(
+        &mut model,
+        json!({"WindowOpenedOrChanged":{"window":resized}}),
+    );
+    let projected = model.snapshot().windows.remove(0);
+    assert!(projected.floating);
+    assert_eq!(projected.window_size, Some((640, 480)));
+}
