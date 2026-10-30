@@ -5,6 +5,7 @@
 
 mod idle;
 mod modules;
+mod motion;
 mod niri;
 mod properties;
 mod reconcile;
@@ -318,6 +319,7 @@ struct ActionCheckpoint {
     services: usize,
     ui: usize,
     timers: usize,
+    motions: usize,
 }
 
 struct Binding {
@@ -369,7 +371,8 @@ pub struct Runtime {
     services: services::Services,
     ui: Rc<RefCell<UiContext>>,
     timers: Rc<RefCell<timer::Timers>>,
-    timer_event_depth: usize,
+    motions: Rc<RefCell<motion::Motions>>,
+    event_depth: usize,
     output: Option<OutputContext>,
     mode: ConfigurationMode,
 }
@@ -478,7 +481,8 @@ impl Runtime {
             services.set_output(output)?;
         }
         let timers = Rc::new(RefCell::new(timer::Timers::default()));
-        let ui = install_ui(&lua, tracker.clone(), &timers)?;
+        let motions = Rc::new(RefCell::new(motion::Motions::new(tracker.clone())));
+        let ui = install_ui(&lua, tracker.clone(), &timers, &motions)?;
         lua.sandbox(true)?;
         let modules = modules::Modules::default();
         let exported = modules.load(&lua, path)?;
@@ -507,6 +511,7 @@ impl Runtime {
         }
         services.freeze_declarations();
         timers.borrow_mut().freeze();
+        motions.borrow_mut().freeze();
         let mut runtime = Self {
             lua,
             surfaces: Vec::new(),
@@ -526,7 +531,8 @@ impl Runtime {
             services,
             ui,
             timers,
-            timer_event_depth: 0,
+            motions,
+            event_depth: 0,
             output,
             mode,
         };
@@ -556,7 +562,7 @@ impl Runtime {
         now: Instant,
         validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<Option<bool>> {
-        self.with_timer_event(Some(now), |runtime| {
+        self.with_event_controls(Some(now), |runtime| {
             let handler = runtime.timers.borrow_mut().claim(token, now);
             let Some(handler) = handler else {
                 return Ok(None);
@@ -606,21 +612,23 @@ impl Runtime {
         })
     }
 
-    fn with_timer_event<T>(
+    fn with_event_controls<T>(
         &mut self,
         now: Option<Instant>,
         callback: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
         let checkpoint = self.timers.borrow().checkpoint();
-        self.timer_event_depth += 1;
+        let motion_checkpoint = self.motions.borrow().checkpoint();
+        self.event_depth += 1;
         let result = callback(self);
-        self.timer_event_depth -= 1;
+        self.event_depth -= 1;
         if result.is_err() {
             self.timers.borrow_mut().truncate(checkpoint);
-        } else if self.timer_event_depth == 0 {
-            self.timers
-                .borrow_mut()
-                .commit(now.map_or_else(Instant::now, |now| now.max(Instant::now())));
+            self.motions.borrow_mut().truncate(motion_checkpoint);
+        } else if self.event_depth == 0 {
+            let now = now.map_or_else(Instant::now, |now| now.max(Instant::now()));
+            self.timers.borrow_mut().commit(now);
+            self.motions.borrow_mut().commit_controls(now);
         }
         result
     }
@@ -733,7 +741,7 @@ impl Runtime {
         validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<Option<bool>> {
         let now = Instant::now();
-        self.with_timer_event(Some(now), |runtime| {
+        self.with_event_controls(Some(now), |runtime| {
             let tracker = runtime.services.tracker().clone();
             let (signal, callback, handle) = {
                 let watches = runtime.services.idle_watches().borrow();
@@ -980,7 +988,7 @@ impl Runtime {
         &mut self,
         validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<PointerDispatchOutcome> {
-        self.with_timer_event(None, |runtime| {
+        self.with_event_controls(None, |runtime| {
             runtime.reconcile_pointer_checked_inner(validate)
         })
     }
@@ -1009,7 +1017,7 @@ impl Runtime {
         event: PointerEvent,
         validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<PointerDispatchOutcome> {
-        self.with_timer_event(None, |runtime| {
+        self.with_event_controls(None, |runtime| {
             runtime.begin_pointer_checked_inner(target, event, validate)
         })
     }
@@ -1079,7 +1087,7 @@ impl Runtime {
         event: PointerEvent,
         validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<PointerDispatchOutcome> {
-        self.with_timer_event(None, |runtime| {
+        self.with_event_controls(None, |runtime| {
             runtime.dispatch_pointer_checked_inner(event, validate)
         })
     }
@@ -1144,7 +1152,7 @@ impl Runtime {
         &mut self,
         validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<PointerDispatchOutcome> {
-        self.with_timer_event(None, |runtime| {
+        self.with_event_controls(None, |runtime| {
             runtime.cancel_pointer_checked_inner(validate)
         })
     }
@@ -1209,7 +1217,7 @@ impl Runtime {
         input: ScrollInput,
         validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<Option<ScrollDispatchOutcome>> {
-        self.with_timer_event(None, |runtime| {
+        self.with_event_controls(None, |runtime| {
             runtime.dispatch_scroll_checked_inner(target, input, validate)
         })
     }
@@ -1297,7 +1305,7 @@ impl Runtime {
         event: Event,
         validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<bool> {
-        self.with_timer_event(None, |runtime| {
+        self.with_event_controls(None, |runtime| {
             runtime.dispatch_checked_inner(id, event, validate)
         })
     }
@@ -1323,7 +1331,7 @@ impl Runtime {
         input: KeyInput,
         validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<Option<KeyDispatch>> {
-        self.with_timer_event(None, |runtime| {
+        self.with_event_controls(None, |runtime| {
             runtime.dispatch_key_checked_inner(id, input, validate)
         })
     }
@@ -1631,11 +1639,26 @@ impl Runtime {
         now: Instant,
         validate: &impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<bool> {
+        self.refresh_frame_checked(now, validate, false)
+    }
+
+    fn refresh_frame_checked(
+        &mut self,
+        now: Instant,
+        validate: &impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+        advance: bool,
+    ) -> Result<bool> {
         let mut dirty = std::mem::take(&mut self.tracker.borrow_mut().dirty);
-        if dirty.is_empty() {
-            return Ok(false);
+        if dirty.is_empty() && (!advance || !self.has_active_transitions()) {
+            return Ok(self.motions.borrow().has_controls());
         }
-        dirty.append(&mut self.deferred);
+        let previous_deferred = if advance {
+            // animation ticks do not retry unrelated rejected event updates.
+            std::mem::take(&mut self.deferred)
+        } else {
+            dirty.append(&mut self.deferred);
+            BTreeSet::new()
+        };
         // retry a failed batch when another dependency changes. retaining the
         // whole batch prevents unrelated, valid changes from being lost.
         self.deferred = dirty.clone();
@@ -1648,7 +1671,27 @@ impl Runtime {
         let mut sources = self.sources.clone();
         let mut staged_transitions = BTreeMap::new();
         let mut ui_structure_changed = false;
+        let mut targets_changed = false;
         let result = (|| {
+            if advance {
+                for (index, binding) in &self.bindings {
+                    let Some(previous) = binding
+                        .transition
+                        .as_ref()
+                        .filter(|state| state.is_active())
+                    else {
+                        continue;
+                    };
+                    let mut state = previous.clone();
+                    state.advance(now);
+                    let node = candidate
+                        .iter_mut()
+                        .find_map(|surface| surface.root.find_mut(binding.node))
+                        .ok_or_else(|| Error::runtime("animation refers to a missing widget"))?;
+                    properties::apply_animation_frame(node, &binding.property, state.current())?;
+                    staged_transitions.insert(*index, state);
+                }
+            }
             for index in dirty {
                 if retired.contains(&index) {
                     continue;
@@ -1756,9 +1799,13 @@ impl Runtime {
                         .ok_or_else(|| {
                             Error::runtime("reactive binding refers to a missing widget")
                         })?;
-                    if let Some(previous) = self.bindings[&index].transition.as_ref() {
+                    if let Some(previous) = staged_transitions
+                        .get(&index)
+                        .or(self.bindings[&index].transition.as_ref())
+                    {
                         let target = transition::target(value, &property)?;
                         let mut state = previous.clone();
+                        targets_changed |= target != state.target();
                         state.retarget(target, now);
                         properties::apply_animation_frame(node, &property, state.current())?;
                         staged_transitions.insert(index, state);
@@ -1793,7 +1840,7 @@ impl Runtime {
             // target geometry must be representable before animation starts,
             // but the displayed candidate is validated last so a successful
             // host can retain and reuse that exact layout plan.
-            if target != candidate {
+            if target != candidate && (!advance || targets_changed || ui_structure_changed) {
                 validate(&target).map_err(Error::runtime)?;
             }
             validate(&candidate).map_err(Error::runtime)?;
@@ -1805,11 +1852,13 @@ impl Runtime {
             for index in self.bindings.split_off(&checkpoint).keys() {
                 self.tracker.borrow_mut().forget(*index);
             }
+            self.deferred.extend(previous_deferred);
             return Err(error);
         }
         for index in retired {
             self.bindings.remove(&index);
             self.tracker.borrow_mut().forget(index);
+            staged_transitions.remove(&index);
         }
         for (index, transition) in staged_transitions {
             self.bindings
@@ -1823,11 +1872,17 @@ impl Runtime {
         let changed = candidate != self.surfaces;
         self.surfaces = candidate;
         let ui_identity_changed = ui_structure_changed && self.sync_ui_targets();
-        self.deferred.clear();
-        Ok(changed || ui_identity_changed || self.has_active_transitions())
+        self.deferred = previous_deferred
+            .into_iter()
+            .filter(|index| self.bindings.contains_key(index))
+            .collect();
+        Ok(changed
+            || ui_identity_changed
+            || (!advance
+                && (self.has_active_transitions() || self.motions.borrow().has_controls())))
     }
 
-    /// advance active style animations to a monotonic point in time.
+    /// advance style and shared animations to a monotonic point in time.
     pub fn advance(&mut self, now: Instant) -> Result<bool> {
         self.advance_checked(now, |_| Ok(()))
     }
@@ -1838,67 +1893,62 @@ impl Runtime {
         now: Instant,
         validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
     ) -> Result<bool> {
-        let mut candidate = self.surfaces.clone();
-        let mut staged = BTreeMap::new();
-        for (index, binding) in &self.bindings {
-            let Some(previous) = binding
-                .transition
-                .as_ref()
-                .filter(|state| state.is_active())
-            else {
-                continue;
-            };
-            let mut state = previous.clone();
-            state.advance(now);
-            let node = candidate
-                .iter_mut()
-                .find_map(|surface| surface.root.find_mut(binding.node))
-                .ok_or_else(|| Error::runtime("animation refers to a missing widget"))?;
-            properties::apply_animation_frame(node, &binding.property, state.current())?;
-            staged.insert(*index, state);
+        let frame = self.motions.borrow().stage(now)?;
+        match self.refresh_frame_checked(now, &validate, true) {
+            Ok(changed) => {
+                self.motions.borrow_mut().commit_frame(frame);
+                Ok(changed)
+            }
+            Err(error) => {
+                self.motions.borrow_mut().reject_frame(frame)?;
+                Err(error)
+            }
         }
-        if staged.is_empty() {
-            return Ok(false);
-        }
-        for surface in &candidate {
-            surface.root.validate().map_err(Error::external)?;
-        }
-        validate(&candidate).map_err(Error::runtime)?;
-        for (index, transition) in staged {
-            self.bindings
-                .get_mut(&index)
-                .expect("an active animation belongs to a live binding")
-                .transition = Some(transition);
-        }
-        let changed = candidate != self.surfaces;
-        self.surfaces = candidate;
-        Ok(changed)
     }
 
-    /// whether a widget has an active style animation.
+    /// whether a widget reads a shared motion or has an active style animation.
     pub fn is_animating(&self, id: NodeId) -> bool {
-        self.bindings.values().any(|binding| {
+        let motions = self.motions.borrow().active_bindings();
+        self.bindings.iter().any(|(index, binding)| {
             binding.node == id
-                && binding
-                    .transition
-                    .as_ref()
-                    .is_some_and(transition::State::is_active)
+                && (motions.contains(index)
+                    || binding
+                        .transition
+                        .as_ref()
+                        .is_some_and(transition::State::is_active))
         })
     }
 
-    /// whether any widget in a set has an active style animation.
+    /// whether a layout needs frames for style or shared animation.
     pub fn is_any_animating(&self, ids: impl IntoIterator<Item = NodeId>) -> bool {
-        let active: BTreeSet<_> = self
+        let motions = self.motions.borrow().active_bindings();
+        let mut active: BTreeSet<_> = self
             .bindings
-            .values()
-            .filter_map(|binding| {
-                binding
-                    .transition
-                    .as_ref()
-                    .is_some_and(transition::State::is_active)
-                    .then_some(binding.node)
+            .iter()
+            .filter_map(|(index, binding)| {
+                (motions.contains(index)
+                    || binding
+                        .transition
+                        .as_ref()
+                        .is_some_and(transition::State::is_active))
+                .then_some(binding.node)
             })
             .collect();
+        // a hidden or zero-sized child may become visible as its motion advances.
+        // keep its mapped surface ticking even without a child paint placement.
+        if !motions.is_empty() {
+            let motion_nodes: BTreeSet<_> = motions
+                .iter()
+                .filter_map(|index| self.bindings.get(index).map(|binding| binding.node))
+                .collect();
+            for surface in &self.surfaces {
+                let mut nodes = BTreeSet::new();
+                reconcile::ids(&surface.root, &mut nodes);
+                if !nodes.is_disjoint(&motion_nodes) {
+                    active.insert(surface.root.id);
+                }
+            }
+        }
         ids.into_iter().any(|id| active.contains(&id))
     }
 
@@ -1944,12 +1994,14 @@ impl Runtime {
             services: self.services.action_count(),
             ui: self.ui.borrow().actions.len(),
             timers: self.timers.borrow().checkpoint(),
+            motions: self.motions.borrow().checkpoint(),
         }
     }
 
     fn allow_actions(&self, allowed: bool) {
         self.services.allow_actions(allowed);
         self.timers.borrow_mut().allow_controls(allowed);
+        self.motions.borrow_mut().allow_controls(allowed);
         let mut ui = self.ui.borrow_mut();
         ui.action_start = allowed.then_some(ui.actions.len());
     }
@@ -1958,6 +2010,7 @@ impl Runtime {
         self.services.truncate_actions(checkpoint.services);
         self.ui.borrow_mut().actions.truncate(checkpoint.ui);
         self.timers.borrow_mut().truncate(checkpoint.timers);
+        self.motions.borrow_mut().truncate(checkpoint.motions);
     }
 
     fn sync_ui_targets(&self) -> bool {
@@ -2499,9 +2552,11 @@ fn install_ui(
     lua: &Lua,
     tracker: Rc<RefCell<Tracker>>,
     timers: &Rc<RefCell<timer::Timers>>,
+    motions: &Rc<RefCell<motion::Motions>>,
 ) -> Result<Rc<RefCell<UiContext>>> {
     let ui = lua.create_table()?;
     timer::Timers::install(timers, lua, &ui)?;
+    motion::Motions::install(motions, lua, &ui)?;
     let context = Rc::new(RefCell::new(UiContext::default()));
     let next_id = Rc::new(Cell::new(1_u64));
     for name in [

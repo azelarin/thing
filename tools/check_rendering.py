@@ -22,9 +22,11 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests/rendering"
 ARTIFACTS = ROOT / "target/render-tests"
-CASES = ("image-fit", "stencil", "gradients", "radial-gradients", "shadows")
+CASES = (
+    "image-fit", "stencil", "gradients", "radial-gradients", "shadows", "shared-motion"
+)
 # these accept a state only after the same passing frame is captured twice.
-STABLE_FRAMES = {"radial-gradients": 2, "shadows": 2}
+STABLE_FRAMES = {"radial-gradients": 2, "shadows": 2, "shared-motion": 2}
 RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
 # the runtime error each panel-invalid.luau must produce, in thing check and in
 # the log of the running host.
@@ -356,6 +358,21 @@ def verify_shadows(image, stage, scale):
         clear("k: no shadow above", (360, 320))
 
 
+def verify_shared_motion(image, stage, scale):
+    background = (13, 17, 23)
+    fill = (121, 151, 255) if stage == "reload" else (40, 179, 161)
+    targets = (180, 140, 20) if stage == "reload" else (120, 80, 20)
+    for y, target in zip((45, 115, 185), targets):
+        edge = 160 + target
+        expect_color(image, (170, y), scale, fill, "sampled path interior", tolerance=3)
+        expect_color(image, (edge - 3, y), scale, fill, "sampled path end", tolerance=3)
+        expect_color(image, (edge + 4, y), scale, background, "path and marker gap", tolerance=3)
+        expect_color(
+            image, (edge + 12, y), scale, (71, 209, 108), "settled content marker", tolerance=3
+        )
+        expect_color(image, (edge + 20, y), scale, background, "content marker end", tolerance=3)
+
+
 def verify_capture(case, image, stage, scale):
     if case == "image-fit":
         verify_image_fit(image, stage, scale)
@@ -367,6 +384,8 @@ def verify_capture(case, image, stage, scale):
         verify_radial_gradients(image, stage, scale)
     elif case == "shadows":
         verify_shadows(image, stage, scale)
+    elif case == "shared-motion":
+        verify_shared_motion(image, stage, scale)
     else:
         raise FixtureError(f"unknown renderer fixture: {case}")
 
@@ -728,6 +747,15 @@ def run_inner(run_directory, binary, renderer, case, niri, grim):
         }
         if rejection is not None:
             result["rejected_reload"] = rejection
+        if case == "shared-motion":
+            with log_path.open("rb") as recorded:
+                text = recorded.read(MAX_LOG_BYTES).decode("utf-8", errors="replace")
+            count = text.count("thing: animation frame rejected:")
+            if count < 2:
+                raise FixtureError(
+                    "initial and reloaded motion must each reject a frame before recovery"
+                )
+            result["rejected_animation_frames"] = count
         return result
     finally:
         stop_child(process)

@@ -115,6 +115,25 @@ export type ThingSpringOptions = {
     epsilon: number?,
 }
 
+export type ThingMotionOptions = {
+    kind: "transition",
+    duration: number,
+    easing: ThingEasing?,
+} | {
+    kind: "spring",
+    stiffness: number,
+    damping: number,
+    epsilon: number?,
+}
+
+declare extern type ThingMotion with
+    read get: (self: ThingMotion) -> number
+    read velocity: (self: ThingMotion) -> number
+    read to: (self: ThingMotion, target: number) -> ()
+    read jump: (self: ThingMotion, value: number) -> ()
+    read stop: (self: ThingMotion) -> ()
+end
+
 export type ThingAnchors = {
     top: boolean?,
     right: boolean?,
@@ -964,6 +983,7 @@ declare ui: {
     reveal: (widget: ThingWidget) -> (),
     state: <T>(initial: T & ThingStateValue) -> ThingState<T>,
     timer: (options: ThingTimerOptions) -> ThingTimer,
+    motion: (initial: number, options: ThingMotionOptions) -> ThingMotion,
     transition: (
         ((value: () -> number, options: ThingTransitionOptions) -> ThingNumberTransition)
         & ((value: () -> string, options: ThingTransitionOptions) -> ThingColorTransition)
