@@ -15,6 +15,7 @@ mod hover;
 mod idle_inhibit;
 mod idle_notify;
 mod input_method;
+mod inspect;
 mod keyboard;
 mod launch;
 mod lock;
@@ -34,6 +35,7 @@ mod system_tray;
 mod text_data;
 mod watch;
 pub use host::{run, run_with_options};
+pub use inspect::LayoutInspector;
 pub use lock::{check as check_lock, run as run_lock};
 pub use system_tray::{SystemTray, SystemTrayMode};
 

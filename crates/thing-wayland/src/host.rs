@@ -161,7 +161,7 @@ use crate::{
     niri::Niri,
     notifications::Server as NotificationServer,
     output::output_context,
-    panel::{self, Geometry, ResolvedInputRegion},
+    panel::{self, Geometry, ResolvedInputRegion, logical_size as panel_size},
     popup::{self, Position as PopupPosition},
     power::Power,
     render::{FrameResult, Render, Window},
@@ -5948,27 +5948,6 @@ fn active_text_input_is_current(
                 && interactive_path(root, id).is_some()
         })
         && focused_widget_is_interactive(layout, id)
-}
-
-fn panel_size(geometry: Geometry, output: (u32, u32)) -> (u32, u32) {
-    let requested = geometry.requested_size;
-    (
-        if requested.0 == 0 {
-            fill_dimension(output.0, geometry.margins.left, geometry.margins.right)
-        } else {
-            requested.0
-        },
-        if requested.1 == 0 {
-            fill_dimension(output.1, geometry.margins.top, geometry.margins.bottom)
-        } else {
-            requested.1
-        },
-    )
-}
-
-fn fill_dimension(output: u32, start_margin: i32, end_margin: i32) -> u32 {
-    (i64::from(output) - i64::from(start_margin) - i64::from(end_margin))
-        .clamp(1, i64::from(u32::MAX)) as u32
 }
 
 fn configured_panel_size(

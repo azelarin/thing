@@ -1618,6 +1618,32 @@ each load, event callback, and reactive update batch has a default execution bud
 of 250 ms. the luau heap is limited to 64 mib; this is a ceiling, not preallocated
 memory or a limit on the whole application. the execution budget does not bound native i/o time.
 
+### inspecting layout
+
+when a widget has an unexpected size or disappears behind a container, inspect
+its initial layout without opening a window:
+
+```sh
+thing inspect --output-size 1920x1080 --output-name DP-1 --scale 1.25 panel.luau
+```
+
+the required output size is in logical pixels. the name is optional, and scale
+defaults to 1, rounded to the nearest 1/120. these values are also available
+through `services.output`, so output-dependent configurations use the supplied
+context. other services have their default state; timers and processes are not
+started.
+
+the report lists panels and requested popup layouts, followed by widget kinds,
+ids, keys, visibility, layout bounds, transformed bounds, and clipping regions.
+`body=omitted` means the widget has no body placement in this layout. shadows
+can still extend outside that body's clip. widget text and input contents are
+not included.
+
+this is a starting-state snapshot, not an inspection of a running shell. popup
+positions and final surface sizes depend on the compositor. clipping regions
+and transformed bounds are enclosing rectangles, not exact rounded outlines.
+the command uses the same font measurement and layout code as the renderer.
+
 ## clock, idle, and audio
 
 service values have the same `:get()` interface as local state, but are read-only.
