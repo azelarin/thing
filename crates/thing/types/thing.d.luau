@@ -769,8 +769,35 @@ declare extern type ThingClockService with
     read date: ThingSignal<string>
 end
 
+declare extern type ThingIdleWatch with
+    read idle: ThingSignal<boolean>
+end
+
+export type ThingIdleWatchOptions = {
+    timeout: number,
+    on_idle: ((watch: ThingIdleWatch) -> ())?,
+    on_resume: ((watch: ThingIdleWatch) -> ())?,
+}
+
 declare extern type ThingIdleService with
     read inhibit_available: ThingSignal<boolean>
+    read watch_available: ThingSignal<boolean>
+    read watch: (options: ThingIdleWatchOptions) -> ThingIdleWatch
+end
+
+export type ThingSleepInhibitorStatus =
+    "stopped" | "requested" | "active" | "unavailable" | "failed"
+
+export type ThingSleepInhibitorOptions = {
+    key: string,
+    reason: string,
+}
+
+declare extern type ThingSleepInhibitor with
+    read state: ThingSignal<ThingSleepInhibitorStatus>
+    read error: ThingSignal<string>
+    read start: () -> ()
+    read stop: () -> ()
 end
 
 declare extern type ThingApplicationsService with
@@ -904,6 +931,7 @@ declare extern type ThingServices with
         & ((options: ThingScheduledProcessOptions) -> ThingScheduledProcess)
         & ((options: ThingManagedProcessOptions) -> ThingManagedProcess)
     )
+    read sleep_inhibitor: (options: ThingSleepInhibitorOptions) -> ThingSleepInhibitor
     read launch: (arguments: { string }, working_directory: string?) -> ()
 end
 

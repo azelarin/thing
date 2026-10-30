@@ -68,6 +68,10 @@ pub enum Action {
         cwd: Option<String>,
     },
     LaunchApplication(ApplicationLaunch),
+    SleepInhibitor {
+        key: String,
+        action: crate::SleepInhibitorAction,
+    },
 }
 
 /// a request to start an installed application from its desktop entry.
@@ -999,6 +1003,7 @@ pub struct ServiceSnapshot {
     pub(crate) notification_history: Vec<Notification>,
     pub(crate) system_tray_items: Vec<SystemTrayItem>,
     pub(crate) managed_processes: Vec<ManagedProcessState>,
+    pub(crate) sleep_inhibitors: Vec<crate::SleepInhibitorState>,
     pub(crate) niri: NiriState,
 }
 
@@ -1097,6 +1102,13 @@ impl ServiceSnapshot {
     pub fn set_managed_processes(&mut self, snapshot: ManagedProcessSnapshot) -> Result<()> {
         validate_managed_process_states(&snapshot.states)?;
         self.managed_processes = snapshot.states;
+        Ok(())
+    }
+
+    /// replaces the process-wide sleep inhibitor states new runtimes start with.
+    pub fn set_sleep_inhibitors(&mut self, states: Vec<crate::SleepInhibitorState>) -> Result<()> {
+        crate::sleep::validate_states(&states)?;
+        self.sleep_inhibitors = states;
         Ok(())
     }
 
@@ -1580,7 +1592,11 @@ pub(crate) struct Services {
     system_tray_items_revision: usize,
     managed_processes: Rc<RefCell<BTreeMap<String, ManagedProcessState>>>,
     managed_process_signals: Rc<RefCell<BTreeMap<String, ManagedProcessSignals>>>,
+    // idle watches and sleep inhibitors share the managed process rule: they
+    // are declared while the configuration loads and frozen afterward.
     managed_process_declarations_open: Rc<Cell<bool>>,
+    idle_watches: Rc<RefCell<crate::idle::IdleWatches>>,
+    sleep_inhibitors: Rc<RefCell<crate::sleep::SleepInhibitors>>,
     application_launches_allowed: Rc<Cell<bool>>,
     niri: NiriData,
 }
@@ -1630,6 +1646,8 @@ impl Services {
             managed_processes: Rc::default(),
             managed_process_signals: Rc::default(),
             managed_process_declarations_open: Rc::new(Cell::new(true)),
+            idle_watches: Rc::default(),
+            sleep_inhibitors: Rc::default(),
             application_launches_allowed: Rc::new(Cell::new(true)),
             niri: niri_data,
         };
@@ -1756,6 +1774,7 @@ impl Services {
             ("clock.time", Scalar::String("--:--".into())),
             ("clock.date", Scalar::String(String::new())),
             ("idle.inhibit_available", Scalar::Boolean(false)),
+            ("idle.watch_available", Scalar::Boolean(false)),
             ("media.available", Scalar::Boolean(false)),
             ("media.selected_id", Scalar::String(String::new())),
             ("media.playing", Scalar::Boolean(false)),
@@ -2147,6 +2166,13 @@ impl Services {
         }
         niri.set_readonly(true);
         clock.set_readonly(true);
+        crate::idle::install(
+            lua,
+            &idle,
+            result.tracker.clone(),
+            result.idle_watches.clone(),
+            result.managed_process_declarations_open.clone(),
+        )?;
         idle.set_readonly(true);
         output.set_readonly(true);
         let actions = result.actions.clone();
@@ -2207,6 +2233,15 @@ impl Services {
                 managed_process_handle(lua, signals, &tracker, &actions, &allowed)
             })?,
         )?;
+        crate::sleep::install(
+            lua,
+            &services,
+            result.tracker.clone(),
+            result.sleep_inhibitors.clone(),
+            result.actions.clone(),
+            result.allowed.clone(),
+            result.managed_process_declarations_open.clone(),
+        )?;
         services.set("applications", applications)?;
         services.set("audio", audio)?;
         services.set("authentication", authentication)?;
@@ -2232,8 +2267,28 @@ impl Services {
         self.application_launches_allowed.set(false);
     }
 
-    pub fn freeze_managed_process_declarations(&self) {
+    /// ends the load phase for managed processes, idle watches, and sleep
+    /// inhibitors.
+    pub fn freeze_declarations(&self) {
         self.managed_process_declarations_open.set(false);
+    }
+
+    pub(crate) fn idle_watches(&self) -> &Rc<RefCell<crate::idle::IdleWatches>> {
+        &self.idle_watches
+    }
+
+    pub(crate) fn tracker(&self) -> &Rc<RefCell<Tracker>> {
+        &self.tracker
+    }
+
+    pub fn sleep_inhibitor_definitions(&self) -> Vec<crate::SleepInhibitorDefinition> {
+        self.sleep_inhibitors.borrow().definitions()
+    }
+
+    pub fn set_sleep_inhibitors(&self, states: Vec<crate::SleepInhibitorState>) -> Result<()> {
+        self.sleep_inhibitors
+            .borrow_mut()
+            .set_states(&self.tracker, states)
     }
 
     pub fn managed_process_definitions(&self) -> Vec<ManagedProcessDefinition> {
@@ -2691,6 +2746,13 @@ impl Services {
             notification_history: self.notification_history.borrow().clone(),
             system_tray_items: self.system_tray_items.borrow().clone(),
             managed_processes: self.managed_processes.borrow().values().cloned().collect(),
+            sleep_inhibitors: self
+                .sleep_inhibitors
+                .borrow()
+                .states
+                .values()
+                .cloned()
+                .collect(),
             niri: self.niri.snapshot(),
         }
     }
@@ -3359,6 +3421,7 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "clipboard.available"
             | "clipboard.loading"
             | "idle.inhibit_available"
+            | "idle.watch_available"
             | "niri.available",
             Scalar::Boolean(_),
         ) => true,
@@ -3987,7 +4050,11 @@ fn invalid_notification_text(value: &str) -> bool {
     value.len() > 64 * 1024 || value.contains('\0')
 }
 
-fn enqueue(actions: &RefCell<Vec<Action>>, allowed: &Cell<bool>, action: Action) -> Result<()> {
+pub(crate) fn enqueue(
+    actions: &RefCell<Vec<Action>>,
+    allowed: &Cell<bool>,
+    action: Action,
+) -> Result<()> {
     if !allowed.get() {
         return Err(Error::runtime(
             "service actions are allowed only in event handlers",
@@ -4183,7 +4250,7 @@ mod tests {
             ]
         );
 
-        services.freeze_managed_process_declarations();
+        services.freeze_declarations();
         assert!(lua.load("services.process('late')").exec().is_err());
     }
 

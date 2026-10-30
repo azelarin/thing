@@ -598,6 +598,7 @@ impl Host {
             )
             .unwrap(),
             power: Power::inert().unwrap(),
+            sleep: crate::sleep::SleepInhibition::inert(),
             niri: Niri::inert().unwrap(),
             notifications: None,
             system_tray: None,
@@ -616,6 +617,7 @@ impl Host {
             closed_surfaces: Vec::new(),
             registry: RegistryState::new(&globals),
             idle_inhibit: IdleInhibitState::default(),
+            idle_notify: crate::idle_notify::State::default(),
             seats: SeatState::new(&globals, &qh),
             outputs: OutputState::new(&globals, &qh),
             compositor: CompositorState::bind(&globals, &qh).unwrap(),

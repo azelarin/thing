@@ -73,6 +73,10 @@ use wayland_protocols::{
         ext_data_control_offer_v1::{self, ExtDataControlOfferV1},
         ext_data_control_source_v1::{self, ExtDataControlSourceV1},
     },
+    ext::idle_notify::v1::client::{
+        ext_idle_notification_v1::{self, ExtIdleNotificationV1},
+        ext_idle_notifier_v1::ExtIdleNotifierV1,
+    },
     wp::idle_inhibit::zv1::client::{
         zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
         zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
@@ -108,6 +112,8 @@ use xkbcommon::xkb;
 use crate::output::{fallback_logical_size, valid_dimensions};
 
 #[cfg(test)]
+mod idle_sleep_tests;
+#[cfg(test)]
 mod launch_tests;
 #[cfg(test)]
 mod wheel_tests;
@@ -132,6 +138,10 @@ use crate::{
     focused_clipboard::{FocusedClipboard, PasteId},
     hover::{Command as HoverCommand, HoverKey, HoverStates, HoverTarget},
     idle_inhibit::{self, Inhibitor, State as IdleInhibitState},
+    idle_notify::{
+        Desired as IdleWatchDesired, Notification as IdleNotification, State as IdleNotifyState,
+        Transition as IdleTransition,
+    },
     input_method::{
         ChangeCause as InputMethodChangeCause, CursorRectangle as InputMethodCursorRectangle,
         Done as InputMethodDone, InputMethod, TextState as InputMethodTextState,
@@ -155,6 +165,7 @@ use crate::{
     popup::{self, Position as PopupPosition},
     power::Power,
     render::{FrameResult, Render, Window},
+    sleep::{SleepInhibition, Transport as SleepTransport},
     watch::Watch,
 };
 
@@ -212,6 +223,17 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
             Scalar::Boolean(idle_inhibit.active().is_some()),
         )
         .map_err(|error| error.to_string())?;
+    let mut idle_notify = IdleNotifyState::default();
+    // idle watches are optional: without the protocol they stay unarmed.
+    if let Err(error) = idle_notify.bind_next(&registry, &qh) {
+        eprintln!("thing: {error}");
+    }
+    services
+        .set_service(
+            "idle.watch_available",
+            Scalar::Boolean(idle_notify.available()),
+        )
+        .map_err(|error| error.to_string())?;
     let compositor = CompositorState::bind(&globals, &qh).map_err(|error| error.to_string())?;
     let layer_shell = LayerShell::bind(&globals, &qh)
         .map_err(|error| format!("the compositor must support wlr-layer-shell: {error}"))?;
@@ -246,6 +268,9 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         .map_err(|e| format!("cannot start application activation worker: {e}"))?;
     let (power_ping, power_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let power = Power::start(power_ping).map_err(|e| format!("cannot start power worker: {e}"))?;
+    let (sleep_ping, sleep_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
+    // the worker starts with the first started inhibitor.
+    let sleep = SleepInhibition::new(SleepTransport::System, sleep_ping);
     let (niri_ping, niri_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let niri = Niri::start(niri_ping).map_err(|e| format!("cannot start niri worker: {e}"))?;
     let (notifications, notification_source) = if options.notification_server {
@@ -294,6 +319,7 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         application_catalog: Arc::default(),
         activator,
         power,
+        sleep,
         niri,
         notifications,
         system_tray,
@@ -309,6 +335,7 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         closed_surfaces: Vec::new(),
         registry,
         idle_inhibit,
+        idle_notify,
         seats: SeatState::new(&globals, &qh),
         outputs: OutputState::new(&globals, &qh),
         compositor,
@@ -371,6 +398,10 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
     event_loop
         .handle()
         .insert_source(power_source, |_, _, app| app.update_power())
+        .map_err(|e| e.to_string())?;
+    event_loop
+        .handle()
+        .insert_source(sleep_source, |_, _, app| app.update_sleep())
         .map_err(|e| e.to_string())?;
     if let Some(source) = notification_source {
         event_loop
@@ -498,6 +529,8 @@ impl App {
         }
         self.install_prepared_layouts(prepared);
         arm_managed_processes(self.managed_processes.as_ref(), activation);
+        self.reconcile_sleep();
+        self.reconcile_idle_watches();
         self.loading_outputs = false;
         self.update_watch();
         Ok(())
@@ -520,6 +553,13 @@ impl App {
             self.reload(qh)?;
         }
         self.dispatch_due_timers(Instant::now());
+        if self
+            .sleep
+            .next_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            self.update_sleep();
+        }
         self.draw(qh)?;
         self.process_hover(qh);
         connection.flush().map_err(|error| error.to_string())?;
@@ -1089,6 +1129,7 @@ pub(crate) struct App {
     application_catalog: Arc<Catalog>,
     activator: Activator,
     power: Power,
+    sleep: SleepInhibition,
     niri: Niri,
     notifications: Option<NotificationServer>,
     system_tray: Option<SystemTray>,
@@ -1107,6 +1148,7 @@ pub(crate) struct App {
     closed_surfaces: Vec<SurfaceOwner>,
     registry: RegistryState,
     idle_inhibit: IdleInhibitState,
+    idle_notify: IdleNotifyState,
     seats: SeatState,
     outputs: OutputState,
     compositor: CompositorState,
@@ -1146,6 +1188,7 @@ impl Drop for App {
         // popups are appended after their parents and must be released first.
         while self.surfaces.pop().is_some() {}
         self.idle_inhibit.take_active();
+        self.idle_notify.clear();
     }
 }
 
@@ -1269,6 +1312,84 @@ impl App {
         Ok(())
     }
 
+    fn publish_idle_watch_availability(&mut self) {
+        let available = self.idle_notify.available();
+        if let Err(error) = self
+            .configurations
+            .set_service("idle.watch_available", Scalar::Boolean(available))
+        {
+            eprintln!("thing: {error}");
+        }
+        self.refresh();
+    }
+
+    /// arms the watches of the accepted configurations on the current seat
+    /// and delivers the resumes of retired watches that were idle.
+    fn reconcile_idle_watches(&mut self) {
+        let desired: Vec<_> = self
+            .configurations
+            .idle_watches()
+            .into_iter()
+            .flat_map(|(output, consumer, definitions)| {
+                definitions
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(index, definition)| IdleWatchDesired {
+                        output: output.clone(),
+                        consumer: consumer.clone(),
+                        index,
+                        definition,
+                    })
+            })
+            .collect();
+        let resumes = self
+            .idle_notify
+            .reconcile(&desired, self.seat.as_ref(), &self.queue);
+        for resume in resumes {
+            self.deliver_idle(resume);
+        }
+    }
+
+    /// runs an idle transition through the checked event path of the
+    /// configuration that armed the watch, if that configuration is current.
+    fn deliver_idle(&mut self, transition: IdleTransition) {
+        let IdleTransition {
+            output,
+            consumer,
+            index,
+            idle,
+        } = transition;
+        if self.configurations.consumer(&output) != Some(consumer.as_str()) {
+            return;
+        }
+        let Some(entry) = self.current_layout_validation_entry(&output) else {
+            return;
+        };
+        let preflight = LayoutPreflight::new(
+            &mut self.render,
+            self.layer_shell_version,
+            self.idle_inhibit.active().is_some(),
+            vec![entry],
+        );
+        let result = self.configurations.dispatch_idle_checked(
+            &output,
+            &consumer,
+            index,
+            idle,
+            |surfaces| preflight.validate(&output, surfaces),
+        );
+        let prepared = preflight.into_prepared();
+        match result {
+            Ok(Some(outcome)) => {
+                self.finish_dispatch(output, Some(consumer), Ok(outcome), None, prepared);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.finish_dispatch(output, Some(consumer), Err(error), None, prepared);
+            }
+        }
+    }
+
     fn next_deadline(&self) -> Option<Instant> {
         earliest_deadline(
             self.reload_at,
@@ -1278,6 +1399,7 @@ impl App {
         )
         .into_iter()
         .chain(self.configurations.next_timer_deadline())
+        .chain(self.sleep.next_deadline())
         .min()
     }
 
@@ -1348,6 +1470,23 @@ impl App {
         }
         self.refresh();
     }
+    fn update_sleep(&mut self) {
+        let Some(states) = self.sleep.poll(Instant::now()) else {
+            return;
+        };
+        if let Err(error) = self.configurations.set_sleep_inhibitors(states) {
+            eprintln!("thing: {error}");
+        }
+        self.refresh();
+    }
+
+    /// leases follow the declarations of the accepted configurations; the
+    /// new states arrive through the sleep ping.
+    fn reconcile_sleep(&mut self) {
+        let definitions = self.configurations.sleep_inhibitor_definitions();
+        self.sleep.reconcile(&definitions);
+    }
+
     fn update_notifications(&mut self) {
         let Some(snapshot) = self
             .notifications
@@ -1624,6 +1763,8 @@ impl App {
         }
         self.install_prepared_layouts(prepared);
         arm_managed_processes(self.managed_processes.as_ref(), activation);
+        self.reconcile_sleep();
+        self.reconcile_idle_watches();
         if self
             .keyboard_surface
             .as_ref()
@@ -1690,6 +1831,8 @@ impl App {
             self.sync_output_surfaces(&output, false, qh)?;
             self.install_prepared_layouts(prepared);
             arm_managed_processes(self.managed_processes.as_ref(), activation);
+            self.reconcile_sleep();
+            self.reconcile_idle_watches();
             self.update_watch();
             return Ok(());
         }
@@ -2947,6 +3090,10 @@ impl App {
                 ),
                 Action::ManagedProcess { key, action } => {
                     send_managed_process_action(self.managed_processes.as_ref(), &key, action)
+                }
+                Action::SleepInhibitor { key, action } => {
+                    self.sleep.act(&key, action);
+                    Ok(())
                 }
                 Action::Launch { argv, cwd } => {
                     self.request_launch(
@@ -6706,6 +6853,8 @@ impl OutputHandler for App {
             if let Err(error) = process_reconciliation {
                 self.error = Some(format!("cannot remove output configuration: {error}"));
             }
+            self.reconcile_sleep();
+            self.reconcile_idle_watches();
         }
         self.update_watch();
         if self
@@ -6868,7 +7017,11 @@ impl SeatHandler for App {
         if self.seat.as_ref().is_some_and(|active| active != &seat) {
             return;
         }
+        let attached = self.seat.is_none();
         self.seat = Some(seat.clone());
+        if attached {
+            self.reconcile_idle_watches();
+        }
         if let Some(clipboard) = &mut self.clipboard {
             clipboard.attach_seat(&seat, qh);
         }
@@ -6926,6 +7079,8 @@ impl SeatHandler for App {
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
         if self.seat.as_ref() == Some(&seat) {
             self.seat = None;
+            // watches armed on the seat resume while their configuration is current.
+            self.reconcile_idle_watches();
             if let Some(clipboard) = &mut self.clipboard {
                 clipboard.detach_seat();
             }
@@ -8846,6 +9001,62 @@ delegate_noop!(App: ignore ZwlrDataControlManagerV1);
 delegate_noop!(App: ignore ZwpTextInputManagerV3);
 delegate_noop!(App: ignore ZwpIdleInhibitManagerV1);
 delegate_noop!(App: ignore ZwpIdleInhibitorV1);
+delegate_noop!(App: ignore ExtIdleNotifierV1);
+
+impl Dispatch<ExtIdleNotificationV1, IdleNotification> for App {
+    fn event(
+        app: &mut Self,
+        _: &ExtIdleNotificationV1,
+        event: ext_idle_notification_v1::Event,
+        notification: &IdleNotification,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let idle = match event {
+            ext_idle_notification_v1::Event::Idled => true,
+            ext_idle_notification_v1::Event::Resumed => false,
+            _ => return,
+        };
+        if let Some(transition) = app.idle_notify.transition(notification.0, idle) {
+            app.deliver_idle(transition);
+        }
+    }
+}
+
+impl RegistryHandler<App> for IdleNotifyState {
+    fn new_global(
+        app: &mut App,
+        _: &Connection,
+        qh: &QueueHandle<App>,
+        _: u32,
+        interface: &str,
+        _: u32,
+    ) {
+        if interface != ExtIdleNotifierV1::interface().name {
+            return;
+        }
+        match app.idle_notify.bind_next(&app.registry, qh) {
+            Ok(true) => {
+                app.publish_idle_watch_availability();
+                app.reconcile_idle_watches();
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!("thing: {error}"),
+        }
+    }
+
+    fn remove_global(app: &mut App, _: &Connection, qh: &QueueHandle<App>, name: u32, _: &str) {
+        if !app.idle_notify.retire(name) {
+            return;
+        }
+        if let Err(error) = app.idle_notify.bind_next(&app.registry, qh) {
+            eprintln!("thing: {error}");
+        }
+        // watches of the removed notifier resume and rearm on a replacement.
+        app.reconcile_idle_watches();
+        app.publish_idle_watch_availability();
+    }
+}
 delegate_noop!(App: ignore xdg_positioner::XdgPositioner);
 
 impl RegistryHandler<App> for IdleInhibitState {
@@ -8896,5 +9107,5 @@ impl ProvidesRegistryState for App {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry
     }
-    registry_handlers![OutputState, SeatState, IdleInhibitState];
+    registry_handlers![OutputState, SeatState, IdleInhibitState, IdleNotifyState];
 }

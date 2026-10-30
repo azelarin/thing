@@ -7,11 +7,11 @@ use std::{
 use thing_core::{Node, NodeId};
 use thing_runtime::{
     Action, ApplicationsSnapshot, AudioSnapshot, AuthenticationSnapshot, ClipboardSnapshot, Event,
-    KeyInput, ManagedProcessDefinition, ManagedProcessSnapshot, ManagedProcessState, MediaSnapshot,
-    NiriState, NotificationSnapshot, OutputContext,
+    IdleWatchDefinition, KeyInput, ManagedProcessDefinition, ManagedProcessSnapshot,
+    ManagedProcessState, MediaSnapshot, NiriState, NotificationSnapshot, OutputContext,
     PointerDispatchOutcome as RuntimePointerOutcome, PointerEvent, PowerSnapshot, Runtime, Scalar,
-    ScrollInput, ServiceSnapshot, SurfaceKey, SurfaceTree, SystemTraySnapshot, TimerToken,
-    UiAction, UiTarget,
+    ScrollInput, ServiceSnapshot, SleepInhibitorDefinition, SleepInhibitorState, SurfaceKey,
+    SurfaceTree, SystemTraySnapshot, TimerToken, UiAction, UiTarget,
 };
 use thing_ui::Layout;
 
@@ -223,6 +223,12 @@ impl<K: Clone + Eq> Configurations<K> {
                 .map(|instance| &instance.runtime)
                 .chain(std::iter::once(&runtime)),
         )?;
+        collect_sleep_inhibitor_definitions(
+            self.instances
+                .iter()
+                .map(|instance| &instance.runtime)
+                .chain(std::iter::once(&runtime)),
+        )?;
         let mut services = self.services.clone();
         let snapshot = reconciled_managed_processes(services.managed_processes(), &definitions);
         services
@@ -279,6 +285,12 @@ impl<K: Clone + Eq> Configurations<K> {
             .load(&self.entry, output.clone(), &self.services)?;
         validate(&runtime)?;
         let definitions = collect_managed_process_definitions(
+            self.instances
+                .iter()
+                .map(|instance| &instance.runtime)
+                .chain(std::iter::once(&runtime)),
+        )?;
+        collect_sleep_inhibitor_definitions(
             self.instances
                 .iter()
                 .map(|instance| &instance.runtime)
@@ -704,6 +716,30 @@ impl<K: Clone + Eq> Configurations<K> {
         Ok(())
     }
 
+    /// the sleep inhibitor keys every accepted configuration declares.
+    pub(crate) fn sleep_inhibitor_definitions(&self) -> Vec<SleepInhibitorDefinition> {
+        collect_sleep_inhibitor_definitions(self.instances.iter().map(|instance| &instance.runtime))
+            .expect("accepted sleep inhibitor declarations must remain compatible")
+    }
+
+    pub(crate) fn set_sleep_inhibitors(
+        &mut self,
+        states: Vec<SleepInhibitorState>,
+    ) -> Result<(), String> {
+        let mut services = self.services.clone();
+        services
+            .set_sleep_inhibitors(states.clone())
+            .map_err(|error| error.to_string())?;
+        for instance in &mut self.instances {
+            instance
+                .runtime
+                .set_sleep_inhibitors(states.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        self.services = services;
+        Ok(())
+    }
+
     pub(crate) fn set_clipboard(&mut self, clipboard: ClipboardSnapshot) -> Result<(), String> {
         let mut services = self.services.clone();
         services
@@ -860,6 +896,53 @@ impl<K: Clone + Eq> Configurations<K> {
         }))
     }
 
+    /// each output's consumer with the idle watches its configuration
+    /// declared, in declaration order.
+    pub(crate) fn idle_watches(&self) -> Vec<(K, String, Vec<IdleWatchDefinition>)> {
+        self.instances
+            .iter()
+            .map(|instance| {
+                (
+                    instance.key.clone(),
+                    instance.consumer.clone(),
+                    instance.runtime.idle_watches(),
+                )
+            })
+            .collect()
+    }
+
+    /// reports an idle transition to the configuration that armed the watch.
+    /// a transition for a replaced configuration or a repeated state does
+    /// nothing.
+    pub(crate) fn dispatch_idle_checked(
+        &mut self,
+        key: &K,
+        consumer: &str,
+        index: usize,
+        idle: bool,
+        validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
+    ) -> Result<Option<DispatchOutcome>, String> {
+        let Some(instance) = self
+            .instances
+            .iter_mut()
+            .find(|instance| &instance.key == key && instance.consumer == consumer)
+        else {
+            return Ok(None);
+        };
+        let runtime = &mut instance.runtime;
+        let Some(changed) = runtime
+            .dispatch_idle_checked(index, idle, validate)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(DispatchOutcome {
+            changed,
+            actions: runtime.take_actions(),
+            ui_actions: runtime.take_ui_actions(),
+        }))
+    }
+
     pub(crate) fn dispatch_key_checked(
         &mut self,
         key: &K,
@@ -1003,6 +1086,7 @@ impl<K: Clone + Eq> Configurations<K> {
         let definitions = collect_managed_process_definitions(
             candidates.iter().map(|instance| &instance.runtime),
         )?;
+        collect_sleep_inhibitor_definitions(candidates.iter().map(|instance| &instance.runtime))?;
         Ok(PreparedConfigurations {
             services,
             instances: candidates,
@@ -1076,6 +1160,7 @@ impl<K: Clone + Eq> Configurations<K> {
         let definitions = collect_managed_process_definitions(
             candidates.iter().map(|instance| &instance.runtime),
         )?;
+        collect_sleep_inhibitor_definitions(candidates.iter().map(|instance| &instance.runtime))?;
         let snapshot = ManagedProcessSnapshot {
             states: definitions
                 .iter()
@@ -1149,6 +1234,29 @@ fn collect_managed_process_definitions<'a>(
         {
             return Err(format!(
                 "managed process {:?} has conflicting declarations across outputs",
+                definition.key
+            ));
+        }
+        definitions.insert(definition.key.clone(), definition);
+    }
+    Ok(definitions.into_values().collect())
+}
+
+/// a key may be declared by several outputs only with the same reason, so
+/// one lease means one thing whichever output started it.
+fn collect_sleep_inhibitor_definitions<'a>(
+    runtimes: impl IntoIterator<Item = &'a Runtime>,
+) -> Result<Vec<SleepInhibitorDefinition>, String> {
+    let mut definitions = BTreeMap::<String, SleepInhibitorDefinition>::new();
+    for definition in runtimes
+        .into_iter()
+        .flat_map(Runtime::sleep_inhibitor_definitions)
+    {
+        if let Some(existing) = definitions.get(&definition.key)
+            && existing != &definition
+        {
+            return Err(format!(
+                "sleep inhibitor {:?} has conflicting declarations across outputs",
                 definition.key
             ));
         }
@@ -3203,6 +3311,56 @@ mod tests {
         assert!(error.contains("conflicting declarations across outputs"));
         assert!(!scope_changed);
         assert!(configurations.keys().next().is_none());
+    }
+
+    #[test]
+    fn conflicting_sleep_inhibitor_declarations_fail_before_any_change() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            "services.sleep_inhibitor { key = 'shared', reason = 'same' }\nreturn ui.panel {}",
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry.clone(), ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        let shared = vec![SleepInhibitorDefinition {
+            key: "shared".into(),
+            reason: "same".into(),
+        }];
+        assert_eq!(configurations.sleep_inhibitor_definitions(), shared);
+
+        // a second output may share the key only with the same reason.
+        fs::write(
+            &entry,
+            r#"
+            local reason = if services.output.name:get() == 'DP-1' then 'same' else 'other'
+            services.sleep_inhibitor { key = 'shared', reason = reason }
+            return ui.panel {}
+            "#,
+        )
+        .unwrap();
+        let error = match configurations.prepare_add_checked(2, output("DP-2", 2560), |_| Ok(())) {
+            Err(error) => error,
+            Ok(_) => panic!("conflicting declarations were accepted"),
+        };
+        assert!(
+            error.contains("conflicting declarations across outputs"),
+            "{error}"
+        );
+        let error = configurations
+            .prepare_reload_for_checked(
+                vec![(1, output("DP-1", 1920)), (2, output("DP-2", 2560))],
+                |_, _| Ok(()),
+            )
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("conflicting declarations across outputs"),
+            "{error}"
+        );
+        assert_eq!(configurations.keys().copied().collect::<Vec<_>>(), [1]);
+        assert_eq!(configurations.sleep_inhibitor_definitions(), shared);
     }
 
     #[test]
