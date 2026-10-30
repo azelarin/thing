@@ -698,5 +698,39 @@ class SharedMotionProbes(unittest.TestCase):
             )
 
 
+class WidgetBoundsProbes(unittest.TestCase):
+    def frame(self, scale, *, reload=False, offset=0, short=False):
+        canvas = Canvas(scale)
+        canvas.rect(0, 0, 640, 200, (13, 17, 23))
+        colors = ((224, 164, 81), (196, 112, 210)) if reload else (
+            (40, 179, 161), (121, 151, 255)
+        )
+        for left, right, color in ((20, 80 if short else 200, colors[0]), (236, 326, colors[1])):
+            canvas.rect(left, 20, right, 60, color)
+            center = (left + right) / 2 + offset
+            canvas.rect(center - 4, 80, center + 4, 120, color)
+        return canvas.image()
+
+    def test_markers_match_target_centers_at_both_scales_and_reload(self):
+        for scale in (1.0, 1.25):
+            for reload in (False, True):
+                check_rendering.verify_capture(
+                    "widget-bounds", self.frame(scale, reload=reload),
+                    "reload" if reload else "scale-1", scale
+                )
+
+    def test_layout_coordinates_cannot_replace_transformed_coordinates(self):
+        with self.assertRaises(check_rendering.FixtureError):
+            check_rendering.verify_capture(
+                "widget-bounds", self.frame(1.25, offset=-12), "scale-1", 1.25
+            )
+
+    def test_an_initial_short_label_cannot_pass_the_final_state(self):
+        with self.assertRaises(check_rendering.FixtureError):
+            check_rendering.verify_capture(
+                "widget-bounds", self.frame(1, short=True), "scale-1", 1
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

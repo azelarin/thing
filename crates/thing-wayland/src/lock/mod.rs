@@ -1591,7 +1591,17 @@ impl App {
                     surface.waiting = true;
                     surface.scroll = scroll;
                     let (consumer, targets) = presented_ui;
-                    surface.layouts.publish(layout, root.id, consumer, targets);
+                    let layout = Rc::new(layout);
+                    let bounds = configurations.record_presented_bounds(
+                        &surface.output,
+                        &consumer,
+                        root.id,
+                        layout.clone(),
+                    );
+                    surface
+                        .layouts
+                        .publish_shared(layout, root.id, consumer, targets);
+                    surface.layouts.keep_bounds(bounds);
                     surface.dirty = redraw || animating;
                     presented.push(index);
                 }

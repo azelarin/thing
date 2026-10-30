@@ -9,6 +9,19 @@ export type ThingSignal<T> = {
     get: (self: ThingSignal<T>) -> T,
 }
 
+declare extern type ThingBoundsRect with
+    read x: number
+    read y: number
+    read width: number
+    read height: number
+end
+
+declare extern type ThingWidgetBounds with
+    read surface: string
+    read layout: ThingBoundsRect
+    read visual: ThingBoundsRect
+end
+
 declare extern type ThingTimer with
     read start: (self: ThingTimer) -> ()
     read stop: (self: ThingTimer) -> ()
@@ -981,6 +994,7 @@ declare ui: {
     range: (properties: ThingRangeProperties) -> ThingWidget,
     focus: (widget: ThingWidget) -> (),
     reveal: (widget: ThingWidget) -> (),
+    bounds: (widget: ThingWidget) -> ThingWidgetBounds?,
     state: <T>(initial: T & ThingStateValue) -> ThingState<T>,
     timer: (options: ThingTimerOptions) -> ThingTimer,
     motion: (initial: number, options: ThingMotionOptions) -> ThingMotion,
