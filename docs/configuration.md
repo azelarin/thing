@@ -1769,6 +1769,83 @@ a rejected frame preserves the previous position, velocity, and running sample;
 it does not announce a successful completion. as with other shared-motion
 readers, this signal needs a mapped surface to advance.
 
+### replacing content after a fade
+
+keep the shown key separate from the requested key. close the current item,
+wait for its motion to settle at zero, then switch keys and fade the new item
+in. a timer can make that decision from accepted samples:
+
+```luau
+local shown, requested, phase = ui.state('alpha'), ui.state('alpha'), ui.state('idle')
+local fade = ui.motion(1, { kind = 'transition', duration = 180, easing = 'linear' })
+local pump = ui.timer {
+    interval = 20, repeating = true,
+    on_timeout = function(timer)
+        if phase:get() == 'closing' then
+            if not fade:running() and fade:get() == 0 then
+                shown:set(requested:get())
+                phase:set('opening')
+                fade:to(1)
+            else
+                fade:to(0)
+            end
+        elseif phase:get() == 'opening' then
+            if not fade:running() and fade:get() == 1 then
+                phase:set('idle')
+                timer:stop()
+            else
+                fade:to(1)
+            end
+        else
+            timer:stop()
+        end
+    end,
+}
+local function select(value)
+    requested:set(value)
+    local returning = value == shown:get()
+    phase:set(if returning then 'opening' else 'closing')
+    fade:to(if returning then 1 else 0)
+    pump:start()
+end
+```
+
+call `select('beta')` from a handler. use `shown:get()` to choose a keyed child
+and `math.clamp(fade:get(), 0, 1)` for its opacity. requests arriving during the
+close update `requested`, so the latest choice appears. selecting the shown
+item again reverses the close and keeps its widget identity.
+
+the timer runs only during a transition and stops once the new item has opened.
+keep the surface mapped until that happens. if the outgoing content comes from
+a changing service record, keep the data you want to display through its exit
+separately from that live record.
+
+### crossfading opaque layers
+
+for two opaque, equally sized layers, keep the lower one opaque and animate
+the upper one's opacity. this blends their colors without exposing the backdrop
+halfway through. animate `mix` towards `1` or `0` from an input handler:
+
+```luau
+local mix = ui.motion(0, { kind = 'transition', duration = 300 })
+
+ui.stack {
+    style = { width = 100, height = 60 },
+    children = {
+        ui.row { style = { width = 100, height = 60, background = '#e84bb5' } },
+        ui.row { style = {
+            width = 100, height = 60, background = '#28b3a1',
+            opacity = function() return math.clamp(mix:get(), 0, 1) end,
+        } },
+    },
+}
+```
+
+widget opacity applies to each draw, including descendants. it does not flatten
+a group into one image. fading two arbitrary widget groups this way can blend
+overlapping parts differently; the fade-out, replace, and fade-in pattern above
+works for general content.
+
 ### theme modules
 
 a theme is an ordinary table returned from a module. for example, save this as
