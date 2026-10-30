@@ -115,6 +115,8 @@ pub struct NiriWindow {
     pub row: Option<usize>,
     pub width: f64,
     pub height: f64,
+    /// visual window size without compositor decorations, when reported.
+    pub window_size: Option<(i32, i32)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -164,6 +166,8 @@ impl NiriState {
                     || !w.height.is_finite()
                     || w.width < 0.0
                     || w.height < 0.0
+                    || w.window_size
+                        .is_some_and(|(width, height)| width < 0 || height < 0)
             })
         {
             return Err(Error::runtime("invalid niri snapshot"));
@@ -375,6 +379,8 @@ impl UserData for List {
                     item.set("row", w.row)?;
                     item.set("width", w.width)?;
                     item.set("height", w.height)?;
+                    item.set("window_width", w.window_size.map(|size| size.0))?;
+                    item.set("window_height", w.window_size.map(|size| size.1))?;
                     item.set_readonly(true);
                     list.raw_set(index + 1, item)?;
                 }

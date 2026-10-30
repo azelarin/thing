@@ -1268,9 +1268,12 @@ index. entries contain `id`, `index`, `name`, `output`, `active`, `focused`, and
 
 `windows:get()` returns an immutable array sorted by id. entries contain `id`,
 `workspace_id`, `title`, `app_id`, `focused`, `urgent`, `floating`, `column`, `row`,
-`width`, and `height`. column and row are one-based and can be nil; width and height
-are the tile dimensions in logical pixels. optional strings and workspace ids
-can also be nil. workspaces and windows may briefly refer to different compositor
+`width`, `height`, `window_width`, and `window_height`. column and row are
+one-based and can be nil. `width` and `height` are the tile dimensions in logical
+pixels, including niri's decorations. `window_width` and `window_height` describe
+the window's visual geometry without those decorations; they are nil if the
+compositor did not report them. optional strings and workspace ids can also be
+nil. workspaces and windows may briefly refer to different compositor
 states while related events arrive; scripts must tolerate missing references.
 
 ids are decimal **strings**, preserving all 64 bits. pass them unchanged to

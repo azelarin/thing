@@ -152,10 +152,14 @@ impl Model {
             }
             Event::WindowsChanged { windows } => {
                 check_count(windows.len())?;
+                for window in &windows {
+                    window.layout.validate()?;
+                }
                 self.windows = windows.into_iter().map(|w| (w.id, w.into())).collect();
                 self.windows_initialized = true;
             }
             Event::WindowOpenedOrChanged { window } => {
+                window.layout.validate()?;
                 if window.is_focused {
                     for w in self.windows.values_mut() {
                         w.focused = false;
@@ -178,6 +182,9 @@ impl Model {
                 }
             }
             Event::WindowLayoutsChanged { changes } => {
+                for (_, layout) in &changes {
+                    layout.validate()?;
+                }
                 for (id, layout) in changes {
                     if let Some(w) = self.windows.get_mut(&id) {
                         layout.apply(w);
@@ -362,14 +369,31 @@ struct WireWindow {
 struct WireLayout {
     pos_in_scrolling_layout: Option<(usize, usize)>,
     tile_size: (f64, f64),
+    window_size: Option<(i32, i32)>,
 }
 
 impl WireLayout {
+    fn validate(&self) -> io::Result<()> {
+        let (width, height) = self.tile_size;
+        if !width.is_finite()
+            || !height.is_finite()
+            || width < 0.0
+            || height < 0.0
+            || self
+                .window_size
+                .is_some_and(|(width, height)| width < 0 || height < 0)
+        {
+            return Err(io::Error::other("invalid niri window dimensions"));
+        }
+        Ok(())
+    }
+
     fn apply(self, window: &mut NiriWindow) {
         window.column = self.pos_in_scrolling_layout.map(|p| p.0);
         window.row = self.pos_in_scrolling_layout.map(|p| p.1);
         window.width = self.tile_size.0;
         window.height = self.tile_size.1;
+        window.window_size = self.window_size;
     }
 }
 
@@ -387,6 +411,7 @@ impl From<WireWindow> for NiriWindow {
             row: None,
             width: 0.0,
             height: 0.0,
+            window_size: None,
         };
         w.layout.apply(&mut window);
         window

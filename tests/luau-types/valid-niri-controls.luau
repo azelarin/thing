@@ -16,6 +16,11 @@ return ui.panel { children = {
         end } },
     },
     ui.text { text = function()
+        for _, window in niri.windows:get() do
+            local width: number? = window.window_width
+            local height: number? = window.window_height
+            if width and height then return tostring(width) .. 'x' .. tostring(height) end
+        end
         local opened: boolean? = niri.overview_open:get()
         return if opened then "overview" else "desktop"
     end },
