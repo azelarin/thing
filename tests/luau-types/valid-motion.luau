@@ -5,6 +5,10 @@ local fade = ui.motion(0, { kind = "transition", duration = 180, easing = "out_c
 
 return ui.panel {
     children = {
+        ui.text { text = function()
+            local running: boolean = fade:running()
+            return if running then "moving" else "idle"
+        end },
         ui.button {
             on_secondary_click = function()
                 depth:stop()

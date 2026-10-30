@@ -17,7 +17,7 @@ const MAX_CONTROLS: usize = 256;
 
 struct Entry {
     state: State,
-    sources: [usize; 2],
+    sources: [usize; 3],
     pending_sample: bool,
 }
 
@@ -73,13 +73,14 @@ impl Motions {
                 let spec = Spec::motion(lua, options)?;
                 let sources = {
                     let mut tracker = motions.tracker.borrow_mut();
-                    // reserve both signals before changing the tracker.
-                    if tracker.remaining_values() < 2 {
+                    // reserve all signals before changing the tracker.
+                    if tracker.remaining_values() < 3 {
                         return Err(Error::runtime("configuration exceeds 10,000 state values"));
                     }
                     [
                         tracker.insert(Scalar::Number(f64::from(initial)))?,
                         tracker.insert(Scalar::Number(0.0))?,
+                        tracker.insert(Scalar::Boolean(false))?,
                     ]
                 };
                 let id = motions.entries.len();
@@ -157,13 +158,13 @@ impl Motions {
             let Resolved::Number(position) = state.current() else {
                 unreachable!("shared motions have numeric values");
             };
-            for (source, value) in entry
-                .sources
-                .into_iter()
-                .zip([f64::from(position), state.velocity(now)])
-            {
+            for (source, value) in entry.sources.into_iter().zip([
+                Scalar::Number(f64::from(position)),
+                Scalar::Number(state.velocity(now)),
+                Scalar::Boolean(state.is_active()),
+            ]) {
                 frame.previous.push((source, tracker.peek(source)));
-                values.push((source, Scalar::Number(value)));
+                values.push((source, value));
             }
             frame.states.push((id, state));
         }
@@ -204,11 +205,16 @@ impl Handle {
             .ok_or_else(|| Error::runtime("motion runtime has ended"))
     }
 
-    fn sample(&self, component: usize) -> Result<f64> {
+    fn read(&self, component: usize) -> Result<Scalar> {
         let owner = self.owner()?;
         let motions = owner.borrow();
         let source = motions.entries[self.id].sources[component];
-        let Scalar::Number(value) = motions.tracker.borrow_mut().read(source) else {
+        let value = motions.tracker.borrow_mut().read(source);
+        Ok(value)
+    }
+
+    fn sample(&self, component: usize) -> Result<f64> {
+        let Scalar::Number(value) = self.read(component)? else {
             unreachable!("motion signals are numeric");
         };
         Ok(value)
@@ -234,6 +240,12 @@ impl UserData for Handle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("get", |_, this, ()| this.sample(0));
         methods.add_method("velocity", |_, this, ()| this.sample(1));
+        methods.add_method("running", |_, this, ()| {
+            let Scalar::Boolean(value) = this.read(2)? else {
+                unreachable!("motion activity is a boolean");
+            };
+            Ok(value)
+        });
         methods.add_method("to", |_, this, target: Value| {
             this.queue(Control::Target(number(target)?))
         });
@@ -256,4 +268,29 @@ fn number(value: Value) -> Result<f32> {
         ));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insufficient_capacity_does_not_reserve_partial_signals() {
+        let tracker = Rc::new(RefCell::new(Tracker::default()));
+        for _ in 0..9998 {
+            tracker.borrow_mut().insert(Scalar::Nil).unwrap();
+        }
+        let motions = Rc::new(RefCell::new(Motions::new(tracker.clone())));
+        let lua = Lua::new();
+        let ui = lua.create_table().unwrap();
+        Motions::install(&motions, &lua, &ui).unwrap();
+        lua.globals().set("ui", ui).unwrap();
+        assert!(
+            lua.load("return ui.motion(0, {kind='transition',duration=1})")
+                .exec()
+                .is_err()
+        );
+        assert_eq!(tracker.borrow().remaining_values(), 2);
+        assert!(motions.borrow().entries.is_empty());
+    }
 }

@@ -45,6 +45,7 @@ CASES = (
     Case(
         "invalid-motion.luau",
         (
+            "Expected this to be 'string', but got 'boolean'",
             "Expected this to be 'number', but got 'string'",
             "Property 'duration' is not compatible.",
             "missing field 'damping'",

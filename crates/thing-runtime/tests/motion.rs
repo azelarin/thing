@@ -427,3 +427,154 @@ fn lock_presentation_can_animate_without_desktop_actions() {
     assert_eq!(node(&runtime, "value").text, "25");
     assert!(runtime.take_actions().is_empty());
 }
+
+#[test]
+fn running_only_readers_drive_frames_until_the_accepted_completion_sample() {
+    let (_directory, mut runtime) = load(
+        r#"
+        local x = ui.motion(0, { kind = 'transition', duration = 1000, easing = 'in_cubic' })
+        ui.timer { interval = 1, autostart = true, on_timeout = function() x:to(1) end }
+        return ui.panel { children = {
+            ui.text { key = 'status', text = function() return tostring(x:running()) end },
+        } }
+    "#,
+    );
+    assert_eq!(node(&runtime, "status").text, "false");
+    let start = start(&mut runtime);
+    assert_eq!(node(&runtime, "status").text, "false");
+    let root = runtime.root().unwrap().id;
+    assert!(runtime.is_any_animating([root]));
+    runtime.advance(start).unwrap();
+    assert_eq!(node(&runtime, "status").text, "true");
+    assert!(!runtime.advance(start + Duration::from_millis(500)).unwrap());
+    assert!(runtime.is_any_animating([root]));
+    runtime.advance(start + Duration::from_secs(1)).unwrap();
+    assert_eq!(node(&runtime, "status").text, "false");
+    assert!(!runtime.is_any_animating([root]));
+}
+
+#[test]
+fn spring_exit_retains_content_through_overshoot_and_reopening() {
+    let (_directory, mut runtime) = load(
+        r#"
+        local opened = ui.state(false)
+        local progress = ui.motion(1, { kind = 'spring', stiffness = 100, damping = 0.1, epsilon = 0.001 })
+        ui.timer { interval = 1, autostart = true, on_timeout = function() progress:to(0) end }
+        ui.timer { interval = 151, autostart = true,
+            on_timeout = function() opened:set(true); progress:to(1) end }
+        ui.timer { interval = 301, autostart = true,
+            on_timeout = function() opened:set(false); progress:to(0) end }
+        return ui.panel { children = {
+            ui.text { key = 'status', text = function() return tostring(progress:running()) end },
+            ui.text { key = 'position', text = function() return tostring(progress:get()) end },
+            ui.column { key = 'holder', children = function()
+                if not opened:get() and not progress:running() and progress:get() == 0 then
+                    return {}
+                end
+                return { ui.button { key = 'body', style = {
+                    opacity = function() return math.clamp(progress:get(), 0, 1) end,
+                } } }
+            end },
+        } }
+    "#,
+    );
+    let id = node(&runtime, "body").id;
+    let start = start(&mut runtime);
+    runtime.advance(start + Duration::from_millis(200)).unwrap();
+    assert!(node(&runtime, "position").text.parse::<f64>().unwrap() < 0.0);
+    assert_eq!(node(&runtime, "status").text, "true");
+    assert_eq!(node(&runtime, "body").id, id);
+    fire(&mut runtime, start + Duration::from_millis(250));
+    runtime.advance(start + Duration::from_millis(450)).unwrap();
+    assert_eq!(node(&runtime, "body").id, id);
+    fire(&mut runtime, start + Duration::from_millis(500));
+    runtime.advance(start + Duration::from_millis(700)).unwrap();
+    assert_eq!(node(&runtime, "body").id, id);
+    runtime.advance(start + Duration::from_secs(100)).unwrap();
+    assert_eq!(node(&runtime, "position").text, "0");
+    assert_eq!(node(&runtime, "status").text, "false");
+    assert!(node(&runtime, "holder").children.is_empty());
+    assert!(!runtime.is_any_animating([runtime.root().unwrap().id]));
+}
+
+#[test]
+fn stop_and_jump_clear_running_on_their_next_sample() {
+    let (_directory, mut runtime) = load(
+        r#"
+        local x = ui.motion(0, { kind = 'transition', duration = 1000, easing = 'linear' })
+        local y = ui.motion(0, { kind = 'transition', duration = 1000, easing = 'linear' })
+        ui.timer { interval = 1, autostart = true, on_timeout = function() x:to(100); y:to(100) end }
+        ui.timer { interval = 251, autostart = true, on_timeout = function() x:stop(); y:jump(42) end }
+        return ui.panel { children = {
+            ui.text { key = 'x', text = function() return tostring(x:get()) .. ':' .. tostring(x:running()) end },
+            ui.text { key = 'y', text = function() return tostring(y:get()) .. ':' .. tostring(y:running()) end },
+        } }
+    "#,
+    );
+    let start = start(&mut runtime);
+    runtime.advance(start + Duration::from_millis(100)).unwrap();
+    assert_eq!(node(&runtime, "x").text, "10:true");
+    let stopped = start + Duration::from_millis(250);
+    fire(&mut runtime, stopped);
+    assert_eq!(node(&runtime, "x").text, "10:true");
+    runtime.advance(stopped).unwrap();
+    assert_eq!(node(&runtime, "x").text, "25:false");
+    assert_eq!(node(&runtime, "y").text, "42:false");
+}
+
+#[test]
+fn immediate_and_unchanged_targets_never_report_a_running_sample() {
+    let (_directory, mut runtime) = load(
+        r#"
+        local x = ui.motion(0, { kind = 'transition', duration = 0 })
+        local y = ui.motion(0, { kind = 'transition', duration = 1000 })
+        ui.timer { interval = 1, autostart = true, on_timeout = function() x:to(1); y:to(0) end }
+        return ui.panel { children = {
+            ui.text { key = 'x', text = function() return tostring(x:get()) .. ':' .. tostring(x:running()) end },
+            ui.text { key = 'y', text = function() return tostring(y:running()) end },
+        } }
+    "#,
+    );
+    let start = start(&mut runtime);
+    runtime.advance(start).unwrap();
+    assert_eq!(node(&runtime, "x").text, "1:false");
+    assert_eq!(node(&runtime, "y").text, "false");
+    assert!(!runtime.is_any_animating([runtime.root().unwrap().id]));
+}
+
+#[test]
+fn rejected_completion_preserves_the_running_sample_until_recovery() {
+    let (_directory, mut runtime) = load(
+        r#"
+        local x = ui.motion(0, { kind = 'transition', duration = 1000 })
+        ui.timer { interval = 1, autostart = true, on_timeout = function() x:to(1) end }
+        return ui.panel { children = {
+            ui.text { key = 'status', text = function() return tostring(x:running()) end },
+            ui.button { key = 'reset', on_click = function() x:jump(0) end },
+            ui.row { key = 'holder', children = function()
+                return if x:running() then { ui.text { key = 'retained', text = 'leaving' } } else {}
+            end },
+        } }
+    "#,
+    );
+    let start = start(&mut runtime);
+    runtime.advance(start + Duration::from_millis(100)).unwrap();
+    assert_eq!(node(&runtime, "status").text, "true");
+    let retained = node(&runtime, "retained").id;
+    assert!(
+        runtime
+            .advance_checked(start + Duration::from_secs(1), |_| Err(
+                "unsupported frame".into()
+            ))
+            .is_err()
+    );
+    assert_eq!(node(&runtime, "status").text, "true");
+    assert_eq!(node(&runtime, "retained").id, retained);
+    assert!(!runtime.is_any_animating([runtime.root().unwrap().id]));
+    runtime
+        .dispatch(node(&runtime, "reset").id, Event::Click)
+        .unwrap();
+    runtime.advance(start + Duration::from_secs(2)).unwrap();
+    assert_eq!(node(&runtime, "status").text, "false");
+    assert!(node(&runtime, "holder").children.is_empty());
+}

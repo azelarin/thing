@@ -144,6 +144,7 @@ export type ThingMotionOptions = {
 declare extern type ThingMotion with
     read get: (self: ThingMotion) -> number
     read velocity: (self: ThingMotion) -> number
+    read running: (self: ThingMotion) -> boolean
     read to: (self: ThingMotion, target: number) -> ()
     read jump: (self: ThingMotion, value: number) -> ()
     read stop: (self: ThingMotion) -> ()
