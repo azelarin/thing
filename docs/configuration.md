@@ -1695,6 +1695,64 @@ to a text widget or `style = theme.button` to a button. changing the table after
 construction does not update existing widgets; use property functions for style
 values that need to follow state.
 
+## widget bounds
+
+`ui.bounds(widget)` reads the widget's border boxes from the last frame
+successfully submitted to the compositor. call it from an event handler or timer
+callback:
+
+```luau
+local label = ui.text { text = 'anchor' }
+local center = ui.state(0)
+
+return ui.panel {
+    children = {
+        ui.button {
+            children = { label },
+            on_click = function()
+                local bounds = ui.bounds(label)
+                if bounds then
+                    center:set(bounds.visual.x + bounds.visual.width / 2)
+                end
+            end,
+        },
+        ui.text { text = function() return tostring(center:get()) end },
+    },
+}
+```
+
+the result has three read-only fields:
+
+| field | meaning |
+| --- | --- |
+| `layout` | `{ x, y, width, height }` before visual transforms |
+| `visual` | the axis-aligned box around the transformed border box |
+| `surface` | an opaque identifier for the boxes' coordinate space |
+
+both rectangles use logical coordinates relative to the owning surface. they
+describe the complete border box, including parts outside an ancestor's clip.
+they do not report whether another widget or application covers it. compare
+`surface` values before combining rectangles; a popup has its own coordinate
+space. the identifier is local to this configuration, and does not expose a
+global window position or map between independent wayland surfaces.
+
+the result is `nil` before the widget has been presented, after its surface is
+unmapped, or when its widget reference no longer belongs to the current tree.
+a hidden widget has no box in a newly presented layout. clipped and disabled
+widgets can still have measurements. failed updates and failed reloads preserve
+the existing snapshot; a successful reload starts without one. replacing an
+unkeyed widget invalidates measurements until a new frame is submitted. keyed
+widgets that retain their identity can keep using the previous frame's boxes.
+
+reads do not trigger layout or subscribe to geometry changes. a saved result is
+an immutable snapshot. even after a handler changes state, another read in that
+handler still sees the previous frame. property functions and configuration
+setup cannot call `ui.bounds`; this avoids a layout loop in which a widget
+continually resizes itself from its own measurement.
+
+`ui.bounds` cannot measure unconstrained content or return dimensions for an
+unopened popup.
+
 ## imports
 
 `require('./theme')` loads `theme.luau` relative to the importing file. `../` paths

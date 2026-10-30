@@ -1,19 +1,40 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
+    rc::Rc,
     time::Instant,
 };
 
-use thing_core::{Node, NodeId};
+use thing_core::{Node, NodeId, Rect};
 use thing_runtime::{
-    Action, ApplicationsSnapshot, AudioSnapshot, AuthenticationSnapshot, ClipboardSnapshot, Event,
-    IdleWatchDefinition, KeyInput, ManagedProcessDefinition, ManagedProcessSnapshot,
-    ManagedProcessState, MediaSnapshot, NiriState, NotificationSnapshot, OutputContext,
-    PointerDispatchOutcome as RuntimePointerOutcome, PointerEvent, PowerSnapshot, Runtime, Scalar,
-    ScrollInput, ServiceSnapshot, SleepInhibitorDefinition, SleepInhibitorState, SurfaceKey,
-    SurfaceTree, SystemTraySnapshot, TimerToken, UiAction, UiTarget,
+    Action, ApplicationsSnapshot, AudioSnapshot, AuthenticationSnapshot, BoundsProvider,
+    BoundsRect, ClipboardSnapshot, Event, IdleWatchDefinition, KeyInput, ManagedProcessDefinition,
+    ManagedProcessSnapshot, ManagedProcessState, MediaSnapshot, NiriState, NotificationSnapshot,
+    OutputContext, PointerDispatchOutcome as RuntimePointerOutcome, PointerEvent, PowerSnapshot,
+    PresentedBounds, Runtime, Scalar, ScrollInput, ServiceSnapshot, SleepInhibitorDefinition,
+    SleepInhibitorState, SurfaceKey, SurfaceTree, SystemTraySnapshot, TimerToken, UiAction,
+    UiTarget, WidgetBounds,
 };
 use thing_ui::Layout;
+
+struct LayoutBounds(Rc<Layout>);
+
+impl BoundsProvider for LayoutBounds {
+    fn get(&self, node: NodeId) -> Option<WidgetBounds> {
+        let placement = self.0.semantic_placement(node)?;
+        let rect = |value: Rect| BoundsRect {
+            x: value.x.into(),
+            y: value.y.into(),
+            width: value.width.into(),
+            height: value.height.into(),
+        };
+        Some(WidgetBounds {
+            node,
+            layout: rect(placement.bounds),
+            visual: rect(placement.border_aabb),
+        })
+    }
+}
 
 struct Instance<K> {
     key: K,
@@ -506,6 +527,28 @@ impl<K: Clone + Eq> Configurations<K> {
             .iter()
             .find(|instance| &instance.key == key)
             .map(|instance| &instance.output)
+    }
+
+    pub(crate) fn record_presented_bounds(
+        &self,
+        key: &K,
+        consumer: &str,
+        root: NodeId,
+        layout: Rc<Layout>,
+    ) -> Option<Rc<PresentedBounds>> {
+        if self.consumer(key)? != consumer {
+            return None;
+        }
+        match self
+            .runtime(key)?
+            .record_presented_bounds(root, Rc::new(LayoutBounds(layout)))
+        {
+            Ok(bounds) => Some(bounds),
+            Err(error) => {
+                eprintln!("thing: cannot retain presented bounds: {error}");
+                None
+            }
+        }
     }
 
     pub(crate) fn consumer(&self, key: &K) -> Option<&str> {
@@ -1617,6 +1660,95 @@ mod tests {
                 height: 12.0,
             }
         }
+    }
+
+    #[test]
+    fn bounds_follow_presented_layout_and_surface_ownership() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            local result = ui.state('')
+            local target = ui.row { key = 'target', enabled = false, style = {
+                width = 80, height = 20, translate_x = 325, scale_x = 2,
+                transform_origin = { x = 0, y = 0 },
+            } }
+            return ui.panel { style = { width = 300, height = 80, padding = 10 }, children = {
+                target,
+                ui.button { key = 'read', on_click = function()
+                    local bounds = ui.bounds(target)
+                    result:set(if bounds then string.format('%g %g %g %g', bounds.layout.x,
+                        bounds.layout.width, bounds.visual.x, bounds.visual.width) else 'none')
+                end },
+                ui.text { text = function() return result:get() end },
+            } }
+        "#,
+        )
+        .unwrap();
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        configurations.add(2, output("DP-2", 2560)).unwrap();
+        let root = configurations.root(&1).unwrap().id;
+        let button = configurations.root(&1).unwrap().children[1].id;
+        let second_button = configurations.root(&2).unwrap().children[1].id;
+        let consumer = configurations.consumer(&1).unwrap().to_owned();
+        let layout = Rc::new(
+            Layout::compute(
+                configurations.root(&1).unwrap(),
+                Size {
+                    width: 300.0,
+                    height: 80.0,
+                },
+                &mut FixedText,
+            )
+            .unwrap(),
+        );
+        let target = configurations.root(&1).unwrap().children[0].id;
+        let painted = layout.get(target).unwrap();
+        assert!(painted.border_aabb.intersection(painted.clip).is_none());
+        assert!(layout.semantic_placement(target).is_some());
+        assert!(
+            configurations
+                .record_presented_bounds(&1, "retired", root, layout.clone())
+                .is_none()
+        );
+        let lease = configurations
+            .record_presented_bounds(&1, &consumer, root, layout.clone())
+            .unwrap();
+        let mut surface = crate::focus::SurfaceLayouts::default();
+        surface.publish_shared(layout, root, consumer, BTreeMap::new());
+        surface.keep_bounds(Some(lease));
+        configurations.dispatch(&1, button, Event::Click).unwrap();
+        assert_eq!(
+            configurations.root(&1).unwrap().children[2].text,
+            "10 80 335 160"
+        );
+        configurations
+            .dispatch(&2, second_button, Event::Click)
+            .unwrap();
+        assert_eq!(configurations.root(&2).unwrap().children[2].text, "none");
+
+        let mut input_root = configurations.root(&1).unwrap().clone();
+        input_root.children[0].style.translate_x = 75.0;
+        let input_layout = Layout::compute(
+            &input_root,
+            Size {
+                width: 300.0,
+                height: 80.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        surface.stage_input(input_layout);
+        configurations.dispatch(&1, button, Event::Click).unwrap();
+        assert_eq!(
+            configurations.root(&1).unwrap().children[2].text,
+            "10 80 335 160"
+        );
+        drop(surface);
+        configurations.dispatch(&1, button, Event::Click).unwrap();
+        assert_eq!(configurations.root(&1).unwrap().children[2].text, "none");
     }
 
     #[test]

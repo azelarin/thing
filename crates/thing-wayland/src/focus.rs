@@ -1,14 +1,15 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, rc::Rc};
 
 use thing_core::NodeId;
-use thing_runtime::UiTarget;
+use thing_runtime::{PresentedBounds, UiTarget};
 use thing_ui::Layout;
 
 struct PresentedSurface {
-    layout: Layout,
+    layout: Rc<Layout>,
     root: NodeId,
     consumer: String,
     targets: BTreeMap<NodeId, UiTarget>,
+    _bounds: Option<Rc<PresentedBounds>>,
 }
 
 #[derive(Default)]
@@ -28,7 +29,9 @@ pub(crate) enum LayoutSnapshot {
 
 impl SurfaceLayouts {
     pub(crate) fn presented(&self) -> Option<&Layout> {
-        self.presented.as_ref().map(|presented| &presented.layout)
+        self.presented
+            .as_ref()
+            .map(|presented| presented.layout.as_ref())
     }
 
     pub(crate) fn input(&self) -> Option<&Layout> {
@@ -84,9 +87,20 @@ impl SurfaceLayouts {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn publish(
         &mut self,
         layout: Layout,
+        root: NodeId,
+        consumer: String,
+        targets: BTreeMap<NodeId, UiTarget>,
+    ) {
+        self.publish_shared(Rc::new(layout), root, consumer, targets);
+    }
+
+    pub(crate) fn publish_shared(
+        &mut self,
+        layout: Rc<Layout>,
         root: NodeId,
         consumer: String,
         targets: BTreeMap<NodeId, UiTarget>,
@@ -96,9 +110,16 @@ impl SurfaceLayouts {
             root,
             consumer,
             targets,
+            _bounds: None,
         });
         self.input = None;
         self.input_invalidated = false;
+    }
+
+    pub(crate) fn keep_bounds(&mut self, bounds: Option<Rc<PresentedBounds>>) {
+        if let Some(presented) = &mut self.presented {
+            presented._bounds = bounds;
+        }
     }
 
     pub(crate) fn invalidate_input(&mut self) {

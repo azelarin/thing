@@ -30,6 +30,14 @@ CASES = (
     Case("valid.luau"),
     Case("valid-timers.luau"),
     Case("valid-motion.luau"),
+    Case("valid-bounds.luau"),
+    Case(
+        "invalid-bounds.luau",
+        (
+            "Expected this to be 'ThingWidget', but got 'string'",
+            "Expected this to be 'string', but got 'number'",
+        ),
+    ),
     Case(
         "invalid-motion.luau",
         (

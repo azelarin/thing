@@ -2682,11 +2682,19 @@ impl App {
                 FrameResult::Presented { redraw } => {
                     let animating = configurations.layout_is_animating(&surface.output, &layout);
                     let (consumer, targets) = presented_ui;
+                    let layout = Rc::new(layout);
+                    let bounds = configurations.record_presented_bounds(
+                        &surface.output,
+                        &consumer,
+                        surface.root,
+                        layout.clone(),
+                    );
                     surface.waiting = true;
                     surface.scroll = scroll;
                     surface
                         .layouts
-                        .publish(layout, surface.root, consumer, targets);
+                        .publish_shared(layout, surface.root, consumer, targets);
+                    surface.layouts.keep_bounds(bounds);
                     surface.dirty = redraw || animating;
                     presented.push(index);
                 }

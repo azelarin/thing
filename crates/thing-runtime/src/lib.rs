@@ -3,6 +3,7 @@
 //! a [`Runtime`] owns a loaded configuration and its state. it exposes validated
 //! surface trees to the renderer.
 
+mod bounds;
 mod idle;
 mod modules;
 mod motion;
@@ -14,6 +15,7 @@ mod sleep;
 mod state;
 mod timer;
 mod transition;
+pub use bounds::{BoundsProvider, BoundsRect, PresentedBounds, WidgetBounds};
 pub use idle::{IdleWatchDefinition, MAX_IDLE_TIMEOUT_MS, MAX_IDLE_WATCHES, MIN_IDLE_TIMEOUT_MS};
 pub use niri::{NiriAction, NiriState, NiriWindow, Workspace};
 pub use services::{
@@ -372,6 +374,7 @@ pub struct Runtime {
     ui: Rc<RefCell<UiContext>>,
     timers: Rc<RefCell<timer::Timers>>,
     motions: Rc<RefCell<motion::Motions>>,
+    bounds: Rc<RefCell<bounds::Bounds>>,
     event_depth: usize,
     output: Option<OutputContext>,
     mode: ConfigurationMode,
@@ -482,7 +485,8 @@ impl Runtime {
         }
         let timers = Rc::new(RefCell::new(timer::Timers::default()));
         let motions = Rc::new(RefCell::new(motion::Motions::new(tracker.clone())));
-        let ui = install_ui(&lua, tracker.clone(), &timers, &motions)?;
+        let bounds = Rc::new(RefCell::new(bounds::Bounds::default()));
+        let ui = install_ui(&lua, tracker.clone(), &timers, &motions, &bounds)?;
         lua.sandbox(true)?;
         let modules = modules::Modules::default();
         let exported = modules.load(&lua, path)?;
@@ -532,6 +536,7 @@ impl Runtime {
             ui,
             timers,
             motions,
+            bounds,
             event_depth: 0,
             output,
             mode,
@@ -856,6 +861,27 @@ impl Runtime {
             .filter(|target| ids.contains(&target.node))
             .map(|target| (target.node, target.clone()))
             .collect()
+    }
+
+    /// publish measured boxes after submitting a frame. keep the returned lease until
+    /// the surface is unmapped or its next frame replaces these measurements.
+    pub fn record_presented_bounds(
+        &self,
+        root: NodeId,
+        provider: Rc<dyn BoundsProvider>,
+    ) -> Result<Rc<PresentedBounds>> {
+        let is_surface = self.surfaces.iter().any(|surface| {
+            surface
+                .root
+                .find(root)
+                .is_some_and(|node| root == surface.root.id || node.kind == Kind::Popup)
+        });
+        if !is_surface {
+            return Err(Error::runtime(
+                "presented bounds have no current surface root",
+            ));
+        }
+        self.bounds.borrow_mut().record(root, provider)
     }
 
     pub fn focus_target(&self, id: NodeId) -> Option<UiTarget> {
@@ -2002,6 +2028,7 @@ impl Runtime {
         self.services.allow_actions(allowed);
         self.timers.borrow_mut().allow_controls(allowed);
         self.motions.borrow_mut().allow_controls(allowed);
+        self.bounds.borrow_mut().allow_reads(allowed);
         let mut ui = self.ui.borrow_mut();
         ui.action_start = allowed.then_some(ui.actions.len());
     }
@@ -2055,6 +2082,9 @@ impl Runtime {
                 .is_none_or(|current| !ui_target_identity_matches(current, previous))
         });
         context.targets = targets;
+        if identity_changed {
+            self.bounds.borrow_mut().clear();
+        }
         identity_changed
     }
 
@@ -2553,11 +2583,13 @@ fn install_ui(
     tracker: Rc<RefCell<Tracker>>,
     timers: &Rc<RefCell<timer::Timers>>,
     motions: &Rc<RefCell<motion::Motions>>,
+    bounds: &Rc<RefCell<bounds::Bounds>>,
 ) -> Result<Rc<RefCell<UiContext>>> {
     let ui = lua.create_table()?;
     timer::Timers::install(timers, lua, &ui)?;
     motion::Motions::install(motions, lua, &ui)?;
     let context = Rc::new(RefCell::new(UiContext::default()));
+    bounds::Bounds::install(bounds, &context, lua, &ui)?;
     let next_id = Rc::new(Cell::new(1_u64));
     for name in [
         "panel",

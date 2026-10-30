@@ -23,10 +23,13 @@ ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests/rendering"
 ARTIFACTS = ROOT / "target/render-tests"
 CASES = (
-    "image-fit", "stencil", "gradients", "radial-gradients", "shadows", "shared-motion"
+    "image-fit", "stencil", "gradients", "radial-gradients", "shadows", "shared-motion",
+    "widget-bounds",
 )
 # these accept a state only after the same passing frame is captured twice.
-STABLE_FRAMES = {"radial-gradients": 2, "shadows": 2, "shared-motion": 2}
+STABLE_FRAMES = {
+    "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2,
+}
 RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
 # the runtime error each panel-invalid.luau must produce, in thing check and in
 # the log of the running host.
@@ -373,6 +376,31 @@ def verify_shared_motion(image, stage, scale):
         expect_color(image, (edge + 20, y), scale, background, "content marker end", tolerance=3)
 
 
+def verify_widget_bounds(image, stage, scale):
+    colors = ((224, 164, 81), (196, 112, 210)) if stage == "reload" else (
+        (40, 179, 161), (121, 151, 255)
+    )
+
+    def span(y, color):
+        pixels = [
+            x for x in range(physical(20, scale), physical(620, scale))
+            if max(abs(a - b) for a, b in zip(image.pixel(x, physical(y, scale)), color)) <= 3
+        ]
+        if not pixels:
+            raise FixtureError("target or measurement marker has not appeared")
+        return pixels[0], pixels[-1]
+
+    for index, color in enumerate(colors):
+        target = span(40, color)
+        marker = span(100, color)
+        if index == 0 and target[1] - target[0] + 1 < 150 * scale:
+            raise FixtureError("waiting for the target text to grow")
+        if abs(sum(target) - sum(marker)) > 3:
+            raise FixtureError("measurement marker does not follow the presented target center")
+        if abs(marker[1] - marker[0] + 1 - 8 * scale) > 2:
+            raise FixtureError("measurement marker has an unexpected width")
+
+
 def verify_capture(case, image, stage, scale):
     if case == "image-fit":
         verify_image_fit(image, stage, scale)
@@ -386,6 +414,8 @@ def verify_capture(case, image, stage, scale):
         verify_shadows(image, stage, scale)
     elif case == "shared-motion":
         verify_shared_motion(image, stage, scale)
+    elif case == "widget-bounds":
+        verify_widget_bounds(image, stage, scale)
     else:
         raise FixtureError(f"unknown renderer fixture: {case}")
 
