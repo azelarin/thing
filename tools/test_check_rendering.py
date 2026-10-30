@@ -1,6 +1,7 @@
 """test the renderer harness without starting a compositor or graphics backend."""
 
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -377,7 +378,7 @@ class ShadowOracleTest(unittest.TestCase):
 
 
 class StableCaptureTest(unittest.TestCase):
-    def capture(self, frames, required):
+    def capture(self, frames, required, case="shadows", scale=1.0):
         calls = []
         sequence = iter(frames)
 
@@ -403,9 +404,9 @@ class StableCaptureTest(unittest.TestCase):
                     RunningProcess(),
                     "output",
                     Path(directory) / "capture.ppm",
-                    "shadows",
+                    case,
                     "scale-1",
-                    1.0,
+                    scale,
                     len(frames),
                     frames=required,
                 )
@@ -424,6 +425,107 @@ class StableCaptureTest(unittest.TestCase):
         with self.assertRaisesRegex(FixtureError, "waiting for 2 identical frames"):
             self.capture([good, broken, good], 2)
         self.assertEqual(self.capture([good, broken, good, good], 2), 4)
+
+
+    def test_radial_gradients_need_two_identical_passing_frames(self):
+        required = check_rendering.STABLE_FRAMES["radial-gradients"]
+        self.assertEqual(required, 2)
+        frame = RadialFrame(1.0)
+        self.assertEqual(self.capture([frame, frame], required, "radial-gradients"), 2)
+        with self.assertRaisesRegex(FixtureError, "waiting for 2 identical frames"):
+            self.capture([frame, RadialFrame(1.0, filled_hole=True), frame], required, "radial-gradients")
+
+
+RADIAL_BACKGROUND = check_rendering.RADIAL_BACKGROUND
+RED = check_rendering.RADIAL_RED
+BLUE = check_rendering.RADIAL_BLUE
+
+
+class RadialFrame:
+    """a plausible radial-gradients frame, evaluated from the gallery's
+    geometry at each physical pixel center. `linear` replaces every radial
+    cell with a horizontal linear gradient; `filled_hole` paints the path's
+    hole; `blank` paints only the panel background."""
+
+    def __init__(self, scale, *, reload=False, linear=False, filled_hole=False, blank=False):
+        self.scale = scale
+        width = check_rendering.physical(460, scale)
+        height = check_rendering.physical(240, scale)
+        pixels = bytearray()
+        for row in range(height):
+            y = (row + 0.5) / scale
+            for column in range(width):
+                x = (column + 0.5) / scale
+                color = RADIAL_BACKGROUND if blank else self.pixel(x, y, reload, linear, filled_hole)
+                pixels += bytes(color)
+        self.ppm_image = Ppm(width, height, bytes(pixels))
+
+    @staticmethod
+    def pixel(x, y, reload, linear, filled_hole):
+        def gray(distance):
+            return (check_rendering.falloff_gray(distance),) * 3
+
+        def falloff(center, radii, box):
+            if linear:
+                return gray((x - box[0]) / box[1])
+            return gray(math.hypot((x - center[0]) / radii[0], (y - center[1]) / radii[1]))
+
+        top = 10 <= y < 110
+        bottom = 130 <= y < 230
+        if top and 10 <= x < 210:
+            if reload:
+                return falloff((60, 60), (50, 50), (10, 200))
+            return falloff((110, 60), (100, 50), (10, 200))
+        if top and 230 <= x < 330:
+            distance = (x - 230) / 100 if linear else math.hypot(x - 280, y - 60) / 50
+            alpha = 1 - min(distance, 1.0)
+            return (round(255 * alpha + RADIAL_BACKGROUND[0] * (1 - alpha)),) * 3
+        if top and 350 <= x < 450:
+            distance = (x - 350) / 100 if linear else math.hypot(x - 400, y - 60) / 50
+            return RED if distance < 0.5 else BLUE
+        if bottom and 10 <= x < 210:
+            return falloff((160, 180), (50, 50), (10, 200))
+        if bottom and 230 <= x < 330:
+            if 260 <= x < 300 and 160 <= y < 200 and not filled_hole:
+                return RADIAL_BACKGROUND
+            return falloff((280, 180), (50, 50), (230, 100))
+        return RADIAL_BACKGROUND
+
+    def image(self):
+        return self.ppm_image
+
+    def ppm(self):
+        image = self.ppm_image
+        return f"P6\n{image.width} {image.height}\n255\n".encode() + image.pixels
+
+
+class RadialOracleTest(unittest.TestCase):
+    def verify(self, frame, stage="scale-1"):
+        check_rendering.verify_capture("radial-gradients", frame.image(), stage, frame.scale)
+
+    def test_accepts_plausible_frames_at_both_scales(self):
+        for scale in (1.0, 1.25):
+            with self.subTest(scale=scale):
+                self.verify(RadialFrame(scale), "scale-1")
+                self.verify(RadialFrame(scale, reload=True), "reload")
+
+    def test_rejects_a_blank_frame(self):
+        with self.assertRaises(FixtureError):
+            self.verify(RadialFrame(1.0, blank=True))
+
+    def test_rejects_a_linear_gradient_substitute(self):
+        with self.assertRaisesRegex(FixtureError, "a: ellipse"):
+            self.verify(RadialFrame(1.25, linear=True), "scale-1.25")
+
+    def test_rejects_a_filled_path_hole(self):
+        with self.assertRaisesRegex(FixtureError, "e: path hole stays clear"):
+            self.verify(RadialFrame(1.25, filled_hole=True), "scale-1.25")
+
+    def test_stale_pixels_do_not_pass_the_valid_reload(self):
+        with self.assertRaisesRegex(FixtureError, "a: reloaded circle"):
+            self.verify(RadialFrame(1.25), "reload")
+        with self.assertRaisesRegex(FixtureError, "a: ellipse"):
+            self.verify(RadialFrame(1.25, reload=True), "scale-1.25")
 
 
 class RejectedReloadTest(unittest.TestCase):

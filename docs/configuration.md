@@ -1354,7 +1354,8 @@ style = {
 
 ### gradients
 
-`style.background` and a path's `fill` accept a hex color or a linear gradient:
+`style.background` and a path's `fill` accept a hex color, a linear gradient,
+or a radial gradient:
 
 ```luau
 background = {
@@ -1368,9 +1369,9 @@ background = {
 }
 ```
 
-endpoints are fractions of the paint box: `(0, 0)` is its top-left corner and
-`(1, 1)` its bottom-right. a background uses the widget's border box; a path
-uses its content box after padding, before the path is fitted into it. the
+gradient coordinates are fractions of the paint box: `(0, 0)` is its top-left
+corner and `(1, 1)` its bottom-right. a background uses the widget's border box;
+a path uses its content box after padding, before the path is fitted into it. the
 existing radius and path clips still apply. moving, scaling, or rotating a
 widget moves its gradient with it.
 
@@ -1382,7 +1383,35 @@ fringe. inherited opacity applies to the result.
 
 endpoints must be finite and different, but can lie outside the paint box.
 coordinates that cannot be represented by the renderer are rejected during
-layout. a function can return a whole gradient to react to state; changing a
+layout.
+
+a radial gradient spreads its stops from `center` out to an ellipse. `radius.x`
+is a fraction of the paint box's width and `radius.y` a fraction of its height,
+so equal values follow the box's shape. to draw a circle on a 200 by 100 box,
+halve the horizontal fraction:
+
+```luau
+background = {
+    kind = 'radial',
+    center = { x = 0.5, y = 0.5 },
+    -- 0.25 of 200 and 0.5 of 100 are both 50 pixels.
+    radius = { x = 0.25, y = 0.5 },
+    stops = {
+        { position = 0, color = '#ffffff' },
+        { position = 1, color = '#ffffff00' },
+    },
+}
+```
+
+position 0 is the center and position 1 the ellipse; beyond it the last color
+continues. both radii are required and must be finite and positive. the center
+may lie outside the paint box and radii may exceed 1, so a glow can come from a
+corner or past an edge. stops, mixing, clipping, and opacity work as they do
+for linear gradients. layout rejects radii too small to represent and distant
+centers whose rings lose precision within the paint box. there are no focal
+points, conical gradients, or repeat modes.
+
+a function can return a whole gradient to react to state; changing a
 stop in a plain table does not trigger a refresh. color transitions still work
 with solid backgrounds. to animate a gradient, animate state used by the
 function that returns it; gradient tables do not interpolate automatically.

@@ -22,9 +22,9 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests/rendering"
 ARTIFACTS = ROOT / "target/render-tests"
-CASES = ("image-fit", "stencil", "gradients", "shadows")
-# shadows accept a state only after the same passing frame is captured twice.
-STABLE_FRAMES = {"shadows": 2}
+CASES = ("image-fit", "stencil", "gradients", "radial-gradients", "shadows")
+# these accept a state only after the same passing frame is captured twice.
+STABLE_FRAMES = {"radial-gradients": 2, "shadows": 2}
 RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
 # the runtime error each panel-invalid.luau must produce, in thing check and in
 # the log of the running host.
@@ -199,6 +199,70 @@ def verify_gradients(image, stage, scale):
     expect_color(image, (450, 245), scale, (59, 59, 59), "mirrored gradient end")
 
 
+RADIAL_BACKGROUND = (32, 32, 32)
+RADIAL_RED = (255, 0, 0)
+RADIAL_BLUE = (0, 0, 255)
+
+
+def falloff_gray(distance):
+    """the srgb gray of a white-to-black falloff interpolated in linear light."""
+    linear = 1 - min(max(distance, 0.0), 1.0)
+    encoded = 12.92 * linear if linear <= 0.0031308 else 1.055 * linear ** (1 / 2.4) - 0.055
+    return round(255 * encoded)
+
+
+def radial_distance(point, scale, center, radii):
+    """the normalized distance of the physical pixel a logical probe lands on."""
+    x = (physical(point[0], scale) + 0.5) / scale
+    y = (physical(point[1], scale) + 0.5) / scale
+    return math.hypot((x - center[0]) / radii[0], (y - center[1]) / radii[1])
+
+
+def verify_radial_gradients(image, stage, scale):
+    def falloff(label, point, center, radii):
+        distance = radial_distance(point, scale, center, radii)
+        gray = falloff_gray(distance)
+        expect_color(image, point, scale, (gray,) * 3, label, tolerance=12)
+
+    def fade(label, point):
+        # white fading to transparent white over the panel background.
+        alpha = 1 - min(radial_distance(point, scale, (280, 60), (50, 50)), 1.0)
+        value = round(255 * alpha + RADIAL_BACKGROUND[0] * (1 - alpha))
+        expect_color(image, point, scale, (value,) * 3, label, tolerance=12)
+
+    # a: a 200 by 100 box with equal proportions forms a 100 by 50 ellipse.
+    # the reload turns it into a circle centered on the left quarter.
+    if stage == "reload":
+        for point in ((60, 60), (85, 60), (60, 85), (110, 60), (180, 60)):
+            falloff("a: reloaded circle", point, (60, 60), (50, 50))
+    else:
+        for point in ((110, 60), (160, 60), (110, 85), (60, 60), (200, 105)):
+            falloff("a: ellipse", point, (110, 60), (100, 50))
+        wide = brightness(sample(image, (160, 60), scale))
+        tall = brightness(sample(image, (110, 85), scale))
+        if abs(wide - tall) > 8:
+            raise FixtureError(
+                f"a: ellipse halfway points differ: {wide:.0f} across, {tall:.0f} down"
+            )
+    # b: alpha falls off around the center and leaves the panel at the corner.
+    for point in ((280, 60), (305, 60), (280, 100), (233, 13)):
+        fade("b: transparent falloff", point)
+    # c: a hard stop at half the radius; a linear substitute would be red at
+    # the left probe and blue at the right one.
+    expect_color(image, (400, 60), scale, RADIAL_RED, "c: hard stop inner ring")
+    expect_color(image, (385, 60), scale, RADIAL_RED, "c: hard stop inner ring")
+    for point in ((365, 60), (435, 60), (400, 95), (440, 100)):
+        expect_color(image, point, scale, RADIAL_BLUE, "c: hard stop outer ring")
+    # d: the circle sits on the left quarter of its box before the mirror.
+    for point in ((160, 180), (185, 180), (160, 205), (110, 180), (60, 180)):
+        falloff("d: mirrored circle", point, (160, 180), (50, 50))
+    # e: an even-odd ring keeps its hole clear and fills the ring.
+    for point in ((280, 180), (265, 165), (295, 195)):
+        expect_color(image, point, scale, RADIAL_BACKGROUND, "e: path hole stays clear")
+    for point in ((245, 180), (280, 145), (315, 180), (325, 225)):
+        falloff("e: path ring", point, (280, 180), (50, 50))
+
+
 SHADOW_BACKGROUND = (224, 224, 224)
 SHADOW_WHITE = (255, 255, 255)
 SHADOW_GREEN = (0, 160, 0)
@@ -299,6 +363,8 @@ def verify_capture(case, image, stage, scale):
         verify_stencil(image, stage, scale)
     elif case == "gradients":
         verify_gradients(image, stage, scale)
+    elif case == "radial-gradients":
+        verify_radial_gradients(image, stage, scale)
     elif case == "shadows":
         verify_shadows(image, stage, scale)
     else:

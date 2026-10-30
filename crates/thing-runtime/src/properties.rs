@@ -43,35 +43,65 @@ fn brush(value: Value, name: &str) -> Result<thing_core::Brush> {
     let Value::Table(table) = value else {
         return color(value, name).map(Into::into);
     };
+    let kind = string(table.raw_get("kind")?, "brush.kind")?;
+    let fields: &[&str] = match kind.as_str() {
+        "linear" => &["kind", "from", "to", "stops"],
+        "radial" => &["kind", "center", "radius", "stops"],
+        _ => return Err(Error::runtime("brush kind must be 'linear' or 'radial'")),
+    };
     for field in table.clone().pairs::<String, Value>() {
         let (field, _) = field?;
-        if !matches!(field.as_str(), "kind" | "from" | "to" | "stops") {
-            return Err(Error::runtime(format!("unknown brush property {field:?}")));
+        if !fields.contains(&field.as_str()) {
+            return Err(Error::runtime(format!(
+                "unknown {kind} gradient property {field:?}"
+            )));
         }
     }
-    if string(table.raw_get("kind")?, "brush.kind")? != "linear" {
-        return Err(Error::runtime("brush kind must be 'linear'"));
-    }
-    fn point(value: Value) -> Result<thing_core::GradientPoint> {
-        let Value::Table(table) = value else {
-            return Err(Error::runtime("gradient endpoints must be point tables"));
-        };
-        for pair in table.clone().pairs::<String, Value>() {
-            let (field, _) = pair?;
-            if !matches!(field.as_str(), "x" | "y") {
-                return Err(Error::runtime(format!(
-                    "unknown gradient endpoint property {field:?}"
-                )));
-            }
-        }
-        Ok(thing_core::GradientPoint {
-            x: number(table.raw_get("x")?, "gradient x")?,
-            y: number(table.raw_get("y")?, "gradient y")?,
+    let stops = gradient_stops(table.raw_get("stops")?)?;
+    let brush = if kind == "linear" {
+        thing_core::Brush::Linear(thing_core::LinearGradient {
+            from: gradient_point(table.raw_get("from")?, "gradient from")?,
+            to: gradient_point(table.raw_get("to")?, "gradient to")?,
+            stops,
         })
+    } else {
+        let radius = gradient_point(table.raw_get("radius")?, "gradient radius")?;
+        if radius.x <= 0.0 || radius.y <= 0.0 {
+            return Err(Error::runtime("gradient radius x and y must be positive"));
+        }
+        thing_core::Brush::Radial(thing_core::RadialGradient {
+            center: gradient_point(table.raw_get("center")?, "gradient center")?,
+            radius,
+            stops,
+        })
+    };
+    brush.validate().map_err(Error::external)?;
+    Ok(brush)
+}
+
+/// a paint box point or radius pair with finite `x` and `y` and no other keys.
+fn gradient_point(value: Value, name: &str) -> Result<thing_core::GradientPoint> {
+    let Value::Table(table) = value else {
+        return Err(Error::runtime(format!(
+            "{name} must be a table with x and y"
+        )));
+    };
+    for pair in table.clone().pairs::<String, Value>() {
+        let (field, _) = pair?;
+        if !matches!(field.as_str(), "x" | "y") {
+            return Err(Error::runtime(format!("unknown {name} property {field:?}")));
+        }
     }
-    let from = point(table.raw_get("from")?)?;
-    let to = point(table.raw_get("to")?)?;
-    let stops: Table = table.raw_get("stops")?;
+    Ok(thing_core::GradientPoint {
+        x: number(table.raw_get("x")?, &format!("{name} x"))?,
+        y: number(table.raw_get("y")?, &format!("{name} y"))?,
+    })
+}
+
+fn gradient_stops(value: Value) -> Result<Vec<thing_core::GradientStop>> {
+    let Value::Table(stops) = value else {
+        return Err(Error::runtime("gradient stops must be an array"));
+    };
     let length = stops.raw_len();
     if !(2..=16).contains(&length) {
         return Err(Error::runtime("a gradient needs 2 through 16 stops"));
@@ -111,13 +141,7 @@ fn brush(value: Value, name: &str) -> Result<thing_core::Brush> {
             color: color(stop.raw_get("color")?, "gradient stop color")?,
         });
     }
-    let brush = thing_core::Brush::Linear(thing_core::LinearGradient {
-        from,
-        to,
-        stops: parsed,
-    });
-    brush.validate().map_err(Error::external)?;
-    Ok(brush)
+    Ok(parsed)
 }
 
 fn shadow(value: Value) -> Result<Option<thing_core::Shadow>> {
