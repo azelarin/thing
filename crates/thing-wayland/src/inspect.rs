@@ -4,7 +4,7 @@ use thing_core::{Kind, Node, Rect, Scale};
 use thing_runtime::{OutputContext, Runtime, ServiceSnapshot, SurfaceKey};
 use thing_ui::{Layout, Size, TextSystem};
 
-use crate::{panel, popup};
+use crate::{panel, popup, toplevel};
 
 /// evaluates layout with an explicit output context and no desktop connections.
 pub struct LayoutInspector {
@@ -53,13 +53,17 @@ impl LayoutInspector {
                 SurfaceKey::Default => "default".into(),
                 SurfaceKey::Named(key) => format!("{key:?}"),
             };
-            let size = panel::logical_size(
-                panel::geometry(&surface.root, None),
-                (self.output.width, self.output.height),
-            );
+            let size = if surface.root.kind == Kind::Window {
+                toplevel::initial_size(&surface.root.window, None)
+            } else {
+                panel::logical_size(
+                    panel::geometry(&surface.root, None),
+                    (self.output.width, self.output.height),
+                )
+            };
             describe_surface(
                 &mut report,
-                &format!("panel {key}"),
+                &format!("{} {key}", kind(surface.root.kind)),
                 &surface.root,
                 size,
                 &mut text,
@@ -163,6 +167,7 @@ fn optional_name(name: Option<&str>) -> String {
 fn kind(kind: Kind) -> &'static str {
     match kind {
         Kind::Panel => "panel",
+        Kind::Window => "window",
         Kind::Lock => "lock",
         Kind::Popup => "popup",
         Kind::Row => "row",

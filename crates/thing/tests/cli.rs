@@ -455,3 +455,37 @@ fn check_validates_managed_processes_without_starting_the_host_service() {
     assert!(output.status.success(), "{output:?}");
     assert!(!marker.exists());
 }
+
+#[test]
+fn inspect_reports_a_window_at_its_initial_content_size() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("windows.luau");
+    fs::write(
+        &path,
+        r#"
+        return {
+            ui.panel { key = 'bar', style = { height = 40 } },
+            ui.window { key = 'settings', size = { width = 420, height = 300 },
+                children = { ui.text { text = 'settings' } },
+            },
+        }
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/does/not/exist")
+        .args(["inspect", "--output-size", "1920x1080"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(report.contains("panel \"bar\" size=1920x40"), "{report}");
+    assert!(
+        report.contains("window \"settings\" size=420x300"),
+        "{report}"
+    );
+}
