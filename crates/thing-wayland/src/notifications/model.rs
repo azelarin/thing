@@ -131,6 +131,8 @@ pub(crate) struct Notification {
     pub(crate) created_at_ms: u64,
     pub(crate) updated_at_ms: u64,
     pub(crate) expires_at_ms: Option<u64>,
+    pub(crate) expiry_paused: bool,
+    pub(crate) paused_remaining_ms: Option<u32>,
     pub(crate) closed: Option<Closed>,
     retained_bytes: usize,
 }
@@ -246,7 +248,16 @@ impl Model {
             current.urgency = urgency;
             current.effective_timeout_ms = effective_timeout_ms;
             current.updated_at_ms = now_ms;
-            current.expires_at_ms = expires_at_ms;
+            current.expires_at_ms = if current.expiry_paused {
+                None
+            } else {
+                expires_at_ms
+            };
+            current.paused_remaining_ms = if current.expiry_paused {
+                effective_timeout_ms
+            } else {
+                None
+            };
             current.retained_bytes = retained_bytes;
             self.retained_bytes = next_retained;
             return Ok(Published {
@@ -288,6 +299,8 @@ impl Model {
                 created_at_ms: now_ms,
                 updated_at_ms: now_ms,
                 expires_at_ms,
+                expiry_paused: false,
+                paused_remaining_ms: None,
                 closed: None,
                 retained_bytes,
             },
@@ -422,6 +435,37 @@ impl Model {
         let changed = !self.history.is_empty();
         self.history.clear();
         self.history_bytes = 0;
+        changed
+    }
+
+    pub(crate) fn set_expiry_holds(&mut self, holds: &BTreeSet<u64>, now_ms: u64) -> bool {
+        let mut changed = false;
+        for notification in &mut self.active {
+            let paused = holds.contains(&notification.key);
+            if paused == notification.expiry_paused {
+                continue;
+            }
+            if paused {
+                // a late hold must not revive a record whose deadline already passed.
+                if notification
+                    .expires_at_ms
+                    .is_some_and(|deadline| deadline <= now_ms)
+                {
+                    continue;
+                }
+                notification.paused_remaining_ms =
+                    notification.expires_at_ms.take().map(|deadline| {
+                        deadline.saturating_sub(now_ms).min(u64::from(u32::MAX)) as u32
+                    });
+            } else {
+                notification.expires_at_ms = notification
+                    .paused_remaining_ms
+                    .take()
+                    .map(|remaining| now_ms.saturating_add(u64::from(remaining)));
+            }
+            notification.expiry_paused = paused;
+            changed = true;
+        }
         changed
     }
 
@@ -957,5 +1001,72 @@ mod tests {
             model.notify(0, request("one more"), 5),
             Err(ModelError::Capacity)
         );
+    }
+
+    #[test]
+    fn expiry_holds_freeze_remaining_time_without_changing_content() {
+        let mut model = Model::new(TimeoutPolicy::default());
+        let published = model.notify(0, request("mail"), 100).unwrap();
+        let holds = BTreeSet::from([published.key]);
+        assert!(model.set_expiry_holds(&holds, 1100));
+        let record = &model.active()[0];
+        assert_eq!(record.paused_remaining_ms, Some(4000));
+        assert_eq!(record.expires_at_ms, None);
+        assert_eq!(
+            (record.revision, record.created_at_ms, record.updated_at_ms),
+            (1, 100, 100)
+        );
+        assert!(!model.set_expiry_holds(&holds, 1200));
+        assert!(model.expire(10000).is_empty());
+        assert!(model.set_expiry_holds(&BTreeSet::new(), 12000));
+        assert_eq!(model.active()[0].expires_at_ms, Some(16000));
+        assert_eq!(model.active()[0].paused_remaining_ms, None);
+        assert!(!model.set_expiry_holds(&BTreeSet::new(), 13000));
+        assert!(model.expire(15999).is_empty());
+        let expired = model.expire(16000);
+        assert_eq!(expired[0].key, published.key);
+        assert_eq!(expired[0].closed.unwrap().reason, CloseReason::Expired);
+    }
+
+    #[test]
+    fn replacement_keeps_the_hold_and_uses_its_new_timeout() {
+        let mut model = Model::new(TimeoutPolicy::default());
+        let first = model.notify(0, request("first"), 0).unwrap();
+        model.set_expiry_holds(&BTreeSet::from([first.key]), 1000);
+        let mut replacement = request("replacement");
+        replacement.expire_timeout_ms = 1500;
+        let published = model.notify(first.id, replacement, 10000).unwrap();
+        assert_eq!(published.key, first.key);
+        let record = &model.active()[0];
+        assert_eq!(record.revision, 2);
+        assert_eq!(record.paused_remaining_ms, Some(1500));
+        assert_eq!(record.expires_at_ms, None);
+        assert!(record.expiry_paused);
+        let mut persistent = request("persistent");
+        persistent.expire_timeout_ms = 0;
+        model.notify(first.id, persistent, 11000).unwrap();
+        assert_eq!(model.active()[0].paused_remaining_ms, None);
+        assert!(model.active()[0].expiry_paused);
+        model
+            .notify(first.id, request("timed again"), 12000)
+            .unwrap();
+        assert_eq!(model.active()[0].paused_remaining_ms, Some(5000));
+        model.set_expiry_holds(&BTreeSet::new(), 13000);
+        assert_eq!(model.active()[0].expires_at_ms, Some(18000));
+    }
+
+    #[test]
+    fn late_holds_cannot_revive_expired_or_reused_protocol_ids() {
+        let mut model = Model::new(TimeoutPolicy::default());
+        let first = model.notify(0, request("first"), 0).unwrap();
+        let holds = BTreeSet::from([first.key]);
+        assert!(!model.set_expiry_holds(&holds, 5000));
+        assert_eq!(model.expire(5000).len(), 1);
+        let second = model
+            .notify(first.id, request("new lifetime"), 6000)
+            .unwrap();
+        assert_ne!(first.key, second.key);
+        assert!(!model.set_expiry_holds(&holds, 6001));
+        assert!(!model.active()[0].expiry_paused);
     }
 }

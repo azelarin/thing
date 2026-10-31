@@ -1,5 +1,6 @@
 use crate::OutputContext;
 use crate::niri::{NiriAction, NiriData, NiriState, parse_id, parse_layout_target, parse_output};
+use crate::notification_expiry::ExpiryHolds;
 use crate::state::{Scalar, Signal, Tracker};
 use mlua::{Error, Lua, Result, Table, UserData, UserDataMethods, Value};
 use std::{
@@ -507,7 +508,13 @@ pub struct Notification {
     pub created_at_ms: u64,
     /// when the notification was last replaced, in server-relative milliseconds.
     pub updated_at_ms: u64,
-    /// a server-relative deadline, or none when the notification does not expire.
+    /// whether expiry was paused in this snapshot.
+    pub expiry_paused: bool,
+    /// frozen time left while expiry is paused; absent for non-expiring records.
+    pub paused_remaining_ms: Option<u32>,
+    /// monotonic origin of the server-relative timestamps.
+    pub time_origin: Instant,
+    /// a server-relative deadline, absent while paused or when expiry is disabled.
     pub expires_at_ms: Option<u64>,
     pub category: String,
     pub desktop_entry: String,
@@ -522,6 +529,27 @@ pub struct Notification {
     pub image: Option<ImageSource>,
     /// why and when, in server-relative milliseconds, a history record closed.
     pub closed: Option<(NotificationCloseReason, u64)>,
+}
+
+impl Notification {
+    /// samples remaining expiry time without starting a frame clock.
+    pub fn remaining_at(&self, now: Instant) -> Option<u32> {
+        if self.closed.is_some() {
+            return None;
+        }
+        let timeout = self.effective_timeout_ms?;
+        if self.expiry_paused {
+            return self
+                .paused_remaining_ms
+                .map(|remaining| remaining.min(timeout));
+        }
+        let elapsed = now.saturating_duration_since(self.time_origin).as_millis();
+        self.expires_at_ms.map(|deadline| {
+            u128::from(deadline)
+                .saturating_sub(elapsed)
+                .min(u128::from(timeout)) as u32
+        })
+    }
 }
 
 /// one confirmed generation of notification-server state.
@@ -1251,6 +1279,7 @@ impl UserData for NotificationList {
                 item.set("urgency_code", notification.urgency.code())?;
                 item.set("raw_expire_timeout_ms", notification.raw_expire_timeout_ms)?;
                 item.set("effective_timeout_ms", notification.effective_timeout_ms)?;
+                item.set("expiry_paused", notification.expiry_paused)?;
                 item.set("created_at_ms", notification.created_at_ms as f64)?;
                 item.set("updated_at_ms", notification.updated_at_ms as f64)?;
                 item.set(
@@ -1585,6 +1614,7 @@ pub(crate) struct Services {
     power_devices: Rc<RefCell<Vec<PowerDevice>>>,
     power_devices_revision: usize,
     notifications: Rc<RefCell<Vec<Notification>>>,
+    pub(crate) notification_expiry: Rc<RefCell<ExpiryHolds>>,
     notifications_revision: usize,
     notification_history: Rc<RefCell<Vec<Notification>>>,
     notification_history_revision: usize,
@@ -1638,6 +1668,7 @@ impl Services {
             power_devices: Rc::default(),
             power_devices_revision,
             notifications: Rc::default(),
+            notification_expiry: Rc::default(),
             notifications_revision,
             notification_history: Rc::default(),
             notification_history_revision,
@@ -2144,6 +2175,48 @@ impl Services {
             "clear_history",
             lua.create_function(move |_, ()| {
                 enqueue(&actions, &allowed, Action::ClearNotificationHistory)
+            })?,
+        )?;
+        let expiry = result.notification_expiry.clone();
+        let records = result.notifications.clone();
+        let allowed = result.allowed.clone();
+        notifications.set(
+            "set_expiry_paused",
+            lua.create_function(move |_, (key, paused): (Value, Value)| {
+                if !allowed.get() {
+                    return Err(Error::runtime(
+                        "notification expiry controls require an event handler",
+                    ));
+                }
+                let key = notification_key(key)?;
+                let Value::Boolean(paused) = paused else {
+                    return Err(Error::runtime("expiry paused state must be a boolean"));
+                };
+                let record_key = key.to_string();
+                if paused
+                    && !records
+                        .borrow()
+                        .iter()
+                        .any(|record| record.key == record_key)
+                {
+                    return Err(Error::runtime("notification is no longer active"));
+                }
+                expiry.borrow_mut().stage(key, paused)
+            })?,
+        )?;
+        let tracker = result.tracker.clone();
+        let revision = result.notifications_revision;
+        let records = result.notifications.clone();
+        notifications.set(
+            "remaining",
+            lua.create_function(move |_, key: Value| {
+                let key = notification_key(key)?.to_string();
+                tracker.borrow_mut().read(revision);
+                Ok(records
+                    .borrow()
+                    .iter()
+                    .find(|record| record.key == key)
+                    .and_then(|record| record.remaining_at(Instant::now())))
             })?,
         )?;
         notifications.set_readonly(true);
@@ -2680,6 +2753,12 @@ impl Services {
         }
         tracker.write_batch(updates)?;
         if records_changed {
+            let keys = notifications
+                .active
+                .iter()
+                .filter_map(|record| record.key.parse().ok())
+                .collect();
+            self.notification_expiry.borrow_mut().retain(&keys);
             *records = notifications.active;
         }
         if history_changed {
@@ -2784,6 +2863,11 @@ impl Services {
     pub fn set_notification_records(&self, notifications: Vec<Notification>) -> Result<()> {
         validate_notifications(&notifications, false)?;
         if *self.notifications.borrow() != notifications {
+            let keys = notifications
+                .iter()
+                .filter_map(|record| record.key.parse().ok())
+                .collect();
+            self.notification_expiry.borrow_mut().retain(&keys);
             *self.notifications.borrow_mut() = notifications;
             let mut tracker = self.tracker.borrow_mut();
             let revision = tracker.read(self.notifications_revision);
@@ -4056,12 +4140,17 @@ fn validate_notifications(notifications: &[Notification], closed: bool) -> Resul
                 || match (
                     notification.effective_timeout_ms,
                     notification.expires_at_ms,
+                    notification.expiry_paused,
+                    notification.paused_remaining_ms,
                 ) {
-                    (None, None) => false,
-                    (Some(timeout), Some(deadline)) => {
+                    (None, None, _, None) => false,
+                    (Some(timeout), None, true, Some(remaining)) => {
+                        timeout == 0 || remaining > timeout
+                    }
+                    (Some(timeout), Some(deadline), false, None) => {
                         timeout == 0
                             || deadline
-                                != notification
+                                < notification
                                     .updated_at_ms
                                     .saturating_add(u64::from(timeout))
                     }

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
@@ -32,7 +32,8 @@ const MAX_IMAGE_EDGE: u32 = 256;
 const MAX_SOURCE_IMAGE_EDGE: i32 = 8192;
 
 /// receives the active notifications and the history, newest first.
-pub(crate) type ChangeHook = Arc<dyn Fn(Vec<Notification>, Vec<Notification>) + Send + Sync>;
+pub(crate) type ChangeHook =
+    Arc<dyn Fn(Vec<Notification>, Vec<Notification>, Instant) + Send + Sync>;
 
 struct State {
     model: Mutex<Model>,
@@ -67,6 +68,16 @@ impl Notifications {
 
     pub(crate) fn history(&self) -> Vec<Notification> {
         lock(&self.state.model).history().iter().cloned().collect()
+    }
+
+    pub(crate) fn time_origin(&self) -> Instant {
+        self.state.started
+    }
+
+    pub(crate) fn set_expiry_holds(&self, holds: &BTreeSet<u64>) {
+        if lock(&self.state.model).set_expiry_holds(holds, self.now_ms()) {
+            self.publish();
+        }
     }
 
     pub(crate) fn next_key(&self) -> u64 {
@@ -181,7 +192,7 @@ impl Notifications {
                 model.history().iter().cloned().collect(),
             )
         };
-        (self.state.changed)(active, history);
+        (self.state.changed)(active, history, self.state.started);
     }
 }
 
@@ -310,7 +321,7 @@ pub(crate) async fn serve(
     address: &str,
     timeout_policy: TimeoutPolicy,
 ) -> zbus::Result<(Connection, Notifications)> {
-    serve_with(Some(address), timeout_policy, 1, Arc::new(|_, _| {})).await
+    serve_with(Some(address), timeout_policy, 1, Arc::new(|_, _, _| {})).await
 }
 
 pub(crate) async fn serve_with(

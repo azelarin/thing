@@ -723,6 +723,13 @@ impl<K: Clone + Eq> Configurations<K> {
         Ok(())
     }
 
+    pub(crate) fn notification_expiry_holds(&self) -> BTreeSet<u64> {
+        self.instances
+            .iter()
+            .flat_map(|instance| instance.runtime.notification_expiry_holds())
+            .collect()
+    }
+
     pub(crate) fn set_notifications(
         &mut self,
         notifications: NotificationSnapshot,
@@ -3025,6 +3032,41 @@ mod tests {
         }
     }
 
+    fn notification() -> Notification {
+        Notification {
+            key: "1".into(),
+            id: 7,
+            revision: 1,
+            app_name: "Test".into(),
+            app_icon: "test".into(),
+            summary: "Saved".into(),
+            body: "The file was saved".into(),
+            actions: vec![NotificationButton {
+                key: "open".into(),
+                label: "Open".into(),
+            }],
+            urgency: NotificationUrgency::Normal,
+            raw_expire_timeout_ms: 0,
+            effective_timeout_ms: None,
+            expiry_paused: false,
+            paused_remaining_ms: None,
+            time_origin: std::time::Instant::now(),
+            created_at_ms: 10,
+            updated_at_ms: 10,
+            expires_at_ms: None,
+            category: String::new(),
+            desktop_entry: "test".into(),
+            image_path: String::new(),
+            resident: false,
+            transient: false,
+            action_icons: false,
+            can_reply: false,
+            reply_placeholder: String::new(),
+            image: None,
+            closed: None,
+        }
+    }
+
     #[test]
     fn notification_updates_reach_existing_and_later_outputs_together() {
         let directory = tempdir().unwrap();
@@ -3044,35 +3086,7 @@ mod tests {
         .unwrap();
         let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
         configurations.add(1, output("DP-1", 1920)).unwrap();
-        let notification = Notification {
-            key: "1".into(),
-            id: 7,
-            revision: 1,
-            app_name: "Test".into(),
-            app_icon: "test".into(),
-            summary: "Saved".into(),
-            body: "The file was saved".into(),
-            actions: vec![NotificationButton {
-                key: "open".into(),
-                label: "Open".into(),
-            }],
-            urgency: NotificationUrgency::Normal,
-            raw_expire_timeout_ms: 0,
-            effective_timeout_ms: None,
-            created_at_ms: 10,
-            updated_at_ms: 10,
-            expires_at_ms: None,
-            category: String::new(),
-            desktop_entry: "test".into(),
-            image_path: String::new(),
-            resident: false,
-            transient: false,
-            action_icons: false,
-            can_reply: false,
-            reply_placeholder: String::new(),
-            image: None,
-            closed: None,
-        };
+        let notification = notification();
         configurations
             .set_notifications(NotificationSnapshot {
                 history: Vec::new(),
@@ -3099,6 +3113,84 @@ mod tests {
         assert!(configurations.refresh().is_empty());
         assert_eq!(text(&configurations, 1), "true::1:1:Saved:Open");
         assert_eq!(text(&configurations, 2), "true::1:1:Saved:Open");
+    }
+
+    #[test]
+    fn expiry_holds_follow_output_and_reload_lifetimes() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        let source = r#"
+            return ui.panel { children = { ui.button {
+                on_click = function() services.notifications.set_expiry_paused('1', true) end,
+                on_secondary_click = function() services.notifications.set_expiry_paused('1', false) end,
+            } } }
+        "#;
+        fs::write(&entry, source).unwrap();
+        let mut configurations = Configurations::new(entry.clone(), ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        configurations.add(2, output("DP-2", 2560)).unwrap();
+        configurations
+            .set_notifications(NotificationSnapshot {
+                owned: true,
+                active: vec![notification()],
+                ..NotificationSnapshot::default()
+            })
+            .unwrap();
+        for output in [1, 2] {
+            let id = configurations.root(&output).unwrap().children[0].id;
+            configurations.dispatch(&output, id, Event::Click).unwrap();
+        }
+        assert_eq!(
+            configurations.notification_expiry_holds(),
+            BTreeSet::from([1])
+        );
+        let id = configurations.root(&1).unwrap().children[0].id;
+        configurations
+            .dispatch(&1, id, Event::SecondaryClick)
+            .unwrap();
+        assert_eq!(
+            configurations.notification_expiry_holds(),
+            BTreeSet::from([1])
+        );
+        configurations.remove(&2).unwrap();
+        assert!(configurations.notification_expiry_holds().is_empty());
+        configurations.add(2, output("DP-2", 2560)).unwrap();
+        assert!(configurations.notification_expiry_holds().is_empty());
+        configurations.dispatch(&1, id, Event::Click).unwrap();
+        fs::write(&entry, "error('broken configuration')").unwrap();
+        assert!(configurations.reload().is_err());
+        assert_eq!(
+            configurations.notification_expiry_holds(),
+            BTreeSet::from([1])
+        );
+        fs::write(&entry, source).unwrap();
+        assert!(
+            configurations
+                .prepare_reload_for_checked(
+                    vec![(1, output("DP-1", 1920)), (2, output("DP-2", 2560))],
+                    |_, _| Err("rejected candidate".into()),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            configurations.notification_expiry_holds(),
+            BTreeSet::from([1])
+        );
+        configurations.reload().unwrap();
+        assert!(configurations.notification_expiry_holds().is_empty());
+        for output in [1, 2] {
+            let id = configurations.root(&output).unwrap().children[0].id;
+            configurations.dispatch(&output, id, Event::Click).unwrap();
+        }
+        configurations.remove(&1).unwrap();
+        assert_eq!(
+            configurations.notification_expiry_holds(),
+            BTreeSet::from([1])
+        );
+        configurations
+            .set_notifications(NotificationSnapshot::default())
+            .unwrap();
+        assert!(configurations.notification_expiry_holds().is_empty());
     }
 
     #[test]
