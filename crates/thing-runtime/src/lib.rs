@@ -16,6 +16,7 @@ mod sleep;
 mod state;
 mod timer;
 mod transition;
+mod window;
 pub use bounds::{BoundsProvider, BoundsRect, PresentedBounds, WidgetBounds};
 pub use idle::{IdleWatchDefinition, MAX_IDLE_TIMEOUT_MS, MAX_IDLE_WATCHES, MIN_IDLE_TIMEOUT_MS};
 pub use niri::{
@@ -39,6 +40,7 @@ pub use sleep::{
     SleepInhibitorAction, SleepInhibitorDefinition, SleepInhibitorState, SleepInhibitorStatus,
 };
 pub use timer::TimerToken;
+pub use window::{WindowRequest, WindowState};
 
 use mlua::{Error, ErrorContext, Function, Lua, Result, Table, Value, VmState};
 pub use state::Scalar;
@@ -491,7 +493,7 @@ impl Runtime {
         let timers = Rc::new(RefCell::new(timer::Timers::default()));
         let motions = Rc::new(RefCell::new(motion::Motions::new(tracker.clone())));
         let bounds = Rc::new(RefCell::new(bounds::Bounds::default()));
-        let ui = install_ui(&lua, tracker.clone(), &timers, &motions, &bounds)?;
+        let ui = install_ui(&lua, tracker.clone(), &timers, &motions, &bounds, &services)?;
         lua.sandbox(true)?;
         let modules = modules::Modules::default();
         let exported = modules.load(&lua, path)?;
@@ -514,6 +516,11 @@ impl Runtime {
             if !services.sleep_inhibitor_definitions().is_empty() {
                 return Err(Error::runtime(
                     "sleep inhibitors are unavailable in lock configurations",
+                ));
+            }
+            if !services.window_state_keys().is_empty() {
+                return Err(Error::runtime(
+                    "windows are unavailable in lock configurations",
                 ));
             }
             services.forbid_application_launches();
@@ -547,6 +554,16 @@ impl Runtime {
             mode,
         };
         runtime.surfaces = runtime.parse_surfaces(exported)?;
+        for key in runtime.services.window_state_keys() {
+            let declared = runtime.surfaces.iter().any(|surface| {
+                surface.root.kind == Kind::Window && surface.key == SurfaceKey::Named(key.clone())
+            });
+            if !declared {
+                return Err(Error::runtime(format!(
+                    "ui.window_state({key:?}) does not name a ui.window in this configuration"
+                )));
+            }
+        }
         let _ = runtime.sync_ui_targets();
         Ok(runtime)
     }
@@ -729,6 +746,19 @@ impl Runtime {
     /// the managed process keys declared while this configuration loaded.
     pub fn managed_process_definitions(&self) -> Vec<ManagedProcessDefinition> {
         self.services.managed_process_definitions()
+    }
+
+    /// publishes what the compositor configured for the window with `key`.
+    /// a window without a `ui.window_state` handle ignores it. call
+    /// [`Self::refresh`] afterward.
+    pub fn set_window_state(&mut self, key: &str, state: WindowState) -> Result<()> {
+        self.services.set_window_state(key, state)
+    }
+
+    /// whether widget `id` has an `on_close` handler, so the host knows
+    /// whether a configuration decides what a close request does.
+    pub fn handles_close(&self, id: NodeId) -> bool {
+        self.handlers.contains_key(&(id, "on_close"))
     }
 
     /// the sleep inhibitor keys declared while this configuration loaded.
@@ -2126,7 +2156,7 @@ impl Runtime {
         let Value::Table(table) = exported else {
             return Err(Error::runtime(match self.mode {
                 ConfigurationMode::Shell => {
-                    "the entry file must return ui.panel { ... } or a dense panel array"
+                    "the entry file must return ui.panel { ... }, ui.window { ... }, or a dense surface array"
                 }
                 ConfigurationMode::Lock => "the lock entry file must return ui.lock { ... }",
             }));
@@ -2162,19 +2192,30 @@ impl Runtime {
             if !seen_keys.insert(key.clone()) {
                 return Err(Error::runtime(format!("duplicate surface key {key:?}")));
             }
+            let window = matches!(
+                table.raw_get::<Value>("_kind")?,
+                Value::String(kind) if kind.as_bytes().as_ref() == b"window"
+            );
+            if window && !table.raw_get::<Value>("namespace")?.is_nil() {
+                return Err(Error::runtime(
+                    "namespace is a panel property; windows identify themselves with app_id",
+                ));
+            }
             let namespace = if matches!(self.mode, ConfigurationMode::Lock) {
                 "thing-lock".into()
             } else {
                 surface_namespace(&table, &key)?
             };
             let root = self.parse_node(Value::Table(table), 0, &mut seen_widgets)?;
-            let expected = match self.mode {
-                ConfigurationMode::Shell => Kind::Panel,
-                ConfigurationMode::Lock => Kind::Lock,
+            let accepted = match self.mode {
+                ConfigurationMode::Shell => matches!(root.kind, Kind::Panel | Kind::Window),
+                ConfigurationMode::Lock => root.kind == Kind::Lock,
             };
-            if root.kind != expected {
+            if !accepted {
                 return Err(Error::runtime(match self.mode {
-                    ConfigurationMode::Shell => "every surface root must be ui.panel { ... }",
+                    ConfigurationMode::Shell => {
+                        "every surface root must be ui.panel { ... } or ui.window { ... }"
+                    }
                     ConfigurationMode::Lock => "the lock surface root must be ui.lock { ... }",
                 }));
             }
@@ -2269,9 +2310,12 @@ impl Runtime {
                         || (key == "on_pressed" && kind != Kind::Range)
                         || (key == "on_submit" && kind != Kind::TextInput)
                         || (key == "on_hover" && kind != Kind::Popup && !kind.is_interactive())
-                        || (key == "on_close" && kind != Kind::Popup)
+                        || (key == "on_close" && !matches!(kind, Kind::Popup | Kind::Window))
                         || (key == "on_key"
-                            && !matches!(kind, Kind::Panel | Kind::Popup | Kind::Lock))
+                            && !matches!(
+                                kind,
+                                Kind::Panel | Kind::Window | Kind::Popup | Kind::Lock
+                            ))
                         || (key == "on_pointer"
                             && !matches!(kind, Kind::Button | Kind::PointerArea))
                     {
@@ -2461,7 +2505,7 @@ fn dense_root_tables(table: Table) -> Result<Vec<Table>> {
         .map(|index| match table.raw_get(index)? {
             Value::Table(root) => Ok(root),
             _ => Err(Error::runtime(
-                "every surface root must be ui.panel { ... }",
+                "every surface root must be ui.panel { ... } or ui.window { ... }",
             )),
         })
         .collect()
@@ -2586,6 +2630,7 @@ fn kind(name: &str) -> Result<Kind> {
     match name {
         "panel" => Ok(Kind::Panel),
         "lock" => Ok(Kind::Lock),
+        "window" => Ok(Kind::Window),
         "popup" => Ok(Kind::Popup),
         "row" => Ok(Kind::Row),
         "centerbox" => Ok(Kind::CenterBox),
@@ -2611,16 +2656,19 @@ fn install_ui(
     timers: &Rc<RefCell<timer::Timers>>,
     motions: &Rc<RefCell<motion::Motions>>,
     bounds: &Rc<RefCell<bounds::Bounds>>,
+    services: &services::Services,
 ) -> Result<Rc<RefCell<UiContext>>> {
     let ui = lua.create_table()?;
     timer::Timers::install(timers, lua, &ui)?;
     motion::Motions::install(motions, lua, &ui)?;
+    services.install_window_states(lua, &ui)?;
     let context = Rc::new(RefCell::new(UiContext::default()));
     bounds::Bounds::install(bounds, &context, lua, &ui)?;
     let next_id = Rc::new(Cell::new(1_u64));
     for name in [
         "panel",
         "lock",
+        "window",
         "popup",
         "row",
         "centerbox",

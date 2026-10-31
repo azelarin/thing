@@ -144,6 +144,40 @@ fn gradient_stops(value: Value) -> Result<Vec<thing_core::GradientStop>> {
     Ok(parsed)
 }
 
+/// `{ width, height }` in whole logical pixels, or `nil` for no constraint.
+fn window_size(value: Value, name: &str) -> Result<Option<thing_core::WindowSize>> {
+    if value.is_nil() {
+        return Ok(None);
+    }
+    let Value::Table(table) = value else {
+        return Err(Error::runtime(format!(
+            "{name} must be a table with width and height"
+        )));
+    };
+    for pair in table.clone().pairs::<String, Value>() {
+        let (field, _) = pair?;
+        if !matches!(field.as_str(), "width" | "height") {
+            return Err(Error::runtime(format!("unknown {name} property {field:?}")));
+        }
+    }
+    let dimension = |field: &str| -> Result<u32> {
+        let value = number(table.raw_get(field)?, &format!("{name}.{field}"))?;
+        if value.fract() != 0.0
+            || !(1.0..=f64::from(thing_core::MAX_WINDOW_DIMENSION)).contains(&value)
+        {
+            return Err(Error::runtime(format!(
+                "{name}.{field} must be a whole number from 1 through {}",
+                thing_core::MAX_WINDOW_DIMENSION
+            )));
+        }
+        Ok(value as u32)
+    };
+    Ok(Some(thing_core::WindowSize {
+        width: dimension("width")?,
+        height: dimension("height")?,
+    }))
+}
+
 fn shadow(value: Value) -> Result<Option<thing_core::Shadow>> {
     use thing_core::{MAX_SHADOW_BLUR, MAX_SHADOW_OFFSET, MAX_SHADOW_SPREAD, Shadow};
     if value.is_nil() {
@@ -774,7 +808,15 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "input_region" if node.kind == Kind::Panel => {
             node.panel.input_region = panel_input_region(value)?
         }
-        "idle_inhibit" if matches!(node.kind, Kind::Panel | Kind::Popup) => {
+        "title" if node.kind == Kind::Window => node.window.title = string(value, name)?,
+        "app_id" if node.kind == Kind::Window => node.window.app_id = string(value, name)?,
+        "size" if node.kind == Kind::Window => {
+            node.window.size = window_size(value, name)?
+                .ok_or_else(|| Error::runtime("size must be a table with width and height"))?
+        }
+        "min_size" if node.kind == Kind::Window => node.window.min_size = window_size(value, name)?,
+        "max_size" if node.kind == Kind::Window => node.window.max_size = window_size(value, name)?,
+        "idle_inhibit" if matches!(node.kind, Kind::Panel | Kind::Window | Kind::Popup) => {
             node.idle_inhibit = boolean(value, name)?
         }
         "style.width" => {

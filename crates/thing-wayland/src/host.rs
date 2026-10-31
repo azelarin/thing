@@ -16,7 +16,7 @@ use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat, delegate_xdg_popup, delegate_xdg_shell,
+    delegate_registry, delegate_seat, delegate_xdg_popup, delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryHandler, RegistryState},
     registry_handlers,
@@ -34,9 +34,9 @@ use smithay_client_toolkit::{
             LayerSurfaceConfigure, SurfaceKind,
         },
         xdg::{
-            XdgShell,
+            XdgShell, XdgSurface,
             popup::{Popup as XdgPopup, PopupConfigure, PopupHandler},
-            window::{Window as XdgWindow, WindowConfigure, WindowHandler},
+            window::{Window as XdgWindow, WindowConfigure, WindowDecorations, WindowHandler},
         },
     },
 };
@@ -49,7 +49,7 @@ use thing_runtime::{
     ManagedProcessSnapshot, OutputContext, PointerButton as RuntimePointerButton,
     PointerEvent as RuntimePointerEvent, PointerPhase, Scalar, ScrollInput as RuntimeScrollInput,
     ScrollSource as RuntimeScrollSource, ServiceSnapshot, SurfaceKey, SurfaceTree,
-    SystemTrayAction, SystemTrayMenuAction, UiAction,
+    SystemTrayAction, SystemTrayMenuAction, UiAction, WindowRequest, WindowState,
 };
 use thing_ui::{
     Interaction, Layout, PaintFrame, ScrollState, ScrollStep, SemanticPlacement, Size,
@@ -117,6 +117,8 @@ mod idle_sleep_tests;
 mod launch_tests;
 #[cfg(test)]
 mod wheel_tests;
+#[cfg(test)]
+mod window_tests;
 
 #[cfg(test)]
 delegate_noop!(App: ignore wayland_client::protocol::wl_shm::WlShm);
@@ -166,6 +168,7 @@ use crate::{
     power::Power,
     render::{FrameResult, Render, Window},
     sleep::{SleepInhibition, Transport as SleepTransport},
+    toplevel::{self, WindowRole},
     watch::Watch,
 };
 
@@ -235,8 +238,9 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         )
         .map_err(|error| error.to_string())?;
     let compositor = CompositorState::bind(&globals, &qh).map_err(|error| error.to_string())?;
-    let layer_shell = LayerShell::bind(&globals, &qh)
-        .map_err(|error| format!("the compositor must support wlr-layer-shell: {error}"))?;
+    // a configuration made only of windows runs without layer shell; one that
+    // declares a panel is rejected during validation instead.
+    let layer_shell = LayerShell::bind(&globals, &qh).ok();
     let xdg_shell = XdgShell::bind(&globals, &qh).map_err(|error| error.to_string())?;
     let activation: Option<XdgActivationV1> = globals.bind(&qh, 1..=1, ()).ok();
     let (image_ping, image_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
@@ -333,6 +337,7 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         pending_ui_actions: Vec::new(),
         surfaces: Vec::new(),
         closed_surfaces: Vec::new(),
+        pending_window_states: Vec::new(),
         registry,
         idle_inhibit,
         idle_notify,
@@ -554,6 +559,7 @@ impl App {
             self.reload(qh)?;
         }
         self.dispatch_due_timers(Instant::now());
+        self.publish_window_states();
         if self
             .sleep
             .next_deadline()
@@ -759,7 +765,7 @@ struct PreparedSurfaceLayout {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LayoutSurfaceRole {
-    Panel,
+    Root,
     Popup,
 }
 
@@ -768,6 +774,8 @@ struct LayoutSurfaceState {
     root: NodeId,
     role: LayoutSurfaceRole,
     size: (u32, u32),
+    /// the scale the surface draws at and the one the compositor prefers.
+    scale: Scale,
     preferred_scale: Scale,
     scroll: ScrollState,
     focused: Option<NodeId>,
@@ -967,20 +975,37 @@ struct PopupRole {
 
 enum Role {
     Panel(LayerSurface),
+    Window(Box<WindowRole>),
     Popup(PopupRole),
 }
 impl Role {
     fn surface(&self) -> &wl_surface::WlSurface {
         match self {
             Self::Panel(layer) => layer.wl_surface(),
+            Self::Window(window) => window.shell.wl_surface(),
             Self::Popup(role) => role.shell.wl_surface(),
         }
     }
 
     fn popup_mode(&self) -> Option<&PopupMode> {
         match self {
-            Self::Panel(_) => None,
+            Self::Panel(_) | Self::Window(_) => None,
             Self::Popup(role) => Some(&role.mode),
+        }
+    }
+
+    /// panels and windows are the roots of a configuration's surfaces;
+    /// popups belong to one of them.
+    fn is_root(&self) -> bool {
+        !matches!(self, Self::Popup(_))
+    }
+
+    /// whether the root's declared kind still matches this role.
+    fn matches_kind(&self, kind: Kind) -> bool {
+        match self {
+            Self::Panel(_) => kind == Kind::Panel,
+            Self::Window(_) => kind == Kind::Window,
+            Self::Popup(_) => false,
         }
     }
 }
@@ -1153,7 +1178,9 @@ pub(crate) struct App {
     seats: SeatState,
     outputs: OutputState,
     compositor: CompositorState,
-    layer_shell: LayerShell,
+    layer_shell: Option<LayerShell>,
+    /// window states waiting to be published, newest last for each owner.
+    pending_window_states: Vec<(SurfaceOwner, WindowState)>,
     layer_shell_version: u32,
     xdg_shell: XdgShell,
     activation: Option<XdgActivationV1>,
@@ -1207,10 +1234,11 @@ impl App {
                 key: surface.key.clone(),
                 root: surface.root,
                 role: match surface.role {
-                    Role::Panel(_) => LayoutSurfaceRole::Panel,
+                    Role::Panel(_) | Role::Window(_) => LayoutSurfaceRole::Root,
                     Role::Popup(_) => LayoutSurfaceRole::Popup,
                 },
                 size: surface.size,
+                scale: surface.scale,
                 preferred_scale: surface.preferred_scale,
                 scroll: surface.scroll.clone(),
                 focused: surface.input.keyboard_focused(),
@@ -1471,6 +1499,62 @@ impl App {
         }
         self.refresh();
     }
+    fn request_window(
+        &mut self,
+        output: &wl_output::WlOutput,
+        key: &str,
+        request: WindowRequest,
+    ) -> Result<(), String> {
+        let owner = SurfaceOwner {
+            output: output.clone(),
+            key: SurfaceKey::Named(key.to_owned()),
+        };
+        let window = self
+            .root_index(&owner)
+            .and_then(|index| match &self.surfaces[index].role {
+                Role::Window(window) => Some(window),
+                _ => None,
+            })
+            .ok_or_else(|| format!("window {key:?} is not open"))?;
+        // the compositor answers with a configure that updates the state.
+        match request {
+            WindowRequest::Maximized(true) => window.shell.set_maximized(),
+            WindowRequest::Maximized(false) => window.shell.unset_maximized(),
+            WindowRequest::Fullscreen(true) => window.shell.set_fullscreen(None),
+            WindowRequest::Fullscreen(false) => window.shell.unset_fullscreen(),
+        }
+        Ok(())
+    }
+
+    /// window states change while surfaces are being synchronized, so they
+    /// are published from the event loop rather than inside a refresh.
+    fn queue_window_state(&mut self, owner: SurfaceOwner, state: WindowState) {
+        if !matches!(owner.key, SurfaceKey::Named(_)) {
+            return;
+        }
+        self.pending_window_states
+            .retain(|(pending, _)| pending != &owner);
+        self.pending_window_states.push((owner, state));
+    }
+
+    fn publish_window_states(&mut self) {
+        if self.pending_window_states.is_empty() {
+            return;
+        }
+        for (owner, state) in std::mem::take(&mut self.pending_window_states) {
+            let SurfaceKey::Named(key) = &owner.key else {
+                continue;
+            };
+            if let Err(error) = self
+                .configurations
+                .set_window_state(&owner.output, key, state)
+            {
+                eprintln!("thing: {error}");
+            }
+        }
+        self.refresh();
+    }
+
     fn update_sleep(&mut self) {
         let Some(states) = self.sleep.poll(Instant::now()) else {
             return;
@@ -1758,13 +1842,12 @@ impl App {
             .surfaces
             .iter()
             .filter(|surface| {
-                matches!(surface.role, Role::Panel(_))
-                    && !self.configurations.contains(&surface.output)
+                surface.role.is_root() && !self.configurations.contains(&surface.output)
             })
             .map(Surface::owner)
             .collect();
         for owner in removed {
-            self.remove_panel(&owner, false);
+            self.remove_root(&owner, false);
         }
         let outputs: Vec<_> = self.configurations.keys().cloned().collect();
         for output in &outputs {
@@ -1868,8 +1951,9 @@ impl App {
             )
         };
         let size = panel_size(panel.geometry, (context.width, context.height));
+        let layer_shell = self.layer_shell.as_ref().ok_or(LAYER_SHELL_REQUIRED)?;
         let wl = self.compositor.create_surface(qh);
-        let layer = self.layer_shell.create_layer_surface(
+        let layer = layer_shell.create_layer_surface(
             qh,
             wl,
             wayland_layer(panel.layer),
@@ -1899,6 +1983,94 @@ impl App {
         surface.role.surface().commit();
         self.surfaces.push(surface);
         Ok(())
+    }
+
+    fn create_window(&mut self, owner: SurfaceOwner, qh: &QueueHandle<Self>) -> Result<(), String> {
+        let (root, namespace, properties, scale) = {
+            let surface = self
+                .configurations
+                .surface(&owner.output, &owner.key)
+                .ok_or("surface configuration is unavailable")?;
+            let context = self
+                .configurations
+                .output(&owner.output)
+                .ok_or("output context is unavailable")?;
+            (
+                surface.root.id,
+                surface.namespace.clone(),
+                surface.root.window.clone(),
+                context.scale,
+            )
+        };
+        let wl = self.compositor.create_surface(qh);
+        // server decorations are requested; thing draws no frame of its own.
+        let shell = self
+            .xdg_shell
+            .create_window(wl, WindowDecorations::RequestServer, qh);
+        let role = WindowRole::new(shell, &properties);
+        let surface = self.make_surface(
+            Role::Window(Box::new(role)),
+            SurfaceInit {
+                owner,
+                namespace,
+                root,
+                size: toplevel::initial_size(&properties, None),
+                // the owner's output is only a first guess; the compositor's
+                // preferred scale follows the window wherever it is shown.
+                scale,
+            },
+            qh,
+        )?;
+        // the initial commit has no buffer; drawing waits for the configure.
+        surface.role.surface().commit();
+        self.surfaces.push(surface);
+        Ok(())
+    }
+
+    /// sends changed window properties for an open window.
+    fn sync_window(&mut self, owner: &SurfaceOwner) {
+        let Some(index) = self.root_index(owner) else {
+            return;
+        };
+        let Some(root) = self.configurations.surface_root(&owner.output, &owner.key) else {
+            return;
+        };
+        let properties = root.window.clone();
+        let root_id = root.id;
+        let surface = &mut self.surfaces[index];
+        let Role::Window(window) = &mut surface.role else {
+            return;
+        };
+        let limits = window.apply(&properties);
+        let wl = surface.role.surface().clone();
+        // a reload binds the open window to the replacement runtime's root;
+        // input and focus from the previous runtime do not carry over.
+        let replaced = surface.root != root_id;
+        if replaced {
+            surface.root = root_id;
+            surface.layouts = SurfaceLayouts::default();
+            surface.prepared = None;
+            surface.scroll = ScrollState::default();
+            surface.input = Interaction::default();
+            surface.focus_target = None;
+            surface.pending_focus = None;
+            surface.ui_actions.clear();
+            surface.autofocus_pending = true;
+            surface.text_input = None;
+            surface.pointer_position = None;
+            surface.hover_path.clear();
+            surface.press_serial = None;
+            surface.pressed_button = None;
+            surface.pressed_target = None;
+            surface.range_press = None;
+        }
+        if limits || replaced {
+            surface.dirty = true;
+        }
+        if replaced && self.keyboard_surface.as_ref() == Some(&wl) {
+            self.clear_key_repeat();
+            self.schedule_autofocus(index);
+        }
     }
 
     fn make_surface(
@@ -2005,29 +2177,32 @@ impl App {
                     surface.namespace.clone(),
                     surface.root.visible,
                     surface.root.panel.layer,
+                    surface.root.kind,
                 )
             })
             .collect();
 
+        // a root the compositor closed stays closed until it is hidden.
         self.closed_surfaces.retain(|owner| {
             &owner.output != output
                 || desired
                     .iter()
-                    .any(|(key, _, visible, _)| key == &owner.key && *visible)
+                    .any(|(key, _, visible, _, _)| key == &owner.key && *visible)
         });
 
         let stale: Vec<_> = self
             .surfaces
             .iter()
-            .filter(|surface| &surface.output == output && matches!(surface.role, Role::Panel(_)))
+            .filter(|surface| &surface.output == output && surface.role.is_root())
             .filter(|surface| {
-                let Some((_, namespace, visible, layer)) =
-                    desired.iter().find(|(key, _, _, _)| key == &surface.key)
+                let Some((_, namespace, visible, layer, kind)) =
+                    desired.iter().find(|(key, _, _, _, _)| key == &surface.key)
                 else {
                     return true;
                 };
                 !visible
-                    || namespace != &surface.namespace
+                    || !surface.role.matches_kind(*kind)
+                    || (*kind == Kind::Panel && namespace != &surface.namespace)
                     || (surface
                         .panel
                         .as_ref()
@@ -2037,30 +2212,37 @@ impl App {
             .map(Surface::owner)
             .collect();
         for owner in stale {
-            self.remove_panel(&owner, !force);
+            self.remove_root(&owner, !force);
         }
 
-        for (key, _, visible, _) in &desired {
+        for (key, _, visible, _, kind) in &desired {
             let owner = SurfaceOwner {
                 output: output.clone(),
                 key: key.clone(),
             };
             if *visible
                 && !self.closed_surfaces.contains(&owner)
-                && self.panel_index(&owner).is_none()
+                && self.root_index(&owner).is_none()
             {
-                self.create_panel(owner, qh)?;
+                match kind {
+                    Kind::Window => self.create_window(owner, qh)?,
+                    _ => self.create_panel(owner, qh)?,
+                }
             }
         }
 
         let owners: Vec<_> = self
             .surfaces
             .iter()
-            .filter(|surface| &surface.output == output && matches!(surface.role, Role::Panel(_)))
-            .map(Surface::owner)
+            .filter(|surface| &surface.output == output && surface.role.is_root())
+            .map(|surface| (surface.owner(), matches!(surface.role, Role::Window(_))))
             .collect();
-        for owner in owners {
-            self.sync_panel(&owner, force)?;
+        for (owner, window) in owners {
+            if window {
+                self.sync_window(&owner);
+            } else {
+                self.sync_panel(&owner, force)?;
+            }
         }
         Ok(())
     }
@@ -2225,7 +2407,7 @@ impl App {
                     surface.prepared = Some(prepared);
                     surface.dirty = true;
                 }
-                Err(error) => eprintln!("thing: cannot update popup scale: {error}"),
+                Err(error) => eprintln!("thing: cannot update surface scale: {error}"),
             }
         }
     }
@@ -2279,19 +2461,18 @@ impl App {
         }
     }
 
-    fn panel_index(&self, owner: &SurfaceOwner) -> Option<usize> {
+    fn root_index(&self, owner: &SurfaceOwner) -> Option<usize> {
         self.surfaces.iter().position(|surface| {
-            surface.output == owner.output
-                && surface.key == owner.key
-                && matches!(surface.role, Role::Panel(_))
+            surface.output == owner.output && surface.key == owner.key && surface.role.is_root()
         })
     }
 
-    fn remove_panel(&mut self, owner: &SurfaceOwner, notify_hover: bool) {
+    /// removes a panel or window with its popups and cancels its input.
+    fn remove_root(&mut self, owner: &SurfaceOwner, notify_hover: bool) {
         while let Some(index) = self.popup_index(owner) {
             self.remove_popup(index, notify_hover, false);
         }
-        let Some(index) = self.panel_index(owner) else {
+        let Some(index) = self.root_index(owner) else {
             return;
         };
         let wl = self.surfaces[index].role.surface().clone();
@@ -2316,6 +2497,9 @@ impl App {
             .flatten();
         if let Err(error) = self.render.park() {
             self.error = Some(error);
+        }
+        if matches!(self.surfaces[index].role, Role::Window(_)) {
+            self.queue_window_state(owner.clone(), WindowState::default());
         }
         self.surfaces.remove(index);
         self.hover.remove_owner(owner);
@@ -2732,7 +2916,7 @@ impl App {
             .iter()
             .filter_map(|index| self.surfaces.get(*index))
         {
-            let panel = matches!(surface.role, Role::Panel(_));
+            let panel = surface.role.is_root();
             let owner = surface.owner();
             if let Some((_, presented)) =
                 owners.iter_mut().find(|(candidate, _)| candidate == &owner)
@@ -2765,7 +2949,7 @@ impl App {
             && self.surfaces.iter().any(|surface| {
                 surface.output == owner.output
                     && surface.key == owner.key
-                    && matches!(surface.role, Role::Panel(_))
+                    && surface.role.is_root()
                     && surface.dirty
             })
         {
@@ -2822,9 +3006,7 @@ impl App {
             return None;
         };
         let parent_index = self.surfaces.iter().position(|surface| {
-            surface.output == owner.output
-                && surface.key == owner.key
-                && matches!(surface.role, Role::Panel(_))
+            surface.output == owner.output && surface.key == owner.key && surface.role.is_root()
         })?;
         let parent = &self.surfaces[parent_index];
         let root = self
@@ -2854,11 +3036,7 @@ impl App {
             },
         };
         let node = root.find(popup_surface.root)?;
-        let edge = root
-            .panel
-            .anchors
-            .and_then(|anchors| anchors.exclusive_edge())
-            .or(root.panel.anchors.is_none().then_some(root.panel.edge));
+        let edge = popup_edge(root);
         Some((
             index,
             anchor,
@@ -3137,6 +3315,7 @@ impl App {
                     self.sleep.act(&key, action);
                     Ok(())
                 }
+                Action::Window { key, request } => self.request_window(&output, &key, request),
                 Action::Launch { argv, cwd } => {
                     self.request_launch(
                         PendingLaunch::spawn(LaunchRequest { argv, cwd }),
@@ -4815,7 +4994,7 @@ impl App {
         };
         let parent_wl = parent_surface.role.surface().clone();
         let owner = parent_surface.owner();
-        if !matches!(parent_surface.role, Role::Panel(_)) {
+        if !parent_surface.role.is_root() {
             return;
         }
 
@@ -4927,8 +5106,12 @@ impl App {
             return false;
         };
         let parent = &self.surfaces[parent_index];
-        let Role::Panel(layer) = &parent.role else {
-            return false;
+        // a panel adopts its popup through layer shell; a window is the
+        // popup's xdg parent and its coordinate space.
+        let parent_role = match &parent.role {
+            Role::Panel(layer) => PopupParent::Layer(layer.clone()),
+            Role::Window(window) => PopupParent::Window(window.shell.clone()),
+            Role::Popup(_) => return false,
         };
         let owner = parent.owner();
         let namespace = parent.namespace.clone();
@@ -4970,18 +5153,13 @@ impl App {
             .configurations
             .surface_root(&owner.output, &owner.key)
             .and_then(|root| {
-                let edge = root
-                    .panel
-                    .anchors
-                    .and_then(|anchors| anchors.exclusive_edge())
-                    .or(root.panel.anchors.is_none().then_some(root.panel.edge));
+                let edge = popup_edge(root);
                 root.find(id)
                     .and_then(|node| popup::resolve_for_surface(node, anchor, edge, parent.size))
             })
         else {
             return false;
         };
-        let layer = layer.clone();
         let seat = match serial {
             Some(_) => {
                 let Some(seat) = self.seat.clone() else {
@@ -4994,11 +5172,18 @@ impl App {
         let positioner = self.xdg_shell.xdg_wm_base().create_positioner(qh, ());
         popup::configure(&positioner, position, true);
         let wl = self.compositor.create_surface(qh);
-        let popup = XdgPopup::from_surface(None, &positioner, qh, wl, &self.xdg_shell);
+        let xdg_parent = match &parent_role {
+            PopupParent::Layer(_) => None,
+            PopupParent::Window(window) => Some(window.xdg_surface().clone()),
+        };
+        let popup =
+            XdgPopup::from_surface(xdg_parent.as_ref(), &positioner, qh, wl, &self.xdg_shell);
         positioner.destroy();
         match popup {
             Ok(shell) => {
-                layer.get_popup(shell.xdg_popup());
+                if let PopupParent::Layer(layer) = &parent_role {
+                    layer.get_popup(shell.xdg_popup());
+                }
                 if let Some((seat, serial)) = seat.as_ref().zip(serial) {
                     shell.xdg_popup().grab(seat, serial);
                 }
@@ -5101,7 +5286,7 @@ impl App {
                     let Some(parent) = self.surfaces.iter().find(|surface| {
                         surface.output == current.key.owner.output
                             && surface.key == current.key.owner.key
-                            && matches!(surface.role, Role::Panel(_))
+                            && surface.role.is_root()
                     }) else {
                         self.hover.close(&current.key, true);
                         continue;
@@ -5139,7 +5324,7 @@ impl App {
         let index = self.surfaces.iter().position(|surface| {
             surface.output == key.owner.output
                 && surface.key == key.owner.key
-                && matches!(surface.role, Role::Panel(_))
+                && surface.role.is_root()
         })?;
         self.current_presented_target(index, key.anchor)?;
         let target = automatic_target(
@@ -5162,7 +5347,7 @@ impl App {
             .find(|surface| {
                 surface.1.output == key.owner.output
                     && surface.1.key == key.owner.key
-                    && matches!(surface.1.role, Role::Panel(_))
+                    && surface.1.role.is_root()
             })
             .is_some_and(|(index, surface)| {
                 !surface.dirty
@@ -5260,7 +5445,7 @@ impl App {
                 if let Some(PopupMode::Hover(key)) = surface.role.popup_mode() {
                     return self.current_hover_target(key);
                 }
-                if !matches!(surface.role, Role::Panel(_)) {
+                if !surface.role.is_root() {
                     return None;
                 }
                 surface.hover_path.iter().rev().find_map(|anchor| {
@@ -5280,7 +5465,7 @@ impl App {
         let mut owners: Vec<_> = self
             .surfaces
             .iter()
-            .filter(|surface| matches!(surface.role, Role::Panel(_)))
+            .filter(|surface| surface.role.is_root())
             .map(Surface::owner)
             .collect();
         for owner in self.hover.owners() {
@@ -5323,7 +5508,7 @@ impl App {
 
     fn keyboard_hover_target(&self) -> Option<HoverTarget<SurfaceOwner>> {
         self.surfaces.iter().find_map(|surface| {
-            if !matches!(surface.role, Role::Panel(_))
+            if !surface.role.is_root()
                 || self.keyboard_surface.as_ref() != Some(surface.role.surface())
             {
                 return None;
@@ -6043,28 +6228,39 @@ fn prepare_candidate_layouts(
     for surface in surfaces {
         let panel = current.iter().find(|candidate| {
             candidate.key == surface.key
-                && candidate.role == LayoutSurfaceRole::Panel
+                && candidate.role == LayoutSurfaceRole::Root
                 && candidate.root == surface.root.id
         });
-        let prospective = panel_size(
-            panel::geometry(&surface.root, None),
-            (output.width, output.height),
-        );
+        let prospective = if surface.root.kind == Kind::Window {
+            toplevel::initial_size(&surface.root.window, None)
+        } else {
+            panel_size(
+                panel::geometry(&surface.root, None),
+                (output.width, output.height),
+            )
+        };
         let (size, scroll, focused) = panel.map_or_else(
             || (prospective, ScrollState::default(), None),
             |panel| (panel.size, panel.scroll.clone(), panel.focused),
         );
-        let scale = panel.map_or(output.scale, |panel| panel.preferred_scale);
-        prepared.push(prepare_surface_layout(
+        let (layout, scale) = prepare_candidate_layout(
             render,
             surface.key.clone(),
             &surface.root,
-            size,
-            scroll,
-            focused,
-            scale,
-        )?);
-        if size != prospective {
+            (size, scroll, focused),
+            panel.map_or((output.scale, None), |panel| {
+                (panel.preferred_scale, Some(panel.scale))
+            }),
+        )?;
+        prepared.push(layout);
+        // a window shown again starts at its initial size and its owner
+        // output's scale; a panel keeps the scale it already draws at.
+        let prospective_scale = if surface.root.kind == Kind::Window {
+            output.scale
+        } else {
+            scale
+        };
+        if size != prospective || scale != prospective_scale {
             prepare_surface_layout(
                 render,
                 surface.key.clone(),
@@ -6072,7 +6268,7 @@ fn prepare_candidate_layouts(
                 prospective,
                 ScrollState::default(),
                 None,
-                scale,
+                prospective_scale,
             )?;
         }
 
@@ -6089,16 +6285,16 @@ fn prepare_candidate_layouts(
                 || (prospective, ScrollState::default(), None),
                 |popup| (popup.size, popup.scroll.clone(), popup.focused),
             );
-            let scale = existing.map_or(output.scale, |popup| popup.preferred_scale);
-            prepared.push(prepare_surface_layout(
+            let (layout, scale) = prepare_candidate_layout(
                 render,
                 surface.key.clone(),
                 popup_root,
-                size,
-                scroll,
-                focused,
-                scale,
-            )?);
+                (size, scroll, focused),
+                existing.map_or((output.scale, None), |popup| {
+                    (popup.preferred_scale, Some(popup.scale))
+                }),
+            )?;
+            prepared.push(layout);
             if size != prospective {
                 prepare_surface_layout(
                     render,
@@ -6113,6 +6309,37 @@ fn prepare_candidate_layouts(
         }
     }
     Ok(prepared)
+}
+
+/// lays out a candidate at the compositor's preferred scale. when that scale
+/// is rejected, a surface that already draws at another scale keeps it, as
+/// configure handling does, so one oversized preferred scale cannot block
+/// every later update.
+fn prepare_candidate_layout(
+    render: &mut Render,
+    key: SurfaceKey,
+    root: &Node,
+    (size, scroll, focused): ((u32, u32), ScrollState, Option<NodeId>),
+    (preferred, accepted): (Scale, Option<Scale>),
+) -> Result<(PreparedSurfaceLayout, Scale), String> {
+    match prepare_surface_layout(
+        render,
+        key.clone(),
+        root,
+        size,
+        scroll.clone(),
+        focused,
+        preferred,
+    ) {
+        Ok(layout) => Ok((layout, preferred)),
+        Err(error) => match accepted.filter(|accepted| *accepted != preferred) {
+            Some(accepted) => {
+                prepare_surface_layout(render, key, root, size, scroll, focused, accepted)
+                    .map(|layout| (layout, accepted))
+            }
+            None => Err(error),
+        },
+    }
 }
 
 fn prepare_surface_layout(
@@ -6166,10 +6393,14 @@ fn validate_surface_capabilities(
     idle_inhibit_available: bool,
 ) -> Result<(), String> {
     idle_inhibit::validate(surfaces, idle_inhibit_available)?;
+    let mut panels = surfaces
+        .iter()
+        .filter(|surface| surface.root.kind == Kind::Panel);
+    if layer_shell_version == 0 && panels.clone().next().is_some() {
+        return Err(LAYER_SHELL_REQUIRED.into());
+    }
     if layer_shell_version < 4
-        && surfaces
-            .iter()
-            .any(|surface| surface.root.panel.keyboard_mode == KeyboardMode::OnDemand)
+        && panels.any(|surface| surface.root.panel.keyboard_mode == KeyboardMode::OnDemand)
     {
         return Err("keyboard_mode 'on_demand' needs wlr-layer-shell version 4".into());
     }
@@ -6191,8 +6422,28 @@ fn apply_keyboard_mode(layer: &LayerSurface, mode: KeyboardMode) -> Result<(), S
 fn panel_role_version(role: &Role) -> u32 {
     match role {
         Role::Panel(layer) => layer_version(layer),
-        Role::Popup(_) => 0,
+        Role::Window(_) | Role::Popup(_) => 0,
     }
+}
+
+const LAYER_SHELL_REQUIRED: &str =
+    "ui.panel needs a compositor with wlr-layer-shell; ui.window works without it";
+
+enum PopupParent {
+    Layer(LayerSurface),
+    Window(XdgWindow),
+}
+
+/// the output edge automatic popups open away from. windows have no edge, so
+/// their popups open below the trigger as a top panel's do.
+fn popup_edge(root: &Node) -> Option<thing_core::PanelEdge> {
+    if root.kind == Kind::Window {
+        return Some(thing_core::PanelEdge::Top);
+    }
+    root.panel
+        .anchors
+        .and_then(|anchors| anchors.exclusive_edge())
+        .or(root.panel.anchors.is_none().then_some(root.panel.edge))
 }
 
 fn layer_version(layer: &LayerSurface) -> u32 {
@@ -6835,11 +7086,11 @@ impl OutputHandler for App {
         let owners: Vec<_> = self
             .surfaces
             .iter()
-            .filter(|surface| surface.output == output && matches!(surface.role, Role::Panel(_)))
+            .filter(|surface| surface.output == output && surface.role.is_root())
             .map(Surface::owner)
             .collect();
         for owner in owners {
-            self.remove_panel(&owner, false);
+            self.remove_root(&owner, false);
         }
         while let Some(index) = self
             .surfaces
@@ -6896,7 +7147,7 @@ impl LayerShellHandler for App {
             if !self.closed_surfaces.contains(&owner) {
                 self.closed_surfaces.push(owner.clone());
             }
-            self.remove_panel(&owner, true);
+            self.remove_root(&owner, true);
         }
     }
     fn configure(
@@ -6945,7 +7196,7 @@ impl LayerShellHandler for App {
                     eprintln!("thing: cannot apply panel configuration: {error}");
                     if initial {
                         let owner = self.surfaces[index].owner();
-                        self.remove_panel(&owner, false);
+                        self.remove_root(&owner, false);
                     }
                     return;
                 }
@@ -6968,18 +7219,89 @@ impl LayerShellHandler for App {
     }
 }
 
-// `XdgShell`'s dispatch adapter also exposes toplevel events. this host creates
-// only layers and popups, so it has no toplevel windows to configure or close.
 impl WindowHandler for App {
-    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &XdgWindow) {}
+    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, window: &XdgWindow) {
+        // a close for a window that was already replaced finds no surface.
+        let Some(index) = self.index(window.wl_surface()) else {
+            return;
+        };
+        let owner = self.surfaces[index].owner();
+        let root = self.surfaces[index].root;
+        let handled = self
+            .configurations
+            .runtime(&owner.output)
+            .is_some_and(|runtime| runtime.handles_close(root));
+        if handled {
+            // the configuration decides; the window stays unless the callback
+            // hides it, and a failing callback publishes none of its actions.
+            self.dispatch(owner.output.clone(), root, Event::Close, None);
+            return;
+        }
+        // without a handler a close hides the window until its declaration is
+        // hidden and shown again, or the configuration reloads.
+        if !self.closed_surfaces.contains(&owner) {
+            self.closed_surfaces.push(owner.clone());
+        }
+        self.remove_root(&owner, true);
+    }
+
     fn configure(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &XdgWindow,
-        _: WindowConfigure,
+        window: &XdgWindow,
+        configure: WindowConfigure,
         _: u32,
     ) {
+        // sctk has acknowledged the serial; the next commit answers it.
+        let Some(index) = self.index(window.wl_surface()) else {
+            return;
+        };
+        let Some(root) = self
+            .configurations
+            .surface_root(&self.surfaces[index].output, &self.surfaces[index].key)
+        else {
+            return;
+        };
+        let surface = &self.surfaces[index];
+        let current = surface.configured.then_some(surface.size);
+        let size = toplevel::configured_size(
+            configure.new_size,
+            current,
+            &root.window,
+            configure.suggested_bounds,
+        );
+        match self.prepare_configured_surface_layout(index, size) {
+            Ok(prepared) => {
+                let surface = &mut self.surfaces[index];
+                if surface.size != size {
+                    surface.layouts.invalidate_input();
+                }
+                surface.size = size;
+                surface.scale = prepared.scale;
+                surface.prepared = Some(prepared);
+                surface.configured = true;
+                surface.dirty = true;
+            }
+            Err(error) => {
+                // the last accepted layout keeps drawing at its own size.
+                eprintln!("thing: cannot apply window configuration: {error}");
+                let surface = &mut self.surfaces[index];
+                if !surface.configured {
+                    let owner = surface.owner();
+                    self.remove_root(&owner, false);
+                    return;
+                }
+                surface.dirty = true;
+            }
+        }
+        let surface = &mut self.surfaces[index];
+        let state = toplevel::state(&configure, surface.size);
+        let owner = surface.owner();
+        if let Role::Window(role) = &mut surface.role {
+            role.state = state;
+        }
+        self.queue_window_state(owner, state);
     }
 }
 
@@ -9083,6 +9405,7 @@ delegate_compositor!(App);
 delegate_output!(App);
 delegate_layer!(App);
 delegate_xdg_shell!(App);
+delegate_xdg_window!(App);
 delegate_xdg_popup!(App);
 delegate_seat!(App);
 delegate_keyboard!(App);

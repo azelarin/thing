@@ -33,6 +33,7 @@ mod skia_vulkan;
 mod sleep;
 mod system_tray;
 mod text_data;
+mod toplevel;
 mod watch;
 pub use host::{run, run_with_options};
 pub use inspect::LayoutInspector;

@@ -227,6 +227,18 @@ CASES = (
             "Property 'text' is not compatible.",
         ),
     ),
+    Case("valid-windows.luau"),
+    Case(
+        "invalid-windows.luau",
+        (
+            "Cannot add property 'layer' to table 'ThingWindowProperties'",
+            "Property 'size' is not compatible.",
+            "Property 'title' is not compatible.",
+            "Property 'on_close' is not compatible.",
+            "Expected this to be 'boolean', but got 'string'",
+            "Key 'set' not found in table 'ThingSignal<number>'",
+        ),
+    ),
     Case("valid-container-scroll.luau"),
     Case(
         "invalid-container-scroll.luau",

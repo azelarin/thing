@@ -39,7 +39,7 @@ enum Backend {
     #[cfg(test)]
     Test {
         buffer: wl_buffer::WlBuffer,
-        size: (u32, u32),
+        size: Option<(u32, u32)>,
     },
 }
 
@@ -61,7 +61,19 @@ impl Render {
     #[cfg(test)]
     pub(crate) fn new_test(buffer: wl_buffer::WlBuffer, size: (u32, u32)) -> Self {
         Self {
-            backend: Backend::Test { buffer, size },
+            backend: Backend::Test {
+                buffer,
+                size: Some(size),
+            },
+        }
+    }
+
+    /// a test renderer that attaches its one buffer at any surface size, for
+    /// fixtures whose compositor does not inspect buffer dimensions.
+    #[cfg(test)]
+    pub(crate) fn new_test_any_size(buffer: wl_buffer::WlBuffer) -> Self {
+        Self {
+            backend: Backend::Test { buffer, size: None },
         }
     }
 
@@ -148,7 +160,7 @@ impl Render {
             }
             #[cfg(test)]
             Backend::Test { size, .. } => {
-                if *size != (width, height) {
+                if size.is_some_and(|size| size != (width, height)) {
                     return Err("test buffer does not match the lock surface size".into());
                 }
                 Ok(Window::Test(surface.clone()))
@@ -209,7 +221,7 @@ impl Render {
             ),
             #[cfg(test)]
             (Backend::Test { buffer, size }, Window::Test(surface)) => {
-                if frame.physical != *size {
+                if size.is_some_and(|size| frame.physical != size) {
                     return Err("test frame does not match its shared-memory buffer".into());
                 }
                 before_present();

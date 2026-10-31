@@ -11,6 +11,7 @@ pub struct NodeId(pub u64);
 pub enum Kind {
     Panel,
     Lock,
+    Window,
     Popup,
     Row,
     CenterBox,
@@ -298,6 +299,92 @@ pub enum PanelInputRegion {
     Rectangles(Vec<PanelInputRect>),
 }
 
+/// the largest window dimension, in logical pixels, a configuration may ask for.
+pub const MAX_WINDOW_DIMENSION: u32 = 16_384;
+pub const MAX_WINDOW_TITLE_BYTES: usize = 1_024;
+pub const MAX_WINDOW_APP_ID_BYTES: usize = 255;
+
+/// a window content size in logical pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// toplevel properties that are meaningful only on a root window. the
+/// compositor owns the actual size; `size` is used until it suggests one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowProperties {
+    pub title: String,
+    /// an empty app id is not sent to the compositor.
+    pub app_id: String,
+    pub size: WindowSize,
+    pub min_size: Option<WindowSize>,
+    pub max_size: Option<WindowSize>,
+}
+
+impl Default for WindowProperties {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            app_id: String::new(),
+            size: WindowSize {
+                width: 640,
+                height: 480,
+            },
+            min_size: None,
+            max_size: None,
+        }
+    }
+}
+
+impl WindowProperties {
+    fn validate(&self) -> Result<(), TreeError> {
+        let valid = |size: WindowSize| {
+            (1..=MAX_WINDOW_DIMENSION).contains(&size.width)
+                && (1..=MAX_WINDOW_DIMENSION).contains(&size.height)
+        };
+        if ![Some(self.size), self.min_size, self.max_size]
+            .into_iter()
+            .flatten()
+            .all(valid)
+        {
+            return Err(TreeError(format!(
+                "window sizes must be whole logical pixels from 1 through {MAX_WINDOW_DIMENSION}"
+            )));
+        }
+        let at_least = |size: WindowSize, minimum: WindowSize| {
+            size.width >= minimum.width && size.height >= minimum.height
+        };
+        if let Some(minimum) = self.min_size
+            && !at_least(self.size, minimum)
+        {
+            return Err(TreeError("window size must not be below min_size".into()));
+        }
+        if let Some(maximum) = self.max_size
+            && !at_least(maximum, self.size)
+        {
+            return Err(TreeError("window size must not exceed max_size".into()));
+        }
+        if self.title.len() > MAX_WINDOW_TITLE_BYTES || self.title.chars().any(char::is_control) {
+            return Err(TreeError(format!(
+                "window title must be at most {MAX_WINDOW_TITLE_BYTES} bytes without control characters"
+            )));
+        }
+        if self.app_id.len() > MAX_WINDOW_APP_ID_BYTES
+            || self
+                .app_id
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace())
+        {
+            return Err(TreeError(format!(
+                "window app_id must be at most {MAX_WINDOW_APP_ID_BYTES} bytes without spaces or control characters"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// surface properties that are meaningful only on the root panel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PanelProperties {
@@ -459,6 +546,7 @@ impl Kind {
             Self::Button
                 | Self::PointerArea
                 | Self::Panel
+                | Self::Window
                 | Self::Popup
                 | Self::Row
                 | Self::Column
@@ -473,6 +561,7 @@ impl Kind {
             self,
             Self::Panel
                 | Self::Lock
+                | Self::Window
                 | Self::Popup
                 | Self::Row
                 | Self::CenterBox
@@ -814,6 +903,7 @@ pub struct Node {
     pub slider: Slider,
     pub range_inset: f32,
     pub panel: PanelProperties,
+    pub window: WindowProperties,
     pub idle_inhibit: bool,
     pub enabled: bool,
     pub visible: bool,
@@ -850,6 +940,7 @@ impl Node {
             slider: Slider::default(),
             range_inset: 0.0,
             panel: PanelProperties::default(),
+            window: WindowProperties::default(),
             idle_inhibit: false,
             enabled: true,
             visible: true,
@@ -931,6 +1022,24 @@ impl Node {
                 "lock is valid only as the root of a lock configuration".into(),
             ));
         }
+        if depth > 0 && self.kind == Kind::Window {
+            return Err(TreeError("window is valid only as a surface root".into()));
+        }
+        if self.kind != Kind::Window && self.window != WindowProperties::default() {
+            return Err(TreeError(
+                "window properties are only valid on a window".into(),
+            ));
+        }
+        if self.kind == Kind::Window {
+            self.window.validate()?;
+            if self.style.width.is_some() || self.style.height.is_some() {
+                return Err(TreeError(
+                    "a window's size comes from size, min_size, max_size, and the compositor; \
+                     style width and height are not available on ui.window"
+                        .into(),
+                ));
+            }
+        }
         if scope.lock_root && self.kind == Kind::Popup {
             return Err(TreeError(
                 "popups are not available in a lock configuration".into(),
@@ -951,9 +1060,9 @@ impl Node {
                 "panel surface properties are only valid on a panel".into(),
             ));
         }
-        if self.idle_inhibit && !matches!(self.kind, Kind::Panel | Kind::Popup) {
+        if self.idle_inhibit && !matches!(self.kind, Kind::Panel | Kind::Window | Kind::Popup) {
             return Err(TreeError(
-                "idle_inhibit is available only on panel and popup surfaces".into(),
+                "idle_inhibit is available only on panel, window, and popup surfaces".into(),
             ));
         }
         if self.kind != Kind::Scroll && self.scroll_axis != ScrollAxis::Vertical {
@@ -991,7 +1100,7 @@ impl Node {
             shadow.validate()?;
         }
         if (self.kind == Kind::Popup
-            || (depth == 0 && matches!(self.kind, Kind::Panel | Kind::Lock)))
+            || (depth == 0 && matches!(self.kind, Kind::Panel | Kind::Lock | Kind::Window)))
             && [
                 style.min_width,
                 style.max_width,
@@ -1006,7 +1115,7 @@ impl Node {
             ));
         }
         if (self.kind == Kind::Popup
-            || (depth == 0 && matches!(self.kind, Kind::Panel | Kind::Lock)))
+            || (depth == 0 && matches!(self.kind, Kind::Panel | Kind::Lock | Kind::Window)))
             && (style.width_fraction.is_some() || style.height_fraction.is_some())
         {
             return Err(TreeError(
@@ -1045,6 +1154,7 @@ impl Node {
                 self.kind,
                 Kind::Panel
                     | Kind::Lock
+                    | Kind::Window
                     | Kind::Popup
                     | Kind::Row
                     | Kind::Column

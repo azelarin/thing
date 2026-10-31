@@ -766,6 +766,22 @@ impl<K: Clone + Eq> Configurations<K> {
         Ok(())
     }
 
+    /// publishes a window's configured state to the runtime that owns it.
+    /// call [`Self::refresh`] or the host's refresh afterward.
+    pub(crate) fn set_window_state(
+        &mut self,
+        key: &K,
+        window: &str,
+        state: thing_runtime::WindowState,
+    ) -> Result<(), String> {
+        let Some(runtime) = self.runtime_mut(key) else {
+            return Ok(());
+        };
+        runtime
+            .set_window_state(window, state)
+            .map_err(|error| error.to_string())
+    }
+
     /// the sleep inhibitor keys every accepted configuration declares.
     pub(crate) fn sleep_inhibitor_definitions(&self) -> Vec<SleepInhibitorDefinition> {
         collect_sleep_inhibitor_definitions(self.instances.iter().map(|instance| &instance.runtime))

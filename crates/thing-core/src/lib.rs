@@ -13,9 +13,10 @@ pub use geometry::{HorizontalRange, Point, Rect, Scale};
 pub use shadow::{MAX_SHADOW_BLUR, MAX_SHADOW_OFFSET, MAX_SHADOW_SPREAD, Shadow};
 pub use widget::{
     ClipMode, CrossAlign, Image, ImageCandidate, ImageFit, ImagePixmap, ImageSource, KeyboardMode,
-    Kind, MainAlign, Node, NodeId, PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins,
-    PanelProperties, PathFillRule, PathFit, PathStrokeCap, PathStrokeJoin, PopupAlignment,
-    PopupAnchor, PopupConstraints, PopupOffset, PopupOptions, ScrollAxis, Slider, Style,
-    SurfaceAnchors, SurfaceLayer, TextAlign, TextOverflow, TransformOrigin, TreeError, VectorPath,
-    VectorSegment, ViewBox,
+    Kind, MAX_WINDOW_APP_ID_BYTES, MAX_WINDOW_DIMENSION, MAX_WINDOW_TITLE_BYTES, MainAlign, Node,
+    NodeId, PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins, PanelProperties,
+    PathFillRule, PathFit, PathStrokeCap, PathStrokeJoin, PopupAlignment, PopupAnchor,
+    PopupConstraints, PopupOffset, PopupOptions, ScrollAxis, Slider, Style, SurfaceAnchors,
+    SurfaceLayer, TextAlign, TextOverflow, TransformOrigin, TreeError, VectorPath, VectorSegment,
+    ViewBox, WindowProperties, WindowSize,
 };
