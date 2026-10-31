@@ -134,6 +134,12 @@ CASES = (
         ),
     ),
     Case("valid-notification-history.luau"),
+    Case("valid-notification-expiry.luau"),
+    Case("invalid-notification-expiry.luau", (
+        "Expected this to be 'string', but got 'number'",
+        "Expected this to be 'boolean', but got 'string'",
+        "Expected this to be 'number', but got 'number?'",
+    )),
     Case(
         "invalid-notification-history.luau",
         (

@@ -687,6 +687,7 @@ declare extern type ThingNotification with
     read urgency_code: number
     read raw_expire_timeout_ms: number
     read effective_timeout_ms: number?
+    read expiry_paused: boolean
     read created_at_ms: number
     read updated_at_ms: number
     read expires_at_ms: number?
@@ -933,6 +934,8 @@ declare extern type ThingNotificationService with
     read reply: (key: string, text: string) -> ()
     read forget: (key: string) -> ()
     read clear_history: () -> ()
+    read set_expiry_paused: (key: string, paused: boolean) -> ()
+    read remaining: (key: string) -> number?
 end
 
 declare extern type ThingSystemTrayService with

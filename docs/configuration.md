@@ -2345,7 +2345,8 @@ notification lifetime first. each record contains:
 | `actions` | immutable `{ key, label }` records advertised by the client |
 | `urgency`, `urgency_code` | `low`, `normal`, or `critical`, and its numeric code |
 | `raw_expire_timeout_ms` | timeout from the client; `-1` means the server default |
-| `effective_timeout_ms`, `expires_at_ms` | resolved timeout and server-relative deadline, or `nil` |
+| `effective_timeout_ms`, `expires_at_ms` | resolved timeout and server-relative deadline, or `nil`; the deadline is absent while paused |
+| `expiry_paused` | whether the server has paused expiry |
 | `created_at_ms`, `updated_at_ms` | server-relative times for the first and latest revision |
 | `category`, `desktop_entry`, `image_path` | optional application metadata |
 | `resident`, `transient`, `action_icons` | standard notification behavior hints |
@@ -2377,6 +2378,37 @@ ui.column {
     end,
 }
 ```
+
+`set_expiry_paused(key, true)` holds a live notification open. passing `false`
+releases this configuration's hold and resumes with the time left, rather than
+restarting the timeout. these controls run in event handlers. when several
+outputs hold the same notification, expiry resumes after the last one releases
+it. repeated calls with the same value have no additional effect.
+
+holds survive replacement of the same notification lifetime; the replacement's
+timeout becomes its new remaining time. closing a record discards its holds.
+successful reloads and output removal release the affected configurations'
+holds; a failed reload keeps them. controls reject keys absent from the active
+list. a notification can still expire before a requested hold reaches the
+server; a late hold cannot bring it back.
+
+keep hover and reply state in the configuration, and combine them before
+calling `set_expiry_paused`. for a card that only pauses on hover:
+
+```luau
+ui.button {
+    on_enter = function() notifications.set_expiry_paused(notification.key, true) end,
+    on_leave = function() notifications.set_expiry_paused(notification.key, false) end,
+    children = { ui.text { text = notification.summary } },
+}
+```
+
+`remaining(key)` samples the time left in milliseconds using a monotonic clock.
+it stays fixed while paused and returns nil for a non-expiring, closed, or
+unknown record. reading it does not schedule redraws; use a timer to update a
+visible countdown. `expiry_paused` reflects the server's reported state, so it
+may change after the handler returns. pausing does not change content revisions
+or `updated_at_ms`. history records keep their state at closure.
 
 `invoke(key, action_key)` activates one of the record's actions. non-resident
 notifications close after an action; resident notifications stay active. both

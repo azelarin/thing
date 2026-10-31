@@ -30,6 +30,9 @@ fn notification(key: &str, id: u32, summary: &str) -> Notification {
         urgency: NotificationUrgency::Normal,
         raw_expire_timeout_ms: -1,
         effective_timeout_ms: Some(5_000),
+        expiry_paused: false,
+        paused_remaining_ms: None,
+        time_origin: std::time::Instant::now(),
         created_at_ms: 20,
         updated_at_ms: 20,
         expires_at_ms: Some(5_020),
@@ -497,4 +500,164 @@ fn history_record_limit_is_validated_before_replacing_the_snapshot() {
     );
     assert!(!runtime.refresh().unwrap());
     assert_eq!(runtime.root().unwrap().children[0].text, "128");
+}
+
+#[test]
+fn expiry_holds_commit_only_after_an_accepted_event() {
+    let (_directory, mut runtime) = load_runtime(
+        r#"
+        local n = services.notifications
+        local revision = ui.state(0)
+        return ui.panel { children = {
+            ui.button { on_click = function()
+                n.set_expiry_paused('1', true)
+                assert(n.active:get()[1].expiry_paused == false)
+            end },
+            ui.button { on_click = function()
+                n.set_expiry_paused('1', false); revision:set(revision:get() + 1)
+            end, children = { ui.text { text = function() return tostring(revision:get()) end } } },
+            ui.button { on_click = function() n.set_expiry_paused('1', false); error('failed') end },
+        } }
+    "#,
+    );
+    runtime
+        .set_notifications(NotificationSnapshot {
+            owned: true,
+            active: vec![notification("1", 1, "mail")],
+            ..NotificationSnapshot::default()
+        })
+        .unwrap();
+    runtime
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
+        .unwrap();
+    assert_eq!(runtime.notification_expiry_holds(), vec![1]);
+    assert!(runtime.take_actions().is_empty());
+    assert!(
+        runtime
+            .dispatch(runtime.root().unwrap().children[2].id, Event::Click)
+            .is_err()
+    );
+    assert_eq!(runtime.notification_expiry_holds(), vec![1]);
+    let release = runtime.root().unwrap().children[1].id;
+    // host rejection must also discard controls from a successful callback.
+    assert!(
+        runtime
+            .dispatch_checked(release, Event::Click, |_| Err("rejected".into()))
+            .is_err()
+    );
+    assert_eq!(runtime.notification_expiry_holds(), vec![1]);
+    runtime.dispatch(release, Event::Click).unwrap();
+    assert!(runtime.notification_expiry_holds().is_empty());
+    runtime
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
+        .unwrap();
+    runtime
+        .set_notifications(NotificationSnapshot {
+            owned: true,
+            active: vec![],
+            ..NotificationSnapshot::default()
+        })
+        .unwrap();
+    assert!(runtime.notification_expiry_holds().is_empty());
+}
+
+#[test]
+fn expiry_controls_check_phase_keys_and_boolean_arguments() {
+    for call in [
+        "n.set_expiry_paused('1', true)",
+        "n.set_expiry_paused('1', false)",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("panel.luau");
+        fs::write(
+            &path,
+            format!("local n=services.notifications; {call}; return ui.panel {{}}"),
+        )
+        .unwrap();
+        assert!(Runtime::load(&path).is_err());
+    }
+    for call in [
+        "n.set_expiry_paused('1', 'true')",
+        "n.set_expiry_paused(1, true)",
+        "n.set_expiry_paused('2', true)",
+        "n.set_expiry_paused('18446744073709551616', true)",
+        "for _=1,129 do n.set_expiry_paused('1', true) end",
+    ] {
+        let (_directory, mut runtime) = load_runtime(&format!(
+            "local n=services.notifications; return ui.panel {{ children = {{ ui.button {{ on_click=function() {call} end }} }} }}"
+        ));
+        runtime
+            .set_notifications(NotificationSnapshot {
+                owned: true,
+                active: vec![notification("1", 1, "mail")],
+                ..NotificationSnapshot::default()
+            })
+            .unwrap();
+        assert!(
+            runtime
+                .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
+                .is_err(),
+            "{call}"
+        );
+        assert!(runtime.notification_expiry_holds().is_empty());
+    }
+}
+
+#[test]
+fn remaining_time_uses_a_monotonic_origin_and_frozen_pause_sample() {
+    use std::time::{Duration, Instant};
+    let mut record = notification("1", 1, "mail");
+    let origin = Instant::now();
+    record.time_origin = origin;
+    assert_eq!(record.remaining_at(origin), Some(5000));
+    assert_eq!(
+        record.remaining_at(origin + Duration::from_millis(1020)),
+        Some(4000)
+    );
+    assert_eq!(
+        record.remaining_at(origin + Duration::from_millis(6020)),
+        Some(0)
+    );
+    record.expiry_paused = true;
+    record.expires_at_ms = None;
+    record.paused_remaining_ms = Some(1234);
+    assert_eq!(
+        record.remaining_at(origin + Duration::from_secs(100)),
+        Some(1234)
+    );
+    let (_directory, mut runtime) = load_runtime(
+        r#"
+        return ui.panel { children = { ui.text { text = function()
+            local n = services.notifications
+            local record = n.active:get()[1]
+            if not record then return 'empty' end
+            assert(not pcall(function() record.expiry_paused = false end))
+            assert(n.remaining('2') == nil)
+            return tostring(record.expiry_paused) .. ':' .. tostring(n.remaining(record.key))
+        end } } }
+    "#,
+    );
+    runtime
+        .set_notifications(NotificationSnapshot {
+            owned: true,
+            active: vec![record.clone()],
+            ..NotificationSnapshot::default()
+        })
+        .unwrap();
+    runtime.refresh().unwrap();
+    assert_eq!(runtime.root().unwrap().children[0].text, "true:1234");
+    let mut invalid = record.clone();
+    invalid.paused_remaining_ms = Some(5001);
+    assert!(
+        runtime
+            .set_notifications(NotificationSnapshot {
+                owned: true,
+                active: vec![invalid],
+                ..NotificationSnapshot::default()
+            })
+            .is_err()
+    );
+    assert!(!runtime.refresh().unwrap());
+    record.closed = Some((NotificationCloseReason::Dismissed, 2000));
+    assert_eq!(record.remaining_at(origin), None);
 }

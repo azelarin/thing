@@ -8,6 +8,7 @@ mod idle;
 mod modules;
 mod motion;
 mod niri;
+mod notification_expiry;
 mod properties;
 mod reconcile;
 mod services;
@@ -321,6 +322,7 @@ impl UiContext {
 
 #[derive(Clone, Copy)]
 struct ActionCheckpoint {
+    notification_expiry: usize,
     services: usize,
     ui: usize,
     timers: usize,
@@ -627,16 +629,22 @@ impl Runtime {
     ) -> Result<T> {
         let checkpoint = self.timers.borrow().checkpoint();
         let motion_checkpoint = self.motions.borrow().checkpoint();
+        let expiry_checkpoint = self.services.notification_expiry.borrow().checkpoint();
         self.event_depth += 1;
         let result = callback(self);
         self.event_depth -= 1;
         if result.is_err() {
             self.timers.borrow_mut().truncate(checkpoint);
             self.motions.borrow_mut().truncate(motion_checkpoint);
+            self.services
+                .notification_expiry
+                .borrow_mut()
+                .truncate(expiry_checkpoint);
         } else if self.event_depth == 0 {
             let now = now.map_or_else(Instant::now, |now| now.max(Instant::now()));
             self.timers.borrow_mut().commit(now);
             self.motions.borrow_mut().commit_controls(now);
+            self.services.notification_expiry.borrow_mut().commit();
         }
         result
     }
@@ -817,6 +825,17 @@ impl Runtime {
         self.services.set_output(&output)?;
         self.output = Some(output);
         Ok(())
+    }
+
+    /// notification lifetime keys this configuration wants to keep from expiring.
+    pub fn notification_expiry_holds(&self) -> Vec<u64> {
+        self.services
+            .notification_expiry
+            .borrow()
+            .keys()
+            .iter()
+            .copied()
+            .collect()
     }
 
     /// takes the service actions queued by event handlers.
@@ -2020,6 +2039,7 @@ impl Runtime {
 
     fn action_checkpoint(&self) -> ActionCheckpoint {
         ActionCheckpoint {
+            notification_expiry: self.services.notification_expiry.borrow().checkpoint(),
             services: self.services.action_count(),
             ui: self.ui.borrow().actions.len(),
             timers: self.timers.borrow().checkpoint(),
@@ -2037,6 +2057,10 @@ impl Runtime {
     }
 
     fn truncate_actions(&self, checkpoint: ActionCheckpoint) {
+        self.services
+            .notification_expiry
+            .borrow_mut()
+            .truncate(checkpoint.notification_expiry);
         self.services.truncate_actions(checkpoint.services);
         self.ui.borrow_mut().actions.truncate(checkpoint.ui);
         self.timers.borrow_mut().truncate(checkpoint.timers);

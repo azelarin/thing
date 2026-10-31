@@ -4,7 +4,7 @@ use std::{
     os::{fd::AsRawFd, unix::net::UnixStream},
     sync::{Arc, Mutex, MutexGuard},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_io::{Async, Timer};
@@ -69,6 +69,7 @@ struct Shared {
     targets: BTreeMap<u64, BTreeSet<String>>,
     replyable: BTreeSet<u64>,
     history: BTreeSet<u64>,
+    expiry_holds: BTreeSet<u64>,
     generation: u64,
     active_generation: Option<u64>,
     stop: bool,
@@ -111,6 +112,18 @@ impl Server {
 
     pub(crate) fn take_snapshot(&self) -> Option<NotificationSnapshot> {
         lock(&self.shared).latest.take()
+    }
+
+    pub(crate) fn set_expiry_holds(&self, mut holds: BTreeSet<u64>) {
+        let mut shared = lock(&self.shared);
+        holds.retain(|key| shared.targets.contains_key(key));
+        if shared.expiry_holds != holds {
+            shared.expiry_holds = holds;
+            drop(shared);
+            // latest desired state has its own mailbox, so cleanup cannot be
+            // dropped when the ordinary action queue is full.
+            wake(&self.wake);
+        }
     }
 
     pub(crate) fn dismiss(&self, key: u64) -> Result<(), &'static str> {
@@ -253,6 +266,7 @@ fn worker(
             }
             state.commands.clear();
             state.targets.clear();
+            state.expiry_holds.clear();
             state.replyable.clear();
             state.history.clear();
             if state.stop {
@@ -322,13 +336,14 @@ async fn session(
         .map_err(|error| Failure::Retry(error.to_string()))?;
     let callback_shared = context.shared.clone();
     let callback_ping = context.ping.clone();
-    let changed: ChangeHook = Arc::new(move |active, history| {
+    let changed: ChangeHook = Arc::new(move |active, history, time_origin| {
         publish_owned(
             &callback_shared,
             &callback_ping,
             generation,
             active,
             history,
+            time_origin,
         );
         wake(&callback_stream);
     });
@@ -398,6 +413,7 @@ async fn connection_session(
         generation,
         notifications.active(),
         notifications.history(),
+        notifications.time_origin(),
     );
     let emitter = SignalEmitter::new(connection, OBJECT_PATH)
         .map_err(|error| Failure::Retry(error.to_string()))?;
@@ -406,6 +422,8 @@ async fn connection_session(
         if stopping(shared) {
             return Ok(());
         }
+        let holds = lock(shared).expiry_holds.clone();
+        notifications.set_expiry_holds(&holds);
         let input = future::race(
             async {
                 connection.closed().await;
@@ -553,6 +571,7 @@ fn publish_owned(
     generation: u64,
     active: Vec<Notification>,
     history: Vec<Notification>,
+    time_origin: Instant,
 ) {
     let replyable = active
         .iter()
@@ -580,8 +599,14 @@ fn publish_owned(
     let snapshot = NotificationSnapshot {
         owned: true,
         error: String::new(),
-        active: active.into_iter().map(runtime_notification).collect(),
-        history: history.into_iter().map(runtime_notification).collect(),
+        active: active
+            .into_iter()
+            .map(|record| runtime_notification(record, time_origin))
+            .collect(),
+        history: history
+            .into_iter()
+            .map(|record| runtime_notification(record, time_origin))
+            .collect(),
     };
     let changed = {
         let mut shared = lock(shared);
@@ -589,6 +614,8 @@ fn publish_owned(
             return;
         }
         shared.targets = targets;
+        let active_keys: BTreeSet<_> = shared.targets.keys().copied().collect();
+        shared.expiry_holds.retain(|key| active_keys.contains(key));
         shared.replyable = replyable;
         shared.history = history_keys;
         replace_snapshot(&mut shared, snapshot)
@@ -618,7 +645,7 @@ fn replace_snapshot(shared: &mut Shared, snapshot: NotificationSnapshot) -> bool
     true
 }
 
-fn runtime_notification(notification: Notification) -> RuntimeNotification {
+fn runtime_notification(notification: Notification, time_origin: Instant) -> RuntimeNotification {
     // a new revision may carry a different image, so the identity includes it.
     let image = notification.request.hints.image.clone().and_then(|pixmap| {
         let candidate = ImageCandidate::new(None, vec![pixmap]).ok()?;
@@ -655,6 +682,9 @@ fn runtime_notification(notification: Notification) -> RuntimeNotification {
         },
         raw_expire_timeout_ms: notification.request.expire_timeout_ms,
         effective_timeout_ms: notification.effective_timeout_ms,
+        expiry_paused: notification.expiry_paused,
+        paused_remaining_ms: notification.paused_remaining_ms,
+        time_origin,
         created_at_ms: notification.created_at_ms,
         updated_at_ms: notification.updated_at_ms,
         expires_at_ms: notification.expires_at_ms,
@@ -806,13 +836,13 @@ mod tests {
                 .active()
                 .iter()
                 .cloned()
-                .map(runtime_notification)
+                .map(|record| runtime_notification(record, Instant::now()))
                 .collect(),
             history: model
                 .history()
                 .iter()
                 .cloned()
-                .map(runtime_notification)
+                .map(|record| runtime_notification(record, Instant::now()))
                 .collect(),
         };
         thing_runtime::ServiceSnapshot::default()
@@ -1001,6 +1031,95 @@ mod tests {
     }
 
     #[test]
+    fn worker_holds_replacement_expiry_until_released() {
+        let mut bus = Bus::start();
+        let (ping, _source) = calloop::ping::make_ping().unwrap();
+        let server = Server::start_at(Some(bus.address.clone()), ping).unwrap();
+        wait_snapshot(&server, |snapshot| snapshot.owned);
+        async_io::block_on(async {
+            let client = connect(&bus.address).await;
+            let proxy = TestNotificationsProxy::new(&client).await.unwrap();
+            let mut closed = proxy.receive_notification_closed().await.unwrap();
+            let id = notify(&proxy, "timed", vec!["default".into(), "open".into()], 3000).await;
+            let initial = wait_snapshot(&server, |snapshot| !snapshot.active.is_empty())
+                .active
+                .remove(0);
+            let key = initial.key.parse().unwrap();
+            server.set_expiry_holds(BTreeSet::from([key]));
+            let paused = wait_snapshot(&server, |snapshot| {
+                snapshot
+                    .active
+                    .first()
+                    .is_some_and(|record| record.expiry_paused)
+            });
+            let remaining = paused.active[0].paused_remaining_ms.unwrap();
+            assert!((1..=3000).contains(&remaining));
+            assert_eq!(paused.active[0].revision, 1);
+            assert_eq!(paused.active[0].expires_at_ms, None);
+            // reaching the original deadline must not invalidate the live record.
+            Timer::at(
+                initial.time_origin + Duration::from_millis(initial.expires_at_ms.unwrap() + 50),
+            )
+            .await;
+            assert!(server.invoke(key, "missing".into()).is_err());
+            assert!(lock(&server.shared).targets.contains_key(&key));
+            assert_eq!(
+                proxy
+                    .notify(
+                        "test app",
+                        id,
+                        "",
+                        "replacement",
+                        "",
+                        vec![],
+                        HashMap::new(),
+                        500
+                    )
+                    .await
+                    .unwrap(),
+                id
+            );
+            let replacement = wait_snapshot(&server, |snapshot| {
+                snapshot
+                    .active
+                    .first()
+                    .is_some_and(|record| record.revision == 2)
+            });
+            assert_eq!(replacement.active[0].key, initial.key);
+            assert!(replacement.active[0].expiry_paused);
+            assert_eq!(replacement.active[0].paused_remaining_ms, Some(500));
+            server.set_expiry_holds(BTreeSet::new());
+            let resumed = wait_snapshot(&server, |snapshot| {
+                snapshot
+                    .active
+                    .first()
+                    .is_some_and(|record| !record.expiry_paused)
+            });
+            assert!(resumed.active[0].remaining_at(Instant::now()).unwrap() <= 500);
+            assert!(
+                resumed.active[0].expires_at_ms.unwrap() >= resumed.active[0].updated_at_ms + 500
+            );
+            let signal = future::race(async { closed.next().await.unwrap() }, async {
+                Timer::after(Duration::from_secs(5)).await;
+                panic!("resumed notification never expired");
+            })
+            .await;
+            let args = signal.args().unwrap();
+            assert_eq!(
+                (*args.id(), *args.reason()),
+                (id, CloseReason::Expired.code())
+            );
+            let expired = wait_snapshot(&server, |snapshot| snapshot.active.is_empty());
+            assert_eq!(expired.history[0].key, initial.key);
+            assert!(lock(&server.shared).expiry_holds.is_empty());
+            server.set_expiry_holds(BTreeSet::from([key]));
+            assert!(lock(&server.shared).expiry_holds.is_empty());
+        });
+        drop(server);
+        bus.stop();
+    }
+
+    #[test]
     fn name_conflict_is_terminal_for_the_running_server() {
         let mut bus = Bus::start();
         async_io::block_on(async {
@@ -1054,6 +1173,14 @@ mod tests {
                 .unwrap()
         });
 
+        server.set_expiry_holds(BTreeSet::from([first_key]));
+        wait_snapshot(&server, |snapshot| {
+            snapshot
+                .active
+                .first()
+                .is_some_and(|record| record.expiry_paused)
+        });
+
         bus.stop();
         wait_snapshot(&server, |snapshot| {
             !snapshot.owned && !snapshot.error.is_empty()
@@ -1069,6 +1196,8 @@ mod tests {
                 .parse::<u64>()
                 .unwrap()
         });
+        assert!(lock(&server.shared).expiry_holds.is_empty());
+        assert!(!lock(&server.shared).current.active[0].expiry_paused);
         assert!(second_key > first_key);
         assert_eq!(
             server.dismiss(first_key),
@@ -1144,6 +1273,11 @@ mod tests {
             }
         }
         assert_eq!(server.dismiss(1), Err("notification command queue is full"));
+        server.set_expiry_holds(BTreeSet::from([1, 2]));
+        assert_eq!(lock(&server.shared).expiry_holds, BTreeSet::from([1]));
+        server.set_expiry_holds(BTreeSet::new());
+        assert!(lock(&server.shared).expiry_holds.is_empty());
+        assert_eq!(lock(&server.shared).commands.len(), MAX_COMMANDS);
         drop(server);
         drop(wake_reader);
         drop(shutdown_reader);

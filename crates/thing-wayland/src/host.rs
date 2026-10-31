@@ -524,6 +524,7 @@ impl App {
         )?;
         let prepared = preflight.into_prepared();
         self.configurations.commit_reload(prepared_configurations);
+        self.reconcile_notification_expiry();
         for (output, _) in &outputs {
             self.sync_output_surfaces(output, false, qh)?;
         }
@@ -1648,7 +1649,14 @@ impl App {
         self.reconcile_published_configuration();
     }
 
+    fn reconcile_notification_expiry(&self) {
+        if let Some(server) = &self.notifications {
+            server.set_expiry_holds(self.configurations.notification_expiry_holds());
+        }
+    }
+
     fn reconcile_published_configuration(&mut self) {
+        self.reconcile_notification_expiry();
         self.reconcile_idle_inhibitors();
         self.reconcile_focus_targets();
         self.apply_pending_ui_actions_now();
@@ -1721,6 +1729,7 @@ impl App {
             }
         };
         self.configurations.commit_reload(configurations);
+        self.reconcile_notification_expiry();
         self.cancel_pending_text_paste();
         // the replacement runtimes never inherit an in-flight pointer sequence.
         if let Some(capture) = self.pointer_capture.take() {
@@ -6868,6 +6877,7 @@ impl OutputHandler for App {
             self.reconcile_sleep();
             self.reconcile_idle_watches();
         }
+        self.reconcile_notification_expiry();
         self.update_watch();
         if self
             .keyboard_surface
