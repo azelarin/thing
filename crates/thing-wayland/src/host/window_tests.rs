@@ -1213,6 +1213,45 @@ fn rejected_reloads_keep_the_window_and_accepted_ones_update_it_in_place() {
 }
 
 #[test]
+fn reload_preserves_configure_state_when_node_ids_repeat() {
+    let mut host = Host::start(&settings("nil"), true);
+    let (toplevel, _) = host.toplevels()[0];
+    host.configure(toplevel, (640, 480), vec![]);
+    host.until(|host| host.title(toplevel).as_deref() == Some("settings 0 640x480 false"));
+    let owner = host.owner();
+    let before = host
+        .app
+        .configurations
+        .surface_root(&owner.output, &owner.key)
+        .unwrap()
+        .id;
+    let index = host.app.root_index(&owner).unwrap();
+    let focused = host
+        .app
+        .configurations
+        .surface_root(&owner.output, &owner.key)
+        .unwrap()
+        .children[0]
+        .id;
+    host.app.surfaces[index]
+        .input
+        .focus_from_pointer(Some(focused));
+    host.write(&settings("nil").replace("settings %d", "reloaded %d"));
+    host.reload();
+    host.turn();
+    let root = host
+        .app
+        .configurations
+        .surface_root(&owner.output, &owner.key)
+        .unwrap();
+    assert_eq!(root.id, before);
+    assert_eq!(root.window.title, "reloaded 0 640x480 false");
+    assert_eq!(host.app.surfaces[index].input.focused, None);
+    assert_eq!(host.toplevels().len(), 1);
+    assert!(!host.has(&Record::DestroyToplevel(toplevel)));
+}
+
+#[test]
 fn scale_follows_the_compositor_and_the_owner_output_retires_the_window() {
     // a full-size blurred shadow fits the effect budget at scale 1 but not at
     // scale 2, so the preferred scale waits until the window shrinks.

@@ -2028,7 +2028,7 @@ impl App {
     }
 
     /// sends changed window properties for an open window.
-    fn sync_window(&mut self, owner: &SurfaceOwner) {
+    fn sync_window(&mut self, owner: &SurfaceOwner, force: bool) {
         let Some(index) = self.root_index(owner) else {
             return;
         };
@@ -2042,10 +2042,11 @@ impl App {
             return;
         };
         let limits = window.apply(&properties);
+        let state = window.state;
         let wl = surface.role.surface().clone();
         // a reload binds the open window to the replacement runtime's root;
         // input and focus from the previous runtime do not carry over.
-        let replaced = surface.root != root_id;
+        let replaced = force || surface.root != root_id;
         if replaced {
             surface.root = root_id;
             surface.layouts = SurfaceLayouts::default();
@@ -2070,6 +2071,9 @@ impl App {
         if replaced && self.keyboard_surface.as_ref() == Some(&wl) {
             self.clear_key_repeat();
             self.schedule_autofocus(index);
+        }
+        if replaced {
+            self.queue_window_state(owner.clone(), state);
         }
     }
 
@@ -2239,7 +2243,7 @@ impl App {
             .collect();
         for (owner, window) in owners {
             if window {
-                self.sync_window(&owner);
+                self.sync_window(&owner, force);
             } else {
                 self.sync_panel(&owner, force)?;
             }
