@@ -9,8 +9,7 @@ return ui.panel { children = function()
         local paused: boolean = record.expiry_paused
         table.insert(rows, ui.button {
             key = record.key,
-            on_enter = function() n.set_expiry_paused(record.key, true) end,
-            on_leave = function() n.set_expiry_paused(record.key, false) end,
+            on_hover = function(inside) n.set_expiry_paused(record.key, inside) end,
             children = { ui.text { text = function()
                 tick:get()
                 local remaining: number? = n.remaining(record.key)

@@ -509,9 +509,9 @@ fn expiry_holds_commit_only_after_an_accepted_event() {
         local n = services.notifications
         local revision = ui.state(0)
         return ui.panel { children = {
-            ui.button { on_click = function()
-                n.set_expiry_paused('1', true)
-                assert(n.active:get()[1].expiry_paused == false)
+            ui.button { on_hover = function(inside)
+                n.set_expiry_paused('1', inside)
+                if inside then assert(n.active:get()[1].expiry_paused == false) end
             end },
             ui.button { on_click = function()
                 n.set_expiry_paused('1', false); revision:set(revision:get() + 1)
@@ -528,7 +528,7 @@ fn expiry_holds_commit_only_after_an_accepted_event() {
         })
         .unwrap();
     runtime
-        .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Hover(true))
         .unwrap();
     assert_eq!(runtime.notification_expiry_holds(), vec![1]);
     assert!(runtime.take_actions().is_empty());
@@ -549,7 +549,7 @@ fn expiry_holds_commit_only_after_an_accepted_event() {
     runtime.dispatch(release, Event::Click).unwrap();
     assert!(runtime.notification_expiry_holds().is_empty());
     runtime
-        .dispatch(runtime.root().unwrap().children[0].id, Event::Click)
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Hover(true))
         .unwrap();
     runtime
         .set_notifications(NotificationSnapshot {
@@ -557,6 +557,9 @@ fn expiry_holds_commit_only_after_an_accepted_event() {
             active: vec![],
             ..NotificationSnapshot::default()
         })
+        .unwrap();
+    runtime
+        .dispatch(runtime.root().unwrap().children[0].id, Event::Hover(false))
         .unwrap();
     assert!(runtime.notification_expiry_holds().is_empty());
 }

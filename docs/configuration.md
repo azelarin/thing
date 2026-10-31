@@ -2388,8 +2388,9 @@ it. repeated calls with the same value have no additional effect.
 holds survive replacement of the same notification lifetime; the replacement's
 timeout becomes its new remaining time. closing a record discards its holds.
 successful reloads and output removal release the affected configurations'
-holds; a failed reload keeps them. controls reject keys absent from the active
-list. a notification can still expire before a requested hold reaches the
+holds; a failed reload keeps them. pausing requires a key in the active list.
+releasing a closed record is harmless, so a late hover-leave callback can clean
+up its hold. a notification can still expire before a requested hold reaches the
 server; a late hold cannot bring it back.
 
 keep hover and reply state in the configuration, and combine them before
@@ -2397,8 +2398,9 @@ calling `set_expiry_paused`. for a card that only pauses on hover:
 
 ```luau
 ui.button {
-    on_enter = function() notifications.set_expiry_paused(notification.key, true) end,
-    on_leave = function() notifications.set_expiry_paused(notification.key, false) end,
+    on_hover = function(inside)
+        notifications.set_expiry_paused(notification.key, inside)
+    end,
     children = { ui.text { text = notification.summary } },
 }
 ```

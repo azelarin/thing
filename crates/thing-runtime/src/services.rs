@@ -2193,10 +2193,11 @@ impl Services {
                     return Err(Error::runtime("expiry paused state must be a boolean"));
                 };
                 let record_key = key.to_string();
-                if !records
-                    .borrow()
-                    .iter()
-                    .any(|record| record.key == record_key)
+                if paused
+                    && !records
+                        .borrow()
+                        .iter()
+                        .any(|record| record.key == record_key)
                 {
                     return Err(Error::runtime("notification is no longer active"));
                 }
