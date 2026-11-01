@@ -758,6 +758,7 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "icon" if node.kind == Kind::Image => node.image.icon = optional_string(value, name)?,
         "app_id" if node.kind == Kind::Image => node.image.app_id = optional_string(value, name)?,
         "icon_theme" if node.kind == Kind::Image => node.image.theme = string(value, name)?,
+        "revision" if node.kind == Kind::Image => node.image.revision = image_revision(value)?,
         "fit" if node.kind == Kind::Image => node.image_fit = image_fit(value, name)?,
         "data" if node.kind == Kind::Path => node
             .path
@@ -949,10 +950,60 @@ fn optional_string(value: Value, name: &str) -> Result<Option<String>> {
     }
 }
 
+/// a string or whole number naming the version of an image's content.
+fn image_revision(value: Value) -> Result<Option<String>> {
+    let revision = match value {
+        Value::Nil => return Ok(None),
+        Value::String(value) => value.to_str()?.to_owned(),
+        Value::Integer(value) => value.to_string(),
+        Value::Number(value) if value.is_finite() && value.fract() == 0.0 => {
+            format!("{value:.0}")
+        }
+        _ => {
+            return Err(Error::runtime(
+                "revision must be a string, a whole number, or nil",
+            ));
+        }
+    };
+    if revision.len() > 256 || revision.contains('\0') {
+        return Err(Error::runtime(
+            "revision must be at most 256 bytes without NUL",
+        ));
+    }
+    Ok(Some(revision))
+}
+
+/// a remote source must be a plain http or https url; other strings keep
+/// their meaning as paths, including `file:` urls handled by the loader.
+fn validate_image_url(source: &str) -> Result<()> {
+    let lower = source.get(..8).unwrap_or(source).to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Ok(());
+    }
+    let rest = &source[source.find("://").map_or(0, |index| index + 3)..];
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+    if source.len() > 8192
+        || host.is_empty()
+        || source
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(Error::runtime(
+            "image urls need a host and at most 8192 bytes without spaces or control characters",
+        ));
+    }
+    Ok(())
+}
+
 fn image_source(value: Value, name: &str) -> Result<(Option<String>, Option<ImageSource>)> {
     match value {
         Value::Nil => Ok((None, None)),
-        Value::String(value) => Ok((Some(value.to_str()?.to_owned()), None)),
+        Value::String(value) => {
+            let source = value.to_str()?.to_owned();
+            validate_image_url(&source)?;
+            Ok((Some(source), None))
+        }
         Value::UserData(value) => value
             .borrow::<ImageHandle>()
             .map(|source| (None, Some(source.0.clone())))

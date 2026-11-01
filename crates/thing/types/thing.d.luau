@@ -517,6 +517,8 @@ export type ThingImageProperties = {
     app_id: ThingReactive<string?>?,
     icon_theme: ThingReactive<string>?,
     fit: ThingReactive<ThingImageFit>?,
+    -- a different value loads the same source again.
+    revision: ThingReactive<(string | number)?>?,
 }
 
 export type ThingPathProperties = {

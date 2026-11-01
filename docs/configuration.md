@@ -814,9 +814,10 @@ ui.image {
 }
 ```
 
-use `source` for a local file or an opaque image handle supplied by a desktop
-service, `icon` for a theme icon name, or `app_id` to look up an application's
-desktop-entry icon. these properties are mutually exclusive.
+use `source` for a local file, a `file:`, `http:`, or `https:` url, or an
+opaque image handle supplied by a desktop service. use `icon` for a theme icon
+name, or `app_id` to look up an application's desktop-entry icon. these
+properties are mutually exclusive.
 `icon_theme` defaults to `hicolor`. application matching uses desktop filenames
 and `StartupWMClass`, case-insensitively, then the app id itself. missing icons
 fall back to `application-x-executable`. application discovery honors xdg data
@@ -854,6 +855,62 @@ limited to 4096 bytes and each output configuration may reference 10,000 distinc
 asset files. thing watches files registered by `ui.asset`; creating or changing one
 reloads the configuration and clears the image cache. other source paths are not
 watched.
+
+### refreshing and remote images
+
+an image is cached by its source, fit, and size, so a file replaced at the
+same path keeps showing its old content. give the image a `revision`, a
+string or whole number, and change it whenever the content may have changed:
+
+```luau
+local generated = ui.state(0)
+
+return ui.panel {
+    children = {
+        -- current mpris artwork; the title changes when the track does.
+        ui.image {
+            source = function()
+                local url = services.media.art_url:get()
+                return if url ~= '' then url else nil
+            end,
+            revision = function() return services.media.title:get() end,
+            fit = 'cover',
+            style = { width = 48, height = 48, radius = 6 },
+        },
+        -- a chart another program rewrites; its button asks for the new one.
+        ui.button {
+            on_click = function() generated:set(generated:get() + 1) end,
+            children = { ui.image {
+                source = '/tmp/usage-chart.png',
+                revision = function() return generated:get() end,
+            } },
+        },
+    },
+}
+```
+
+a new revision loads the file or url again, and until it is ready the box is
+empty rather than showing the previous content. an unchanged revision reuses
+the cache, including for a new size or output scale.
+
+`file:` urls must name a local absolute path; percent escapes are decoded.
+`http:` and `https:` downloads use the system `curl`, which verifies tls
+certificates with the system trust store. they follow at most 3 redirects,
+only to http or https, and give up after 5 seconds without a connection, 20
+seconds in total, or 10 seconds below one byte per second. a download is
+limited to 16 mib and decodes like a local file; svg is recognized by its
+content. at most 2 downloads run at once and 16 more may wait. later images
+start as earlier ones finish. downloaded files stay in memory, at most 16 of
+them and 32 mib, so a new size or scale decodes without another download.
+nothing is written to disk.
+
+a failed download leaves an empty box and is not retried automatically, for
+any size, until the source or revision changes or the configuration reloads.
+the reason is logged without the url's credentials, query, or fragment.
+downloads are cancelled when no active surface uses their source and revision;
+two widgets may use different revisions of the same url without cancelling each
+other. a reload cancels every download. stalled downloads do not block local
+files or icons.
 
 ## vector paths
 
@@ -2453,10 +2510,10 @@ still use `seek`. offsets and positions must be finite and within about 31 years
 position cannot be negative. like the other controls, the reported position
 changes only after the player confirms the jump.
 
-`art_url` is mpris metadata, not an image path. it may contain a `file:` url or a
-remote url. `ui.image` currently accepts local filesystem paths and does not fetch
-urls, so passing `art_url` directly to `source` is not supported. remote
-artwork loading is not part of this api yet.
+`art_url` is mpris metadata. it may hold a `file:` url or a remote url, and
+both work directly as an image `source`. some players reuse one artwork path
+for every track, so give the image a `revision` that changes with the track;
+see [refreshing and remote images](#refreshing-and-remote-images).
 
 ## power
 

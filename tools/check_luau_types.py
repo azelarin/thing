@@ -249,6 +249,15 @@ CASES = (
             "Property 'cursor' is not compatible.",
         ),
     ),
+    Case("valid-remote-images.luau"),
+    Case(
+        "invalid-remote-images.luau",
+        (
+            "invalid-remote-images.luau(5,18): TypeError",
+            "invalid-remote-images.luau(6,80): TypeError",
+            "Property 'revision' is not compatible.",
+        ),
+    ),
     Case("valid-container-scroll.luau"),
     Case(
         "invalid-container-scroll.luau",
