@@ -4,7 +4,7 @@ mod icons;
 mod remote;
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::{Cursor, Read},
     num::NonZeroU64,
     sync::{Arc, Condvar, Mutex, MutexGuard},
@@ -21,6 +21,7 @@ const DOWNLOAD_ENTRIES: usize = 16;
 const DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
 /// failed downloads remembered until their source or revision changes.
 const FAILED_DOWNLOADS: usize = 64;
+const DECODE_REQUESTS: usize = 32;
 
 /// where a `source` string points.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,6 +190,20 @@ struct Inbox {
     stop: bool,
 }
 
+impl Inbox {
+    fn queue_download(&mut self, key: Key, bytes: Arc<[u8]>) -> bool {
+        let queued_bytes: usize = self.downloaded.values().map(|bytes| bytes.len()).sum();
+        if self.requests.len() >= DECODE_REQUESTS
+            || queued_bytes.saturating_add(bytes.len()) > DOWNLOAD_BYTES
+        {
+            return false;
+        }
+        self.downloaded.insert(key.clone(), bytes);
+        self.requests.push_back(key);
+        true
+    }
+}
+
 #[derive(Default)]
 struct Shared {
     inbox: Mutex<Inbox>,
@@ -318,8 +333,11 @@ impl Images {
                     self.remote.remember(identity, bytes.clone(), self.tick);
                     let mut inbox = lock(&self.shared.inbox);
                     for key in waiting {
-                        inbox.downloaded.insert(key.clone(), bytes.clone());
-                        inbox.requests.push_back(key);
+                        if !inbox.queue_download(key.clone(), bytes.clone()) {
+                            // the retained bytes can be queued on the next draw;
+                            // do not pin a request that has no decoder work.
+                            self.cache.remove(&key);
+                        }
                     }
                     drop(inbox);
                     self.shared.changed.notify_one();
@@ -344,28 +362,11 @@ impl Images {
     /// while the download queue is full, so the request is tried again on a
     /// later frame instead of being remembered as pending.
     fn request_download(&mut self, key: &Key, identity: remote::Identity) -> bool {
-        // a new revision of the same url supersedes any older one in flight.
-        let superseded: Vec<_> = self
-            .remote
-            .running
-            .keys()
-            .filter(|running| running.url == identity.url && **running != identity)
-            .cloned()
-            .collect();
-        for old in superseded {
-            self.remote.cancel(&old);
-            self.cache.retain(|candidate, entry| {
-                !(matches!(entry.state, State::Pending)
-                    && remote_identity(&candidate.image).as_ref() == Some(&old))
-            });
-        }
         if let Some((bytes, touched)) = self.remote.downloads.get_mut(&identity) {
             *touched = self.tick;
             let bytes = bytes.clone();
             let mut inbox = lock(&self.shared.inbox);
-            inbox.downloaded.insert(key.clone(), bytes);
-            inbox.requests.push_back(key.clone());
-            return true;
+            return inbox.queue_download(key.clone(), bytes);
         }
         if self.remote.running.contains_key(&identity) {
             return true;
@@ -393,6 +394,25 @@ impl Images {
                 true
             }
             None => false,
+        }
+    }
+
+    /// cancel downloads only when no active surface still uses their identity.
+    pub fn retain_sources<'a>(&mut self, images: impl IntoIterator<Item = &'a Image>) {
+        let active: BTreeSet<_> = images.into_iter().filter_map(remote_identity).collect();
+        let unused: Vec<_> = self
+            .remote
+            .running
+            .keys()
+            .filter(|identity| !active.contains(*identity))
+            .cloned()
+            .collect();
+        for old in unused {
+            self.remote.cancel(&old);
+            self.cache.retain(|candidate, entry| {
+                !(matches!(entry.state, State::Pending)
+                    && remote_identity(&candidate.image).as_ref() == Some(&old))
+            });
         }
     }
 
@@ -513,7 +533,7 @@ impl Images {
         });
         if !self.cache.contains_key(&key)
             && !pending
-            && lock(&self.shared.inbox).requests.len() < 32
+            && lock(&self.shared.inbox).requests.len() < DECODE_REQUESTS
         {
             while self.cache.len() >= 128 {
                 if !self.evict(fallback.as_ref()) {

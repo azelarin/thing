@@ -373,6 +373,7 @@ fn a_new_revision_refetches_and_a_superseded_download_cannot_return() {
         thread::sleep(Duration::from_millis(5));
     }
     let second = image(&slow, Some("b"));
+    images.retain_sources([&second]);
     assert!(
         images
             .get(&second, ImageFit::Fill, bounds(16.0), 1.0)
@@ -389,6 +390,31 @@ fn a_new_revision_refetches_and_a_superseded_download_cannot_return() {
     assert_eq!(ready(&mut images, &second, 16.0), RED);
     let stale = request_key(&image(&slow, Some("a")), ImageFit::Fill, bounds(16.0), 1.0);
     assert!(!images.cache.contains_key(&stale));
+}
+
+#[test]
+fn widgets_can_load_different_revisions_of_the_same_url_together() {
+    let server = Server::start(vec![("/shared.png", Reply::Held(RED))]);
+    let mut images = images(limits());
+    let first = image(&server.url("/shared.png"), Some("first"));
+    let second = image(&server.url("/shared.png"), Some("second"));
+    images.get(&first, ImageFit::Fill, bounds(16.0), 1.0);
+    let deadline = Instant::now() + WAIT;
+    while server.requests("/shared.png") == 0 {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    images.get(&second, ImageFit::Fill, bounds(16.0), 1.0);
+    images.retain_sources([&first, &second]);
+    assert_eq!(
+        images.remote.running.len(),
+        2,
+        "one widget cancelled the other's image"
+    );
+    server.release.store(true, Ordering::SeqCst);
+    assert_eq!(ready(&mut images, &first, 16.0), RED);
+    assert_eq!(ready(&mut images, &second, 16.0), RED);
+    assert_eq!(server.requests("/shared.png"), 2);
 }
 
 #[test]
@@ -563,6 +589,78 @@ fn queued_downloads_and_kept_bytes_stay_bounded() {
     }
     assert!(images.remote.downloads.len() <= DOWNLOAD_ENTRIES);
     assert!(images.remote.downloaded_bytes() <= DOWNLOAD_BYTES);
+}
+
+#[test]
+fn completed_downloads_wait_for_the_ui_before_more_bodies_are_loaded() {
+    let server = Server::start(vec![("/red.png", Reply::Png(RED))]);
+    let mut fetcher = remote::Fetcher::start(
+        remote::Limits {
+            workers: 1,
+            queue: 3,
+            ..limits()
+        },
+        Arc::new(|| {}),
+    )
+    .unwrap();
+    let mut ids = Vec::new();
+    for revision in ["a", "b", "c"] {
+        ids.push(
+            fetcher
+                .submit(remote::Identity {
+                    url: server.url("/red.png"),
+                    revision: Some(revision.into()),
+                })
+                .unwrap(),
+        );
+    }
+    let deadline = Instant::now() + WAIT;
+    for id in ids {
+        while fetcher.completed() == 0 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        // leave the result uncollected while other requests are already queued.
+        thread::sleep(Duration::from_millis(50));
+        let done = fetcher.take_done();
+        assert_eq!(done.len(), 1, "completed bodies exceeded the worker budget");
+        assert_eq!(done[0].0, id);
+        assert!(done[0].2.is_ok());
+    }
+    assert_eq!(server.requests("/red.png"), 3);
+}
+
+#[test]
+fn helper_errors_do_not_expose_redirect_credentials() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = TempDir::new();
+    let helper = directory.path().join("curl");
+    std::fs::write(&helper, "#!/bin/sh\nread -r line\nprintf '%s' 'https://user:secret@redirect.example/image?token=private' >&2\nexit 60\n").unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut fetcher = remote::Fetcher::start(
+        remote::Limits {
+            program: helper,
+            ..limits()
+        },
+        Arc::new(|| {}),
+    )
+    .unwrap();
+    fetcher
+        .submit(remote::Identity {
+            url: "https://origin.example/image".into(),
+            revision: None,
+        })
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    while fetcher.completed() == 0 {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    let done = fetcher.take_done();
+    assert_eq!(
+        done[0].2.as_ref().unwrap_err(),
+        "the image server's TLS certificate could not be verified"
+    );
 }
 
 #[test]

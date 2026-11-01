@@ -1463,6 +1463,10 @@ impl App {
         }
         self.reconcile_layout_focus();
         let configurations = &self.configurations;
+        self.render
+            .retain_images(self.surfaces.iter().filter_map(|surface| {
+                configurations.surface_root(&surface.output, &SurfaceKey::Default)
+            }));
         let keyboard_surface = self.keyboard_surface.clone();
         let mut presented = Vec::new();
         let mut repeat_invalidated = false;

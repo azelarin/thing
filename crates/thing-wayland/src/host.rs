@@ -2831,6 +2831,11 @@ impl App {
         }
         self.apply_pending_ui_actions(MissingSurfacePolicy::Expire)?;
         let configurations = &self.configurations;
+        self.render.retain_images(
+            self.surfaces
+                .iter()
+                .filter_map(|surface| configurations.surface_root(&surface.output, &surface.key)),
+        );
         let keyboard_surface = self.keyboard_surface.clone();
         let mut presented = Vec::new();
         for (index, surface) in self.surfaces.iter_mut().enumerate() {

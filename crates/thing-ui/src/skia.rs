@@ -274,6 +274,20 @@ impl Painter {
         Layout::compute_with_scroll(root, size, scroll, &mut self.text)
     }
 
+    /// provide every active surface root before drawing, including surfaces
+    /// that do not need a frame, so one surface cannot cancel another's artwork.
+    pub fn retain_images<'a>(&mut self, roots: impl IntoIterator<Item = &'a Node>) {
+        let mut pending: Vec<_> = roots.into_iter().collect();
+        let mut images = Vec::new();
+        while let Some(node) = pending.pop() {
+            if node.kind == Kind::Image {
+                images.push(&node.image);
+            }
+            pending.extend(&node.children);
+        }
+        self.images.retain_sources(images);
+    }
+
     pub fn paint(&mut self, frame: PaintFrame<'_>, framebuffer: u32) -> Result<(), String> {
         let width = i32::try_from(frame.physical.0).map_err(|error| error.to_string())?;
         let height = i32::try_from(frame.physical.1).map_err(|error| error.to_string())?;

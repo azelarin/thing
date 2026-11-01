@@ -86,6 +86,13 @@ impl Fetcher {
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
         });
+        // if a later thread cannot start, dropping the pool stops the workers
+        // that already started instead of leaving them waiting forever.
+        let fetcher = Self {
+            shared: shared.clone(),
+            limits: limits.clone(),
+            next_id: 1,
+        };
         for index in 0..limits.workers {
             let shared = shared.clone();
             let limits = limits.clone();
@@ -94,11 +101,7 @@ impl Fetcher {
                 .name(format!("thing-image-fetch-{index}"))
                 .spawn(move || work(&shared, &limits, wake.as_ref()))?;
         }
-        Ok(Self {
-            shared,
-            limits,
-            next_id: 1,
-        })
+        Ok(fetcher)
     }
 
     /// queues a download, or returns `None` while the queue is full.
@@ -124,16 +127,25 @@ impl Fetcher {
             state.cancelled.insert(id);
         }
         state.done.retain(|(done, _, _)| *done != id);
+        drop(state);
+        self.shared.changed.notify_all();
     }
 
     pub(super) fn take_done(&mut self) -> Vec<(u64, Identity, Outcome)> {
-        std::mem::take(&mut lock(&self.shared.state).done)
+        let done = std::mem::take(&mut lock(&self.shared.state).done);
+        self.shared.changed.notify_all();
+        done
     }
 
     #[cfg(test)]
     pub(super) fn active(&self) -> usize {
         let state = lock(&self.shared.state);
         state.queue.len() + state.running.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn completed(&self) -> usize {
+        lock(&self.shared.state).done.len()
     }
 }
 
@@ -157,7 +169,11 @@ fn work(shared: &Shared, limits: &Limits, wake: &(dyn Fn() + Send + Sync)) {
                 if state.stop {
                     return;
                 }
-                if let Some(next) = state.queue.pop_front() {
+                // completed bytes still occupy a worker's slot until the UI
+                // takes them. a stalled UI cannot accumulate download bodies.
+                if state.done.len() + state.running.len() < limits.workers
+                    && let Some(next) = state.queue.pop_front()
+                {
                     state.running.insert(next.0);
                     break next;
                 }
@@ -247,7 +263,9 @@ fn download(url: &str, limits: &Limits, cancelled: impl Fn() -> bool) -> Outcome
         .env_remove("CURL_HOME")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        // helper diagnostics can contain a redirect's credentials or query.
+        // report the exit category instead of forwarding arbitrary stderr.
+        .stderr(Stdio::null());
     // SAFETY: the closure runs in the forked child before exec and calls only
     // async-signal-safe functions. the helper starts with no blocked signals
     // and dies with the thread that started it.
@@ -271,16 +289,19 @@ fn download(url: &str, limits: &Limits, cancelled: impl Fn() -> bool) -> Outcome
     }
     let status = finish(&mut child);
     let bytes = result?;
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.by_ref().take(4096).read_to_string(&mut stderr);
-    }
     match status {
         Some(status) if status.success() => Ok(bytes.into()),
-        Some(_) => {
-            let message = stderr.lines().next().unwrap_or("download failed").trim();
-            Err(redact_text(message, url))
-        }
+        Some(status) => Err(match status.code() {
+            Some(6) => "cannot resolve the image host".into(),
+            Some(7) => "cannot connect to the image host".into(),
+            Some(22) => "the image server returned an HTTP error".into(),
+            Some(28) => "the image download timed out".into(),
+            Some(47) => "the image download exceeded the redirect limit".into(),
+            Some(60) => "the image server's TLS certificate could not be verified".into(),
+            Some(63) => format!("image exceeds {} MiB", limits.max_bytes / (1024 * 1024)),
+            Some(code) => format!("curl exited with status {code}"),
+            None => "the image download was interrupted".into(),
+        }),
         None => Err("the image download did not finish".into()),
     }
 }
@@ -291,37 +312,32 @@ fn transfer(
     limits: &Limits,
     cancelled: impl Fn() -> bool,
 ) -> Result<Vec<u8>, String> {
+    // include the stdin handoff in the deadline: a stuck helper may stop
+    // reading before curl can install its own network timeouts.
+    let deadline = Instant::now() + limits.overall + limits.connect + Duration::from_secs(1);
     let mut stdin = child.stdin.take().ok_or("curl has no stdin")?;
-    stdin
-        .write_all(config.as_bytes())
-        .map_err(|error| format!("cannot pass the url to curl: {error}"))?;
+    nonblocking(stdin.as_raw_fd())?;
+    let mut remaining = config.as_bytes();
+    while !remaining.is_empty() {
+        wait_for_pipe(stdin.as_raw_fd(), libc::POLLOUT, deadline, &cancelled)?;
+        match stdin.write(remaining) {
+            Ok(0) => return Err("curl closed its input".into()),
+            Ok(written) => remaining = &remaining[written..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(format!("cannot pass the url to curl: {error}")),
+        }
+    }
     drop(stdin);
     let mut stdout = child.stdout.take().ok_or("curl has no stdout")?;
-    // SAFETY: the descriptor belongs to `stdout`, which outlives these calls.
-    unsafe {
-        let flags = libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL);
-        libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
-    // a little longer than curl's own limit, in case the helper misbehaves.
-    let deadline = Instant::now() + limits.overall + limits.connect + Duration::from_secs(1);
+    nonblocking(stdout.as_raw_fd())?;
     let mut bytes = Vec::new();
     let mut buffer = [0; 64 * 1024];
     loop {
-        if cancelled() {
-            return Err("the image download was cancelled".into());
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return Err("the image download timed out".into());
-        }
-        let wait = (deadline - now).min(Duration::from_millis(50));
-        let mut descriptor = libc::pollfd {
-            fd: stdout.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one initialized pollfd for the duration of the call.
-        unsafe { libc::poll(&mut descriptor, 1, wait.as_millis() as i32) };
+        wait_for_pipe(stdout.as_raw_fd(), libc::POLLIN, deadline, &cancelled)?;
         match stdout.read(&mut buffer) {
             Ok(0) => return Ok(bytes),
             Ok(read) => {
@@ -341,6 +357,49 @@ fn transfer(
             Err(error) => return Err(error.to_string()),
         }
     }
+}
+
+fn nonblocking(fd: std::os::fd::RawFd) -> Result<(), String> {
+    // SAFETY: each caller owns the pipe and keeps it alive for this call.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags == -1 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == -1 {
+            return Err(format!(
+                "cannot monitor the image download: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_pipe(
+    fd: std::os::fd::RawFd,
+    events: i16,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+) -> Result<(), String> {
+    if cancelled() {
+        return Err("the image download was cancelled".into());
+    }
+    let now = Instant::now();
+    if now >= deadline {
+        return Err("the image download timed out".into());
+    }
+    let wait = (deadline - now).min(Duration::from_millis(50));
+    let mut descriptor = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    // SAFETY: one initialized pollfd, with its pipe alive until the call returns.
+    if unsafe { libc::poll(&mut descriptor, 1, wait.as_millis() as i32) } == -1 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(format!("cannot monitor the image download: {error}"));
+        }
+    }
+    Ok(())
 }
 
 /// reaps the helper, killing it if it lingers after its output closed.
@@ -374,15 +433,6 @@ pub(super) fn redact(url: &str) -> String {
     format!("{scheme}://{host}{path}")
 }
 
-fn redact_text(message: &str, url: &str) -> String {
-    let message: String = message
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(512)
-        .collect();
-    message.replace(url, &redact(url))
-}
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
@@ -390,6 +440,35 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_interrupts_a_full_helper_input_pipe() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let fd = child.stdin.as_ref().unwrap().as_raw_fd();
+        // SAFETY: the live child owns this pipe. reducing its capacity makes
+        // the blocked-writer case independent of the machine's pipe defaults.
+        assert!(unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, 4096) } >= 4096);
+        let started = Instant::now();
+        let result = transfer(
+            &mut child,
+            &"x".repeat(16 * 1024),
+            &Limits::default(),
+            || started.elapsed() >= Duration::from_millis(50),
+        );
+        let elapsed = started.elapsed();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "cancellation took {elapsed:?}"
+        );
+        assert!(result.unwrap_err().contains("cancelled"));
+    }
 
     #[test]
     fn urls_are_redacted_and_quoted_without_option_injection() {

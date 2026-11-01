@@ -906,10 +906,11 @@ nothing is written to disk.
 
 a failed download leaves an empty box and is not retried automatically, for
 any size, until the source or revision changes or the configuration reloads.
-the reason is logged without the url's credentials, query, or fragment. a new
-revision of the same url cancels the older download, and a reload cancels
-every download. a stalled server delays only its own image: local files and
-icons decode independently.
+the reason is logged without the url's credentials, query, or fragment.
+downloads are cancelled when no active surface uses their source and revision;
+two widgets may use different revisions of the same url without cancelling each
+other. a reload cancels every download. stalled downloads do not block local
+files or icons.
 
 ## vector paths
 

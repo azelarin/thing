@@ -168,6 +168,24 @@ impl Render {
         }
     }
 
+    pub fn retain_images<'a>(&mut self, roots: impl IntoIterator<Item = &'a Node>) {
+        match &mut self.backend {
+            Backend::OpenGl { painter, .. } => {
+                if let Some(painter) = painter {
+                    painter.retain_images(roots);
+                }
+            }
+            #[cfg(feature = "vulkan")]
+            Backend::Vulkan { painter, .. } => {
+                if let Some(painter) = painter {
+                    painter.retain_images(roots);
+                }
+            }
+            #[cfg(test)]
+            Backend::Test { .. } => {}
+        }
+    }
+
     pub fn layout(
         &mut self,
         root: &Node,
