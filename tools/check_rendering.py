@@ -24,10 +24,11 @@ FIXTURES = ROOT / "tests/rendering"
 ARTIFACTS = ROOT / "target/render-tests"
 CASES = (
     "image-fit", "stencil", "gradients", "radial-gradients", "shadows", "shared-motion",
-    "widget-bounds", "rounded-clips", "horizontal-scroll", "motion-lifecycle", "content-transitions",
+    "widget-bounds", "rounded-clips", "horizontal-scroll", "motion-lifecycle", "content-transitions", "windows",
 )
 # these accept a state only after the same passing frame is captured twice.
 STABLE_FRAMES = {
+    "windows": 2,
     "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2, "rounded-clips": 2, "horizontal-scroll": 2, "motion-lifecycle": 2, "content-transitions": 2,
 }
 RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
@@ -462,8 +463,47 @@ def verify_content_transitions(image, stage, scale):
         expect_color(image, point, scale, color, label, tolerance=3)
 
 
+def color_bounds(image, color):
+    needle = bytes(color)
+    offset = image.pixels.find(needle)
+    left, top, right, bottom = image.width, image.height, -1, -1
+    while offset >= 0:
+        if offset % 3 == 0:
+            pixel = offset // 3
+            x, y = pixel % image.width, pixel // image.width
+            left, top = min(left, x), min(top, y)
+            right, bottom = max(right, x), max(bottom, y)
+        offset = image.pixels.find(needle, offset + 1)
+    return None if right < 0 else (left, top, right + 1, bottom + 1)
+
+
+def verify_windows(image, stage, scale):
+    reloaded = stage in ("reload", "closed", "reopened")
+    body = (41, 67, 111) if reloaded else (22, 77, 48)
+    bounds = color_bounds(image, body)
+    if stage == "closed":
+        if bounds is not None:
+            raise FixtureError("closed window content is still visible")
+        return
+    if bounds is None:
+        raise FixtureError("window content is not visible")
+    width, height = (280, 180) if stage == "reopened" else (
+        (480, 300) if stage in ("resized", "reload") else (360, 220)
+    )
+    left, top, right, bottom = bounds
+    expected = physical(width, scale), physical(height, scale)
+    if (right - left, bottom - top) != expected:
+        raise FixtureError(f"window content was {right-left}x{bottom-top}; expected {expected}")
+    marker = (218, 178, 61) if reloaded else (225, 87, 67)
+    actual = image.pixel(left + physical(16, scale), top + physical(height / 2, scale))
+    if max(abs(a-b) for a, b in zip(actual, marker)) > 5:
+        raise FixtureError(f"window child was {actual}; expected {marker}")
+
+
 def verify_capture(case, image, stage, scale):
-    if case == "image-fit":
+    if case == "windows":
+        verify_windows(image, stage, scale)
+    elif case == "image-fit":
         verify_image_fit(image, stage, scale)
     elif case == "stencil":
         verify_stencil(image, stage, scale)
@@ -729,6 +769,22 @@ def stop_process_group(process, timeout=STOP_TIMEOUT):
             process.wait(timeout=timeout)
 
 
+def fixture_window(niri, environment, deadline, *, absent=False, title=None):
+    while time.monotonic() < deadline:
+        result = checked([niri, "msg", "--json", "windows"], env=environment, deadline=deadline)
+        try:
+            windows = json.loads(result.stdout)
+            matches = [w for w in windows if w.get("app_id") == "org.thing.render.windows"]
+        except (ValueError, TypeError, AttributeError) as error:
+            raise FixtureError("invalid window list from nested niri") from error
+        if absent and not matches:
+            return None
+        if not absent and len(matches) == 1 and (title is None or matches[0].get("title") == title):
+            return matches[0]
+        time.sleep(0.02)
+    raise FixtureError("nested window did not reach its expected state")
+
+
 def run_inner(run_directory, binary, renderer, case, niri, grim):
     environment = private_environment()
     deadline = time.monotonic() + INNER_TIMEOUT
@@ -798,6 +854,15 @@ def run_inner(run_directory, binary, renderer, case, niri, grim):
             frames=frames,
         )
 
+        window_id = None
+        if case == "windows":
+            window_id = fixture_window(niri, environment, deadline)["id"]
+            for axis, size in (("width", "480"), ("height", "300")):
+                checked([niri, "msg", "action", f"set-window-{axis}", "--id", str(window_id), size],
+                        env=environment, deadline=deadline)
+            capture_until(grim, environment, process, output, run_directory / "resized.ppm",
+                          case, "resized", 1.25, min(deadline, time.monotonic() + 10), frames=frames)
+
         invalid = fixture / "panel-invalid.luau"
         if invalid.exists():
             # only log written after the replacement counts as evidence.
@@ -838,6 +903,20 @@ def run_inner(run_directory, binary, renderer, case, niri, grim):
                 min(deadline, time.monotonic() + 10),
                 frames=frames,
             )
+        if case == "windows":
+            current = fixture_window(niri, environment, deadline, title="reloaded 480x300")
+            if current["id"] != window_id:
+                raise FixtureError("reload replaced the live window")
+            checked([niri, "msg", "action", "close-window", "--id", str(window_id)],
+                    env=environment, deadline=deadline)
+            fixture_window(niri, environment, deadline, absent=True)
+            capture_until(grim, environment, process, output, run_directory / "closed.ppm",
+                          case, "closed", 1.25, min(deadline, time.monotonic() + 10), frames=frames)
+            atomic_copy(reload, panel)
+            capture_until(grim, environment, process, output, run_directory / "reopened.ppm",
+                          case, "reopened", 1.25, min(deadline, time.monotonic() + 10), frames=frames)
+            fixture_window(niri, environment, deadline, title="reloaded 280x180")
+
         result = {
             "ok": True,
             "case": case,
@@ -868,7 +947,8 @@ def prepare_run_directory(case, renderer):
     )
     try:
         shutil.copytree(FIXTURES / case, run_directory / "fixture")
-        shutil.copy2(FIXTURES / "niri.kdl", run_directory / "niri.kdl")
+        config = run_directory / "fixture" / "niri.kdl"
+        shutil.copy2(config if config.exists() else FIXTURES / "niri.kdl", run_directory / "niri.kdl")
         for encoded in (run_directory / "fixture").glob("*.b64"):
             payload = "".join(encoded.read_text(encoding="ascii").split())
             try:

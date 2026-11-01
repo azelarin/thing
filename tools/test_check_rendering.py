@@ -650,6 +650,17 @@ class StageTest(unittest.TestCase):
         )
         self.assertEqual(result["rejected_reload"], "logged rejection")
 
+    def test_windows_resize_close_and_reopen_with_stable_frames(self):
+        with mock.patch.object(check_rendering, "fixture_window", side_effect=[
+            {"id": 7}, {"id": 7}, None, {"id": 8},
+        ]):
+            events, result, _ = self.run_stages("windows")
+        self.assertEqual([event[0] for event in events], [
+            "scale-1", "scale-1.25", "resized", "reload", "closed", "reopened",
+        ])
+        self.assertTrue(all(event[2] == 2 for event in events))
+        self.assertTrue(result["ok"])
+
     def test_other_cases_keep_their_single_frame_stages(self):
         events, result, texts = self.run_stages("gradients")
         self.assertEqual(
@@ -787,6 +798,31 @@ class ContentTransitionProbes(unittest.TestCase):
         canvas = self.frame(1, midpoint=(81, 112, 132))
         with self.assertRaisesRegex(FixtureError, "opaque midpoint"):
             check_rendering.verify_capture("content-transitions", canvas.image(), "scale-1", 1)
+
+
+class WindowProbes(unittest.TestCase):
+    def frame(self, scale, stage, *, width_delta=0):
+        width, height = (280, 180) if stage == "reopened" else (
+            (480, 300) if stage in ("resized", "reload") else (360, 220)
+        )
+        reloaded = stage in ("reload", "reopened")
+        body = (41, 67, 111) if reloaded else (22, 77, 48)
+        marker = (218, 178, 61) if reloaded else (225, 87, 67)
+        return Canvas(scale).rect(37, 43, 37+width+width_delta, 43+height, body).rect(
+            37, 43+height/2-16, 69, 43+height/2+16, marker
+        ).image()
+
+    def test_accepts_window_content_at_either_scale_and_arbitrary_position(self):
+        for scale in (1.0, 1.25):
+            for stage in ("scale-1", "scale-1.25", "resized", "reload", "reopened"):
+                check_rendering.verify_capture("windows", self.frame(scale, stage), stage, scale)
+            check_rendering.verify_capture("windows", Canvas(scale).image(), "closed", scale)
+
+    def test_rejects_wrong_size_or_content_that_remains_after_close(self):
+        with self.assertRaisesRegex(FixtureError, "window content was"):
+            check_rendering.verify_capture("windows", self.frame(1, "resized", width_delta=-1), "resized", 1)
+        with self.assertRaisesRegex(FixtureError, "still visible"):
+            check_rendering.verify_capture("windows", self.frame(1, "reload"), "closed", 1)
 
 
 if __name__ == "__main__":

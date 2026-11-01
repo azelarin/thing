@@ -1,0 +1,12 @@
+hotkey-overlay { skip-at-startup; }
+layout {
+    background-color "#242424"
+    border { off; }
+    focus-ring { off; }
+}
+window-rule {
+    match app-id="^org[.]thing[.]render[.]windows$"
+    open-floating true
+    // align the position to physical pixels at both tested scales.
+    default-floating-position x=32 y=32 relative-to="top-left"
+}
