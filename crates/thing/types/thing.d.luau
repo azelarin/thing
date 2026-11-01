@@ -921,12 +921,21 @@ declare extern type ThingAuthenticationService with
     read message: ThingSignal<string>
 end
 
+export type ThingClipboardImageStatus =
+    "unavailable" | "none" | "unsupported" | "available" | "loading" | "ready" | "failed"
+
 declare extern type ThingClipboardService with
     read available: ThingSignal<boolean>
     read text: ThingSignal<string?>
     read loading: ThingSignal<boolean>
     read error: ThingSignal<string>
+    read formats: ThingSignal<{ string }>
+    read image_status: ThingSignal<ThingClipboardImageStatus>
+    read image: ThingSignal<ThingImageSource?>
+    read image_error: ThingSignal<string>
     read set_text: (text: string) -> ()
+    read read_image: () -> ()
+    read set_image: (image: ThingImageSource) -> ()
     read clear: () -> ()
 end
 

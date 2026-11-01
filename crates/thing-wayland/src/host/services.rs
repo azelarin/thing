@@ -227,7 +227,12 @@ impl App {
         self.refresh();
     }
     pub(super) fn update_clipboard(&mut self) {
-        let Some(snapshot) = self.clipboard.as_mut().and_then(Clipboard::take_snapshot) else {
+        let queue = self.queue.clone();
+        let Some(snapshot) = self
+            .clipboard
+            .as_mut()
+            .and_then(|clipboard| clipboard.update(&queue))
+        else {
             return;
         };
         if let Err(error) = self.configurations.set_clipboard(snapshot) {

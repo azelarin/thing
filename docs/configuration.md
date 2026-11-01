@@ -3179,10 +3179,93 @@ the service prefers `ext-data-control-v1` and falls back to
 `available:get()` remains false and `error:get()` explains why. there is no
 focus-dependent `wl_data_device` fallback for this desktop-wide service.
 
-thing does not keep clipboard history and does not expose the primary selection,
-images, or arbitrary mime types. without `--clipboard`, the service is
-unavailable with no error and performs no clipboard work. `thing check` never
-connects to wayland.
+### formats and images
+
+`formats:get()` lists the mime types the current selection advertises, in the
+order its owner offered them: at most 64, each up to 256 bytes. images are
+read only when you ask, because they can be large:
+
+```luau
+local clipboard = services.clipboard
+
+local function describe(status)
+    if status == 'ready' then return 'image copied' end
+    if status == 'loading' then return 'reading image…' end
+    if status == 'unsupported' then return 'this image format is not supported' end
+    if status == 'failed' then return clipboard.image_error:get() end
+    return ''
+end
+
+return ui.panel {
+    children = {
+        ui.text {
+            text = function()
+                return `{#clipboard.formats:get()} formats · {describe(clipboard.image_status:get())}`
+            end,
+        },
+        ui.button {
+            enabled = function() return clipboard.image_status:get() == 'available' end,
+            on_click = function() clipboard.read_image() end,
+            children = { ui.text { text = 'show image' } },
+        },
+        ui.image {
+            source = function() return clipboard.image:get() end,
+            style = { width = 120, height = 80 },
+        },
+        ui.button {
+            on_click = function()
+                local image = clipboard.image:get()
+                if image then clipboard.set_image(image) end
+            end,
+            children = { ui.text { text = 'copy it back' } },
+        },
+    },
+}
+```
+
+`image_status:get()` is one of:
+
+| status | meaning |
+| --- | --- |
+| `unavailable` | the clipboard service is unavailable |
+| `none` | the selection is empty or offers no image |
+| `unsupported` | the selection offers images, but not as `image/png` |
+| `available` | the selection offers `image/png`; `read_image()` loads it |
+| `loading` | the png is being transferred and decoded |
+| `ready` | `image:get()` holds the image |
+| `failed` | the transfer or decoding failed; `image_error:get()` says why |
+
+png is the only image format thing reads or writes. it does not convert other
+formats. `image:get()` returns an image handle while the status is `ready`,
+and `nil` otherwise. pass it to `ui.image { source = ... }` or to `set_image`.
+a handle owns its pixels: it stays usable after the selection changes, while
+`image:get()` follows the new selection.
+
+`read_image()` and `set_image(image)` are event-handler actions. `read_image()`
+does nothing while the image is loading or ready, and retries after a failure.
+`set_image` accepts any image handle with raster pixels, such as a clipboard
+image or a notification's image data, and offers its largest raster as
+`image/png`. handles that name only an icon theme entry have no pixels and
+are rejected.
+
+encoding happens off the ui thread, so the new image reaches other applications
+a moment later. a later `set_text`, `set_image`, or `clear` supersedes the
+pending image. an observed selection change also cancels it, including a delayed
+echo of an earlier write. offers do not identify their owner, and wayland has no
+atomic "write only if unchanged" operation, so another application can still
+race with publication. selection changes discard older reads and decodes.
+
+pngs are limited to 16 mib, 8192 pixels per side, and 16 million pixels.
+decoding also limits pixel allocations to 128 mib; 16-bit images may reach that
+limit sooner. color profiles and other non-pixel metadata are ignored.
+image transfers time out after ten seconds, and retained png data is bounded to
+32 mib. at most 64 image copy requests may await the compositor at once.
+transfers and image conversion run off the ui thread, so they do not hold up
+input, rendering, or shutdown.
+
+thing does not keep clipboard history and does not expose the primary
+selection. without `--clipboard`, the service is unavailable with no error and
+performs no clipboard work. `thing check` never connects to wayland.
 
 ## popups and input
 

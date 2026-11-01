@@ -5,6 +5,7 @@ mod editor;
 mod frame;
 mod images;
 mod layout;
+pub mod png;
 mod secret;
 mod shadow;
 mod skia;

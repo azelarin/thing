@@ -40,6 +40,15 @@ CASES = (
             "Expected this to be '(any) -> t1 where t1 = ",
         ),
     ),
+    Case("valid-clipboard-images.luau"),
+    Case(
+        "invalid-clipboard-images.luau",
+        (
+            "Expected this to be 'ThingImageSource', but got 'string'",
+            "Expected this to be 'number', but got",
+            "Function 'services.clipboard.read_image' expects 0 arguments",
+        ),
+    ),
     Case("valid-clipping.luau"),
     Case("valid-scroll-axis.luau"),
     Case("valid-niri-controls.luau"),
