@@ -596,11 +596,64 @@ impl Kind {
 }
 
 /// the boundary used for widget contents and pointer input.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum ClipMode {
     #[default]
     Bounds,
     Rounded,
+    /// a vector shape fitted into the widget's border box. contents and input
+    /// stay inside both the shape and the box.
+    Path(std::sync::Arc<ClipPath>),
+}
+
+impl ClipMode {
+    /// whether the widget's own shape, not just its box, clips descendants
+    /// and their shadows.
+    pub fn is_shaped(&self) -> bool {
+        matches!(self, Self::Rounded | Self::Path(_))
+    }
+}
+
+/// path data for a clip, in view box units. curves count as one segment.
+pub const MAX_CLIP_PATH_SEGMENTS: usize = 1024;
+const MAX_CLIP_PATH_BYTES: usize = 64 * 1024;
+
+/// a clip shape: path data fitted into the widget's border box like `ui.path`
+/// fits into its content box.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClipPath {
+    pub data: String,
+    pub segments: Vec<VectorSegment>,
+    pub view_box: ViewBox,
+    pub fit: PathFit,
+    pub fill_rule: PathFillRule,
+}
+
+impl ClipPath {
+    pub fn new(
+        data: String,
+        view_box: ViewBox,
+        fit: PathFit,
+        fill_rule: PathFillRule,
+    ) -> Result<Self, TreeError> {
+        if data.len() > MAX_CLIP_PATH_BYTES {
+            return Err(TreeError("clip path data exceeds 64 KiB".into()));
+        }
+        view_box.validate()?;
+        let segments = normalize_path(&data)?;
+        if segments.len() > MAX_CLIP_PATH_SEGMENTS {
+            return Err(TreeError(format!(
+                "a clip path may have at most {MAX_CLIP_PATH_SEGMENTS} segments"
+            )));
+        }
+        Ok(Self {
+            data,
+            segments,
+            view_box,
+            fit,
+            fill_rule,
+        })
+    }
 }
 
 /// layout and paint values in logical pixels. colors do not inherit implicitly.

@@ -1603,7 +1603,7 @@ put layout and paint values in `style`. dimensions use logical pixels.
 | `align_content` | `start` |
 | `justify` | `start` |
 | `wrap` | `false` |
-| `clip` | `bounds`; use `rounded` to clip contents and children to `radius` |
+| `clip` | `bounds`; use `rounded` to clip contents and children to `radius`, or a [path table](#clipping) for any other shape |
 | `border_width`, `border_color` | `0`, transparent; border paints inside the box |
 | `padding_x`, `padding_y` | unspecified; override `padding` on that axis |
 | `hover_overlay`, `pressed_overlay` | `#ffffff14`, `#ffffff28`; interactive control feedback |
@@ -1764,6 +1764,49 @@ a widget's own shadow and focus ring can extend past its clip. descendants,
 including their shadows and focus rings, stay inside it. the default `bounds`
 keeps rectangular clipping for children. neither mode changes the wayland
 surface's input region; use `panel.input_region` to control that separately.
+
+for any other shape, give `clip` a path table. `path`, `view_box`, `fit`, and
+`fill_rule` mean what they mean on `ui.path`, except that the view box is
+fitted into the widget's whole border box rather than its padded content box:
+
+```lua
+-- a round button whose press ripple stays inside the circle.
+local pressed = ui.state(false)
+
+return ui.panel { children = { ui.button {
+    on_click = function() pressed:set(not pressed:get()) end,
+    style = {
+        width = 64,
+        height = 64,
+        background = '#313244',
+        clip = {
+            path = 'M32 0 A32 32 0 1 1 32 64 A32 32 0 1 1 32 0 Z',
+            view_box = { x = 0, y = 0, width = 64, height = 64 },
+        },
+    },
+    children = { ui.stack { style = {
+        width = 64,
+        height = 64,
+        background = function() return if pressed:get() then '#89b4fa' else '#00000000' end,
+    } } },
+} } }
+```
+
+the shape's coordinates are view box units. `fit` defaults to `contain`, which
+centers the view box without distortion; `cover` fills the box and crops, and
+`fill` stretches both axes. the clip is the shape inside the border box, so a
+`cover` path never reaches past the widget. `fill_rule` defaults to `nonzero`;
+use `evenodd` for holes drawn in the same direction as their outline. lines,
+curves, and arcs all work.
+
+a path clip behaves like `rounded`. it clips descendants, their shadows, and
+pointer and wheel input, including the widget's own hit area. the widget's
+background, border, and shadow are not clipped, so a circular clip on a square
+button keeps the square background. clips follow transforms, scrolling, and
+fractional scale, and nested clips intersect. the value may be reactive. a
+malformed path, or one over 64 kib or 1,024 segments, rejects the update. one
+surface may carry at most 16,384 path clip segments, including offscreen
+geometry retained for focus and shadows; beyond that its layout is rejected.
 
 ### shadows
 

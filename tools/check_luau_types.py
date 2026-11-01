@@ -258,6 +258,15 @@ CASES = (
             "Property 'revision' is not compatible.",
         ),
     ),
+    Case("valid-path-clips.luau"),
+    Case(
+        "invalid-path-clips.luau",
+        (
+            "missing field 'view_box'",
+            "Property 'fill_rule' is not compatible.",
+            "Property 'clip' is not compatible.",
+        ),
+    ),
     Case("valid-container-scroll.luau"),
     Case(
         "invalid-container-scroll.luau",

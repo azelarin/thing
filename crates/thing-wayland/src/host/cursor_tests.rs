@@ -118,6 +118,7 @@ enum Record {
 enum Command {
     Enter(f64, f64),
     Motion(f64, f64),
+    Wheel,
     Button(bool),
     Leave,
     CursorScale(i32),
@@ -199,6 +200,10 @@ impl ServerState {
                         Command::Motion(x, y) => {
                             pointer.motion(1, x, y);
                             self.record(Record::Sent("motion", 0));
+                        }
+                        Command::Wheel => {
+                            pointer.axis(1, server_pointer::Axis::VerticalScroll, 15.0);
+                            self.record(Record::Sent("wheel", 0));
                         }
                         Command::Button(pressed) => {
                             let serial = self.next_serial();
@@ -909,6 +914,62 @@ fn shapes_follow_the_widget_under_the_pointer_and_every_enter_sends_again() {
             .iter()
             .any(|record| matches!(record, Record::SetCursor { .. }))
     );
+}
+
+#[test]
+fn path_clip_holes_route_clicks_scrolls_and_cursors_to_the_widget_below() {
+    let mut host = Host::start(true);
+    host.reload(
+        r#"
+        local below = ui.state(0)
+        local above = ui.state(0)
+        local slot = { width = 80, height = 80 }
+        return ui.panel {
+            style = { width = 640, height = 80, align = 'start', justify = 'start' },
+            children = { ui.stack { style = slot, children = {
+                ui.button {
+                    style = slot,
+                    cursor = function()
+                        return if below:get() == 0 then 'crosshair'
+                            elseif below:get() == 1 then 'copy' else 'help'
+                    end,
+                    on_click = function() below:set(1) end,
+                    on_scroll = function() below:set(2); return true end,
+                },
+                ui.stack {
+                    style = { width = 80, height = 80, clip = {
+                        path = 'M40 0 A40 40 0 1 1 40 80 A40 40 0 1 1 40 0 Z M28 28 H52 V52 H28 Z',
+                        view_box = { x = 0, y = 0, width = 80, height = 80 },
+                        fill_rule = 'evenodd',
+                    } },
+                    children = { ui.button {
+                        style = slot,
+                        cursor = function()
+                            return if above:get() == 0 then 'not_allowed'
+                                elseif above:get() == 1 then 'alias' else 'progress'
+                        end,
+                        on_click = function() above:set(1) end,
+                        on_scroll = function() above:set(2); return true end,
+                    } },
+                },
+            } } },
+        }
+    "#,
+    );
+    host.command(Command::Enter(40.0, 40.0));
+    host.shows(&[Shape::Crosshair]);
+    host.command(Command::Button(true));
+    host.command(Command::Button(false));
+    host.shows(&[Shape::Crosshair, Shape::Copy]);
+    host.command(Command::Wheel);
+    host.shows(&[Shape::Copy, Shape::Help]);
+    host.command(Command::Motion(40.0, 10.0));
+    host.shows(&[Shape::Help, Shape::NotAllowed]);
+    host.command(Command::Button(true));
+    host.command(Command::Button(false));
+    host.shows(&[Shape::NotAllowed, Shape::Alias]);
+    host.command(Command::Wheel);
+    host.shows(&[Shape::Alias, Shape::Progress]);
 }
 
 #[test]

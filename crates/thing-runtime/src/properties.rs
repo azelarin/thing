@@ -557,13 +557,42 @@ fn scroll_axis(value: Value, name: &str) -> Result<ScrollAxis> {
 }
 
 fn clip_mode(value: Value, name: &str) -> Result<ClipMode> {
+    if let Value::Table(table) = value {
+        return clip_path(table).map(|path| ClipMode::Path(std::sync::Arc::new(path)));
+    }
     match string(value, name)?.as_str() {
         "bounds" => Ok(ClipMode::Bounds),
         "rounded" => Ok(ClipMode::Rounded),
         _ => Err(Error::runtime(format!(
-            "{name} must be \"bounds\" or \"rounded\""
+            "{name} must be \"bounds\", \"rounded\", or a path table"
         ))),
     }
+}
+
+/// `{ path, view_box, fit?, fill_rule? }`, with the meanings `ui.path` gives
+/// its `data`, `view_box`, `fit`, and `fill_rule`.
+fn clip_path(table: Table) -> Result<thing_core::ClipPath> {
+    for pair in table.clone().pairs::<String, Value>() {
+        let (field, _) = pair?;
+        if !matches!(field.as_str(), "path" | "view_box" | "fit" | "fill_rule") {
+            return Err(Error::runtime(format!("unknown clip property {field:?}")));
+        }
+    }
+    let fit = match table.raw_get::<Value>("fit")? {
+        Value::Nil => PathFit::Contain,
+        value => path_fit(value)?,
+    };
+    let fill_rule = match table.raw_get::<Value>("fill_rule")? {
+        Value::Nil => PathFillRule::NonZero,
+        value => path_fill_rule(value)?,
+    };
+    thing_core::ClipPath::new(
+        string(table.raw_get("path")?, "clip.path")?,
+        path_view_box(table.raw_get("view_box")?)?,
+        fit,
+        fill_rule,
+    )
+    .map_err(Error::external)
 }
 
 fn text_overflow(value: Value, name: &str) -> Result<TextOverflow> {
