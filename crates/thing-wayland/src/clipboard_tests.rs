@@ -1337,6 +1337,9 @@ fn delayed_drains_keep_only_the_latest_image_request() {
         // the first image finishes while the ui is not draining results.
         compositor.set_image(&first).unwrap();
         compositor.until_codec_result();
+        // conversion can finish before the first protocol dispatch. put the
+        // foreign selection after the request's compositor ordering marker.
+        compositor.queue.roundtrip(&mut compositor.state).unwrap();
         assert!(compositor.clipboard().codec.result_count() <= 1);
         // another application's selection retires it and its buffer.
         compositor.select(&[("text/plain", Payload::Bytes(b"theirs".to_vec()))]);
