@@ -744,7 +744,10 @@ fn sync_clip_chain(
             .ok_or("layout refers to a missing clip region")?;
         canvas.save();
         set_surface_transform(canvas, surface_matrix, region.transform)?;
-        if region.radius > 0.0 {
+        if let Some(path) = &region.path {
+            canvas.clip_rect(to_skia_rect(region.bounds), ClipOp::Intersect, false);
+            canvas.clip_path(path, ClipOp::Intersect, true);
+        } else if region.radius > 0.0 {
             canvas.clip_rrect(
                 rounded_rect(region.bounds, region.radius),
                 ClipOp::Intersect,
@@ -954,7 +957,7 @@ fn draw_path(canvas: &Canvas, node: &Node, bounds: Rect, opacity: f32) -> Result
 }
 
 #[derive(Clone, Copy)]
-struct PathTransform {
+pub(crate) struct PathTransform {
     scale_x: f64,
     scale_y: f64,
     translate_x: f64,
@@ -962,7 +965,7 @@ struct PathTransform {
 }
 
 impl PathTransform {
-    fn new(view_box: ViewBox, area: Rect, fit: PathFit) -> Option<Self> {
+    pub(crate) fn new(view_box: ViewBox, area: Rect, fit: PathFit) -> Option<Self> {
         if area.width <= 0.0 || area.height <= 0.0 {
             return None;
         }
@@ -1008,7 +1011,7 @@ impl PathTransform {
     }
 }
 
-fn transformed_path(
+pub(crate) fn transformed_path(
     segments: &[VectorSegment],
     transform: PathTransform,
 ) -> Result<SkiaPath, String> {
@@ -1051,6 +1054,21 @@ fn transformed_path(
 
 fn path_range_error() -> String {
     "path coordinates exceed renderer limits after fitting".into()
+}
+
+/// a clip shape fitted into a widget's local border box. the same path both
+/// clips painting and answers hit tests, so the two cannot disagree.
+pub(crate) fn fitted_clip(clip: &thing_core::ClipPath, bounds: Rect) -> Result<SkiaPath, String> {
+    let Some(transform) = PathTransform::new(clip.view_box, bounds, clip.fit) else {
+        // a box without area clips everything.
+        return Ok(SkiaPath::new());
+    };
+    let mut path = transformed_path(&clip.segments, transform)?;
+    path.set_fill_type(match clip.fill_rule {
+        PathFillRule::NonZero => PathFillType::Winding,
+        PathFillRule::EvenOdd => PathFillType::EvenOdd,
+    });
+    Ok(path)
 }
 
 #[derive(Clone, Copy)]
@@ -1385,7 +1403,7 @@ mod tests {
                 root.style.width = Some(80.0);
                 root.style.height = Some(80.0);
                 root.style.radius = 40.0;
-                root.style.clip = mode;
+                root.style.clip = mode.clone();
                 let mut child = Node::new(NodeId(2), Kind::Row);
                 child.style.width = Some(80.0);
                 child.style.height = Some(80.0);
@@ -2321,6 +2339,109 @@ mod tests {
             surface.peek_pixels().unwrap().get_color((70, 70)),
             SkiaColor::BLACK
         );
+    }
+
+    fn clipped_ripple(rule: thing_core::PathFillRule) -> Node {
+        // a blue button with a red ripple filling its content, clipped to a
+        // circle with a square hole.
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        root.style.padding = 20.0;
+        root.style.align = thing_core::CrossAlign::Start;
+        root.style.justify = thing_core::MainAlign::Start;
+        root.style.background = thing_core::Color::WHITE.into();
+        let mut button = Node::new(NodeId(2), Kind::Button);
+        button.style.width = Some(100.0);
+        button.style.height = Some(100.0);
+        button.style.background = "#0000ff".parse::<thing_core::Color>().unwrap().into();
+        button.style.clip = thing_core::ClipMode::Path(std::sync::Arc::new(
+            thing_core::ClipPath::new(
+                "M50 0 A50 50 0 1 1 50 100 A50 50 0 1 1 50 0 Z M35 35 H65 V65 H35 Z".into(),
+                ViewBox::new(0.0, 0.0, 100.0, 100.0).unwrap(),
+                thing_core::PathFit::Fill,
+                rule,
+            )
+            .unwrap(),
+        ));
+        let mut ripple = Node::new(NodeId(3), Kind::Stack);
+        ripple.style.width = Some(100.0);
+        ripple.style.height = Some(100.0);
+        ripple.style.background = thing_core::Color([255, 0, 0, 255]).into();
+        button.children.push(ripple);
+        root.children.push(button);
+        root
+    }
+
+    #[test]
+    fn path_clips_shape_descendants_but_not_the_container_decorations() {
+        let red = SkiaColor::from_rgb(255, 0, 0);
+        let blue = SkiaColor::from_rgb(0, 0, 255);
+        let mut surface = raster_scene(
+            &clipped_ripple(thing_core::PathFillRule::EvenOdd),
+            140,
+            140,
+            1.0,
+        )
+        .unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        // the button sits at (20, 20) to (120, 120). its own background fills
+        // the whole box; the ripple shows only inside the ring.
+        assert_eq!(pixels.get_color((70, 35)), red);
+        assert_eq!(pixels.get_color((70, 70)), blue);
+        assert_eq!(pixels.get_color((23, 23)), blue);
+        assert_eq!(pixels.get_color((10, 10)), SkiaColor::WHITE);
+        // nonzero winding fills the hole.
+        let mut surface = raster_scene(
+            &clipped_ripple(thing_core::PathFillRule::NonZero),
+            140,
+            140,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(surface.peek_pixels().unwrap().get_color((70, 70)), red);
+    }
+
+    #[test]
+    fn path_clips_cut_descendant_shadows_and_follow_transforms_at_fractional_scale() {
+        // the ripple casts a hard shadow below it; outside the circle neither
+        // it nor its shadow paints, while the button's own shadow does.
+        let mut root = clipped_ripple(thing_core::PathFillRule::NonZero);
+        let button = &mut root.children[0];
+        button.style.background = thing_core::Color::TRANSPARENT.into();
+        button.style.box_shadow = Some(hard_shadow(0.0, 10.0, 0.0));
+        let ripple = &mut button.children[0];
+        ripple.style.width = Some(60.0);
+        ripple.style.height = Some(60.0);
+        ripple.style.box_shadow = Some(hard_shadow(0.0, 30.0, 0.0));
+        let mut surface = raster_scene(&root, 140, 140, 1.0).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        // the button's shadow shows below its box.
+        assert_eq!(pixels.get_color((70, 125)), SkiaColor::BLACK);
+        // the ripple's shadow shows inside the circle and stops at its edge.
+        assert_eq!(pixels.get_color((70, 100)), SkiaColor::BLACK);
+        // (45, 115) lies inside the shadow's rectangle but outside the circle,
+        // and inside the button's box, where its own shadow is knocked out.
+        assert_eq!(pixels.get_color((45, 115)), SkiaColor::WHITE);
+
+        // a rotated clip at 1.25 scale: a left-half clip turned a half turn
+        // keeps the right half.
+        let mut root = clipped_ripple(thing_core::PathFillRule::NonZero);
+        let button = &mut root.children[0];
+        button.style.background = thing_core::Color::TRANSPARENT.into();
+        button.style.clip = thing_core::ClipMode::Path(std::sync::Arc::new(
+            thing_core::ClipPath::new(
+                "M0 0 H50 V100 H0 Z".into(),
+                ViewBox::new(0.0, 0.0, 100.0, 100.0).unwrap(),
+                thing_core::PathFit::Fill,
+                thing_core::PathFillRule::NonZero,
+            )
+            .unwrap(),
+        ));
+        button.style.rotation = 180.0;
+        let mut surface = raster_scene(&root, 175, 175, 1.25).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        let at = |x: f32, y: f32| pixels.get_color(((x * 1.25) as i32, (y * 1.25) as i32));
+        assert_eq!(at(100.0, 70.0), SkiaColor::from_rgb(255, 0, 0));
+        assert_eq!(at(40.0, 70.0), SkiaColor::WHITE);
     }
 
     #[test]

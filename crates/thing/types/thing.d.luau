@@ -59,7 +59,15 @@ export type ThingMainAlign =
 export type ThingTextAlign = "start" | "center" | "end"
 export type ThingTextOverflow = "clip" | "ellipsis"
 export type ThingScrollAxis = "horizontal" | "vertical"
-export type ThingClipMode = "bounds" | "rounded"
+-- a path fitted into the widget's border box, with ui.path's meanings for
+-- path data, view_box, fit, and fill_rule.
+export type ThingClipPath = {
+    path: string,
+    view_box: ThingPathViewBox,
+    fit: ThingPathFit?,
+    fill_rule: ThingPathFillRule?,
+}
+export type ThingClipMode = "bounds" | "rounded" | ThingClipPath
 export type ThingImageFit = "contain" | "cover" | "fill"
 export type ThingPathFit = "contain" | "cover" | "fill"
 export type ThingPathFillRule = "nonzero" | "evenodd"

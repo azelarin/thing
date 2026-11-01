@@ -759,6 +759,41 @@ class RoundedClipProbes(unittest.TestCase):
             check_rendering.verify_capture("rounded-clips", canvas.image(), "scale-1", 1.25)
 
 
+class PathClipProbes(unittest.TestCase):
+    FILL = (40, 179, 161)
+    RELOADED = (121, 151, 255)
+    DARK = (13, 17, 23)
+
+    def frame(self, scale, fill):
+        canvas = Canvas(scale).rect(0, 0, 640, 320, self.DARK)
+        # every tile drawn as its full rectangle, as a bounds clip would.
+        for left, top in ((20, 20), (140, 20), (260, 20)):
+            canvas.rect(left, top, left + 80, top + 80, fill)
+        canvas.rect(20, 140, 120, 240, (224, 164, 81)).rect(40, 160, 120, 240, fill)
+        return canvas
+
+    def test_blank_frames_cannot_pass_for_either_configuration(self):
+        for scale in (1.0, 1.25):
+            for stage in ("scale-1", "reload"):
+                with self.subTest(scale=scale, stage=stage):
+                    with self.assertRaises(FixtureError):
+                        check_rendering.verify_capture(
+                            "path-clips", Canvas(scale).image(), stage, scale
+                        )
+
+    def test_a_filled_hole_cannot_pass_for_the_evenodd_ring(self):
+        with self.assertRaisesRegex(FixtureError, "ring hole follows its fill rule"):
+            check_rendering.verify_capture(
+                "path-clips", self.frame(1.25, self.FILL).image(), "scale-1.25", 1.25
+            )
+
+    def test_rectangular_clips_cannot_pass_for_curved_paths(self):
+        with self.assertRaisesRegex(FixtureError, "ring corner outside the curve"):
+            check_rendering.verify_capture(
+                "path-clips", self.frame(1.0, self.RELOADED).image(), "reload", 1.0
+            )
+
+
 class HorizontalScrollProbes(unittest.TestCase):
     def test_an_unscrolled_nested_view_cannot_pass_as_revealed(self):
         for scale in (1.0, 1.25):

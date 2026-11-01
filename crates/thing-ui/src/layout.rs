@@ -174,10 +174,12 @@ pub enum ScrollStep {
     Viewport(NodeId),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ClipRegion {
     pub(crate) bounds: Rect,
     pub(crate) radius: f32,
+    /// a path clip in local coordinates, inside `bounds`.
+    pub(crate) path: Option<skia_safe::Path>,
     pub(crate) transform: Affine,
     pub(crate) inverse: Option<Affine>,
     pub(crate) aabb: Rect,
@@ -186,9 +188,12 @@ pub(crate) struct ClipRegion {
 }
 
 impl ClipRegion {
-    fn contains(self, point: Point) -> bool {
+    fn contains(&self, point: Point) -> bool {
         if !self.bounds.contains(point) {
             return false;
+        }
+        if let Some(path) = &self.path {
+            return path.contains((point.x, point.y));
         }
         if self.radius == 0.0 {
             return true;
@@ -206,6 +211,10 @@ impl ClipRegion {
         dx * dx + dy * dy <= f64::from(self.radius).powi(2)
     }
 }
+
+/// the most path clip segments one surface may hit test, so a pointer event
+/// costs a bounded walk however many clips are nested.
+const MAX_CLIP_SEGMENTS: usize = 16 * 1024;
 
 fn clip_radius(node: &Node, bounds: Rect) -> f32 {
     if node.style.clip == ClipMode::Rounded {
@@ -253,6 +262,7 @@ pub struct Layout {
     clip_regions: Vec<ClipRegion>,
     scroll_areas: Vec<ScrollArea>,
     reveal_regions: Vec<RevealRegion>,
+    clip_segments: usize,
 }
 
 impl Layout {
@@ -350,6 +360,7 @@ impl Layout {
         result.clip_regions.push(ClipRegion {
             bounds: clip,
             radius: 0.0,
+            path: None,
             transform: Affine::IDENTITY,
             inverse: Some(Affine::IDENTITY),
             aabb: clip,
@@ -641,6 +652,29 @@ impl Layout {
             && self.clip_contains(placement.clip_chain, point)
     }
 
+    /// fits a node's path clip into its local box, within the surface budget.
+    fn clip_path(
+        &mut self,
+        node: &Node,
+        bounds: Rect,
+        count: bool,
+    ) -> Result<Option<skia_safe::Path>, String> {
+        let ClipMode::Path(clip) = &node.style.clip else {
+            return Ok(None);
+        };
+        if count {
+            self.clip_segments = self.clip_segments.saturating_add(clip.segments.len());
+        }
+        if self.clip_segments > MAX_CLIP_SEGMENTS {
+            return Err(format!(
+                "path clips on one surface exceed {MAX_CLIP_SEGMENTS} segments"
+            ));
+        }
+        crate::skia::fitted_clip(clip, bounds)
+            .map(Some)
+            .map_err(|error| format!("clip path on widget {}: {error}", node.id.0))
+    }
+
     fn clip_contains(&self, mut index: usize, point: Point) -> bool {
         loop {
             let Some(region) = self.clip_regions.get(index) else {
@@ -786,11 +820,14 @@ impl Layout {
         }
 
         let (shadow_clip_chain, shadow_clip) =
-            if node.kind == Kind::Scroll || node.style.clip == ClipMode::Rounded {
+            if node.kind == Kind::Scroll || node.style.clip.is_shaped() {
                 let index = self.clip_regions.len();
+                // the placement pass already counted this path.
+                let path = self.clip_path(node, local_bounds, false)?;
                 self.clip_regions.push(ClipRegion {
                     bounds: local_bounds,
                     radius: clip_radius(node, local_bounds),
+                    path,
                     transform,
                     inverse,
                     aabb: border_aabb,
@@ -873,16 +910,18 @@ impl Layout {
         let disabled_opacity = semantic.disabled_opacity;
         crate::brush::validate(node, local_bounds)?;
         let child_clip_chain = self.clip_regions.len();
+        let path = self.clip_path(node, local_bounds, true)?;
         self.clip_regions.push(ClipRegion {
             bounds: local_bounds,
             radius: clip_radius(node, local_bounds),
+            path,
             transform,
             inverse,
             aabb: border_aabb,
             parent: Some(clip_chain),
             depth: self.clip_regions[clip_chain].depth + 1,
         });
-        let own_clip_chain = if node.style.clip == ClipMode::Rounded {
+        let own_clip_chain = if node.style.clip.is_shaped() {
             child_clip_chain
         } else {
             clip_chain
@@ -1392,7 +1431,7 @@ mod tests {
             }
             let target = if child { NodeId(2) } else { NodeId(1) };
             for mode in [ClipMode::Bounds, ClipMode::Rounded] {
-                root.style.clip = mode;
+                root.style.clip = mode.clone();
                 let layout = Layout::compute(&root, size, &mut FixedText).unwrap();
                 assert_eq!(
                     layout.hit_test(Point { x: 5.0, y: 5.0 }),
@@ -1466,6 +1505,7 @@ mod tests {
                 height: radius * 2.0,
             },
             radius,
+            path: None,
             transform: Affine::IDENTITY,
             inverse: Some(Affine::IDENTITY),
             aabb: Rect::default(),
@@ -3182,5 +3222,193 @@ mod tests {
             ),
             [Cursor::ZoomIn]
         );
+    }
+
+    fn clip(
+        data: &str,
+        view_box: (f32, f32),
+        fit: thing_core::PathFit,
+        rule: thing_core::PathFillRule,
+    ) -> ClipMode {
+        ClipMode::Path(std::sync::Arc::new(
+            thing_core::ClipPath::new(
+                data.into(),
+                thing_core::ViewBox::new(0.0, 0.0, view_box.0, view_box.1).unwrap(),
+                fit,
+                rule,
+            )
+            .unwrap(),
+        ))
+    }
+
+    /// a circle drawn with two arcs, and a square hole in the middle.
+    const RING: &str = "M50 0 A50 50 0 1 1 50 100 A50 50 0 1 1 50 0 Z M35 35 H65 V65 H35 Z";
+
+    fn ring(rule: thing_core::PathFillRule) -> ClipMode {
+        clip(RING, (100.0, 100.0), thing_core::PathFit::Fill, rule)
+    }
+
+    fn hits(layout: &Layout, points: &[(f32, f32)]) -> Vec<Option<NodeId>> {
+        points
+            .iter()
+            .map(|&(x, y)| layout.hit_test(Point { x, y }))
+            .collect()
+    }
+
+    #[test]
+    fn path_clips_shape_hit_testing_with_holes_and_winding_rules() {
+        use thing_core::PathFillRule;
+        let size = Size {
+            width: 100.0,
+            height: 100.0,
+        };
+        // a clipped stack holding a full-size button; only the button hits.
+        let tree = |clip: ClipMode| {
+            let mut root = fixed(1, Kind::Stack, 100.0, 100.0);
+            root.style.clip = clip;
+            root.children.push(fixed(2, Kind::Button, 100.0, 100.0));
+            root
+        };
+        let points = [(50.0, 50.0), (50.0, 20.0), (5.0, 5.0), (97.0, 50.0)];
+        let layout =
+            Layout::compute(&tree(ring(PathFillRule::EvenOdd)), size, &mut FixedText).unwrap();
+        // the hole, the ring, a corner outside the curve, and the curve's edge.
+        assert_eq!(
+            hits(&layout, &points),
+            [None, Some(NodeId(2)), None, Some(NodeId(2))]
+        );
+        // nonzero winding fills the hole: both subpaths run the same way.
+        let layout =
+            Layout::compute(&tree(ring(PathFillRule::NonZero)), size, &mut FixedText).unwrap();
+        assert_eq!(
+            hits(&layout, &points),
+            [Some(NodeId(2)), Some(NodeId(2)), None, Some(NodeId(2))]
+        );
+        // the wheel route follows the same shape.
+        let mut scrolling = tree(ring(PathFillRule::EvenOdd));
+        scrolling.children[0].scroll_events = true;
+        let layout = Layout::compute(&scrolling, size, &mut FixedText).unwrap();
+        assert!(layout.scroll_route(Point { x: 50.0, y: 50.0 }).is_empty());
+        assert_eq!(
+            layout.scroll_route(Point { x: 50.0, y: 20.0 }),
+            [ScrollStep::Handler(NodeId(2))]
+        );
+    }
+
+    #[test]
+    fn path_clips_fit_their_box_and_follow_nesting_transforms_and_scrolling() {
+        use thing_core::{PathFillRule, PathFit};
+        let size = Size {
+            width: 200.0,
+            height: 100.0,
+        };
+        // a triangle with its point at the top center of its view box.
+        let triangle = |fit| {
+            clip(
+                "M50 0 L100 100 L0 100 Z",
+                (100.0, 100.0),
+                fit,
+                PathFillRule::NonZero,
+            )
+        };
+        let tree = |clip: ClipMode| {
+            let mut root = fixed(1, Kind::Stack, 200.0, 100.0);
+            root.style.clip = clip;
+            root.children.push(fixed(2, Kind::Button, 200.0, 100.0));
+            root
+        };
+        // contain centers a 100 by 100 triangle; fill stretches it to the box.
+        let contained =
+            Layout::compute(&tree(triangle(PathFit::Contain)), size, &mut FixedText).unwrap();
+        let filled = Layout::compute(&tree(triangle(PathFit::Fill)), size, &mut FixedText).unwrap();
+        let points = [(100.0, 10.0), (60.0, 90.0), (20.0, 90.0)];
+        assert_eq!(
+            hits(&contained, &points),
+            [Some(NodeId(2)), Some(NodeId(2)), None]
+        );
+        assert_eq!(
+            hits(&filled, &points),
+            [Some(NodeId(2)), Some(NodeId(2)), Some(NodeId(2))]
+        );
+
+        // a nested clip intersects with its ancestor's.
+        let mut nested = tree(triangle(PathFit::Fill));
+        let mut inner = fixed(3, Kind::Stack, 200.0, 100.0);
+        inner.style.clip = clip(
+            "M0 0 H50 V100 H0 Z",
+            (100.0, 100.0),
+            PathFit::Fill,
+            PathFillRule::NonZero,
+        );
+        inner.children.push(nested.children.remove(0));
+        nested.children.push(inner);
+        let layout = Layout::compute(&nested, size, &mut FixedText).unwrap();
+        // inside both, inside only the triangle, and inside only the half.
+        assert_eq!(
+            hits(&layout, &[(80.0, 80.0), (150.0, 80.0), (5.0, 5.0)]),
+            [Some(NodeId(2)), None, None]
+        );
+
+        // a mirror moves the clip with its widget, and a collapsed scale
+        // leaves nothing to hit.
+        let mut mirrored = tree(clip(
+            "M0 0 H50 V100 H0 Z",
+            (100.0, 100.0),
+            PathFit::Fill,
+            PathFillRule::NonZero,
+        ));
+        mirrored.style.scale_x = -1.0;
+        let layout = Layout::compute(&mirrored, size, &mut FixedText).unwrap();
+        assert_eq!(
+            hits(&layout, &[(20.0, 50.0), (180.0, 50.0)]),
+            [None, Some(NodeId(2))]
+        );
+        mirrored.style.scale_x = 0.0;
+        let layout = Layout::compute(&mirrored, size, &mut FixedText).unwrap();
+        assert_eq!(hits(&layout, &[(100.0, 50.0)]), [None]);
+
+        // scrolled content stays inside a clip on the viewport.
+        let mut viewport = fixed(1, Kind::Scroll, 200.0, 100.0);
+        viewport.style.clip = clip(
+            "M0 0 H50 V100 H0 Z",
+            (100.0, 100.0),
+            PathFit::Fill,
+            PathFillRule::NonZero,
+        );
+        let mut column = fixed(2, Kind::Column, 200.0, 300.0);
+        column.style.shrink = Some(0.0);
+        column.children.push(fixed(3, Kind::Button, 200.0, 300.0));
+        viewport.children.push(column);
+        let mut state = ScrollState::default();
+        state.set(NodeId(1), ScrollAxis::Vertical, 150.0);
+        let layout = scrolled(&viewport, size, &mut state);
+        assert_eq!(
+            hits(&layout, &[(50.0, 50.0), (150.0, 50.0)]),
+            [Some(NodeId(3)), None]
+        );
+    }
+
+    #[test]
+    fn path_clips_on_one_surface_share_a_segment_budget() {
+        use thing_core::{PathFillRule, PathFit};
+        // 17 clips of 1,000 segments exceed the 16,384 segment budget.
+        let mut data = String::from("M0 0");
+        for index in 0..999 {
+            data.push_str(&format!(" L{} {}", index % 100, (index * 7) % 100));
+        }
+        let mut root = fixed(1, Kind::Column, 100.0, 100.0);
+        for index in 0..17 {
+            let mut child = fixed(2 + index, Kind::Row, 10.0, 5.0);
+            child.style.clip = clip(&data, (100.0, 100.0), PathFit::Fill, PathFillRule::NonZero);
+            root.children.push(child);
+        }
+        let size = Size {
+            width: 100.0,
+            height: 100.0,
+        };
+        let error = Layout::compute(&root, size, &mut FixedText).unwrap_err();
+        assert!(error.contains("exceed 16384 segments"), "{error}");
+        root.children.truncate(16);
+        assert!(Layout::compute(&root, size, &mut FixedText).is_ok());
     }
 }

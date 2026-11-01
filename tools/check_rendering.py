@@ -24,7 +24,7 @@ FIXTURES = ROOT / "tests/rendering"
 ARTIFACTS = ROOT / "target/render-tests"
 CASES = (
     "image-fit", "stencil", "gradients", "radial-gradients", "shadows", "shared-motion",
-    "widget-bounds", "rounded-clips", "horizontal-scroll", "motion-lifecycle", "content-transitions", "windows",
+    "widget-bounds", "rounded-clips", "path-clips", "horizontal-scroll", "motion-lifecycle", "content-transitions", "windows",
 )
 # these accept a state only after the same passing frame is captured twice.
 STABLE_FRAMES = {
@@ -425,6 +425,31 @@ def verify_rounded_clips(image, stage, scale):
         expect_color(image, point, scale, color, label, tolerance=3)
 
 
+def verify_path_clips(image, stage, scale):
+    background = (13, 17, 23)
+    fill = (121, 151, 255) if stage == "reload" else (40, 179, 161)
+    probes = (
+        ((60, 30), fill, "ring outline"),
+        # the reload changes the first ring from evenodd to nonzero.
+        ((60, 60), fill if stage == "reload" else background, "ring hole follows its fill rule"),
+        ((23, 23), background, "ring corner outside the curve"),
+        ((180, 60), fill, "nonzero ring fills its hole"),
+        ((143, 23), background, "nonzero ring corner"),
+        ((300, 30), fill, "half-turned triangle base"),
+        ((265, 95), background, "half-turned triangle point"),
+        ((300, 92), fill, "half-turned triangle tip"),
+        ((70, 150), (224, 164, 81), "outer circle keeps its own background"),
+        ((22, 142), (224, 164, 81), "own background outside the clip"),
+        ((60, 200), fill, "nested clips intersect"),
+        ((90, 200), (224, 164, 81), "inner clip cuts the content"),
+        ((200, 228), (0, 0, 0), "own shadow extends outside the clip"),
+        ((200, 200), (0, 0, 0), "descendant shadow inside the circle"),
+        ((163, 205), background, "descendant shadow clipped by the circle"),
+    )
+    for point, color, label in probes:
+        expect_color(image, point, scale, color, label, tolerance=3)
+
+
 def verify_horizontal_scroll(image, stage, scale):
     last = (224, 164, 81) if stage == "reload" else (196, 112, 210)
     for point, color, label in (
@@ -523,6 +548,8 @@ def verify_capture(case, image, stage, scale):
         verify_widget_bounds(image, stage, scale)
     elif case == "rounded-clips":
         verify_rounded_clips(image, stage, scale)
+    elif case == "path-clips":
+        verify_path_clips(image, stage, scale)
     elif case == "horizontal-scroll":
         verify_horizontal_scroll(image, stage, scale)
     elif case == "motion-lifecycle":
