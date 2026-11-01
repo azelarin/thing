@@ -1591,6 +1591,9 @@ pub struct Image {
     pub icon: Option<String>,
     pub app_id: Option<String>,
     pub theme: String,
+    /// a refresh token. a different value loads the same source again, so a
+    /// replaced file or changed url content becomes visible.
+    pub revision: Option<String>,
 }
 
 impl Default for Image {
@@ -1601,6 +1604,7 @@ impl Default for Image {
             icon: None,
             app_id: None,
             theme: "hicolor".into(),
+            revision: None,
         }
     }
 }

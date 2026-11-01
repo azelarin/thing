@@ -1,6 +1,7 @@
 //! bounded asynchronous image loading and gpu caching.
 
 mod icons;
+mod remote;
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -15,6 +16,139 @@ use thing_core::{Image, ImageFit, Rect};
 
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_INPUT: u64 = 16 * 1024 * 1024;
+/// downloaded files kept so a new size or scale decodes without fetching.
+const DOWNLOAD_ENTRIES: usize = 16;
+const DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
+/// failed downloads remembered until their source or revision changes.
+const FAILED_DOWNLOADS: usize = 64;
+
+/// where a `source` string points.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Location {
+    Path(std::path::PathBuf),
+    Remote(String),
+}
+
+fn location(source: &str) -> Result<Location, String> {
+    let scheme = source
+        .split_once("://")
+        .map(|(scheme, _)| scheme.to_ascii_lowercase());
+    match scheme.as_deref() {
+        Some("http" | "https") => Ok(Location::Remote(source.to_owned())),
+        Some("file") => file_url_path(source).map(Location::Path),
+        _ => Ok(Location::Path(source.into())),
+    }
+}
+
+/// the local path of a `file://` url, as mpris art urls use. a host other
+/// than empty or `localhost` names another machine and is refused.
+fn file_url_path(url: &str) -> Result<std::path::PathBuf, String> {
+    let rest = &url["file://".len()..];
+    let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) || path.is_empty() {
+        return Err("file urls must name a local absolute path".into());
+    }
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let mut bytes = Vec::with_capacity(path.len());
+    let mut input = path.bytes();
+    while let Some(byte) = input.next() {
+        if byte != b'%' {
+            bytes.push(byte);
+            continue;
+        }
+        let digits = [input.next(), input.next()];
+        let value = match digits {
+            [Some(high), Some(low)] => (char::from(high).to_digit(16))
+                .zip(char::from(low).to_digit(16))
+                .map(|(high, low)| (high * 16 + low) as u8),
+            _ => None,
+        };
+        bytes.push(value.ok_or("file url has an invalid percent escape")?);
+    }
+    use std::os::unix::ffi::OsStringExt;
+    Ok(std::ffi::OsString::from_vec(bytes).into())
+}
+
+/// an image description that is safe to log: remote urls lose credentials
+/// and queries.
+fn describe(image: &Image) -> String {
+    match image.source.as_deref().map(location) {
+        Some(Ok(Location::Remote(url))) => remote::redact(&url),
+        Some(_) => image.source.clone().unwrap_or_default(),
+        None => image
+            .memory
+            .as_ref()
+            .map(|source| source.id().to_owned())
+            .or_else(|| image.icon.clone())
+            .or_else(|| image.app_id.clone())
+            .unwrap_or_default(),
+    }
+}
+
+fn remote_identity(image: &Image) -> Option<remote::Identity> {
+    match image.source.as_deref().map(location) {
+        Some(Ok(Location::Remote(url))) => Some(remote::Identity {
+            url,
+            revision: image.revision.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// downloads, the bytes they produced, and the ones that failed.
+#[derive(Default)]
+struct Remote {
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    limits: remote::Limits,
+    fetcher: Option<remote::Fetcher>,
+    running: BTreeMap<remote::Identity, u64>,
+    downloads: BTreeMap<remote::Identity, (Arc<[u8]>, u64)>,
+    failed: BTreeMap<remote::Identity, u64>,
+}
+
+impl Remote {
+    fn downloaded_bytes(&self) -> usize {
+        self.downloads.values().map(|(bytes, _)| bytes.len()).sum()
+    }
+
+    fn remember(&mut self, identity: remote::Identity, bytes: Arc<[u8]>, tick: u64) {
+        self.downloads.insert(identity, (bytes, tick));
+        while self.downloads.len() > DOWNLOAD_ENTRIES || self.downloaded_bytes() > DOWNLOAD_BYTES {
+            let oldest = self
+                .downloads
+                .iter()
+                .min_by_key(|(_, (_, touched))| *touched)
+                .map(|(identity, _)| identity.clone());
+            match oldest {
+                Some(identity) => self.downloads.remove(&identity),
+                None => break,
+            };
+        }
+    }
+
+    fn fail(&mut self, identity: remote::Identity, tick: u64) {
+        self.failed.insert(identity, tick);
+        while self.failed.len() > FAILED_DOWNLOADS {
+            let oldest = self
+                .failed
+                .iter()
+                .min_by_key(|(_, touched)| **touched)
+                .map(|(identity, _)| identity.clone());
+            match oldest {
+                Some(identity) => self.failed.remove(&identity),
+                None => break,
+            };
+        }
+    }
+
+    fn cancel(&mut self, identity: &remote::Identity) {
+        if let Some(id) = self.running.remove(identity)
+            && let Some(fetcher) = &mut self.fetcher
+        {
+            fetcher.cancel(id);
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Key {
@@ -49,6 +183,8 @@ struct Pixels {
 #[derive(Default)]
 struct Inbox {
     requests: VecDeque<Key>,
+    /// downloaded content for queued remote requests.
+    downloaded: BTreeMap<Key, Arc<[u8]>>,
     result: Option<(Key, Result<Pixels, String>)>,
     stop: bool,
 }
@@ -59,7 +195,7 @@ struct Shared {
     changed: Condvar,
 }
 
-fn start_worker(wake: impl Fn() + Send + 'static) -> Result<Arc<Shared>, String> {
+fn start_worker(wake: Arc<dyn Fn() + Send + Sync>) -> Result<Arc<Shared>, String> {
     let shared = Arc::new(Shared::default());
     let worker = shared.clone();
     thread::Builder::new()
@@ -67,7 +203,7 @@ fn start_worker(wake: impl Fn() + Send + 'static) -> Result<Arc<Shared>, String>
         .spawn(move || {
             let mut icons = icons::Icons::default();
             loop {
-                let key = {
+                let (key, downloaded) = {
                     let mut inbox = lock(&worker.inbox);
                     while !inbox.stop && (inbox.result.is_some() || inbox.requests.is_empty()) {
                         inbox = worker
@@ -78,9 +214,14 @@ fn start_worker(wake: impl Fn() + Send + 'static) -> Result<Arc<Shared>, String>
                     if inbox.stop {
                         break;
                     }
-                    inbox.requests.pop_front().expect("waited for a request")
+                    let key = inbox.requests.pop_front().expect("waited for a request");
+                    let downloaded = inbox.downloaded.remove(&key);
+                    (key, downloaded)
                 };
-                let result = decode(&key, &mut icons);
+                let result = match downloaded {
+                    Some(bytes) => decode_downloaded(&bytes, &key),
+                    None => decode(&key, &mut icons),
+                };
                 {
                     let mut inbox = lock(&worker.inbox);
                     if inbox.stop {
@@ -122,21 +263,141 @@ pub(super) struct Images {
     bytes: usize,
     retired_bytes: usize,
     tick: u64,
+    remote: Remote,
 }
 
 impl Images {
     pub fn new(wake: impl Fn() + Send + 'static) -> Result<Self, String> {
+        Self::with_limits(wake, remote::Limits::default())
+    }
+
+    fn with_limits(
+        wake: impl Fn() + Send + 'static,
+        limits: remote::Limits,
+    ) -> Result<Self, String> {
+        let wake = Mutex::new(wake);
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || (lock(&wake))());
         Ok(Self {
-            shared: start_worker(wake)?,
+            shared: start_worker(wake.clone())?,
             cache: BTreeMap::new(),
             retired: Vec::new(),
             bytes: 0,
             retired_bytes: 0,
             tick: 0,
+            remote: Remote {
+                wake: Some(wake),
+                limits,
+                ..Remote::default()
+            },
         })
     }
 
+    /// moves finished downloads into the decode queue, or fails every
+    /// request waiting on them. a download for a source that was superseded
+    /// or cleared reports nothing.
+    fn collect_downloads(&mut self) {
+        let Some(fetcher) = &mut self.remote.fetcher else {
+            return;
+        };
+        for (id, identity, outcome) in fetcher.take_done() {
+            if self.remote.running.get(&identity) != Some(&id) {
+                continue;
+            }
+            self.remote.running.remove(&identity);
+            let waiting: Vec<_> = self
+                .cache
+                .iter()
+                .filter(|(key, entry)| {
+                    matches!(entry.state, State::Pending)
+                        && remote_identity(&key.image).as_ref() == Some(&identity)
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            match outcome {
+                Ok(bytes) => {
+                    self.remote.remember(identity, bytes.clone(), self.tick);
+                    let mut inbox = lock(&self.shared.inbox);
+                    for key in waiting {
+                        inbox.downloaded.insert(key.clone(), bytes.clone());
+                        inbox.requests.push_back(key);
+                    }
+                    drop(inbox);
+                    self.shared.changed.notify_one();
+                }
+                Err(error) => {
+                    eprintln!(
+                        "thing: cannot load image {:?}: {error}",
+                        remote::redact(&identity.url)
+                    );
+                    self.remote.fail(identity, self.tick);
+                    for key in waiting {
+                        if let Some(entry) = self.cache.get_mut(&key) {
+                            entry.state = State::Failed;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// starts or joins the download a remote request needs. it returns false
+    /// while the download queue is full, so the request is tried again on a
+    /// later frame instead of being remembered as pending.
+    fn request_download(&mut self, key: &Key, identity: remote::Identity) -> bool {
+        // a new revision of the same url supersedes any older one in flight.
+        let superseded: Vec<_> = self
+            .remote
+            .running
+            .keys()
+            .filter(|running| running.url == identity.url && **running != identity)
+            .cloned()
+            .collect();
+        for old in superseded {
+            self.remote.cancel(&old);
+            self.cache.retain(|candidate, entry| {
+                !(matches!(entry.state, State::Pending)
+                    && remote_identity(&candidate.image).as_ref() == Some(&old))
+            });
+        }
+        if let Some((bytes, touched)) = self.remote.downloads.get_mut(&identity) {
+            *touched = self.tick;
+            let bytes = bytes.clone();
+            let mut inbox = lock(&self.shared.inbox);
+            inbox.downloaded.insert(key.clone(), bytes);
+            inbox.requests.push_back(key.clone());
+            return true;
+        }
+        if self.remote.running.contains_key(&identity) {
+            return true;
+        }
+        if self.remote.fetcher.is_none() {
+            let Some(wake) = self.remote.wake.clone() else {
+                return false;
+            };
+            match remote::Fetcher::start(self.remote.limits.clone(), wake) {
+                Ok(fetcher) => self.remote.fetcher = Some(fetcher),
+                Err(error) => {
+                    eprintln!("thing: cannot start image downloads: {error}");
+                    return false;
+                }
+            }
+        }
+        let fetcher = self
+            .remote
+            .fetcher
+            .as_mut()
+            .expect("the fetcher was just started");
+        match fetcher.submit(identity.clone()) {
+            Some(id) => {
+                self.remote.running.insert(identity, id);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn collect(&mut self) {
+        self.collect_downloads();
         let result = lock(&self.shared.inbox).result.take();
         let Some((key, result)) = result else {
             return;
@@ -182,7 +443,10 @@ impl Images {
         }) {
             Ok(state) => state,
             Err(error) => {
-                eprintln!("thing: cannot load image {:?}: {error}", key.image);
+                eprintln!(
+                    "thing: cannot load image {:?}: {error}",
+                    describe(&key.image)
+                );
                 State::Failed
             }
         };
@@ -256,16 +520,38 @@ impl Images {
                     break;
                 }
             }
-            if self.cache.len() < 128 {
+            let identity = remote_identity(image);
+            let failed = identity
+                .as_ref()
+                .is_some_and(|identity| self.remote.failed.contains_key(identity));
+            if self.cache.len() < 128 && failed {
+                // a failed download is not retried until its source or
+                // revision changes, whatever size asks for it.
                 self.cache.insert(
-                    key.clone(),
+                    key,
                     Entry {
-                        state: State::Pending,
+                        state: State::Failed,
                         touched: self.tick,
                     },
                 );
-                lock(&self.shared.inbox).requests.push_back(key);
-                self.shared.changed.notify_one();
+            } else if self.cache.len() < 128 {
+                let queued = match identity {
+                    Some(identity) => self.request_download(&key, identity),
+                    None => {
+                        lock(&self.shared.inbox).requests.push_back(key.clone());
+                        true
+                    }
+                };
+                if queued {
+                    self.cache.insert(
+                        key,
+                        Entry {
+                            state: State::Pending,
+                            touched: self.tick,
+                        },
+                    );
+                    self.shared.changed.notify_one();
+                }
             }
         }
 
@@ -317,6 +603,14 @@ impl Images {
     }
 
     pub fn clear(&mut self) {
+        // a reload loads every source again, so downloads start over.
+        let running: Vec<_> = self.remote.running.keys().cloned().collect();
+        for identity in running {
+            self.remote.cancel(&identity);
+        }
+        self.remote.downloads.clear();
+        self.remote.failed.clear();
+        lock(&self.shared.inbox).downloaded.clear();
         self.cache.clear();
         self.retired.clear();
         self.bytes = 0;
@@ -357,6 +651,7 @@ impl Drop for Images {
         let mut inbox = lock(&self.shared.inbox);
         inbox.stop = true;
         inbox.requests.clear();
+        inbox.downloaded.clear();
         inbox.result.take();
         self.shared.changed.notify_one();
         // decoders cannot be interrupted safely. the worker owns no gl objects;
@@ -366,8 +661,11 @@ impl Drop for Images {
 
 fn decode(key: &Key, icons: &mut icons::Icons) -> Result<Pixels, String> {
     let requested = key.width.max(key.height).min(u16::MAX as u32) as u16;
-    if let Some(path) = key.image.source.as_deref() {
-        return decode_path(std::path::Path::new(path), key);
+    if let Some(source) = key.image.source.as_deref() {
+        return match location(source)? {
+            Location::Path(path) => decode_path(&path, key),
+            Location::Remote(_) => Err("remote image was decoded without its download".into()),
+        };
     }
     let mut last_error = None;
     if let Some(source) = &key.image.memory {
@@ -415,6 +713,29 @@ fn decode_path(path: &std::path::Path, key: &Key) -> Result<Pixels, String> {
         key.fit,
         key.viewport_aspect(),
     )
+}
+
+/// downloaded bytes have no file extension, so svg is recognized by content.
+fn decode_downloaded(bytes: &[u8], key: &Key) -> Result<Pixels, String> {
+    decode_bytes_with_aspect(
+        bytes,
+        looks_like_svg(bytes),
+        key.width,
+        key.height,
+        key.fit,
+        key.viewport_aspect(),
+    )
+}
+
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    let text = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let start = text
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(text.len());
+    let head = &text[start..text.len().min(start + 512)];
+    head.starts_with(b"<svg")
+        || (head.starts_with(b"<?xml") && head.windows(4).any(|window| window == b"<svg"))
 }
 
 fn select_pixmap(
@@ -633,6 +954,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 #[cfg(test)]
+mod remote_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use thing_core::{ImageCandidate, ImagePixmap, ImageSource};
@@ -701,6 +1025,7 @@ mod tests {
             bytes: 0,
             retired_bytes: 0,
             tick: 0,
+            remote: Remote::default(),
         };
 
         drop(images);
@@ -744,6 +1069,7 @@ mod tests {
             bytes: 0,
             retired_bytes: 0,
             tick: 0,
+            remote: Remote::default(),
         };
 
         images.collect();
@@ -963,6 +1289,7 @@ mod tests {
             bytes: 20 * 10 * 4,
             retired_bytes: 0,
             tick: 0,
+            remote: Remote::default(),
         };
 
         let first = images
