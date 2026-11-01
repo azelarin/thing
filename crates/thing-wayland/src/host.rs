@@ -1000,6 +1000,8 @@ const MAX_PENDING_UI_ACTIONS: usize = 4096;
 enum WidgetKeyAction {
     Activate,
     Slider(SliderKeyAction),
+    /// move the keyboard's link selection inside a text widget.
+    Link(i32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1013,7 +1015,7 @@ impl WidgetKeyAction {
     fn repeats(self) -> bool {
         matches!(
             self,
-            Self::Slider(SliderKeyAction::Decrease | SliderKeyAction::Increase)
+            Self::Slider(SliderKeyAction::Decrease | SliderKeyAction::Increase) | Self::Link(_)
         )
     }
 }
@@ -1113,6 +1115,7 @@ struct Surface {
     press_serial: Option<u32>,
     pressed_button: Option<u32>,
     pressed_target: Option<ScopedUiTarget>,
+    pressed_link: Option<(u16, String)>,
     range_press: Option<ScopedUiTarget>,
     configured: bool,
     dirty: bool,
@@ -1600,9 +1603,37 @@ fn pending_paste_is_current(
         && active == Some(expected)
 }
 
+/// a text widget's visible links, once each, in layout order.
+fn visible_links(layout: &Layout, id: NodeId) -> Vec<u16> {
+    let mut links = Vec::new();
+    for (link, _) in layout.link_regions(id) {
+        if !links.contains(link) {
+            links.push(*link);
+        }
+    }
+    links
+}
+
+/// the link `step` places from `current`, stopping at either end.
+fn step_link(links: &[u16], current: Option<u16>, step: i32) -> Option<u16> {
+    let position = current.and_then(|current| links.iter().position(|link| *link == current));
+    let next = match position {
+        None if step < 0 => links.len().checked_sub(1)?,
+        None => 0,
+        Some(position) => position
+            .saturating_add_signed(step as isize)
+            .min(links.len().saturating_sub(1)),
+    };
+    links.get(next).copied()
+}
+
 fn widget_key_action(kind: Kind, keysym: Keysym, direct: bool) -> Option<WidgetKeyAction> {
     match (kind, keysym) {
-        (Kind::Button, Keysym::Return | Keysym::space) if direct => Some(WidgetKeyAction::Activate),
+        (Kind::Button | Kind::Text, Keysym::Return | Keysym::space) if direct => {
+            Some(WidgetKeyAction::Activate)
+        }
+        (Kind::Text, Keysym::Left | Keysym::Up) => Some(WidgetKeyAction::Link(-1)),
+        (Kind::Text, Keysym::Right | Keysym::Down) => Some(WidgetKeyAction::Link(1)),
         (Kind::Slider | Kind::Range, Keysym::Left | Keysym::Down) => {
             Some(WidgetKeyAction::Slider(SliderKeyAction::Decrease))
         }
@@ -2256,7 +2287,7 @@ fn interactive_path(root: &Node, target: NodeId) -> Option<Vec<NodeId>> {
         if !node.visible || !node.enabled {
             return false;
         }
-        let interactive = node.kind.is_interactive();
+        let interactive = node.is_interactive();
         if interactive {
             path.push(node.id);
         }

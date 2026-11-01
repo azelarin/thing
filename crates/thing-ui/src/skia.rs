@@ -448,7 +448,21 @@ impl Scene<'_> {
                 canvas.draw_rrect(shape, &fill(color(overlay), opacity));
             }
             if let Some((focus_color, focus_width)) = focus_ring(node, input) {
-                canvas.draw_rrect(shape, &stroke(color(focus_color), focus_width, opacity));
+                let paint = stroke(color(focus_color), focus_width, opacity);
+                // a focused text widget rings only its selected link.
+                let selected = layout.selected_link(node.id, input.focused_link);
+                let links: Vec<_> = layout
+                    .link_regions(node.id)
+                    .iter()
+                    .filter(|(link, _)| Some(*link) == selected)
+                    .map(|(_, rect)| *rect)
+                    .collect();
+                if links.is_empty() {
+                    canvas.draw_rrect(shape, &paint);
+                }
+                for rect in links {
+                    canvas.draw_rect(to_skia_rect(rect), &paint);
+                }
             }
 
             canvas.restore_to_count(saved);
@@ -773,11 +787,28 @@ fn set_surface_transform(
     Ok(())
 }
 
-fn draw_layout(
+/// how a shaped run's brush paints.
+trait PaintBrush: parley::Brush {
+    fn paint(&self) -> crate::text::TextBrush;
+}
+
+impl PaintBrush for () {
+    fn paint(&self) -> crate::text::TextBrush {
+        crate::text::TextBrush::default()
+    }
+}
+
+impl PaintBrush for crate::text::TextBrush {
+    fn paint(&self) -> crate::text::TextBrush {
+        *self
+    }
+}
+
+fn draw_layout<B: PaintBrush>(
     canvas: &Canvas,
     typefaces: &mut TypefaceCache,
     fonts: &FontMgr,
-    layout: &parley::Layout<()>,
+    layout: &parley::Layout<B>,
     origin: Point,
     foreground: thing_core::Color,
     opacity: f32,
@@ -787,6 +818,21 @@ fn draw_layout(
             let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                 continue;
             };
+            let brush = glyph_run.style().brush.paint();
+            let paint = fill(color(brush.color.unwrap_or(foreground)), opacity);
+            if brush.underline {
+                let metrics = glyph_run.run().metrics();
+                let thickness = metrics.underline_size.max(1.0);
+                canvas.draw_rect(
+                    skia_safe::Rect::from_xywh(
+                        origin.x + glyph_run.offset(),
+                        origin.y + glyph_run.baseline() - metrics.underline_offset,
+                        glyph_run.advance(),
+                        thickness,
+                    ),
+                    &paint,
+                );
+            }
             let run = glyph_run.run();
             let source = run.font();
             let synthesis = run.synthesis();
@@ -809,19 +855,17 @@ fn draw_layout(
                 .iter()
                 .map(|glyph| Point::new(glyph.x, glyph.y))
                 .collect::<Vec<_>>();
-            canvas.draw_glyphs_at(
-                &glyphs,
-                positions.as_slice(),
-                origin,
-                &font,
-                &fill(color(foreground), opacity),
-            );
+            canvas.draw_glyphs_at(&glyphs, positions.as_slice(), origin, &font, &paint);
         }
     }
     Ok(())
 }
 
-fn text_alignment_offset(layout: &parley::Layout<()>, width: f32, align: TextAlign) -> f32 {
+fn text_alignment_offset<B: parley::Brush>(
+    layout: &parley::Layout<B>,
+    width: f32,
+    align: TextAlign,
+) -> f32 {
     let content = layout.full_width();
     let rtl = layout.is_rtl();
     match (align, rtl) {
@@ -1455,6 +1499,85 @@ mod tests {
             surface.peek_pixels().unwrap().get_color((60, 105)),
             SkiaColor::BLACK
         );
+    }
+
+    #[test]
+    fn spans_paint_their_colors_underlines_and_the_focused_link_ring() {
+        let mut root = Node::new(NodeId(1), Kind::Panel);
+        root.style.width = Some(300.0);
+        root.style.height = Some(80.0);
+        let mut label = Node::new(NodeId(2), Kind::Text);
+        label.text = "MMM MMM".into();
+        label.style.font_size = 40.0;
+        label.style.foreground = thing_core::Color([0, 0, 255, 255]);
+        label.style.focus_ring_color = thing_core::Color([0, 255, 0, 255]);
+        label.style.focus_ring_width = 2.0;
+        label.style.padding = 10.0;
+        label.spans = std::sync::Arc::from([
+            thing_core::TextSpan {
+                range: 0..3,
+                color: Some(thing_core::Color([255, 0, 0, 255])),
+                ..thing_core::TextSpan::default()
+            },
+            thing_core::TextSpan {
+                range: 4..7,
+                underline: true,
+                link: Some(0),
+                ..thing_core::TextSpan::default()
+            },
+        ]);
+        label.links = std::sync::Arc::from(["target".to_owned()]);
+        label.link_handler = true;
+        root.children.push(label);
+        let mut text = TextSystem::default();
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 300.0,
+                height: 80.0,
+            },
+            &mut text,
+        )
+        .unwrap();
+        let link = layout.link_regions(NodeId(2))[0].1;
+        let placement = *layout.get(NodeId(2)).unwrap();
+        let origin = (placement.bounds.x, placement.bounds.y);
+
+        let mut input = Interaction::default();
+        input.focus_from_keyboard(NodeId(2));
+        let mut surface = raster_scene_with_input(&root, 300, 80, 1.0, input).unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        let count = |x0: f32, x1: f32, matches: &dyn Fn(SkiaColor) -> bool| {
+            let mut found = 0;
+            for y in 0..80 {
+                for x in x0 as i32..x1 as i32 {
+                    if matches(pixels.get_color((x, y))) {
+                        found += 1;
+                    }
+                }
+            }
+            found
+        };
+        let red = |color: SkiaColor| color.r() > 200 && color.g() < 60 && color.b() < 60;
+        let blue = |color: SkiaColor| color.b() > 200 && color.r() < 60 && color.g() < 60;
+        let link_left = origin.0 + link.x;
+        let link_right = link_left + link.width;
+        // the red span is left of the link, and the link keeps the foreground.
+        assert!(count(0.0, link_left, &red) > 50);
+        assert_eq!(count(link_left, 300.0, &red), 0);
+        assert!(count(link_left, link_right, &blue) > 50);
+        // an underline runs across most of the link's width below its glyphs.
+        let underline_row = (0..80).any(|y| {
+            let covered = (link_left as i32 + 2..link_right as i32 - 2)
+                .filter(|x| blue(pixels.get_color((*x, y))))
+                .count();
+            covered as f32 >= (link.width - 6.0) * 0.95
+        });
+        assert!(underline_row);
+        // the focus ring surrounds the link, not the whole widget.
+        let green = |color: SkiaColor| color.g() > 200 && color.r() < 60 && color.b() < 60;
+        assert!(count(link_left - 2.0, link_right + 2.0, &green) > 20);
+        assert_eq!(count(0.0, link_left - 3.0, &green), 0);
     }
 
     #[test]

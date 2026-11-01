@@ -49,6 +49,16 @@ CASES = (
             "Function 'services.clipboard.read_image' expects 0 arguments",
         ),
     ),
+    Case("valid-styled-text.luau"),
+    Case(
+        "invalid-styled-text.luau",
+        (
+            "Property 'spans' is not compatible.",
+            "Property 'markup' is not compatible.",
+            "Property 'on_link' is not compatible.",
+            "Property 'letter_spacing' is not compatible.",
+        ),
+    ),
     Case("valid-clipping.luau"),
     Case("valid-scroll-axis.luau"),
     Case("valid-niri-controls.luau"),

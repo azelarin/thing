@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use taffy::{
     geometry::Point as TaffyPoint,
@@ -19,6 +19,12 @@ pub struct Size {
 /// text measurement must use the same shaping and fonts as the renderer.
 pub trait Measurer {
     fn measure(&mut self, node: &Node, max_width: Option<f32>) -> Size;
+
+    /// the boxes of each visible link in a text widget laid out at
+    /// `max_width`, relative to its content origin.
+    fn links(&mut self, _node: &Node, _max_width: Option<f32>) -> Vec<(u16, Rect)> {
+        Vec::new()
+    }
 }
 
 /// one visible widget in painting order with stable and transformed geometry.
@@ -263,6 +269,13 @@ struct RevealInherited {
     shadow_clip: Rect,
 }
 
+#[derive(Debug)]
+struct TextLinks {
+    regions: Vec<(u16, Rect)>,
+    // destinations belong to the frame, just like their hit boxes.
+    targets: Arc<[String]>,
+}
+
 /// resolved geometry for one surface. popup children have separate surfaces and
 /// do not participate in their parent's flex layout.
 #[derive(Debug, Default)]
@@ -278,6 +291,8 @@ pub struct Layout {
     clip_segments: usize,
     fitted_clips: BTreeMap<NodeId, skia_safe::Path>,
     content_sizes: BTreeMap<NodeId, Size>,
+    /// visible link boxes of interactive text, in each widget's local space.
+    links: BTreeMap<NodeId, TextLinks>,
 }
 
 impl Layout {
@@ -410,6 +425,7 @@ impl Layout {
                 );
             }
         }
+        result.collect_links(root, measurer);
         *state = next_state;
         Ok(result)
     }
@@ -419,6 +435,95 @@ impl Layout {
     /// one.
     pub fn content_size(&self, id: NodeId) -> Option<Size> {
         self.content_sizes.get(&id).copied()
+    }
+
+    /// shapes interactive text once more at its placed width, the same width
+    /// painting uses, and records where each visible link landed.
+    fn collect_links(&mut self, root: &Node, measurer: &mut impl Measurer) {
+        fn visit(node: &Node, found: &mut Vec<NodeId>) {
+            if node.kind == Kind::Text && node.is_interactive() {
+                found.push(node.id);
+            }
+            for child in &node.children {
+                if child.kind != Kind::Popup {
+                    visit(child, found);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        visit(root, &mut found);
+        for id in found {
+            let (Some(placement), Some(node)) = (self.semantic_placement(id), root.find(id)) else {
+                continue;
+            };
+            let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
+            let padding_y = node.style.padding_y.unwrap_or(node.style.padding);
+            let content = Rect {
+                x: padding_x,
+                y: padding_y,
+                width: (placement.bounds.width - 2.0 * padding_x).max(0.0),
+                height: (placement.bounds.height - 2.0 * padding_y).max(0.0),
+            };
+            let visible = placement.local_bounds();
+            let regions = measurer
+                .links(node, Some(content.width))
+                .into_iter()
+                .filter_map(|(link, rect)| {
+                    let rect = Rect {
+                        x: rect.x + content.x,
+                        y: rect.y + content.y,
+                        ..rect
+                    };
+                    // text beyond a line limit is clipped to the widget's box.
+                    rect.intersection(visible).map(|rect| (link, rect))
+                })
+                .collect();
+            self.links.insert(
+                id,
+                TextLinks {
+                    regions,
+                    targets: node.links.clone(),
+                },
+            );
+        }
+    }
+
+    /// visible link boxes of an interactive text widget, in its local space.
+    pub fn link_regions(&self, id: NodeId) -> &[(u16, Rect)] {
+        self.links
+            .get(&id)
+            .map_or(&[], |links| links.regions.as_slice())
+    }
+
+    /// the destination a link named in this frame.
+    pub fn link_target(&self, id: NodeId, link: u16) -> Option<&str> {
+        self.links
+            .get(&id)?
+            .targets
+            .get(usize::from(link))
+            .map(String::as_str)
+    }
+
+    pub fn selected_link(&self, id: NodeId, preferred: Option<u16>) -> Option<u16> {
+        let regions = self.link_regions(id);
+        preferred
+            .filter(|link| regions.iter().any(|(index, _)| index == link))
+            .or_else(|| regions.first().map(|(link, _)| *link))
+    }
+
+    /// the link of text widget `id` under a surface point, through its
+    /// transform. the caller hit tests first, which applies clipping.
+    pub fn link_at(&self, id: NodeId, point: Point) -> Option<u16> {
+        let local = self.surface_to_local(id, point)?;
+        self.link_regions(id)
+            .iter()
+            .find(|(_, rect)| {
+                local.x >= rect.x
+                    && local.y >= rect.y
+                    && local.x < rect.x + rect.width
+                    && local.y < rect.y + rect.height
+            })
+            .map(|(link, _)| *link)
     }
 
     pub fn placements(&self) -> &[Placement] {
@@ -600,6 +705,23 @@ impl Layout {
     /// reveal a visible, enabled widget in every enclosing scroll viewport,
     /// using the smallest movement along each viewport's axis.
     pub fn reveal(&self, id: NodeId, state: &mut ScrollState) -> bool {
+        self.reveal_region(id, None, state)
+    }
+
+    /// reveal the selected link, or the widget when it has no links.
+    pub fn reveal_focus(&self, id: NodeId, link: Option<u16>, state: &mut ScrollState) -> bool {
+        let rect = self.selected_link(id, link).and_then(|link| {
+            self.link_regions(id)
+                .iter()
+                .find(|(index, _)| *index == link)
+                .map(|(_, rect)| *rect)
+        });
+        let bounds =
+            rect.and_then(|rect| self.semantic_placement(id)?.transform.rect_aabb(rect).ok());
+        self.reveal_region(id, bounds, state)
+    }
+
+    fn reveal_region(&self, id: NodeId, bounds: Option<Rect>, state: &mut ScrollState) -> bool {
         let Some(region) = self
             .reveal_regions
             .iter()
@@ -607,13 +729,14 @@ impl Layout {
         else {
             return false;
         };
-        if axis_edges(region.bounds, ScrollAxis::Vertical).is_none()
-            || axis_edges(region.bounds, ScrollAxis::Horizontal).is_none()
+        let bounds = bounds.unwrap_or(region.bounds);
+        if axis_edges(bounds, ScrollAxis::Vertical).is_none()
+            || axis_edges(bounds, ScrollAxis::Horizontal).is_none()
         {
             return false;
         }
 
-        let mut bounds = region.bounds;
+        let mut bounds = bounds;
         let mut ancestor = region.scroll_parent;
         while let Some(id) = ancestor {
             let Some(area) = self.scroll_areas.iter().find(|area| area.id == id) else {
@@ -833,7 +956,7 @@ impl Layout {
             bounds,
             enabled,
             focusable: enabled
-                && node.kind.is_interactive()
+                && node.is_interactive()
                 && [bounds.x, bounds.y, bounds.width, bounds.height]
                     .into_iter()
                     .all(f32::is_finite)
@@ -987,7 +1110,7 @@ impl Layout {
             border_aabb,
             transform,
             clip: clip_aabb,
-            interactive: enabled && node.kind.is_interactive(),
+            interactive: enabled && node.is_interactive(),
             pointer_events: enabled && node.pointer_events,
             scroll_events: enabled && node.scroll_events,
             enabled,
@@ -3776,5 +3899,89 @@ mod tests {
             .filter(|id| layout.content_size(NodeId(*id)).is_some())
             .count();
         assert_eq!(measured, MAX_MEASURED);
+    }
+
+    fn linked_label(id: u64) -> Node {
+        let mut label = Node::new(NodeId(id), Kind::Text);
+        label.text = "open the settings page".into();
+        label.spans = std::sync::Arc::from([thing_core::TextSpan {
+            range: 9..17,
+            underline: true,
+            link: Some(0),
+            ..thing_core::TextSpan::default()
+        }]);
+        label.links = std::sync::Arc::from(["settings".to_owned()]);
+        label.link_handler = true;
+        label
+    }
+
+    fn center(rect: Rect) -> Point {
+        Point {
+            x: rect.x + rect.width / 2.0,
+            y: rect.y + rect.height / 2.0,
+        }
+    }
+
+    #[test]
+    fn linked_text_hit_tests_its_shaped_links_through_transforms_and_scrolling() {
+        let mut text = crate::text::TextSystem::default();
+        let size = Size {
+            width: 400.0,
+            height: 120.0,
+        };
+        let mut root = fixed(1, Kind::Column, 400.0, 120.0);
+        let mut scaled = linked_label(2);
+        scaled.style.scale_x = 2.0;
+        scaled.style.scale_y = 2.0;
+        scaled.style.padding = 4.0;
+        root.children.push(scaled);
+        let mut plain = linked_label(3);
+        plain.link_handler = false;
+        root.children.push(plain);
+        let mut hidden = linked_label(4);
+        hidden.visible = false;
+        root.children.push(hidden);
+        let layout = Layout::compute(&root, size, &mut text).unwrap();
+
+        let regions = layout.link_regions(NodeId(2));
+        assert_eq!(regions.len(), 1);
+        // the region sits inside the padding, where painting puts the text.
+        assert!(regions[0].1.x > 4.0 && regions[0].1.y >= 4.0);
+        let placement = *layout.get(NodeId(2)).unwrap();
+        let surface = |local: Point| placement.transform.point(local).unwrap();
+        let on_link = surface(center(regions[0].1));
+        assert_eq!(layout.hit_test(on_link), Some(NodeId(2)));
+        assert_eq!(layout.link_at(NodeId(2), on_link), Some(0));
+        let on_word = surface(Point {
+            x: 6.0,
+            y: center(regions[0].1).y,
+        });
+        assert_eq!(layout.hit_test(on_word), Some(NodeId(2)));
+        assert_eq!(layout.link_at(NodeId(2), on_word), None);
+        // without a handler, linked text is ordinary text.
+        assert!(layout.link_regions(NodeId(3)).is_empty());
+        assert!(!layout.pointer_targets().any(|id| id == NodeId(3)));
+        assert!(layout.link_regions(NodeId(4)).is_empty());
+
+        // scrolled into view, the link moves with its text.
+        let mut root = fixed(1, Kind::Column, 400.0, 120.0);
+        let mut viewport = fixed(7, Kind::Scroll, 400.0, 40.0);
+        viewport.children.push(fixed(5, Kind::Column, 400.0, 60.0));
+        viewport.children.push(linked_label(6));
+        root.children.push(viewport);
+        let mut state = ScrollState::default();
+        let before = Layout::compute_with_scroll(&root, size, &mut state, &mut text).unwrap();
+        assert!(before.scroll_view_y(NodeId(7), 40.0, &mut state));
+        let after = Layout::compute_with_scroll(&root, size, &mut state, &mut text).unwrap();
+        let region = after.link_regions(NodeId(6))[0].1;
+        let point = after
+            .get(NodeId(6))
+            .unwrap()
+            .transform
+            .point(center(region))
+            .unwrap();
+        assert!(point.y < 40.0);
+        assert_eq!(after.link_at(NodeId(6), point), Some(0));
+        assert_eq!(after.hit_test(point), Some(NodeId(6)));
     }
 }

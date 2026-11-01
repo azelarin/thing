@@ -1,10 +1,10 @@
-use std::{borrow::Cow, collections::BTreeMap};
+use std::{borrow::Cow, collections::BTreeMap, ops::Range, sync::Arc};
 
 use parley::{
-    Alignment, AlignmentOptions, FontContext, FontFeature, FontSettings, FontStack, LayoutContext,
-    OverflowWrap, StyleProperty, WordBreakStrength,
+    Alignment, AlignmentOptions, FontContext, FontFeature, FontSettings, FontStack, FontStyle,
+    LayoutContext, OverflowWrap, PositionedLayoutItem, StyleProperty, WordBreakStrength,
 };
-use thing_core::{Node, NodeId, TextAlign, TextOverflow};
+use thing_core::{Color, Node, NodeId, Rect, TextAlign, TextOverflow, TextSpan};
 
 use crate::{Measurer, Size};
 
@@ -16,35 +16,73 @@ static TABULAR_FEATURES: [FontFeature; 1] = [parley::swash::Setting {
     value: 1,
 }];
 
+/// how one shaped run paints, and which link it belongs to.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TextBrush {
+    pub color: Option<Color>,
+    pub underline: bool,
+    pub link: Option<u16>,
+}
+
+/// one shaped range: its font settings and its brush.
+#[derive(Clone, Debug, PartialEq)]
+struct Styled {
+    range: Range<usize>,
+    weight: Option<f32>,
+    italic: bool,
+    brush: TextBrush,
+}
+
+impl Styled {
+    fn from_span(span: &TextSpan) -> Self {
+        Self {
+            range: span.range.clone(),
+            weight: span.weight,
+            italic: span.italic,
+            brush: TextBrush {
+                color: span.color,
+                underline: span.underline,
+                link: span.link,
+            },
+        }
+    }
+}
+
 struct Cached {
     text: String,
+    spans: Arc<[TextSpan]>,
     family: String,
     size: f32,
     weight: f32,
+    letter_spacing: f32,
     width: Option<f32>,
     max_lines: Option<u32>,
     overflow: TextOverflow,
     align: TextAlign,
     tabular_digits: bool,
-    layout: parley::Layout<()>,
+    layout: parley::Layout<TextBrush>,
 }
 
 /// font discovery and shaped text cached by widget.
 #[derive(Default)]
 pub struct TextSystem {
     fonts: FontContext,
-    context: LayoutContext<()>,
+    context: LayoutContext<TextBrush>,
     cache: BTreeMap<NodeId, Cached>,
 }
 
 impl TextSystem {
-    pub fn layout(&mut self, node: &Node, width: Option<f32>) -> &parley::Layout<()> {
+    /// the layout thing measures and paints for `node`. both use exactly this
+    /// layout, so an ellipsis or a link range can never differ between them.
+    pub fn layout(&mut self, node: &Node, width: Option<f32>) -> &parley::Layout<TextBrush> {
         let width = width.map(|value| value.max(0.0));
         let valid = self.cache.get(&node.id).is_some_and(|cached| {
             cached.text == node.text
+                && cached.spans == node.spans
                 && cached.family == node.style.font_family
                 && cached.size == node.style.font_size
                 && cached.weight == node.style.font_weight
+                && cached.letter_spacing == node.style.letter_spacing
                 && cached.width == width
                 && cached.max_lines == node.max_lines
                 && cached.overflow == node.text_overflow
@@ -57,9 +95,11 @@ impl TextSystem {
                 node.id,
                 Cached {
                     text: node.text.clone(),
+                    spans: node.spans.clone(),
                     family: node.style.font_family.clone(),
                     size: node.style.font_size,
                     weight: node.style.font_weight,
+                    letter_spacing: node.style.letter_spacing,
                     width,
                     max_lines: node.max_lines,
                     overflow: node.text_overflow,
@@ -78,44 +118,143 @@ impl TextSystem {
     }
 }
 
+/// the boxes each visible link occupies in a laid-out text, relative to the
+/// text's origin. these are text bounds: each glyph run's advance across its
+/// line's full height, not ink bounds. text an ellipsis removed has no box.
+pub fn link_regions(layout: &parley::Layout<TextBrush>) -> Vec<(u16, Rect)> {
+    let mut regions = Vec::new();
+    for line in layout.lines() {
+        let metrics = line.metrics();
+        for item in line.items() {
+            let PositionedLayoutItem::GlyphRun(run) = item else {
+                continue;
+            };
+            let Some(link) = run.style().brush.link else {
+                continue;
+            };
+            let rect = Rect {
+                x: run.offset(),
+                y: metrics.min_coord,
+                width: run.advance(),
+                height: metrics.max_coord - metrics.min_coord,
+            };
+            // adjacent runs of one link on a line become one box.
+            match regions.last_mut() {
+                Some((previous, area)) if *previous == link && touches(area, &rect) => {
+                    let right = (area.x + area.width).max(rect.x + rect.width);
+                    area.x = area.x.min(rect.x);
+                    area.width = right - area.x;
+                }
+                _ => regions.push((link, rect)),
+            }
+        }
+    }
+    regions
+}
+
+fn touches(area: &Rect, rect: &Rect) -> bool {
+    area.y == rect.y
+        && ((rect.x - (area.x + area.width)).abs() < 0.5
+            || (area.x - (rect.x + rect.width)).abs() < 0.5)
+}
+
+/// the styled ranges of `node.text[range]`, shifted to start at zero.
+fn styles_in(node: &Node, range: Range<usize>) -> Vec<Styled> {
+    node.spans
+        .iter()
+        .filter_map(|span| {
+            let start = span.range.start.max(range.start);
+            let end = span.range.end.min(range.end);
+            (start < end).then(|| {
+                let mut styled = Styled::from_span(span);
+                styled.range = start - range.start..end - range.start;
+                styled
+            })
+        })
+        .collect()
+}
+
 fn build_layout(
     fonts: &mut FontContext,
-    context: &mut LayoutContext<()>,
+    context: &mut LayoutContext<TextBrush>,
     node: &Node,
     width: Option<f32>,
-) -> (parley::Layout<()>, Option<String>) {
-    let mut layout = shape(fonts, context, node, &node.text, false);
+) -> (parley::Layout<TextBrush>, Option<String>) {
+    let styles = styles_in(node, 0..node.text.len());
+    let mut layout = shape(fonts, context, node, &node.text, &styles, false);
     let truncated = break_lines(&mut layout, width, node.max_lines);
     let too_wide = width.is_some_and(|width| layout.width() > width);
     if node.text_overflow != TextOverflow::Ellipsis || (!truncated && !too_wide) {
         align(&mut layout, width, node.style.text_align);
         return (layout, None);
     }
-
     let source_is_rtl = layout.is_rtl();
-    ellipsize(fonts, context, node, width, source_is_rtl)
+    let lines = node.max_lines.unwrap_or(1).max(1) as usize;
+    // every line before the last stays as laid out. only the last line's
+    // remainder is shortened, measured with the real shaped text.
+    let last_start = layout
+        .get(lines - 1)
+        .map_or(0, |line| line.text_range().start.min(node.text.len()));
+    ellipsize(
+        fonts,
+        context,
+        node,
+        width,
+        lines,
+        last_start,
+        source_is_rtl,
+    )
 }
 
+/// the text, styles, and ellipsis marker for a candidate ending at `end`.
+fn candidate_styles(node: &Node, end: usize) -> (String, Vec<Styled>) {
+    let mut rendered = String::with_capacity(end + ELLIPSIS.len());
+    rendered.push_str(&node.text[..end]);
+    let mut styles = styles_in(node, 0..end);
+    // the marker continues the style of the text it follows, but is never
+    // part of a link.
+    if let Some(last) = node
+        .spans
+        .iter()
+        .find(|span| end > 0 && span.range.contains(&(end - 1)))
+    {
+        let mut marker = Styled::from_span(last);
+        marker.brush.link = None;
+        marker.brush.underline = false;
+        marker.range = end..end + ELLIPSIS.len();
+        styles.push(marker);
+    }
+    rendered.push_str(ELLIPSIS);
+    (rendered, styles)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn ellipsize(
     fonts: &mut FontContext,
-    context: &mut LayoutContext<()>,
+    context: &mut LayoutContext<TextBrush>,
     node: &Node,
     width: Option<f32>,
+    lines: usize,
+    last_start: usize,
     source_is_rtl: bool,
-) -> (parley::Layout<()>, Option<String>) {
-    let mut marker = shape_candidate(fonts, context, node, ELLIPSIS, source_is_rtl);
+) -> (parley::Layout<TextBrush>, Option<String>) {
+    let mut marker = shape_candidate(fonts, context, node, ELLIPSIS, &[], source_is_rtl);
     marker.break_all_lines(None);
     let marker_width = marker.width();
     let available_width = width.unwrap_or(f32::MAX);
     if marker_width > available_width {
         let rendered = String::new();
-        let mut layout = shape_candidate(fonts, context, node, &rendered, source_is_rtl);
+        let mut layout = shape_candidate(fonts, context, node, &rendered, &[], source_is_rtl);
         layout.break_all_lines(width);
         align(&mut layout, width, node.style.text_align);
         return (layout, Some(rendered));
     }
 
-    let mut source = shape(fonts, context, node, &node.text, true);
+    // estimate the last line's end from its remainder alone, breaking
+    // anywhere so a long word still yields a prefix.
+    let tail = &node.text[last_start..];
+    let tail_styles = styles_in(node, last_start..node.text.len());
+    let mut source = shape(fonts, context, node, tail, &tail_styles, true);
     break_lines(
         &mut source,
         Some((available_width - marker_width).max(0.0)),
@@ -123,7 +262,7 @@ fn ellipsize(
     );
     let mut end = source
         .get(0)
-        .map(|line| line.text_range().end.min(node.text.len()))
+        .map(|line| line.text_range().end.min(tail.len()))
         .unwrap_or(0);
     end = trim_line_end(&source, end);
     source.break_all_lines(None);
@@ -132,12 +271,11 @@ fn ellipsize(
     // fall back to the marker rather than repeatedly reshaping a long string.
     let mut best = None;
     for _ in 0..MAX_ELLIPSIS_CANDIDATES {
-        let mut rendered = String::with_capacity(end + ELLIPSIS.len());
-        rendered.push_str(&node.text[..end]);
-        rendered.push_str(ELLIPSIS);
-        let mut candidate = shape_candidate(fonts, context, node, &rendered, source_is_rtl);
+        let (rendered, styles) = candidate_styles(node, last_start + end);
+        let mut candidate =
+            shape_candidate(fonts, context, node, &rendered, &styles, source_is_rtl);
         candidate.break_all_lines(width);
-        if candidate.len() == 1 && width.is_none_or(|width| candidate.width() <= width) {
+        if candidate.len() <= lines && width.is_none_or(|width| candidate.width() <= width) {
             let Some(next) = next_content_end(&source, end) else {
                 align(&mut candidate, width, node.style.text_align);
                 return (candidate, Some(rendered));
@@ -161,35 +299,52 @@ fn ellipsize(
         return (layout, Some(rendered));
     }
 
+    // nothing of the last line fits beside the marker: end the earlier lines
+    // with it instead, which always fits because they already did.
+    let (rendered, styles) = candidate_styles(node, trim_prefix(node, last_start));
+    let mut layout = shape_candidate(fonts, context, node, &rendered, &styles, source_is_rtl);
+    layout.break_all_lines(width);
+    if last_start > 0 && layout.len() <= lines && width.is_none_or(|width| layout.width() <= width)
+    {
+        align(&mut layout, width, node.style.text_align);
+        return (layout, Some(rendered));
+    }
     marker.break_all_lines(width);
     align(&mut marker, width, node.style.text_align);
     (marker, Some(ELLIPSIS.into()))
 }
 
+/// the end of the text before `end`, without trailing whitespace.
+fn trim_prefix(node: &Node, end: usize) -> usize {
+    node.text[..end].trim_end().len()
+}
+
 fn shape_candidate(
     fonts: &mut FontContext,
-    context: &mut LayoutContext<()>,
+    context: &mut LayoutContext<TextBrush>,
     node: &Node,
     text: &str,
+    styles: &[Styled],
     source_is_rtl: bool,
-) -> parley::Layout<()> {
+) -> parley::Layout<TextBrush> {
     if !source_is_rtl {
-        return shape(fonts, context, node, text, false);
+        return shape(fonts, context, node, text, styles, false);
     }
     // a neutral truncated prefix must retain the source paragraph direction.
     let mut directed = String::with_capacity(text.len() + RTL_MARK.len_utf8());
     directed.push_str(text);
     directed.push(RTL_MARK);
-    shape(fonts, context, node, &directed, false)
+    shape(fonts, context, node, &directed, styles, false)
 }
 
 fn shape(
     fonts: &mut FontContext,
-    context: &mut LayoutContext<()>,
+    context: &mut LayoutContext<TextBrush>,
     node: &Node,
     text: &str,
+    styles: &[Styled],
     break_anywhere: bool,
-) -> parley::Layout<()> {
+) -> parley::Layout<TextBrush> {
     let mut builder = context.ranged_builder(fonts, text, 1.0, false);
     builder.push_default(StyleProperty::FontSize(node.style.font_size));
     builder.push_default(StyleProperty::FontWeight(parley::FontWeight::new(
@@ -198,6 +353,9 @@ fn shape(
     builder.push_default(StyleProperty::FontStack(FontStack::Source(Cow::Borrowed(
         &node.style.font_family,
     ))));
+    if node.style.letter_spacing != 0.0 {
+        builder.push_default(StyleProperty::LetterSpacing(node.style.letter_spacing));
+    }
     if node.style.tabular_digits {
         builder.push_default(StyleProperty::FontFeatures(FontSettings::List(
             Cow::Borrowed(&TABULAR_FEATURES),
@@ -207,11 +365,27 @@ fn shape(
         builder.push_default(StyleProperty::OverflowWrap(OverflowWrap::Anywhere));
         builder.push_default(StyleProperty::WordBreak(WordBreakStrength::BreakAll));
     }
+    for styled in styles {
+        let range = styled.range.start.min(text.len())..styled.range.end.min(text.len());
+        if range.is_empty() {
+            continue;
+        }
+        if let Some(weight) = styled.weight {
+            builder.push(
+                StyleProperty::FontWeight(parley::FontWeight::new(weight)),
+                range.clone(),
+            );
+        }
+        if styled.italic {
+            builder.push(StyleProperty::FontStyle(FontStyle::Italic), range.clone());
+        }
+        builder.push(StyleProperty::Brush(styled.brush), range);
+    }
     builder.build(text)
 }
 
 fn break_lines(
-    layout: &mut parley::Layout<()>,
+    layout: &mut parley::Layout<TextBrush>,
     width: Option<f32>,
     max_lines: Option<u32>,
 ) -> bool {
@@ -230,7 +404,7 @@ fn break_lines(
     truncated
 }
 
-fn align(layout: &mut parley::Layout<()>, width: Option<f32>, value: TextAlign) {
+fn align(layout: &mut parley::Layout<TextBrush>, width: Option<f32>, value: TextAlign) {
     let value = match value {
         TextAlign::Start => Alignment::Start,
         TextAlign::Center => Alignment::Center,
@@ -239,7 +413,7 @@ fn align(layout: &mut parley::Layout<()>, width: Option<f32>, value: TextAlign) 
     layout.align(width, value, AlignmentOptions::default());
 }
 
-fn trim_line_end(layout: &parley::Layout<()>, end: usize) -> usize {
+fn trim_line_end(layout: &parley::Layout<TextBrush>, end: usize) -> usize {
     let mut trimmed = 0;
     for line in layout.lines() {
         for run in line.runs() {
@@ -255,7 +429,7 @@ fn trim_line_end(layout: &parley::Layout<()>, end: usize) -> usize {
     trimmed
 }
 
-fn previous_cluster_start(layout: &parley::Layout<()>, end: usize) -> Option<usize> {
+fn previous_cluster_start(layout: &parley::Layout<TextBrush>, end: usize) -> Option<usize> {
     let mut previous = None;
     for line in layout.lines() {
         for run in line.runs() {
@@ -272,7 +446,7 @@ fn previous_cluster_start(layout: &parley::Layout<()>, end: usize) -> Option<usi
     previous.map(|(_, start)| start)
 }
 
-fn next_content_end(layout: &parley::Layout<()>, end: usize) -> Option<usize> {
+fn next_content_end(layout: &parley::Layout<TextBrush>, end: usize) -> Option<usize> {
     let mut next_content = None;
     let mut next_break = None;
     for line in layout.lines() {
@@ -309,6 +483,10 @@ impl Measurer for TextSystem {
             height: layout.height(),
         }
     }
+
+    fn links(&mut self, node: &Node, max_width: Option<f32>) -> Vec<(u16, Rect)> {
+        link_regions(self.layout(node, max_width))
+    }
 }
 
 #[cfg(test)]
@@ -327,7 +505,7 @@ mod tests {
         text: &mut TextSystem,
         node: &Node,
         width: Option<f32>,
-    ) -> (parley::Layout<()>, Option<String>) {
+    ) -> (parley::Layout<TextBrush>, Option<String>) {
         build_layout(&mut text.fonts, &mut text.context, node, width)
     }
 
@@ -529,5 +707,161 @@ mod tests {
         let marker = Cluster::from_byte_index(&layout, rendered.len() - ELLIPSIS.len()).unwrap();
         let first = Cluster::from_byte_index(&layout, 0).unwrap();
         assert!(marker.visual_offset().unwrap() < first.visual_offset().unwrap());
+    }
+
+    fn span(range: Range<usize>, link: Option<u16>) -> TextSpan {
+        TextSpan {
+            range,
+            underline: link.is_some(),
+            link,
+            ..TextSpan::default()
+        }
+    }
+
+    fn linked(text: &str, links: &[(&str, &str)]) -> Node {
+        let mut node = node(text);
+        let mut spans = Vec::new();
+        let mut targets = Vec::new();
+        for (index, (needle, target)) in links.iter().enumerate() {
+            let start = text.find(needle).unwrap();
+            spans.push(span(start..start + needle.len(), Some(index as u16)));
+            targets.push((*target).to_owned());
+        }
+        spans.sort_by_key(|span| span.range.start);
+        node.spans = spans.into();
+        node.links = targets.into();
+        node.link_handler = true;
+        node
+    }
+
+    #[test]
+    fn spans_and_letter_spacing_change_shaping_without_changing_text() {
+        let mut text = TextSystem::default();
+        let plain = node("weight");
+        let plain_width = text.measure(&plain, None).width;
+        let mut bold = plain.clone();
+        bold.id = NodeId(2);
+        bold.spans = Arc::from([TextSpan {
+            range: 0..6,
+            weight: Some(900.0),
+            ..TextSpan::default()
+        }]);
+        assert!(text.measure(&bold, None).width > plain_width);
+        let mut spaced = plain.clone();
+        spaced.id = NodeId(3);
+        spaced.style.letter_spacing = 4.0;
+        let spaced_width = text.measure(&spaced, None).width;
+        assert!(
+            spaced_width >= plain_width + 4.0 * 5.0,
+            "{spaced_width} {plain_width}"
+        );
+        // a cache entry follows span and spacing changes.
+        spaced.style.letter_spacing = 0.0;
+        assert_eq!(text.measure(&spaced, None).width, plain_width);
+    }
+
+    #[test]
+    fn multiline_ellipsis_obeys_the_line_limit_width_and_clusters() {
+        let mut text = TextSystem::default();
+        let mut node = node("one two three four five six seven eight nine ten eleven twelve");
+        node.max_lines = Some(2);
+        node.text_overflow = TextOverflow::Ellipsis;
+        let (layout, rendered) = build(&mut text, &node, Some(90.0));
+        let rendered = rendered.unwrap();
+        assert!(rendered.ends_with(ELLIPSIS));
+        assert!(node.text.starts_with(rendered.trim_end_matches(ELLIPSIS)));
+        assert_eq!(layout.len(), 2);
+        assert!(layout.width() <= 90.0);
+        // the layout painted is the layout measured.
+        assert_eq!(text.measure(&node, Some(90.0)).height, layout.height());
+
+        // a hard break inside the limit keeps its first line intact.
+        node.text = "first line\nsecond line that is far too long to fit\nthird".into();
+        let (layout, rendered) = build(&mut text, &node, Some(120.0));
+        let rendered = rendered.unwrap();
+        assert!(rendered.starts_with("first line\n"), "{rendered}");
+        assert!(rendered.ends_with(ELLIPSIS));
+        assert!(layout.len() <= 2);
+
+        // emoji, combining marks, and cjk fallback stay whole.
+        for cluster in ["👨‍👩‍👧‍👦", "e\u{301}", "漢"] {
+            node.text = format!(
+                "{cluster} {cluster} {cluster} {cluster} {cluster} {cluster} {cluster} {cluster} {cluster} {cluster} {cluster} {cluster}"
+            );
+            let mut truncated = 0;
+            for width in [40.0, 55.0, 70.0] {
+                let (_, rendered) = build(&mut text, &node, Some(width));
+                let Some(rendered) = rendered else {
+                    continue;
+                };
+                truncated += 1;
+                let visible = rendered.trim_end_matches(ELLIPSIS);
+                assert!(
+                    visible
+                        .split(' ')
+                        .all(|part| part.is_empty() || part == cluster),
+                    "{cluster:?} at {width}: {rendered:?}"
+                );
+            }
+            assert!(truncated > 0, "{cluster:?} never needed an ellipsis");
+        }
+    }
+
+    #[test]
+    fn link_regions_follow_shaped_runs_through_wrapping_rtl_and_ellipsis() {
+        let mut text = TextSystem::default();
+        let node = linked(
+            "read the documentation for details",
+            &[("documentation for", "https://example.org/docs")],
+        );
+        // wide: one box on one line.
+        let regions = link_regions(text.layout(&node, None));
+        assert_eq!(regions.len(), 1);
+        let (link, wide) = regions[0];
+        assert_eq!(link, 0);
+        let mut probe = node.clone();
+        probe.id = NodeId(9);
+        probe.spans = Arc::from([]);
+        probe.text = "read the ".into();
+        // the prefix's advance includes its trailing space.
+        let prefix = text.layout(&probe, None).full_width();
+        assert!((wide.x - prefix).abs() < 1.0, "{} {prefix}", wide.x);
+        // narrow: the link wraps into boxes on two lines.
+        let regions = link_regions(text.layout(&node, Some(110.0)));
+        assert!(regions.len() >= 2, "{regions:?}");
+        assert!(regions.iter().all(|(link, _)| *link == 0));
+        assert!(regions.windows(2).any(|pair| pair[0].1.y < pair[1].1.y));
+
+        // an ellipsis removes the hidden part of a link and is not a link.
+        let mut truncated = linked(
+            "see the link that goes on and on and on and on",
+            &[(
+                "link that goes on and on and on and on",
+                "https://example.org",
+            )],
+        );
+        truncated.max_lines = Some(1);
+        truncated.text_overflow = TextOverflow::Ellipsis;
+        let (layout, rendered) = build(&mut text, &truncated, Some(120.0));
+        let rendered = rendered.unwrap();
+        let regions = link_regions(&layout);
+        assert_eq!(regions.len(), 1);
+        let marker =
+            parley::layout::Cluster::from_byte_index(&layout, rendered.len() - ELLIPSIS.len())
+                .unwrap();
+        let marker_x = marker.visual_offset().unwrap();
+        assert!(regions[0].1.x + regions[0].1.width <= marker_x + 0.5);
+
+        // rtl text keeps its link where the shaped run actually is.
+        let rtl = linked(
+            "مرحبا بالعالم الرابط هنا",
+            &[("الرابط", "https://example.org/ar")],
+        );
+        let layout = text.layout(&rtl, None);
+        assert!(layout.is_rtl());
+        let regions = link_regions(layout);
+        assert_eq!(regions.len(), 1);
+        let width = layout.width();
+        assert!(regions[0].1.x > 0.0 && regions[0].1.x + regions[0].1.width < width);
     }
 }

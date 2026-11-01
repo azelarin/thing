@@ -377,6 +377,49 @@ class ShadowOracleTest(unittest.TestCase):
             self.verify(gallery(1.25, reload=True), "rejected")
 
 
+def styled_text(scale, *, reload=False, missing=()):
+    """a plausible styled-text frame of rectangles placed to satisfy the
+    probes; it approximates glyphs and does not model the renderer."""
+    canvas = Canvas(scale)
+    accent = (71, 209, 108) if reload else (255, 48, 48)
+    if "span" not in missing:
+        canvas.rect(24, 20, 180, 60, accent)
+    canvas.rect(260, 20, 420, 60, (121, 151, 255))
+    # glyphs are broken strokes, not a solid bar.
+    for x in range(24, 180, 8):
+        canvas.rect(x, 86, x + 3, 108, (224, 164, 81))
+    if "underline" not in missing:
+        canvas.rect(24, 110, 180, 112, (224, 164, 81))
+    canvas.rect(20, 120, 220, 190, (40, 179, 161))
+    canvas.rect(22, 124, 200, 150, (255, 255, 255))
+    if "third line" in missing:
+        canvas.rect(22, 168, 200, 180, (255, 255, 255))
+    return canvas
+
+
+class StyledTextOracleTest(unittest.TestCase):
+    def verify(self, canvas, stage="scale-1"):
+        check_rendering.verify_capture("styled-text", canvas.image(), stage, canvas.scale)
+
+    def test_accepts_plausible_frames_at_both_scales(self):
+        for scale in (1, 1.25):
+            self.verify(styled_text(scale))
+        self.verify(styled_text(1, reload=True), "reload")
+
+    def test_rejects_missing_spans_underlines_and_overflowing_lines(self):
+        for mistake, message in (
+            ("span", "colored span"),
+            ("underline", "underline"),
+            ("third line", "beyond the two-line limit"),
+        ):
+            with self.assertRaisesRegex(FixtureError, message):
+                self.verify(styled_text(1, missing=(mistake,)))
+
+    def test_stale_span_colors_do_not_pass_the_reload(self):
+        with self.assertRaisesRegex(FixtureError, "colored span|other stage"):
+            self.verify(styled_text(1), "reload")
+
+
 class StableCaptureTest(unittest.TestCase):
     def capture(self, frames, required, case="shadows", scale=1.0):
         calls = []

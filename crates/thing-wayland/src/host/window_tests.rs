@@ -51,6 +51,7 @@ use wayland_server::{
 use super::*;
 
 mod geometry;
+mod links;
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
@@ -120,6 +121,12 @@ enum Command {
         surface: u32,
         x: f64,
         y: f64,
+    },
+    Button {
+        surface: u32,
+        x: f64,
+        y: f64,
+        pressed: bool,
     },
     RemoveOutput,
 }
@@ -231,6 +238,36 @@ impl ServerState {
                     }
                     let serial = self.next_serial();
                     pointer.leave(serial, &surface);
+                    pointer.frame();
+                }
+                Command::Button {
+                    surface,
+                    x,
+                    y,
+                    pressed,
+                } => {
+                    let (Some(pointer), Some(surface)) =
+                        (self.pointer.clone(), self.surfaces.get(&surface).cloned())
+                    else {
+                        continue;
+                    };
+                    if pressed {
+                        let serial = self.next_serial();
+                        pointer.enter(serial, &surface, x, y);
+                    } else {
+                        pointer.motion(0, x, y);
+                    }
+                    let serial = self.next_serial();
+                    pointer.button(
+                        serial,
+                        0,
+                        LEFT_BUTTON,
+                        if pressed {
+                            server_pointer::ButtonState::Pressed
+                        } else {
+                            server_pointer::ButtonState::Released
+                        },
+                    );
                     pointer.frame();
                 }
                 Command::RemoveOutput => {
