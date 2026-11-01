@@ -492,7 +492,11 @@ def verify_windows(image, stage, scale):
     )
     left, top, right, bottom = bounds
     expected = physical(width, scale), physical(height, scale)
-    if (right - left, bottom - top) != expected:
+    # fractional compositing can blend one edge pixel with the background.
+    tolerance = 1 if scale != int(scale) else 0
+    if any(abs(actual - wanted) > tolerance for actual, wanted in zip(
+        (right - left, bottom - top), expected
+    )):
         raise FixtureError(f"window content was {right-left}x{bottom-top}; expected {expected}")
     marker = (218, 178, 61) if reloaded else (225, 87, 67)
     actual = image.pixel(left + physical(16, scale), top + physical(height / 2, scale))
@@ -769,7 +773,7 @@ def stop_process_group(process, timeout=STOP_TIMEOUT):
             process.wait(timeout=timeout)
 
 
-def fixture_window(niri, environment, deadline, *, absent=False, title=None):
+def fixture_window(niri, environment, deadline, *, absent=False, title=None, size=None):
     while time.monotonic() < deadline:
         result = checked([niri, "msg", "--json", "windows"], env=environment, deadline=deadline)
         try:
@@ -779,8 +783,12 @@ def fixture_window(niri, environment, deadline, *, absent=False, title=None):
             raise FixtureError("invalid window list from nested niri") from error
         if absent and not matches:
             return None
-        if not absent and len(matches) == 1 and (title is None or matches[0].get("title") == title):
-            return matches[0]
+        if not absent and len(matches) == 1:
+            window = matches[0]
+            title_ready = title is None or window.get("title") == title
+            size_ready = size is None or window.get("layout", {}).get("window_size") == list(size)
+            if title_ready and size_ready:
+                return window
         time.sleep(0.02)
     raise FixtureError("nested window did not reach its expected state")
 
@@ -856,7 +864,7 @@ def run_inner(run_directory, binary, renderer, case, niri, grim):
 
         window_id = None
         if case == "windows":
-            window_id = fixture_window(niri, environment, deadline)["id"]
+            window_id = fixture_window(niri, environment, deadline, title="window 360x220", size=(360, 220))["id"]
             for axis, size in (("width", "480"), ("height", "300")):
                 checked([niri, "msg", "action", f"set-window-{axis}", "--id", str(window_id), size],
                         env=environment, deadline=deadline)
@@ -904,7 +912,7 @@ def run_inner(run_directory, binary, renderer, case, niri, grim):
                 frames=frames,
             )
         if case == "windows":
-            current = fixture_window(niri, environment, deadline, title="reloaded 480x300")
+            current = fixture_window(niri, environment, deadline, title="reloaded 480x300", size=(480, 300))
             if current["id"] != window_id:
                 raise FixtureError("reload replaced the live window")
             checked([niri, "msg", "action", "close-window", "--id", str(window_id)],
@@ -915,7 +923,7 @@ def run_inner(run_directory, binary, renderer, case, niri, grim):
             atomic_copy(reload, panel)
             capture_until(grim, environment, process, output, run_directory / "reopened.ppm",
                           case, "reopened", 1.25, min(deadline, time.monotonic() + 10), frames=frames)
-            fixture_window(niri, environment, deadline, title="reloaded 280x180")
+            fixture_window(niri, environment, deadline, title="reloaded 280x180", size=(280, 180))
 
         result = {
             "ok": True,
