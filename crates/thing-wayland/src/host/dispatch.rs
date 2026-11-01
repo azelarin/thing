@@ -335,10 +335,21 @@ impl App {
                     .map_err(str::to_owned),
                 Action::ClearClipboard => self
                     .clipboard
-                    .as_ref()
+                    .as_mut()
                     .ok_or("clipboard service is disabled")
                     .and_then(Clipboard::clear)
                     .map_err(str::to_owned),
+                Action::ReadClipboardImage => self
+                    .clipboard
+                    .as_mut()
+                    .ok_or("clipboard service is disabled")
+                    .and_then(Clipboard::read_image)
+                    .map_err(str::to_owned),
+                Action::SetClipboardImage(image) => self
+                    .clipboard
+                    .as_mut()
+                    .ok_or_else(|| "clipboard service is disabled".to_owned())
+                    .and_then(|clipboard| clipboard.set_image(&image, &self.queue)),
                 action @ (Action::SetVolume(_)
                 | Action::SetMuted(_)
                 | Action::SetDefaultSink(_)

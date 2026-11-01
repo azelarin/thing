@@ -94,13 +94,27 @@ impl Completion {
     }
 }
 
-#[derive(Default)]
 struct Shared {
     commands: VecDeque<Command>,
     completions: VecDeque<Completion>,
     outstanding: BTreeSet<u64>,
     completed_read_bytes: usize,
+    /// the most bytes that active and undrained reads may buffer together.
+    read_budget: usize,
     stop: bool,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            commands: VecDeque::new(),
+            completions: VecDeque::new(),
+            outstanding: BTreeSet::new(),
+            completed_read_bytes: 0,
+            read_budget: MAX_BUFFERED_READ_BYTES,
+            stop: false,
+        }
+    }
 }
 
 pub(crate) struct Worker {
@@ -111,10 +125,19 @@ pub(crate) struct Worker {
 
 impl Worker {
     pub(crate) fn start(ping: Ping) -> io::Result<Self> {
+        Self::with_read_budget(ping, MAX_BUFFERED_READ_BYTES)
+    }
+
+    /// a worker whose reads may buffer `read_budget` bytes in total, counting
+    /// completed reads until they are taken.
+    pub(crate) fn with_read_budget(ping: Ping, read_budget: usize) -> io::Result<Self> {
         let (wake, reader) = UnixStream::pair()?;
         wake.set_nonblocking(true)?;
         reader.set_nonblocking(true)?;
-        let shared = Arc::new(Mutex::new(Shared::default()));
+        let shared = Arc::new(Mutex::new(Shared {
+            read_budget,
+            ..Shared::default()
+        }));
         let state = shared.clone();
         let worker = thread::Builder::new()
             .name("thing-data-transfer".into())
@@ -541,14 +564,22 @@ fn progress(
                     }
                     Ok(read) => {
                         let previous = bytes.capacity();
-                        if bytes.try_reserve_exact(read).is_err() {
-                            return Some(Finished::Read(Err(TransferError::BufferLimit)));
+                        let needed = bytes.len() + read;
+                        if needed > previous {
+                            // grow geometrically, but never past the transfer's own limit.
+                            let target = needed.max(previous.saturating_mul(2)).min(*limit);
+                            if bytes.try_reserve_exact(target - bytes.len()).is_err() {
+                                return Some(Finished::Read(Err(TransferError::BufferLimit)));
+                            }
                         }
                         let retained = buffered
                             .saturating_sub(previous)
                             .saturating_add(bytes.capacity());
-                        let completed = lock(shared).completed_read_bytes;
-                        if completed.saturating_add(retained) > MAX_BUFFERED_READ_BYTES {
+                        let (completed, budget) = {
+                            let shared = lock(shared);
+                            (shared.completed_read_bytes, shared.read_budget)
+                        };
+                        if completed.saturating_add(retained) > budget {
                             return Some(Finished::Read(Err(TransferError::BufferLimit)));
                         }
                         bytes.extend_from_slice(&chunk[..read]);

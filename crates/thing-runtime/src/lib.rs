@@ -32,15 +32,17 @@ pub use niri::{
 };
 pub use services::{
     Action, ApplicationLaunch, ApplicationsSnapshot, AudioDevice, AudioSnapshot, AudioSource,
-    AudioStream, AuthenticationSnapshot, AuthenticationState, ClipboardSnapshot, DesktopAction,
-    DesktopApplication, DesktopArguments, MAX_LAUNCH_ARGUMENT_BYTES, MAX_LAUNCH_ARGUMENTS,
-    MAX_LAUNCH_BYTES, MAX_MEDIA_RATE, MAX_MEDIA_TIME_US, MAX_NOTIFICATION_HISTORY,
-    ManagedProcessAction, ManagedProcessCommand, ManagedProcessDefinition,
-    ManagedProcessShutdownSignal, ManagedProcessSnapshot, ManagedProcessState,
-    ManagedProcessStatus, MediaAction, MediaPlayer, MediaPosition, MediaSnapshot, Notification,
-    NotificationButton, NotificationCloseReason, NotificationSnapshot, NotificationUrgency,
-    PowerDevice, PowerSnapshot, ServiceSnapshot, SystemTrayAction, SystemTrayItem, SystemTrayMenu,
-    SystemTrayMenuAction, SystemTrayMenuItem, SystemTraySnapshot, is_local_file, uri_scheme,
+    AudioStream, AuthenticationSnapshot, AuthenticationState, ClipboardImageStatus,
+    ClipboardSnapshot, DesktopAction, DesktopApplication, DesktopArguments,
+    MAX_CLIPBOARD_FORMAT_BYTES, MAX_CLIPBOARD_FORMATS, MAX_CLIPBOARD_IMAGE_PIXELS,
+    MAX_CLIPBOARD_IMAGE_SIDE, MAX_LAUNCH_ARGUMENT_BYTES, MAX_LAUNCH_ARGUMENTS, MAX_LAUNCH_BYTES,
+    MAX_MEDIA_RATE, MAX_MEDIA_TIME_US, MAX_NOTIFICATION_HISTORY, ManagedProcessAction,
+    ManagedProcessCommand, ManagedProcessDefinition, ManagedProcessShutdownSignal,
+    ManagedProcessSnapshot, ManagedProcessState, ManagedProcessStatus, MediaAction, MediaPlayer,
+    MediaPosition, MediaSnapshot, Notification, NotificationButton, NotificationCloseReason,
+    NotificationSnapshot, NotificationUrgency, PowerDevice, PowerSnapshot, ServiceSnapshot,
+    SystemTrayAction, SystemTrayItem, SystemTrayMenu, SystemTrayMenuAction, SystemTrayMenuItem,
+    SystemTraySnapshot, clipboard_image_pixmap, is_local_file, uri_scheme,
 };
 pub use sleep::{
     MAX_SLEEP_INHIBITOR_KEY_BYTES, MAX_SLEEP_INHIBITOR_REASON_BYTES, MAX_SLEEP_INHIBITORS,
@@ -489,6 +491,7 @@ impl Runtime {
             services.set(&name, value)?;
         }
         services.set_devices(snapshot.devices)?;
+        services.set_clipboard_data(snapshot.clipboard_formats, snapshot.clipboard_image)?;
         services.set_sources(snapshot.sources)?;
         services.set_all_sources(snapshot.all_sources)?;
         services.set_streams(snapshot.streams)?;

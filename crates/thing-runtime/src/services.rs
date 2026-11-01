@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use thing_core::ImageSource;
+use thing_core::{ImagePixmap, ImageSource};
 
 /// a request to a desktop service.
 #[derive(Clone, Debug, PartialEq)]
@@ -59,6 +59,10 @@ pub enum Action {
     },
     ClearNotificationHistory,
     SetClipboardText(String),
+    /// read the current selection's png into `services.clipboard.image`.
+    ReadClipboardImage,
+    /// offer this image's largest pixmap to other applications as a png.
+    SetClipboardImage(ImageSource),
     ClearClipboard,
     ManagedProcess {
         key: String,
@@ -567,6 +571,69 @@ pub struct NotificationSnapshot {
     pub history: Vec<Notification>,
 }
 
+/// the most mime types reported for one selection.
+pub const MAX_CLIPBOARD_FORMATS: usize = 64;
+/// the longest mime type reported for a selection.
+pub const MAX_CLIPBOARD_FORMAT_BYTES: usize = 256;
+/// the largest width or height `set_image` accepts, matching the png limit.
+pub const MAX_CLIPBOARD_IMAGE_SIDE: u32 = 8192;
+/// the most pixels `set_image` accepts, matching the png limit.
+pub const MAX_CLIPBOARD_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
+
+/// the raster `set_image` offers: the image's largest pixmap, which must fit
+/// the png limits. an image without one, or whose largest one is too big, is
+/// refused before anything is queued.
+pub fn clipboard_image_pixmap(image: &ImageSource) -> std::result::Result<&ImagePixmap, String> {
+    let pixmap = image
+        .candidates()
+        .iter()
+        .flat_map(|candidate| candidate.pixmaps())
+        .max_by_key(|pixmap| u64::from(pixmap.width()) * u64::from(pixmap.height()))
+        .ok_or("the image has no pixels to copy; icon-only handles are unsupported")?;
+    let (width, height) = (pixmap.width(), pixmap.height());
+    if width > MAX_CLIPBOARD_IMAGE_SIDE
+        || height > MAX_CLIPBOARD_IMAGE_SIDE
+        || u64::from(width) * u64::from(height) > MAX_CLIPBOARD_IMAGE_PIXELS
+    {
+        return Err(format!(
+            "the image is {width}×{height}; copied images are limited to {MAX_CLIPBOARD_IMAGE_SIDE} pixels per side and {MAX_CLIPBOARD_IMAGE_PIXELS} pixels"
+        ));
+    }
+    Ok(pixmap)
+}
+
+/// what the current selection's image is doing. without a clipboard device,
+/// luau sees `unavailable` instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClipboardImageStatus {
+    /// the selection is empty or offers no image type.
+    #[default]
+    None,
+    /// the selection offers images, but not as `image/png`.
+    Unsupported,
+    /// the selection offers `image/png`; `read_image()` loads it.
+    Available,
+    /// the png is being transferred or decoded.
+    Loading,
+    /// `image:get()` holds the decoded image.
+    Ready,
+    /// the transfer or decoding failed; `image_error` says why.
+    Failed,
+}
+
+impl ClipboardImageStatus {
+    fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Unsupported => "unsupported",
+            Self::Available => "available",
+            Self::Loading => "loading",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// one confirmed generation of clipboard state.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClipboardSnapshot {
@@ -574,6 +641,12 @@ pub struct ClipboardSnapshot {
     pub text: Option<String>,
     pub loading: bool,
     pub error: String,
+    /// the selection's advertised mime types, in offer order.
+    pub formats: Vec<String>,
+    pub image_status: ClipboardImageStatus,
+    /// the decoded image while `image_status` is `Ready`.
+    pub image: Option<ImageSource>,
+    pub image_error: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -639,7 +712,12 @@ impl AuthenticationSnapshot {
 }
 
 impl ClipboardSnapshot {
-    fn values(&self) -> [(&'static str, Scalar); 4] {
+    fn values(&self) -> [(&'static str, Scalar); 6] {
+        let status = if self.available {
+            self.image_status.name()
+        } else {
+            "unavailable"
+        };
         [
             ("clipboard.available", Scalar::Boolean(self.available)),
             (
@@ -648,12 +726,25 @@ impl ClipboardSnapshot {
             ),
             ("clipboard.loading", Scalar::Boolean(self.loading)),
             ("clipboard.error", Scalar::String(self.error.clone())),
+            ("clipboard.image_status", Scalar::String(status.into())),
+            (
+                "clipboard.image_error",
+                Scalar::String(self.image_error.clone()),
+            ),
         ]
     }
 
     fn validate(&self) -> Result<()> {
         for (name, value) in self.values() {
             validate_service(name, &value)?;
+        }
+        validate_clipboard_formats(&self.formats)?;
+        if self.image.is_some() != (self.image_status == ClipboardImageStatus::Ready)
+            || (self.image_status == ClipboardImageStatus::Failed) == self.image_error.is_empty()
+            || (!self.available
+                && (!self.formats.is_empty() || self.image_status != ClipboardImageStatus::None))
+        {
+            return Err(Error::runtime("inconsistent clipboard image snapshot"));
         }
         if !self.available && (self.text.is_some() || self.loading) {
             return Err(Error::runtime("inconsistent clipboard snapshot"));
@@ -1038,6 +1129,8 @@ pub struct ServiceSnapshot {
     pub(crate) managed_processes: Vec<ManagedProcessState>,
     pub(crate) sleep_inhibitors: Vec<crate::SleepInhibitorState>,
     pub(crate) niri: NiriState,
+    pub(crate) clipboard_formats: Vec<String>,
+    pub(crate) clipboard_image: Option<ImageSource>,
 }
 
 impl ServiceSnapshot {
@@ -1129,6 +1222,8 @@ impl ServiceSnapshot {
         for (name, value) in clipboard.values() {
             self.values.insert(name.into(), value);
         }
+        self.clipboard_formats = clipboard.formats;
+        self.clipboard_image = clipboard.image;
         Ok(())
     }
 
@@ -1164,6 +1259,40 @@ impl ServiceSnapshot {
         state.validate()?;
         self.niri = state;
         Ok(())
+    }
+}
+
+struct ClipboardFormats {
+    tracker: Rc<RefCell<Tracker>>,
+    revision: usize,
+    formats: Rc<RefCell<Vec<String>>>,
+}
+
+impl UserData for ClipboardFormats {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |lua, this, ()| {
+            this.tracker.borrow_mut().read(this.revision);
+            readonly_strings(lua, &this.formats.borrow())
+        });
+    }
+}
+
+struct ClipboardImage {
+    tracker: Rc<RefCell<Tracker>>,
+    revision: usize,
+    image: Rc<RefCell<Option<ImageSource>>>,
+}
+
+impl UserData for ClipboardImage {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |lua, this, ()| {
+            this.tracker.borrow_mut().read(this.revision);
+            this.image
+                .borrow()
+                .clone()
+                .map(|image| lua.create_userdata(ImageHandle(image)))
+                .transpose()
+        });
     }
 }
 
@@ -1604,6 +1733,9 @@ pub(crate) struct Services {
     allowed: Rc<Cell<bool>>,
     devices: Rc<RefCell<Vec<AudioDevice>>>,
     devices_revision: usize,
+    clipboard_formats: Rc<RefCell<Vec<String>>>,
+    clipboard_image: Rc<RefCell<Option<ImageSource>>>,
+    clipboard_revision: usize,
     sources: Rc<RefCell<Vec<AudioDevice>>>,
     sources_revision: usize,
     all_sources: Rc<RefCell<Vec<AudioSource>>>,
@@ -1640,6 +1772,7 @@ pub(crate) struct Services {
 impl Services {
     pub fn install(lua: &Lua, tracker: Rc<RefCell<Tracker>>) -> Result<Self> {
         let devices_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
+        let clipboard_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let sources_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let all_sources_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
         let streams_revision = tracker.borrow_mut().insert(Scalar::Boolean(false))?;
@@ -1659,6 +1792,9 @@ impl Services {
             allowed: Rc::default(),
             devices: Rc::default(),
             devices_revision,
+            clipboard_formats: Rc::default(),
+            clipboard_image: Rc::default(),
+            clipboard_revision,
             sources: Rc::default(),
             sources_revision,
             all_sources: Rc::default(),
@@ -1809,6 +1945,11 @@ impl Services {
             ("clipboard.text", Scalar::Nil),
             ("clipboard.loading", Scalar::Boolean(false)),
             ("clipboard.error", Scalar::String(String::new())),
+            (
+                "clipboard.image_status",
+                Scalar::String("unavailable".into()),
+            ),
+            ("clipboard.image_error", Scalar::String(String::new())),
             ("clock.time", Scalar::String("--:--".into())),
             ("clock.date", Scalar::String(String::new())),
             ("idle.inhibit_available", Scalar::Boolean(false)),
@@ -1975,6 +2116,47 @@ impl Services {
                 validate_clipboard_text(&text)?;
                 enqueue_clipboard(&actions, &allowed, Action::SetClipboardText(text))
             })?,
+        )?;
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        clipboard.set(
+            "read_image",
+            lua.create_function(move |_, ()| {
+                enqueue(&actions, &allowed, Action::ReadClipboardImage)
+            })?,
+        )?;
+        let actions = result.actions.clone();
+        let allowed = result.allowed.clone();
+        clipboard.set(
+            "set_image",
+            lua.create_function(move |_, image: Value| {
+                let image = match &image {
+                    Value::UserData(image) => image
+                        .borrow::<ImageHandle>()
+                        .map(|handle| handle.0.clone())
+                        .ok(),
+                    _ => None,
+                }
+                .ok_or_else(|| Error::runtime("set_image needs an image handle"))?;
+                clipboard_image_pixmap(&image).map_err(Error::runtime)?;
+                enqueue_clipboard(&actions, &allowed, Action::SetClipboardImage(image))
+            })?,
+        )?;
+        clipboard.set(
+            "formats",
+            ClipboardFormats {
+                tracker: result.tracker.clone(),
+                revision: result.clipboard_revision,
+                formats: result.clipboard_formats.clone(),
+            },
+        )?;
+        clipboard.set(
+            "image",
+            ClipboardImage {
+                tracker: result.tracker.clone(),
+                revision: result.clipboard_revision,
+                image: result.clipboard_image.clone(),
+            },
         )?;
         let actions = result.actions.clone();
         let allowed = result.allowed.clone();
@@ -2821,11 +3003,37 @@ impl Services {
 
     pub fn set_clipboard(&self, clipboard: ClipboardSnapshot) -> Result<()> {
         clipboard.validate()?;
-        let updates = clipboard
+        let changed = *self.clipboard_formats.borrow() != clipboard.formats
+            || *self.clipboard_image.borrow() != clipboard.image;
+        let mut updates: Vec<_> = clipboard
             .values()
             .into_iter()
-            .map(|(name, value)| (self.signals[name], value));
-        self.tracker.borrow_mut().write_batch(updates)
+            .map(|(name, value)| (self.signals[name], value))
+            .collect();
+        if changed {
+            let revision = self.tracker.borrow_mut().read(self.clipboard_revision);
+            updates.push((
+                self.clipboard_revision,
+                Scalar::Boolean(revision != Scalar::Boolean(true)),
+            ));
+        }
+        self.tracker.borrow_mut().write_batch(updates)?;
+        if changed {
+            *self.clipboard_formats.borrow_mut() = clipboard.formats;
+            *self.clipboard_image.borrow_mut() = clipboard.image;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_clipboard_data(
+        &self,
+        formats: Vec<String>,
+        image: Option<ImageSource>,
+    ) -> Result<()> {
+        validate_clipboard_formats(&formats)?;
+        *self.clipboard_formats.borrow_mut() = formats;
+        *self.clipboard_image.borrow_mut() = image;
+        Ok(())
     }
 
     pub fn set_authentication(&self, authentication: AuthenticationSnapshot) -> Result<()> {
@@ -2951,6 +3159,8 @@ impl Services {
                 .cloned()
                 .collect(),
             niri: self.niri.snapshot(),
+            clipboard_formats: self.clipboard_formats.borrow().clone(),
+            clipboard_image: self.clipboard_image.borrow().clone(),
         }
     }
 
@@ -3642,6 +3852,7 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             | "notifications.error"
             | "system_tray.error"
             | "clipboard.error"
+            | "clipboard.image_error"
             | "niri.error",
             Scalar::String(value),
         ) => value.len() <= 4096 && !value.contains('\0'),
@@ -3658,6 +3869,10 @@ fn validate_service(name: &str, value: &Scalar) -> Result<()> {
             value.is_finite() && (0.0..=MAX_MEDIA_TIME_US as f64 / 1000.0).contains(value)
         }
         ("media.rate", Scalar::Number(value)) => valid_media_rate(*value),
+        ("clipboard.image_status", Scalar::String(value)) => matches!(
+            value.as_str(),
+            "unavailable" | "none" | "unsupported" | "available" | "loading" | "ready" | "failed"
+        ),
         ("clipboard.text", Scalar::Nil) => true,
         ("clipboard.text", Scalar::String(value)) => validate_clipboard_text(value).is_ok(),
         _ => false,
@@ -4267,6 +4482,21 @@ pub(crate) fn enqueue(
         return Err(Error::runtime("too many service actions in one event"));
     }
     actions.push(action);
+    Ok(())
+}
+
+fn validate_clipboard_formats(formats: &[String]) -> Result<()> {
+    if formats.len() > MAX_CLIPBOARD_FORMATS
+        || formats.iter().any(|format| {
+            format.is_empty()
+                || format.len() > MAX_CLIPBOARD_FORMAT_BYTES
+                || format.chars().any(char::is_control)
+        })
+    {
+        return Err(Error::runtime(
+            "clipboard formats must be at most 64 nonempty mime types of 256 bytes",
+        ));
+    }
     Ok(())
 }
 

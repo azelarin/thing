@@ -16,6 +16,7 @@ mod host;
 mod hover;
 mod idle_inhibit;
 mod idle_notify;
+mod image_codec;
 mod input_method;
 mod inspect;
 mod keyboard;

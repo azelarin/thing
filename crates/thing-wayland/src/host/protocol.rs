@@ -762,3 +762,24 @@ impl ProvidesRegistryState for App {
     }
     registry_handlers![OutputState, SeatState, IdleInhibitState, IdleNotifyState];
 }
+
+impl Dispatch<wayland_client::protocol::wl_callback::WlCallback, crate::clipboard::ImageBarrier>
+    for App
+{
+    fn event(
+        app: &mut Self,
+        _: &wayland_client::protocol::wl_callback::WlCallback,
+        event: wayland_client::protocol::wl_callback::Event,
+        data: &crate::clipboard::ImageBarrier,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if matches!(
+            event,
+            wayland_client::protocol::wl_callback::Event::Done { .. }
+        ) && let Some(clipboard) = app.clipboard.as_mut()
+        {
+            clipboard.image_barrier_done(data.0);
+        }
+    }
+}
