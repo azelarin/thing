@@ -1213,6 +1213,28 @@ fn rejected_reloads_keep_the_window_and_accepted_ones_update_it_in_place() {
 }
 
 #[test]
+fn reactive_app_ids_can_be_cleared() {
+    let mut host = Host::start(
+        &settings(
+            r#"{
+        app_id = function()
+            return if services.clock.time:get() == 'clear' then '' else 'org.example.settings'
+        end,
+        min_size = function()
+            return if services.clock.time:get() == 'clear' then { width = 200, height = 150 } else nil
+        end,
+    }"#,
+        ),
+        true,
+    );
+    let (toplevel, _) = host.toplevels()[0];
+    host.set_service("clock.time", "clear");
+    // size requests follow app-id updates on the same connection.
+    host.until(|host| host.has(&Record::MinSize(toplevel, 200, 150)));
+    assert!(host.has(&Record::AppId(toplevel, String::new())));
+}
+
+#[test]
 fn reload_preserves_configure_state_when_node_ids_repeat() {
     let mut host = Host::start(&settings("nil"), true);
     let (toplevel, _) = host.toplevels()[0];

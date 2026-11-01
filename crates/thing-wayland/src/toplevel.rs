@@ -35,13 +35,12 @@ impl WindowRole {
 
     /// sends the properties that differ from what the compositor already has.
     /// size limits are double buffered and need the surface's next commit,
-    /// so this returns whether one is needed. an app id cannot be withdrawn,
-    /// so clearing it keeps the previous one.
+    /// so this returns whether one is needed.
     pub(crate) fn apply(&mut self, next: &WindowProperties) -> bool {
         if self.sent.title != next.title {
             self.shell.set_title(next.title.clone());
         }
-        if self.sent.app_id != next.app_id && !next.app_id.is_empty() {
+        if self.sent.app_id != next.app_id {
             self.shell.set_app_id(next.app_id.clone());
         }
         let limits = self.sent.min_size != next.min_size || self.sent.max_size != next.max_size;
