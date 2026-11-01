@@ -8,8 +8,9 @@
 
 use std::collections::HashSet;
 
-use smithay_client_toolkit::seat::pointer::{
-    CursorIcon, PointerData, PointerDataExt, PointerThemeError, ThemedPointer,
+use smithay_client_toolkit::{
+    compositor::SurfaceData,
+    seat::pointer::{CursorIcon, PointerData, PointerDataExt, PointerThemeError, ThemedPointer},
 };
 use thing_core::Cursor;
 use wayland_client::{
@@ -39,6 +40,7 @@ struct Shown {
     surface: WlSurface,
     cursor: Cursor,
     serial: u32,
+    scale: i32,
 }
 
 /// the cursor last sent for the current pointer enter.
@@ -80,7 +82,16 @@ impl CursorState {
             .shown
             .as_ref()
             .filter(|shown| &shown.surface == surface && shown.serial == serial);
-        if current.is_some_and(|shown| held || shown.cursor == cursor) {
+        let cursor = current
+            .filter(|_| held)
+            .map_or(cursor, |shown| shown.cursor);
+        let scale = pointer
+            .surface()
+            .data::<SurfaceData>()
+            .map_or(1, SurfaceData::scale_factor);
+        // a stationary cursor still needs a new theme buffer after an output
+        // scale change, including while its shape is held during a press.
+        if current.is_some_and(|shown| shown.cursor == cursor && shown.scale == scale) {
             return;
         }
         match pointer.set_cursor(connection, icon(cursor)) {
@@ -103,6 +114,7 @@ impl CursorState {
             surface: surface.clone(),
             cursor,
             serial,
+            scale,
         });
     }
 }

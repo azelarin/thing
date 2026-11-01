@@ -1,5 +1,7 @@
 --!strict
 
+ui.window { cursor = "crosshair", children = {} }
+
 local dragging = ui.state(false)
 
 return ui.panel {

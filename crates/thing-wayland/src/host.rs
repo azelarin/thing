@@ -1449,15 +1449,31 @@ impl App {
             .pointer_position
             .expect("the surface was found by its pointer");
         let wl = surface.role.surface().clone();
+        let owner = self
+            .pointer_capture
+            .as_ref()
+            .filter(|capture| capture.surface == wl)
+            .map(|capture| capture.target.target.node())
+            .or_else(|| {
+                surface
+                    .pressed_target
+                    .as_ref()
+                    .map(|target| target.target.node())
+            });
         let cursor = surface
             .layouts
             .presented()
-            .map_or(Cursor::Default, |layout| layout.cursor_at(point));
-        let held = surface.pressed_button.is_some()
-            || self
-                .pointer_capture
-                .as_ref()
-                .is_some_and(|capture| capture.surface == wl);
+            .map_or(Cursor::Default, |layout| {
+                owner
+                    .and_then(|id| layout.cursor_for(id))
+                    .unwrap_or_else(|| layout.cursor_at(point))
+            });
+        let held = owner.is_none()
+            && (surface.pressed_button.is_some()
+                || self
+                    .pointer_capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.surface == wl));
         self.cursor.show(connection, pointer, &wl, cursor, held);
     }
 

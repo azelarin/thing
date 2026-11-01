@@ -6,6 +6,7 @@ use std::{
     collections::HashMap,
     fs::{self, File},
     os::{fd::AsFd, unix::net::UnixStream},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -60,6 +61,7 @@ const WAIT: Duration = Duration::from_secs(10);
 // panel, whose own cursor reacts to `clock.date`.
 const PANEL: &str = r#"
 local slot = { width = 80, height = 80 }
+local captured = ui.state(false)
 return ui.panel {
     style = { width = 640, height = 80, align = 'start', justify = 'start' },
     cursor = function()
@@ -69,9 +71,24 @@ return ui.panel {
         return nil
     end,
     children = {
-        ui.button { style = slot, children = { ui.text { text = 'b' } } },
+        ui.button {
+            style = slot,
+            cursor = function()
+                return if services.clock.date:get() == 'dragging' then 'grabbing' else nil
+            end,
+            children = { ui.text { text = 'b' } },
+        },
         ui.text_input { style = slot, value = '', on_change = function() end },
         ui.row { style = slot, cursor = 'crosshair' },
+        ui.row { style = { width = 160, height = 80 } },
+        ui.pointer_area {
+            style = slot,
+            cursor = function() return if captured:get() then 'grabbing' else 'grab' end,
+            on_pointer = function(event)
+                captured:set(event.phase == 'press' or event.phase == 'move')
+                return true
+            end,
+        },
     },
 }
 "#;
@@ -87,6 +104,11 @@ enum Record {
     SetCursor {
         serial: u32,
         surface: bool,
+        hotspot: (i32, i32),
+    },
+    Buffer {
+        size: (i32, i32),
+        scale: i32,
     },
     ReleasePointer,
     /// the server sent an event; its serial when it has one.
@@ -98,6 +120,7 @@ enum Command {
     Motion(f64, f64),
     Button(bool),
     Leave,
+    CursorScale(i32),
     Capabilities(server_seat::Capability),
     RemoveSeat,
     AddSeat,
@@ -116,6 +139,8 @@ struct ServerState {
     seats: Vec<ServerSeat>,
     pointer: Option<ServerPointer>,
     panel: Option<ServerSurface>,
+    cursor_surface: Option<ServerSurface>,
+    surface_scales: HashMap<ObjectId, i32>,
     layer: Option<(ServerLayer, bool)>,
     pending_buffers: HashMap<ObjectId, ServerBuffer>,
     frame_callbacks: HashMap<ObjectId, Vec<ServerCallback>>,
@@ -135,6 +160,13 @@ impl ServerState {
         let commands = std::mem::take(&mut self.control.lock().unwrap().commands);
         for command in commands {
             match command {
+                Command::CursorScale(scale) => {
+                    self.cursor_surface
+                        .as_ref()
+                        .unwrap()
+                        .preferred_buffer_scale(scale);
+                    self.record(Record::Sent("cursor_scale", scale as u32));
+                }
                 Command::RemoveSeat => {
                     if let Some(seat) = self.seat.take() {
                         display.remove_global::<ServerState>(seat);
@@ -216,7 +248,7 @@ ignore_requests! {
     ServerRegion => (),
     ServerCallback => (),
     ServerOutput => (),
-    ServerBuffer => (),
+    ServerBuffer => (i32, i32),
     ServerWmBase => (),
     ServerLayer => (),
 }
@@ -299,11 +331,18 @@ impl ServerDispatch<ServerPointer, ()> for ServerState {
     ) {
         match request {
             server_pointer::Request::SetCursor {
-                serial, surface, ..
-            } => state.record(Record::SetCursor {
                 serial,
-                surface: surface.is_some(),
-            }),
+                surface,
+                hotspot_x,
+                hotspot_y,
+            } => {
+                state.record(Record::SetCursor {
+                    serial,
+                    surface: surface.is_some(),
+                    hotspot: (hotspot_x, hotspot_y),
+                });
+                state.cursor_surface = surface;
+            }
             server_pointer::Request::Release => state.record(Record::ReleasePointer),
             _ => {}
         }
@@ -344,6 +383,9 @@ impl ServerDispatch<ServerSurface, ()> for ServerState {
     ) {
         let id = surface.id();
         match request {
+            server_surface::Request::SetBufferScale { scale } => {
+                state.surface_scales.insert(id, scale);
+            }
             server_surface::Request::Attach {
                 buffer: Some(buffer),
                 ..
@@ -363,6 +405,12 @@ impl ServerDispatch<ServerSurface, ()> for ServerState {
                     layer.configure(1, WIDTH, HEIGHT);
                 }
                 if let Some(buffer) = state.pending_buffers.remove(&id) {
+                    if state.panel.as_ref() != Some(surface) {
+                        state.record(Record::Buffer {
+                            size: *buffer.data::<(i32, i32)>().unwrap(),
+                            scale: state.surface_scales.get(&id).copied().unwrap_or(1),
+                        });
+                    }
                     buffer.release();
                 }
                 for callback in state.frame_callbacks.remove(&id).unwrap_or_default() {
@@ -445,8 +493,11 @@ impl ServerDispatch<ServerShmPool, ()> for ServerState {
         _: &DisplayHandle,
         data: &mut DataInit<'_, Self>,
     ) {
-        if let server_shm_pool::Request::CreateBuffer { id, .. } = request {
-            data.init(id, ());
+        if let server_shm_pool::Request::CreateBuffer {
+            id, width, height, ..
+        } = request
+        {
+            data.init(id, (width, height));
         }
     }
 }
@@ -534,6 +585,8 @@ impl PrivateWayland {
                 seats: Vec::new(),
                 pointer: None,
                 panel: None,
+                cursor_surface: None,
+                surface_scales: HashMap::new(),
                 layer: None,
                 pending_buffers: HashMap::new(),
                 frame_callbacks: HashMap::new(),
@@ -659,6 +712,7 @@ impl Host {
             managed_processes: None,
             pending_launches: PendingLaunches::new(),
             pending_ui_actions: Vec::new(),
+            pending_window_states: Vec::new(),
             watch,
             reload_at: None,
             hover: HoverStates::default(),
@@ -670,7 +724,7 @@ impl Host {
             seats: SeatState::new(&globals, &qh),
             outputs: OutputState::new(&globals, &qh),
             compositor: CompositorState::bind(&globals, &qh).unwrap(),
-            layer_shell: LayerShell::bind(&globals, &qh).unwrap(),
+            layer_shell: Some(LayerShell::bind(&globals, &qh).unwrap()),
             layer_shell_version: 4,
             xdg_shell: XdgShell::bind(&globals, &qh).unwrap(),
             activation: None,
@@ -723,6 +777,26 @@ impl Host {
                     .first()
                     .is_some_and(|surface| surface.layouts.presented().is_some())
         });
+        if !shape_protocol {
+            let theme = cursor_theme(host.directory.path());
+            host.app.pointer.take().unwrap().release();
+            host.app.cursor.reset();
+            host.app.pointer = Some(SeatPointer::Themed(
+                host.app
+                    .seats
+                    .get_pointer_with_theme::<_, smithay_client_toolkit::compositor::SurfaceData>(
+                        &host.qh,
+                        host.app.seat.as_ref().unwrap(),
+                        host.app.shm.as_ref().unwrap(),
+                        host.app.compositor.create_surface(&host.qh),
+                        ThemeSpec::Named {
+                            name: theme.to_str().unwrap(),
+                            size: 24,
+                        },
+                    )
+                    .unwrap(),
+            ));
+        }
         host
     }
 
@@ -862,6 +936,41 @@ fn a_press_holds_its_cursor_until_release() {
 }
 
 #[test]
+fn a_pressed_widget_can_update_its_cursor_away_from_the_pointer() {
+    let mut host = Host::start(true);
+    host.command(Command::Enter(40.0, 40.0));
+    host.shows(&[Shape::Pointer]);
+    host.command(Command::Button(true));
+    host.command(Command::Motion(120.0, 40.0));
+    host.until(|host| {
+        host.app.surfaces[0]
+            .pointer_position
+            .is_some_and(|point| point.x == 120.0)
+    });
+    host.set_date("dragging");
+    host.shows(&[Shape::Pointer, Shape::Grabbing]);
+    host.command(Command::Button(false));
+    host.shows(&[Shape::Pointer, Shape::Grabbing, Shape::Text]);
+}
+
+#[test]
+fn a_custom_capture_updates_its_cursor_and_keeps_it_outside_the_widget() {
+    let mut host = Host::start(true);
+    host.command(Command::Enter(440.0, 40.0));
+    host.shows(&[Shape::Grab]);
+    host.command(Command::Button(true));
+    host.shows(&[Shape::Grab, Shape::Grabbing]);
+    host.command(Command::Motion(120.0, 40.0));
+    host.until(|host| {
+        host.app.surfaces[0]
+            .pointer_position
+            .is_some_and(|point| point.x == 120.0)
+    });
+    host.command(Command::Button(false));
+    host.shows(&[Shape::Grab, Shape::Grabbing, Shape::Text]);
+}
+
+#[test]
 fn reactive_and_reloaded_cursors_publish_only_accepted_state() {
     let mut host = Host::start(true);
     host.command(Command::Enter(300.0, 40.0));
@@ -931,17 +1040,23 @@ fn without_the_shape_protocol_the_host_falls_back_to_the_theme() {
     let mut host = Host::start(false);
     host.command(Command::Enter(40.0, 40.0));
     host.until(|host| {
-        host.app
-            .surfaces
-            .first()
-            .is_some_and(|surface| surface.pointer_position.is_some())
+        host.records()
+            .iter()
+            .any(|record| matches!(record, Record::SetCursor { surface: true, .. }))
     });
+    assert!(host.records().contains(&Record::SetCursor {
+        serial: host.sent("enter"),
+        surface: true,
+        hotspot: (4, 6),
+    }));
     // a roundtrip lets the server record every request the enter caused.
     host.connection.roundtrip().unwrap();
     let records = host.records();
     assert!(!records.contains(&Record::ShapeDevice));
-    // whether a theme is installed depends on the machine; a cursor that is
-    // sent always carries an image, and the panel keeps working either way.
+    assert!(records.contains(&Record::Buffer {
+        size: (24, 24),
+        scale: 1
+    }));
     assert!(
         records
             .iter()
@@ -953,4 +1068,57 @@ fn without_the_shape_protocol_the_host_falls_back_to_the_theme() {
             .pointer_position
             .is_some_and(|point| point.x == 120.0)
     });
+}
+
+#[test]
+fn a_stationary_theme_cursor_follows_scale_changes_during_a_press() {
+    let mut host = Host::start(false);
+    host.command(Command::Enter(40.0, 40.0));
+    host.until(|host| {
+        host.records().contains(&Record::Buffer {
+            size: (24, 24),
+            scale: 1,
+        })
+    });
+    host.command(Command::Button(true));
+    host.until(|host| host.app.surfaces[0].pressed_button.is_some());
+    host.command(Command::CursorScale(2));
+    host.until(|host| {
+        host.records().contains(&Record::Buffer {
+            size: (48, 48),
+            scale: 2,
+        })
+    });
+    host.connection.roundtrip().unwrap();
+    assert!(host.records().contains(&Record::SetCursor {
+        serial: host.sent("enter"),
+        surface: true,
+        hotspot: (4, 6),
+    }));
+}
+
+fn cursor_theme(directory: &Path) -> PathBuf {
+    // a private xcursor theme keeps fallback tests independent of installed themes.
+    let theme = directory.join("theme");
+    fs::create_dir_all(theme.join("cursors")).unwrap();
+    fs::write(
+        theme.join("index.theme"),
+        "[Icon Theme]\nName=fixture\nInherits=\n",
+    )
+    .unwrap();
+    let mut words = vec![0x7275_6358, 16, 0x0001_0000, 2];
+    let mut position = 16 + 2 * 12;
+    for size in [24, 48] {
+        words.extend([0xfffd_0002, size, position]);
+        position += 36 + size * size * 4;
+    }
+    for size in [24, 48] {
+        words.extend([36, 0xfffd_0002, size, 1, size, size, size / 6, size / 4, 0]);
+        words.extend(std::iter::repeat_n(0xffff_ffff, (size * size) as usize));
+    }
+    let bytes: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    for name in ["pointer", "text"] {
+        fs::write(theme.join("cursors").join(name), &bytes).unwrap();
+    }
+    theme
 }

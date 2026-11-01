@@ -498,9 +498,21 @@ impl Layout {
     /// nearest ancestor's. hidden widgets have no placement, so they never
     /// decide. a point outside every widget shows the default.
     pub fn cursor_at(&self, point: Point) -> thing_core::Cursor {
-        let mut current = (0..self.placements.len())
+        let current = (0..self.placements.len())
             .rev()
             .find(|index| self.placement_contains(*index, point));
+        self.inherited_cursor(current)
+    }
+
+    /// resolves a presented widget's cursor without requiring the pointer to
+    /// be inside it, for a widget that owns an active press or capture.
+    pub fn cursor_for(&self, id: NodeId) -> Option<thing_core::Cursor> {
+        self.placement_indices
+            .get(&id)
+            .map(|index| self.inherited_cursor(Some(*index)))
+    }
+
+    fn inherited_cursor(&self, mut current: Option<usize>) -> thing_core::Cursor {
         while let Some(index) = current {
             if let Some(cursor) = self.placements[index].cursor {
                 return cursor;

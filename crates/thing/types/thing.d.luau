@@ -425,6 +425,7 @@ export type ThingWindowSize = { width: number, height: number }
 export type ThingWindowProperties = {
     key: string?,
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
     title: ThingReactive<string>?,

@@ -759,9 +759,12 @@ local dragging = ui.state(false)
 
 return ui.panel {
     children = {
-        ui.row {
-            -- a drag handle; its children inherit the shape.
+        ui.pointer_area {
             cursor = function() return if dragging:get() then 'grabbing' else 'grab' end,
+            on_pointer = function(event)
+                dragging:set(event.phase == 'press' or event.phase == 'move')
+                return true
+            end,
             style = { width = 24, height = 24 },
         },
         ui.button { cursor = 'default', children = { ui.text { text = 'quiet button' } } },
@@ -789,10 +792,11 @@ like any other invalid property. `cursor` may be a function, and returning
 
 the cursor comes from the same presented layout that input uses: the topmost
 visible widget under the pointer decides, after transforms, clipping, and
-scrolling. hidden widgets never decide. while a button is held down, or a
-pointer area has captured the pointer, the cursor from the start of the press
-stays until it is released. a rejected update or reload never shows its
-cursor.
+scrolling. hidden widgets never decide. while a control owns a press or a
+pointer area has captured the pointer, its cursor keeps following that widget,
+including reactive changes such as `grab` to `grabbing`. widgets the pointer
+passes over do not change it until release. a rejected update or reload never
+shows its cursor.
 
 thing asks the compositor for the shape through cursor-shape-v1 when it is
 available. otherwise it draws the shape from the cursor theme named by
