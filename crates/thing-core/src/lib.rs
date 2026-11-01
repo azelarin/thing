@@ -2,6 +2,7 @@
 
 mod brush;
 mod color;
+mod cursor;
 mod geometry;
 mod shadow;
 mod vector;
@@ -9,6 +10,7 @@ mod widget;
 
 pub use brush::{Brush, GradientPoint, GradientStop, LinearGradient, RadialGradient};
 pub use color::{Color, ParseColorError};
+pub use cursor::{Cursor, own_cursor};
 pub use geometry::{HorizontalRange, Point, Rect, Scale};
 pub use shadow::{MAX_SHADOW_BLUR, MAX_SHADOW_OFFSET, MAX_SHADOW_SPREAD, Shadow};
 pub use widget::{

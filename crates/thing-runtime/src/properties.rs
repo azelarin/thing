@@ -28,6 +28,20 @@ fn number(value: Value, name: &str) -> Result<f64> {
     Ok(number)
 }
 
+fn cursor(value: Value) -> Result<Option<thing_core::Cursor>> {
+    if value.is_nil() {
+        return Ok(None);
+    }
+    let name = string(value, "cursor")?;
+    thing_core::Cursor::from_name(&name)
+        .map(Some)
+        .ok_or_else(|| {
+            Error::runtime(format!(
+                "unknown cursor {name:?}; expected a name such as 'default', 'pointer', or 'text'"
+            ))
+        })
+}
+
 fn boolean(value: Value, name: &str) -> Result<bool> {
     match value {
         Value::Boolean(value) => Ok(value),
@@ -763,6 +777,7 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
             node.path.stroke_join = path_stroke_join(value)?
         }
         "visible" => node.visible = boolean(value, name)?,
+        "cursor" => node.cursor = cursor(value)?,
         "enabled" => node.enabled = boolean(value, name)?,
         "value" if matches!(node.kind, Kind::Slider | Kind::Range) => {
             node.slider.value = number(value, name)?

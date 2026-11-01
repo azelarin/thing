@@ -749,6 +749,57 @@ from any phase suppresses a button's ordinary click for the rest of that
 sequence; `false` or `nil` leaves it available. the release callback runs before
 that ordinary click.
 
+## pointer cursors
+
+every widget accepts `cursor`, the pointer shape to show while the pointer is
+over it:
+
+```luau
+local dragging = ui.state(false)
+
+return ui.panel {
+    children = {
+        ui.row {
+            -- a drag handle; its children inherit the shape.
+            cursor = function() return if dragging:get() then 'grabbing' else 'grab' end,
+            style = { width = 24, height = 24 },
+        },
+        ui.button { cursor = 'default', children = { ui.text { text = 'quiet button' } } },
+        ui.text_input { value = '', on_change = function() end },
+    },
+}
+```
+
+a widget with no `cursor` of its own inherits its nearest ancestor's. enabled
+buttons, sliders, and ranges show `pointer`, and enabled text and secret
+inputs show `text`, even inside an ancestor with another cursor, as browser
+controls do. set `cursor` on a control itself to replace its default. a
+disabled control has no default and inherits. outside every widget, and where
+nothing sets a cursor, the pointer shows `default`.
+
+the names are the standard css cursor names written with underscores:
+`default`, `context_menu`, `help`, `pointer`, `progress`, `wait`, `cell`,
+`crosshair`, `text`, `vertical_text`, `alias`, `copy`, `move`, `no_drop`,
+`not_allowed`, `grab`, `grabbing`, `e_resize`, `n_resize`, `ne_resize`,
+`nw_resize`, `s_resize`, `se_resize`, `sw_resize`, `w_resize`, `ew_resize`,
+`ns_resize`, `nesw_resize`, `nwse_resize`, `col_resize`, `row_resize`,
+`all_scroll`, `zoom_in`, and `zoom_out`. an unknown name rejects the update,
+like any other invalid property. `cursor` may be a function, and returning
+`nil` removes the widget's own cursor.
+
+the cursor comes from the same presented layout that input uses: the topmost
+visible widget under the pointer decides, after transforms, clipping, and
+scrolling. hidden widgets never decide. while a button is held down, or a
+pointer area has captured the pointer, the cursor from the start of the press
+stays until it is released. a rejected update or reload never shows its
+cursor.
+
+thing asks the compositor for the shape through cursor-shape-v1 when it is
+available. otherwise it draws the shape from the cursor theme named by
+`XCURSOR_THEME` and `XCURSOR_SIZE`. when that theme lacks a shape, thing
+reports it once and the compositor keeps the cursor it showed before. lock
+screens do not set cursors.
+
 ## images and desktop icons
 
 ```luau

@@ -656,6 +656,8 @@ impl Host {
             fractional: None,
             viewporter: None,
             pointer: None,
+            shm: None,
+            cursor: crate::cursor::CursorState::default(),
             pointer_capture: None,
             keyboard: None,
             seat: None,

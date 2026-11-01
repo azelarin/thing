@@ -908,6 +908,9 @@ pub struct Node {
     pub enabled: bool,
     pub visible: bool,
     pub autofocus: bool,
+    /// the explicit pointer cursor, which descendants inherit unless they set
+    /// their own or are enabled controls with a default.
+    pub cursor: Option<crate::Cursor>,
     pub pointer_events: bool,
     pub scroll_events: bool,
     pub key: Option<String>,
@@ -945,6 +948,7 @@ impl Node {
             enabled: true,
             visible: true,
             autofocus: false,
+            cursor: None,
             pointer_events: false,
             scroll_events: false,
             key: None,
