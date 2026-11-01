@@ -31,6 +31,7 @@ CASES = (
     Case("valid-timers.luau"),
     Case("valid-motion.luau"),
     Case("valid-bounds.luau"),
+    Case("valid-geometry.luau"),
     Case("valid-clipping.luau"),
     Case("valid-scroll-axis.luau"),
     Case("valid-niri-controls.luau"),
@@ -47,6 +48,14 @@ CASES = (
     )),
     Case("invalid-scroll-axis.luau", ("Property 'axis' is not compatible.",)),
     Case("invalid-clipping.luau", ("Property 'clip' is not compatible.",)),
+    Case(
+        "invalid-geometry.luau",
+        (
+            "Expected this to be 'ThingWidget', but got 'string'",
+            "Expected this to be 'string', but got 'number'",
+            "Expected this to be 'number', but got 'string'",
+        ),
+    ),
     Case(
         "invalid-bounds.luau",
         (

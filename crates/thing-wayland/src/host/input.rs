@@ -1248,6 +1248,8 @@ impl App {
             self.error = Some(error);
         }
         self.surfaces.remove(index);
+        self.configurations
+            .forget_presented_geometry(&output, surface_root);
         if let Some(PopupMode::Hover(key) | PopupMode::Automatic(key)) = mode {
             self.hover.close(&key, suppress_hover);
         }
@@ -1494,6 +1496,7 @@ impl App {
                         grabbed: serial.is_some(),
                         anchor: anchor_id,
                         reposition: popup::RepositionState::new(position),
+                        position: None,
                     }),
                     SurfaceInit {
                         owner,

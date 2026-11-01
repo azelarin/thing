@@ -354,6 +354,9 @@ impl PopupHandler for App {
                 }
             };
             let surface = &mut self.surfaces[index];
+            if let Role::Popup(role) = &mut surface.role {
+                role.position = Some(config.position);
+            }
             if surface.size != size {
                 surface.layouts.invalidate_input();
                 surface.size = size;

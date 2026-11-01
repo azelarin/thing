@@ -100,10 +100,16 @@ impl SemanticPlacement {
     pub fn is_invertible(self) -> bool {
         self.inverse.is_some()
     }
+
+    /// maps a surface point into this widget's untransformed border box, or
+    /// `None` when its transform has no inverse.
+    pub fn surface_to_local(self, point: Point) -> Option<Point> {
+        self.inverse?.point(point)
+    }
 }
 
 /// scroll offsets for one surface, measured in logical pixels.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ScrollState {
     offsets: BTreeMap<NodeId, (ScrollAxis, f32)>,
 }
@@ -271,6 +277,7 @@ pub struct Layout {
     reveal_regions: Vec<RevealRegion>,
     clip_segments: usize,
     fitted_clips: BTreeMap<NodeId, skia_safe::Path>,
+    content_sizes: BTreeMap<NodeId, Size>,
 }
 
 impl Layout {
@@ -313,47 +320,7 @@ impl Layout {
                     inputs,
                     style,
                     |_, _| 0.0,
-                    |known, available| {
-                        let Some(node) = context.and_then(|id| root.find(*id)) else {
-                            return tf::Size::ZERO;
-                        };
-                        let max_width = known.width.or(match available.width {
-                            tf::AvailableSpace::Definite(value) => Some(value),
-                            _ => None,
-                        });
-                        let intrinsic = match node.kind {
-                            Kind::Slider => Size {
-                                width: 160.0,
-                                height: 24.0,
-                            },
-                            Kind::Text => measurer.measure(node, max_width),
-                            Kind::TextInput | Kind::SecretInput => Size {
-                                width: 160.0,
-                                height: measurer
-                                    .measure(node, None)
-                                    .height
-                                    .max(node.style.font_size * 1.2)
-                                    .max(24.0),
-                            },
-                            Kind::Image => Size {
-                                width: 32.0,
-                                height: 32.0,
-                            },
-                            Kind::Path => node
-                                .path
-                                .view_box
-                                .map(|view_box| Size {
-                                    width: view_box.width,
-                                    height: view_box.height,
-                                })
-                                .unwrap_or_default(),
-                            _ => Size::default(),
-                        };
-                        tf::Size {
-                            width: known.width.unwrap_or(intrinsic.width),
-                            height: known.height.unwrap_or(intrinsic.height),
-                        }
-                    },
+                    |known, available| leaf_size(root, context, known, available, measurer),
                 )
             },
         )
@@ -408,8 +375,50 @@ impl Layout {
                 parent: None,
             },
         )?;
+        // every placement has been read, so a measured subtree may now be laid
+        // out again without constraints.
+        let mut measured = Vec::new();
+        collect_measured(root, &mut measured);
+        for id in measured {
+            let Some(&node) = ids.get(&id) else {
+                continue;
+            };
+            tree.compute_layout_with_measure(
+                node,
+                tf::Size {
+                    width: tf::AvailableSpace::MaxContent,
+                    height: tf::AvailableSpace::MaxContent,
+                },
+                |inputs, _, context, style| {
+                    taffy::compute_leaf_layout(
+                        inputs,
+                        style,
+                        |_, _| 0.0,
+                        |known, available| leaf_size(root, context, known, available, measurer),
+                    )
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            let size = tree.layout(node).map_err(|e| e.to_string())?.size;
+            if size.width.is_finite() && size.height.is_finite() {
+                result.content_sizes.insert(
+                    id,
+                    Size {
+                        width: size.width,
+                        height: size.height,
+                    },
+                );
+            }
+        }
         *state = next_state;
         Ok(result)
+    }
+
+    /// the size a measured widget asks for with unlimited space, after its
+    /// own fixed and minimum sizes. only widgets with `measure_content` have
+    /// one.
+    pub fn content_size(&self, id: NodeId) -> Option<Size> {
+        self.content_sizes.get(&id).copied()
     }
 
     pub fn placements(&self) -> &[Placement] {
@@ -1069,6 +1078,73 @@ fn reveal_delta(target: Rect, viewport: Rect, axis: ScrollAxis) -> Option<f32> {
             0.0
         },
     )
+}
+
+/// the most widgets one surface measures without constraints.
+const MAX_MEASURED: usize = 64;
+
+fn collect_measured(node: &Node, measured: &mut Vec<NodeId>) {
+    // a hidden widget has no placement, so a handle could not report it.
+    if measured.len() >= MAX_MEASURED || !node.visible {
+        return;
+    }
+    if node.measure_content {
+        measured.push(node.id);
+    }
+    for child in &node.children {
+        // a popup is its own surface and is measured in its own layout.
+        if child.kind != Kind::Popup {
+            collect_measured(child, measured);
+        }
+    }
+}
+
+fn leaf_size(
+    root: &Node,
+    context: Option<&mut NodeId>,
+    known: tf::Size<Option<f32>>,
+    available: tf::Size<tf::AvailableSpace>,
+    measurer: &mut impl Measurer,
+) -> tf::Size<f32> {
+    let Some(node) = context.and_then(|id| root.find(*id)) else {
+        return tf::Size::ZERO;
+    };
+    let max_width = known.width.or(match available.width {
+        tf::AvailableSpace::Definite(value) => Some(value),
+        _ => None,
+    });
+    let intrinsic = match node.kind {
+        Kind::Slider => Size {
+            width: 160.0,
+            height: 24.0,
+        },
+        Kind::Text => measurer.measure(node, max_width),
+        Kind::TextInput | Kind::SecretInput => Size {
+            width: 160.0,
+            height: measurer
+                .measure(node, None)
+                .height
+                .max(node.style.font_size * 1.2)
+                .max(24.0),
+        },
+        Kind::Image => Size {
+            width: 32.0,
+            height: 32.0,
+        },
+        Kind::Path => node
+            .path
+            .view_box
+            .map(|view_box| Size {
+                width: view_box.width,
+                height: view_box.height,
+            })
+            .unwrap_or_default(),
+        _ => Size::default(),
+    };
+    tf::Size {
+        width: known.width.unwrap_or(intrinsic.width),
+        height: known.height.unwrap_or(intrinsic.height),
+    }
 }
 
 fn build(
@@ -3560,5 +3636,145 @@ mod tests {
             assert_eq!(layout.scroll_route(point), vec![ScrollStep::Handler(id)]);
             assert_eq!(layout.cursor_at(point), cursor);
         }
+    }
+
+    fn measured_text(id: u64, text: &str) -> Node {
+        let mut node = Node::new(NodeId(id), Kind::Text);
+        node.text = text.to_owned();
+        node.measure_content = true;
+        node
+    }
+
+    #[test]
+    fn content_sizes_measure_flagged_widgets_without_constraints() {
+        let mut root = fixed(1, Kind::Column, 200.0, 100.0);
+        let mut narrow = fixed(2, Kind::Column, 40.0, 60.0);
+        narrow.children.push(measured_text(3, "wraps"));
+        let mut unmeasured = Node::new(NodeId(4), Kind::Text);
+        unmeasured.text = "plain".into();
+        narrow.children.push(unmeasured);
+        root.children.push(narrow);
+        // a row asks for its children's widths plus gaps and padding.
+        let mut row = Node::new(NodeId(5), Kind::Row);
+        row.measure_content = true;
+        row.style.gap = 4.0;
+        row.style.padding = 2.0;
+        row.children.push(fixed(6, Kind::Button, 30.0, 10.0));
+        row.children.push(fixed(7, Kind::Button, 50.0, 12.0));
+        row.style.width = None;
+        let mut holder = fixed(8, Kind::Column, 20.0, 20.0);
+        holder.children.push(row);
+        root.children.push(holder);
+        // a popup's content is measured by the popup's own surface layout.
+        let mut popup = Node::new(NodeId(9), Kind::Popup);
+        popup.children.push(measured_text(10, "elsewhere"));
+        root.children.push(popup);
+        // a hidden subtree has nothing to report, so it is not measured.
+        let mut hidden = Node::new(NodeId(11), Kind::Column);
+        hidden.visible = false;
+        hidden.children.push(measured_text(12, "hidden"));
+        root.children.push(hidden);
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 200.0,
+                height: 100.0,
+            },
+            &mut WrappingText,
+        )
+        .unwrap();
+        // allocated bounds wrap in two lines; the intrinsic size does not.
+        let bounds = layout.semantic_placement(NodeId(3)).unwrap().bounds;
+        assert_eq!((bounds.width, bounds.height), (40.0, 20.0));
+        assert_eq!(
+            layout.content_size(NodeId(3)),
+            Some(Size {
+                width: 80.0,
+                height: 10.0
+            })
+        );
+        assert_eq!(layout.content_size(NodeId(4)), None);
+        assert_eq!(
+            layout.content_size(NodeId(5)),
+            Some(Size {
+                width: 88.0,
+                height: 16.0
+            })
+        );
+        assert_eq!(layout.content_size(NodeId(10)), None);
+        assert_eq!(layout.content_size(NodeId(12)), None);
+        // the extra pass leaves every allocated box as it was without it.
+        fn clear(node: &mut Node) {
+            node.measure_content = false;
+            node.children.iter_mut().for_each(clear);
+        }
+        clear(&mut root);
+        let plain = Layout::compute(
+            &root,
+            Size {
+                width: 200.0,
+                height: 100.0,
+            },
+            &mut WrappingText,
+        )
+        .unwrap();
+        let boxes = |layout: &Layout| {
+            layout
+                .semantic_placements()
+                .iter()
+                .map(|placement| (placement.id, placement.bounds, placement.border_aabb))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(boxes(&layout), boxes(&plain));
+    }
+
+    #[test]
+    fn content_sizes_follow_real_text_shaping_and_are_bounded() {
+        let mut text = crate::text::TextSystem::default();
+        let short = measured_text(2, "menu");
+        let long = measured_text(2, "a considerably longer menu entry");
+        let measure = |label: Node, text: &mut crate::text::TextSystem| {
+            let mut root = fixed(1, Kind::Column, 60.0, 400.0);
+            root.children.push(label);
+            let layout = Layout::compute(
+                &root,
+                Size {
+                    width: 60.0,
+                    height: 400.0,
+                },
+                text,
+            )
+            .unwrap();
+            (
+                layout.semantic_placement(NodeId(2)).unwrap().bounds,
+                layout.content_size(NodeId(2)).unwrap(),
+            )
+        };
+        let (short_bounds, short_content) = measure(short, &mut text);
+        let (long_bounds, long_content) = measure(long, &mut text);
+        assert!(short_content.width > 0.0 && short_content.width <= 60.0);
+        assert!(long_content.width > 60.0, "{long_content:?}");
+        // one unwrapped line is as tall as the short label's line.
+        assert_eq!(long_content.height, short_content.height);
+        assert!(long_bounds.height > short_bounds.height);
+        assert!(long_content.width > long_bounds.width, "{long_bounds:?}");
+
+        let mut root = fixed(1, Kind::Column, 200.0, 4000.0);
+        for id in 0..70 {
+            root.children.push(measured_text(id + 2, "x"));
+        }
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 200.0,
+                height: 4000.0,
+            },
+            &mut text,
+        )
+        .unwrap();
+        let measured = (2..72)
+            .filter(|id| layout.content_size(NodeId(*id)).is_some())
+            .count();
+        assert_eq!(measured, MAX_MEASURED);
     }
 }

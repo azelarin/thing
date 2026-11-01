@@ -22,6 +22,24 @@ declare extern type ThingWidgetBounds with
     read visual: ThingBoundsRect
 end
 
+declare extern type ThingContentSize with
+    read width: number
+    read height: number
+end
+
+declare extern type ThingConvertedPoint with
+    read x: number
+    read y: number
+end
+
+declare extern type ThingGeometry with
+    read available: (self: ThingGeometry) -> boolean
+    read layout: (self: ThingGeometry) -> ThingBoundsRect?
+    read visual: (self: ThingGeometry) -> ThingBoundsRect?
+    read content: (self: ThingGeometry) -> ThingContentSize?
+    read surface: (self: ThingGeometry) -> string?
+end
+
 declare extern type ThingTimer with
     read start: (self: ThingTimer) -> ()
     read stop: (self: ThingTimer) -> ()
@@ -1127,6 +1145,8 @@ declare ui: {
     focus: (widget: ThingWidget) -> (),
     reveal: (widget: ThingWidget) -> (),
     bounds: (widget: ThingWidget) -> ThingWidgetBounds?,
+    geometry: (widget: ThingWidget) -> ThingGeometry,
+    convert: (from: ThingWidget, x: number, y: number, to: ThingWidget) -> ThingConvertedPoint?,
     state: <T>(initial: T & ThingStateValue) -> ThingState<T>,
     timer: (options: ThingTimerOptions) -> ThingTimer,
     motion: (initial: number, options: ThingMotionOptions) -> ThingMotion,

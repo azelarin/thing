@@ -9,17 +9,65 @@ use thing_core::{Node, NodeId, Rect};
 use thing_runtime::{
     Action, ApplicationsSnapshot, AudioSnapshot, AuthenticationSnapshot, BoundsProvider,
     BoundsRect, ClipboardSnapshot, Event, IdleWatchDefinition, KeyInput, ManagedProcessDefinition,
-    ManagedProcessSnapshot, ManagedProcessState, MediaSnapshot, NiriState, NotificationSnapshot,
-    OutputContext, PointerDispatchOutcome as RuntimePointerOutcome, PointerEvent, PowerSnapshot,
-    PresentedBounds, Runtime, Scalar, ScrollInput, ServiceSnapshot, SleepInhibitorDefinition,
-    SleepInhibitorState, SurfaceKey, SurfaceTree, SystemTraySnapshot, TimerToken, UiAction,
-    UiTarget, WidgetBounds,
+    ManagedProcessSnapshot, ManagedProcessState, MappedPoint, MediaSnapshot, NiriState,
+    NotificationSnapshot, OutputContext, PointerDispatchOutcome as RuntimePointerOutcome,
+    PointerEvent, PowerSnapshot, PresentedBounds, Runtime, Scalar, ScrollInput, ServiceSnapshot,
+    SleepInhibitorDefinition, SleepInhibitorState, SurfaceKey, SurfaceTree, SystemTraySnapshot,
+    TimerToken, UiAction, UiTarget, WidgetBounds,
 };
 use thing_ui::Layout;
 
-struct LayoutBounds(Rc<Layout>);
+/// one presented layout, the popup origin it was presented at, and whether
+/// the surface was resized or scrolled since its previous frame.
+struct LayoutBounds(Rc<Layout>, Option<(f64, f64)>, bool);
 
 impl BoundsProvider for LayoutBounds {
+    fn moved(&self) -> bool {
+        self.2
+    }
+
+    fn content(&self, node: NodeId) -> Option<(f64, f64)> {
+        let size = self.0.content_size(node)?;
+        Some((size.width.into(), size.height.into()))
+    }
+
+    fn local_to_surface(&self, node: NodeId, x: f64, y: f64) -> MappedPoint {
+        let Some(placement) = self.0.semantic_placement(node) else {
+            return MappedPoint::Unavailable;
+        };
+        match placement.transform.point_f64(x, y) {
+            Some(point) => MappedPoint::Point {
+                x: point.x.into(),
+                y: point.y.into(),
+            },
+            None => MappedPoint::Unavailable,
+        }
+    }
+
+    fn surface_to_local(&self, node: NodeId, x: f64, y: f64) -> MappedPoint {
+        let Some(placement) = self.0.semantic_placement(node) else {
+            return MappedPoint::Unavailable;
+        };
+        if !placement.is_invertible() {
+            return MappedPoint::Noninvertible;
+        }
+        let point = thing_core::Point {
+            x: x as f32,
+            y: y as f32,
+        };
+        match placement.surface_to_local(point) {
+            Some(point) => MappedPoint::Point {
+                x: point.x.into(),
+                y: point.y.into(),
+            },
+            None => MappedPoint::Unavailable,
+        }
+    }
+
+    fn origin(&self) -> Option<(f64, f64)> {
+        self.1
+    }
+
     fn get(&self, node: NodeId) -> Option<WidgetBounds> {
         let placement = self.0.semantic_placement(node)?;
         let rect = |value: Rect| BoundsRect {
@@ -529,6 +577,7 @@ impl<K: Clone + Eq> Configurations<K> {
             .map(|instance| &instance.output)
     }
 
+    #[cfg(test)]
     pub(crate) fn record_presented_bounds(
         &self,
         key: &K,
@@ -536,19 +585,62 @@ impl<K: Clone + Eq> Configurations<K> {
         root: NodeId,
         layout: Rc<Layout>,
     ) -> Option<Rc<PresentedBounds>> {
+        self.record_presented_frame(key, consumer, root, layout, None, false)
+    }
+
+    /// retains one presented frame for `ui.bounds` and `ui.convert`, and
+    /// publishes it to `ui.geometry` handles. `origin` is a popup's position
+    /// in its parent surface, and `moved` says whether the surface's size or
+    /// scroll offsets changed since its previous frame.
+    pub(crate) fn record_presented_frame(
+        &self,
+        key: &K,
+        consumer: &str,
+        root: NodeId,
+        layout: Rc<Layout>,
+        origin: Option<(f64, f64)>,
+        moved: bool,
+    ) -> Option<Rc<PresentedBounds>> {
         if self.consumer(key)? != consumer {
             return None;
         }
-        match self
-            .runtime(key)?
-            .record_presented_bounds(root, Rc::new(LayoutBounds(layout)))
-        {
-            Ok(bounds) => Some(bounds),
+        let runtime = self.runtime(key)?;
+        let provider = Rc::new(LayoutBounds(layout, origin, moved));
+        // geometry follows only frames that `ui.bounds` and `ui.convert` can
+        // also read.
+        let bounds = match runtime.record_presented_bounds(root, provider.clone()) {
+            Ok(bounds) => bounds,
             Err(error) => {
                 eprintln!("thing: cannot retain presented bounds: {error}");
-                None
+                return None;
             }
+        };
+        match runtime.publish_geometry(root, provider.as_ref()) {
+            Ok(update) if !update.frozen.is_empty() => eprintln!(
+                "thing: geometry of {} widget(s) kept changing its own layout; holding it until something else changes",
+                update.frozen.len()
+            ),
+            Ok(_) => {}
+            Err(error) => eprintln!("thing: cannot publish geometry: {error}"),
         }
+        Some(bounds)
+    }
+
+    /// a surface stopped presenting, so its geometry handles lose their values.
+    pub(crate) fn forget_presented_geometry(&self, key: &K, root: NodeId) {
+        if let Some(Err(error)) = self
+            .runtime(key)
+            .map(|runtime| runtime.forget_presented_geometry(root))
+        {
+            eprintln!("thing: cannot retire geometry: {error}");
+        }
+    }
+
+    /// whether any configuration's geometry changed since the last call.
+    pub(crate) fn take_geometry_refresh(&self) -> bool {
+        self.instances.iter().fold(false, |pending, instance| {
+            instance.runtime.take_geometry_refresh() | pending
+        })
     }
 
     pub(crate) fn consumer(&self, key: &K) -> Option<&str> {
@@ -1683,6 +1775,166 @@ mod tests {
                 height: 12.0,
             }
         }
+    }
+
+    #[test]
+    fn geometry_and_conversion_read_real_layouts_through_scroll_and_transforms() {
+        let directory = tempdir().unwrap();
+        let entry = directory.path().join("panel.luau");
+        fs::write(
+            &entry,
+            r#"
+            local result = ui.state('')
+            local target = ui.row { key = 'target', style = {
+                width = 40, height = 20, scale_x = 2, scale_y = 2,
+                transform_origin = { x = 0, y = 0 },
+            } }
+            local flat = ui.row { key = 'flat', style = { width = 10, height = 10, scale_x = 0 } }
+            local label = ui.text { key = 'label', text = 'measured' }
+            local overlay = ui.stack { key = 'overlay', style = { width = 300, height = 200 } }
+            local measured = ui.geometry(target)
+            local text = ui.geometry(label)
+            local function convert(to)
+                local ok, point = pcall(ui.convert, target, 40, 20, to)
+                result:set(if not ok then tostring(point) elseif point
+                    then string.format('%g %g', point.x, point.y) else 'nil')
+            end
+            return ui.panel { style = { width = 300, height = 200 }, children = { ui.stack { children = {
+                ui.column { children = {
+                    ui.scroll { key = 'scroll', style = { width = 300, height = 60 }, children = {
+                        ui.column { children = { ui.row { style = { height = 40 } }, target, label, flat } },
+                    } },
+                    ui.button { key = 'overlay_point', on_click = function() convert(overlay) end },
+                    ui.button { key = 'flat_point', on_click = function() convert(flat) end },
+                    ui.text { key = 'out', text = function()
+                        local layout, visual, content = measured:layout(), measured:visual(), text:content()
+                        if not layout then return 'none' end
+                        return string.format('%g %g %g %g %s', layout.y, layout.width, visual.y,
+                            visual.width, if content then string.format('%gx%g', content.width, content.height) else '-')
+                    end },
+                    ui.text { key = 'converted', text = function() return result:get() end },
+                } },
+                overlay,
+            } } } }
+        "#,
+        )
+        .unwrap();
+        fn keyed(node: &Node, key: &str) -> Option<NodeId> {
+            if node.key.as_deref() == Some(key) {
+                return Some(node.id);
+            }
+            node.children.iter().find_map(|child| keyed(child, key))
+        }
+        let mut configurations = Configurations::new(entry, ServiceSnapshot::default());
+        configurations.add(1, output("DP-1", 1920)).unwrap();
+        let consumer = configurations.consumer(&1).unwrap().to_owned();
+        let id = |configurations: &Configurations<u32>, key: &str| {
+            keyed(configurations.root(&1).unwrap(), key).unwrap()
+        };
+        let text = |configurations: &Configurations<u32>, key: &str| {
+            configurations
+                .root(&1)
+                .unwrap()
+                .find(id(configurations, key))
+                .unwrap()
+                .text
+                .clone()
+        };
+        let size = Size {
+            width: 300.0,
+            height: 200.0,
+        };
+        let mut scroll = thing_ui::ScrollState::default();
+        let mut present = |configurations: &mut Configurations<u32>, offset: f32| {
+            let previous = scroll.clone();
+            let root = configurations.root(&1).unwrap().clone();
+            let layout =
+                Layout::compute_with_scroll(&root, size, &mut scroll, &mut FixedText).unwrap();
+            let scroller = keyed(&root, "scroll").unwrap();
+            let current = layout
+                .semantic_placement(scroller)
+                .unwrap()
+                .scroll_offset
+                .unwrap();
+            let layout = if layout.scroll_view_y(scroller, offset - current, &mut scroll) {
+                Layout::compute_with_scroll(&root, size, &mut scroll, &mut FixedText).unwrap()
+            } else {
+                layout
+            };
+            let layout = Rc::new(layout);
+            let moved = scroll != previous;
+            let lease = configurations
+                .record_presented_frame(&1, &consumer, root.id, layout.clone(), None, moved)
+                .unwrap();
+            if configurations.take_geometry_refresh() {
+                configurations.refresh();
+            }
+            (layout, lease)
+        };
+        assert_eq!(text(&configurations, "out"), "none");
+        // the observed widgets ask for their content; nothing else does.
+        let root = configurations.root(&1).unwrap();
+        assert!(
+            root.find(id(&configurations, "label"))
+                .unwrap()
+                .measure_content
+        );
+        assert!(
+            !root
+                .find(id(&configurations, "flat"))
+                .unwrap()
+                .measure_content
+        );
+
+        let (layout, _lease) = present(&mut configurations, 0.0);
+        let target = layout
+            .semantic_placement(id(&configurations, "target"))
+            .unwrap();
+        assert_eq!(
+            (target.bounds.width, target.border_aabb.width),
+            (40.0, 80.0)
+        );
+        let measured = layout.content_size(id(&configurations, "label")).unwrap();
+        assert_eq!((measured.width, measured.height), (30.0, 12.0));
+        assert_eq!(
+            text(&configurations, "out"),
+            format!("{} 40 {} 80 30x12", target.bounds.y, target.border_aabb.y)
+        );
+
+        // scrolling moves both boxes and reaches handles without a state write.
+        let (scrolled, _lease) = present(&mut configurations, 15.0);
+        let moved = scrolled
+            .semantic_placement(id(&configurations, "target"))
+            .unwrap();
+        assert_eq!(moved.border_aabb.y, target.border_aabb.y - 15.0);
+        assert_eq!(
+            text(&configurations, "out"),
+            format!("{} 40 {} 80 30x12", moved.bounds.y, moved.border_aabb.y)
+        );
+
+        // the bottom right corner of the scaled, scrolled box in overlay space.
+        configurations
+            .dispatch(&1, id(&configurations, "overlay_point"), Event::Click)
+            .unwrap();
+        let overlay = scrolled
+            .semantic_placement(id(&configurations, "overlay"))
+            .unwrap();
+        let corner = Point {
+            x: moved.border_aabb.x + moved.border_aabb.width - overlay.bounds.x,
+            y: moved.border_aabb.y + moved.border_aabb.height - overlay.bounds.y,
+        };
+        assert_eq!(
+            text(&configurations, "converted"),
+            format!("{} {}", corner.x, corner.y)
+        );
+        configurations
+            .dispatch(&1, id(&configurations, "flat_point"), Event::Click)
+            .unwrap();
+        assert!(
+            text(&configurations, "converted").contains("not invertible"),
+            "{}",
+            text(&configurations, "converted")
+        );
     }
 
     #[test]

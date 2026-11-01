@@ -584,7 +584,18 @@ impl App {
         {
             self.update_sleep();
         }
+        // closing a popup or window during the last turn forgot its geometry.
+        // refresh before an animation frame could evaluate those dependents
+        // without updating window properties.
+        if self.configurations.take_geometry_refresh() {
+            self.refresh();
+        }
         self.draw(qh)?;
+        // presented geometry may feed property functions. their surfaces draw
+        // once a frame callback or another event wakes the loop again.
+        if self.configurations.take_geometry_refresh() {
+            self.refresh();
+        }
         // drawing installs newly accepted layouts, which can change what is
         // under a pointer that has not moved.
         self.reconcile_cursor(connection);
@@ -991,6 +1002,16 @@ struct PopupRole {
     grabbed: bool,
     anchor: Option<NodeId>,
     reposition: popup::RepositionState,
+    /// where the compositor last configured the popup in its parent's
+    /// surface coordinates. it applies from the next presented frame.
+    position: Option<(i32, i32)>,
+}
+
+impl PopupRole {
+    /// the popup's origin in its parent surface, in logical pixels.
+    fn origin(&self) -> Option<(f64, f64)> {
+        self.position.map(|(x, y)| (f64::from(x), f64::from(y)))
+    }
 }
 
 enum Role {
@@ -1048,6 +1069,9 @@ struct Surface {
     layouts: SurfaceLayouts,
     prepared: Option<PreparedSurfaceLayout>,
     scroll: ScrollState,
+    /// the logical size and scroll offsets of the last presented frame, so
+    /// geometry can tell a resize or scroll from feedback.
+    presented_input: Option<((u32, u32), ScrollState)>,
     input: Interaction,
     focus_target: Option<ScopedUiTarget>,
     pending_focus: Option<ScopedUiTarget>,

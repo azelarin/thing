@@ -333,6 +333,7 @@ impl App {
             layouts: SurfaceLayouts::default(),
             prepared: None,
             scroll: ScrollState::default(),
+            presented_input: None,
             input: Interaction::default(),
             focus_target: None,
             pending_focus: None,
@@ -708,6 +709,10 @@ impl App {
             self.queue_window_state(owner.clone(), WindowState::default());
         }
         self.surfaces.remove(index);
+        // a closed window or panel may stay in the tree, but nothing presents
+        // it any more.
+        self.configurations
+            .forget_presented_geometry(&owner.output, surface_root);
         self.hover.remove_owner(owner);
         if self.keyboard_surface.as_ref() == Some(&wl) {
             self.clear_keyboard_focus();
@@ -1084,12 +1089,27 @@ impl App {
                     let animating = configurations.layout_is_animating(&surface.output, &layout);
                     let (consumer, targets) = presented_ui;
                     let layout = Rc::new(layout);
-                    let bounds = configurations.record_presented_bounds(
+                    // a popup's frame relates to its parent through the
+                    // position it was configured at when this frame
+                    // presented.
+                    let origin = match &surface.role {
+                        Role::Popup(role) => role.origin(),
+                        Role::Panel(_) | Role::Window(_) => None,
+                    };
+                    let frame_input = (surface.size, scroll.clone());
+                    let moved = surface
+                        .presented_input
+                        .as_ref()
+                        .is_some_and(|previous| *previous != frame_input);
+                    let bounds = configurations.record_presented_frame(
                         &surface.output,
                         &consumer,
                         surface.root,
                         layout.clone(),
+                        origin,
+                        moved,
                     );
+                    surface.presented_input = Some(frame_input);
                     surface.waiting = true;
                     surface.scroll = scroll;
                     surface
