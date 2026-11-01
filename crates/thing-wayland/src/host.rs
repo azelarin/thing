@@ -119,6 +119,8 @@ mod services;
 mod surfaces;
 
 #[cfg(test)]
+mod command_tests;
+#[cfg(test)]
 mod cursor_tests;
 #[cfg(test)]
 mod idle_sleep_tests;
@@ -144,6 +146,7 @@ use crate::{
     applications::{self, ActivationCall, Activator, Applications, Catalog, Plan},
     audio::Audio,
     clipboard::{Clipboard, OfferData as ClipboardOfferData, SourceData as ClipboardSourceData},
+    command::{self, CommandHost, CommandReply, CommandRequest, CommandServer, OutputResult},
     configuration::{
         Configurations, DispatchOutcome, PointerHandlerOutcome, RemovedConfiguration,
         ScrollHandlerOutcome,
@@ -193,7 +196,26 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
 }
 
 /// run configured surfaces with process-wide service and renderer options.
+/// the configuration's commands listen as the default instance when that name
+/// is free, and are unavailable otherwise.
 pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String> {
+    run_instance(entry, options, command::DEFAULT_INSTANCE, false)
+}
+
+/// run configured surfaces as a named instance. `thing call --instance`
+/// reaches this instance's commands; starting fails when another live
+/// instance already owns the name.
+pub fn run_with_instance(entry: &Path, options: RunOptions, instance: &str) -> Result<(), String> {
+    command::validate_instance_name(instance)?;
+    run_instance(entry, options, instance, true)
+}
+
+fn run_instance(
+    entry: &Path,
+    options: RunOptions,
+    instance: &str,
+    required: bool,
+) -> Result<(), String> {
     let renderer = options.renderer;
     if renderer == Renderer::Vulkan && !cfg!(feature = "vulkan") {
         return Err(
@@ -382,11 +404,19 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         loading_outputs: true,
         exit: false,
         error: None,
+        commands: None,
     };
     queue
         .roundtrip(&mut app)
         .map_err(|error| error.to_string())?;
     app.initialize(&qh)?;
+    match command::runtime_directory()
+        .and_then(|directory| CommandServer::start(&event_loop.handle(), &directory, instance))
+    {
+        Ok(server) => app.commands = Some(server),
+        Err(error) if required => return Err(format!("cannot serve commands: {error}")),
+        Err(error) => eprintln!("thing: commands are unavailable: {error}"),
+    }
     event_loop
         .handle()
         .insert_source(child_signals, |_, _, app| app.reap_children())
@@ -1247,6 +1277,8 @@ pub(crate) struct App {
     loading_outputs: bool,
     exit: bool,
     error: Option<String>,
+    /// the command socket. dropping the app closes it and unlinks the socket.
+    commands: Option<CommandServer<App>>,
 }
 
 impl Drop for App {

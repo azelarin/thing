@@ -542,9 +542,9 @@ fn shared_buffer(globals: &GlobalList, qh: &QueueHandle<App>) -> SharedBuffer {
 
 /// a panel host with inert desktop services. fields drop in order, so the
 /// host disconnects before its compositor stops.
-struct Host {
-    app: App,
-    event_loop: EventLoop<'static, App>,
+pub(super) struct Host {
+    pub(super) app: App,
+    pub(super) event_loop: EventLoop<'static, App>,
     connection: Connection,
     qh: QueueHandle<App>,
     _buffer: SharedBuffer,
@@ -554,11 +554,8 @@ struct Host {
 
 impl Host {
     fn start() -> Self {
-        let directory = tempfile::tempdir().unwrap();
-        let marker = |name: &str| directory.path().join(name).display().to_string();
-        let panel = directory.path().join("panel.luau");
-        fs::write(
-            &panel,
+        Self::start_with(|directory| {
+            let marker = |name: &str| directory.join(name).display().to_string();
             PANEL.replace(
                 "local markers = ...",
                 &format!(
@@ -567,9 +564,16 @@ impl Host {
                     marker("invalid"),
                     marker("rejected"),
                 ),
-            ),
-        )
-        .unwrap();
+            )
+        })
+    }
+
+    /// starts a host on a private compositor with the panel `source` writes,
+    /// given the test's private directory, and waits for its first frame.
+    pub(super) fn start_with(source: impl FnOnce(&Path) -> String) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let panel = directory.path().join("panel.luau");
+        fs::write(&panel, source(directory.path())).unwrap();
         let (wayland, connection) = PrivateWayland::start();
         let (globals, mut queue) = registry_queue_init(&connection).unwrap();
         let qh = queue.handle();
@@ -645,6 +649,7 @@ impl Host {
             loading_outputs: true,
             exit: false,
             error: None,
+            commands: None,
         };
         queue.roundtrip(&mut app).unwrap();
         app.initialize(&qh).unwrap();
@@ -683,7 +688,7 @@ impl Host {
         host
     }
 
-    fn turn(&mut self) {
+    pub(super) fn turn(&mut self) {
         self.app
             .turn(&mut self.event_loop, &self.connection, &self.qh)
             .unwrap();

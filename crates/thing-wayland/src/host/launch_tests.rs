@@ -790,6 +790,7 @@ impl Host {
             loading_outputs: true,
             exit: false,
             error: None,
+            commands: None,
         };
         assert!(app.activation.is_some());
         queue.roundtrip(&mut app).unwrap();
