@@ -161,6 +161,89 @@ fn inspect_distinguishes_usage_errors_from_configuration_errors() {
 }
 
 #[test]
+fn inspect_rejects_options_from_the_other_mode() {
+    // an empty runtime directory: no instance could answer, so every failure
+    // below happens while parsing.
+    let runtime = tempfile::tempdir().unwrap();
+    for (arguments, expected) in [
+        (
+            vec!["--output-size", "640x480", "--keys"],
+            "only with --live",
+        ),
+        (
+            vec!["--output-size", "640x480", "--instance", "a"],
+            "only with --live",
+        ),
+        (
+            vec!["--output-size", "640x480", "--at-pointer"],
+            "only with --live",
+        ),
+        (
+            vec!["--live", "--output-size", "640x480"],
+            "only without --live",
+        ),
+        (vec!["--live", "--scale=2"], "only without --live"),
+        (vec!["--live", "panel.luau"], "no entry file"),
+        (vec!["--live", "--keys=yes"], "does not take a value"),
+        (
+            vec!["--live", "--output", "a", "--all-outputs"],
+            "either --output",
+        ),
+        (vec!["--live", "--timeout", "0"], "--timeout"),
+        (
+            vec!["--live", "--highlight", "0.05", "--node", "3"],
+            "--highlight",
+        ),
+        (vec!["--live", "--highlight", "5"], "needs a node"),
+        (
+            vec!["--live", "--node", "3", "--at-pointer"],
+            "either a node",
+        ),
+        (vec!["--live", "--node", "0"], "positive whole"),
+        (
+            vec!["--live", "--all-outputs", "--node", "3", "--highlight", "1"],
+            "one output",
+        ),
+        (vec!["--live", "--instance", "no/slash"], "instance name"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+            .arg("inspect")
+            .args(&arguments)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {stderr}");
+        assert!(stderr.contains(expected), "{arguments:?}: {stderr}");
+        assert!(output.stdout.is_empty());
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .args(["inspect", "--live", "--help"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--at-pointer"));
+}
+
+#[test]
+fn live_inspection_reports_a_missing_instance_like_call() {
+    let runtime = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .args([
+            "inspect",
+            "--live",
+            "--instance",
+            "absent",
+            "--timeout",
+            "1",
+        ])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no thing instance named \"absent\""));
+}
+
+#[test]
 fn authentication_helper_entry_point_is_not_an_extensible_public_command() {
     let output = Command::new(env!("CARGO_BIN_EXE_thing"))
         .args([HELPER_SENTINEL, "unexpected"])
@@ -542,4 +625,26 @@ fn call_reports_usage_errors_and_missing_instances_distinctly() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2), "{output:?}");
+}
+
+#[test]
+fn an_offline_output_name_can_be_the_literal_live_flag() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("panel.luau");
+    fs::write(&path, "return ui.panel { style = { height = 24 } }").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .args([
+            "inspect",
+            "--output-name",
+            "--live",
+            "--output-size",
+            "640x480",
+        ])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("output \"--live\" size=640x480"));
 }

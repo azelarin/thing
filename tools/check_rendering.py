@@ -25,13 +25,13 @@ ARTIFACTS = ROOT / "target/render-tests"
 CASES = (
     "image-fit", "stencil", "gradients", "radial-gradients", "shadows", "shared-motion",
     "widget-bounds", "rounded-clips", "path-clips", "horizontal-scroll", "motion-lifecycle", "content-transitions", "windows",
-    "styled-text",
+    "styled-text", "live-inspector",
 )
 # these accept a state only after the same passing frame is captured twice.
 STABLE_FRAMES = {
     "windows": 2,
     "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2, "rounded-clips": 2, "horizontal-scroll": 2, "motion-lifecycle": 2, "content-transitions": 2,
-    "styled-text": 2,
+    "styled-text": 2, "live-inspector": 2,
 }
 RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
 # the runtime error each panel-invalid.luau must produce, in thing check and in
@@ -573,8 +573,30 @@ def verify_styled_text(image, stage, scale):
     expect_color(image, (210, 185), scale, (40, 179, 161), "ellipsis box background", tolerance=3)
 
 
+def verify_live_inspector(image, stage, scale):
+    expect_color(image, (400, 80), scale, (121, 151, 255), "unaffected card")
+    expect_color(image, (20, 20), scale, (13, 17, 23), "unaffected background")
+    cyan = near((0, 200, 255), 8)
+    magenta = near((255, 0, 200), 8)
+    if stage.startswith("highlight-"):
+        if count_pixels(image, (265, 20, 360, 230), scale, cyan) < 20 * scale:
+            raise FixtureError("inspector transformed bounds outside the clip are missing")
+        if count_pixels(image, (35, 35, 265, 205), scale, magenta) < 100 * scale:
+            raise FixtureError("inspector clip outline is missing")
+    else:
+        for matches in (cyan, magenta):
+            if count_pixels(image, (0, 0, 640, 240), scale, matches):
+                raise FixtureError("inspector overlay remained after expiry or before selection")
+        expect_color(image, (50, 110), scale, (40, 179, 161), "rounded card")
+        gold = near((224, 164, 81), 8)
+        if count_pixels(image, (80, 90, 260, 160), scale, gold) < 100 * scale:
+            raise FixtureError("the clipped rotated child is missing")
+
+
 def verify_capture(case, image, stage, scale):
-    if case == "windows":
+    if case == "live-inspector":
+        verify_live_inspector(image, stage, scale)
+    elif case == "windows":
         verify_windows(image, stage, scale)
     elif case == "image-fit":
         verify_image_fit(image, stage, scale)
@@ -869,6 +891,31 @@ def fixture_window(niri, environment, deadline, *, absent=False, title=None, siz
     raise FixtureError("nested window did not reach its expected state")
 
 
+def exercise_live_inspector(
+    run_directory, binary, environment, process, output, grim, scale, deadline,
+):
+    arguments = [binary, "inspect", "--live", "--instance", "render-inspector"]
+    reply = checked([*arguments, "--keys"], env=environment, deadline=deadline)
+    try:
+        report = json.loads(reply.stdout)
+        nodes = [node for surface in report["surfaces"] for node in surface["nodes"]
+                 if node.get("key") == "rotated"]
+        if len(nodes) != 1:
+            raise ValueError("expected one rotated widget")
+        node = nodes[0]["id"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise FixtureError("live inspection did not report the rotated widget") from error
+    atomic_json(run_directory / f"inspection-{scale:g}.json", report)
+    checked([*arguments, "--node", str(node), "--highlight", "2"],
+            env=environment, deadline=deadline)
+    for state in ("highlight", "expired"):
+        stage = f"{state}-{scale:g}"
+        capture_until(grim, environment, process, output, run_directory / f"{stage}.ppm",
+                      "live-inspector", stage, scale,
+                      min(deadline, time.monotonic() + 8), frames=2)
+    return node
+
+
 def run_inner(run_directory, binary, renderer, case, niri, grim):
     environment = private_environment()
     deadline = time.monotonic() + INNER_TIMEOUT
@@ -893,9 +940,14 @@ def run_inner(run_directory, binary, renderer, case, niri, grim):
     frames = STABLE_FRAMES.get(case, 1)
     rejection = None
     process = None
+    inspected_nodes = []
+    arguments = [str(binary), "run", "--renderer", renderer]
+    if case == "live-inspector":
+        arguments.extend(["--inspector", "--instance", "render-inspector"])
+    arguments.append(str(panel))
     try:
         process = subprocess.Popen(
-            [str(binary), "run", "--renderer", renderer, str(panel)],
+            arguments,
             stdout=log,
             stderr=subprocess.STDOUT,
             env=environment,
@@ -912,6 +964,11 @@ def run_inner(run_directory, binary, renderer, case, niri, grim):
             min(deadline, time.monotonic() + 10),
             frames=frames,
         )
+
+        if case == "live-inspector":
+            inspected_nodes.append(exercise_live_inspector(
+                run_directory, binary, environment, process, output, grim, 1.0, deadline,
+            ))
 
         checked(
             [niri, "msg", "output", output, "scale", "1.25"],
@@ -937,6 +994,11 @@ def run_inner(run_directory, binary, renderer, case, niri, grim):
             min(deadline, time.monotonic() + 10),
             frames=frames,
         )
+
+        if case == "live-inspector":
+            inspected_nodes.append(exercise_live_inspector(
+                run_directory, binary, environment, process, output, grim, 1.25, deadline,
+            ))
 
         window_id = None
         if case == "windows":
@@ -1007,6 +1069,8 @@ def run_inner(run_directory, binary, renderer, case, niri, grim):
             "output": output,
             "renderer": renderer,
         }
+        if inspected_nodes:
+            result["inspected_nodes"] = inspected_nodes
         if rejection is not None:
             result["rejected_reload"] = rejection
         if case == "shared-motion":

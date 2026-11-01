@@ -673,6 +673,7 @@ impl Host {
             exit: false,
             error: None,
             commands: None,
+            inspector: None,
         };
         queue.roundtrip(&mut app).unwrap();
         app.initialize(&qh).unwrap();

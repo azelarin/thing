@@ -47,6 +47,13 @@ impl Interaction {
     }
 }
 
+/// a live inspector highlight. the renderer paints it after the ordinary
+/// scene from the same frame's layout, so it never changes layout or input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InspectorHighlight {
+    pub node: NodeId,
+}
+
 /// renderer-independent inputs for one frame.
 pub struct PaintFrame<'a> {
     pub root: &'a Node,
@@ -56,6 +63,8 @@ pub struct PaintFrame<'a> {
     pub input: Interaction,
     pub text_input: Option<&'a mut TextInputEditor>,
     pub secret_input: Option<&'a mut SecretInputEditor>,
+    /// always `None` outside `thing run --inspector`.
+    pub inspector: Option<InspectorHighlight>,
 }
 
 #[cfg(test)]

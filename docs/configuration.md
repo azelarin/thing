@@ -2673,6 +2673,59 @@ positions and final surface sizes depend on the compositor. clipping regions
 and transformed bounds are enclosing rectangles, not exact rounded outlines.
 the command uses the same font measurement and layout code as the renderer.
 
+### inspecting a running shell
+
+to see what a running shell actually drew, start it with the inspector and
+ask it from another terminal:
+
+```sh
+thing run --inspector panel.luau
+thing inspect --live
+thing inspect --live --at-pointer
+thing inspect --live --node 12 --highlight 5
+```
+
+inspection is off unless `thing run` gets `--inspector`, and the lock screen
+never offers it. `thing inspect --live` uses the command socket, so
+`--instance`, `--output`, `--all-outputs`, and `--timeout` work as they do for
+`thing call`, and it prints json. it runs no configuration code and does not
+need any `ui.command`. offline options such as `--output-size` are rejected
+with `--live`, and live options are rejected without it.
+
+each output's report lists its surfaces with their role, size, scale, and, for
+popups, the position used by that submitted frame. every widget has its
+id, kind, parent, visibility, layout `bounds`, transformed `visual` bounds,
+enclosing `clip`, opacity, and whether it is enabled and interactive. a `null`
+clip means nothing of the widget is painted. the report always describes the
+last frame the compositor received, even when a newer state has already been
+accepted and is waiting to be drawn.
+
+reports never include text, input values, link destinations, image sources,
+or other property values. widget keys and named surface keys can contain your
+data, so they appear only with `--keys`. keys are limited to 128 bytes on a
+character boundary, with a truncation flag when cut. each surface captures up
+to 2048 widget records; a reply holds at most 512 widgets and 256 KiB. widgets and
+surfaces that did not fit are counted in `omitted` and `omitted_surfaces`.
+use `--surface <name>` (`default` for the unnamed panel) or `--node <id>` to
+narrow a large report to one surface or one widget and its descendants.
+the numeric `root` identifies a surface without revealing its key.
+
+`--at-pointer` reports the frontmost widget box under the pointer, interactive
+or not, with its ancestors. it respects transforms and rounded or path clips. it
+only reads where the pointer already is, so clicks and hovering keep working
+as usual.
+
+`--highlight <seconds>`, with `--node` or `--at-pointer`, outlines that widget
+for 0.1 to 60 seconds: its own box in cyan and the clip that limits it in a
+translucent magenta. a widget whose painting is clipped away entirely gets an
+orange outline instead. there is one highlight per instance, so a new one
+replaces the last. it ends early when the widget is hidden or removed, its
+surface closes, or a reload succeeds; a rejected reload keeps it. the overlay
+is drawn on top of the frame and changes no layout, input, focus, or geometry.
+it uses the identity from the inspected frame: a request cannot highlight an
+unrelated replacement that reused the same id. disabled widgets can still be
+highlighted.
+
 ## clock, idle, and audio
 
 service values have the same `:get()` interface as local state, but are read-only.

@@ -57,24 +57,10 @@ pub(super) fn run(mut args: impl Iterator<Item = OsString>) -> Result<()> {
         match option {
             "--instance" => instance = value,
             "--output" => output = Some(value),
-            _ => {
-                let seconds: f64 = value
-                    .parse()
-                    .ok()
-                    .filter(|seconds: &f64| {
-                        seconds.is_finite() && *seconds > 0.0 && *seconds <= 600.0
-                    })
-                    .ok_or_else(|| usage("--timeout must be between 0 and 600 seconds"))?;
-                timeout = Duration::from_secs_f64(seconds);
-            }
+            _ => timeout = parse_timeout(&value).map_err(usage)?,
         }
     }
-    let selection = match (output, all) {
-        (Some(_), true) => return Err(usage("choose either --output or --all-outputs")),
-        (Some(name), false) => OutputSelection::Named(name),
-        (None, true) => OutputSelection::All,
-        (None, false) => OutputSelection::Implicit,
-    };
+    let selection = output_selection(output, all).map_err(usage)?;
     let mut positional = positional.into_iter();
     let name = positional
         .next()
@@ -97,4 +83,27 @@ pub(super) fn run(mut args: impl Iterator<Item = OsString>) -> Result<()> {
     })?;
     println!("{printed}");
     Ok(())
+}
+
+/// the reply timeout `thing call` and `thing inspect --live` accept.
+pub(super) fn parse_timeout(value: &str) -> std::result::Result<Duration, &'static str> {
+    value
+        .parse()
+        .ok()
+        .filter(|seconds: &f64| seconds.is_finite() && *seconds > 0.0 && *seconds <= 600.0)
+        .map(Duration::from_secs_f64)
+        .ok_or("--timeout must be between 0 and 600 seconds")
+}
+
+/// the outputs `--output` and `--all-outputs` name.
+pub(super) fn output_selection(
+    output: Option<String>,
+    all: bool,
+) -> std::result::Result<OutputSelection, &'static str> {
+    match (output, all) {
+        (Some(_), true) => Err("choose either --output or --all-outputs"),
+        (Some(name), false) => Ok(OutputSelection::Named(name)),
+        (None, true) => Ok(OutputSelection::All),
+        (None, false) => Ok(OutputSelection::Implicit),
+    }
 }

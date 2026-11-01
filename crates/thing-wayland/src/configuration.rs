@@ -1063,6 +1063,20 @@ impl<K: Clone + Eq> Configurations<K> {
         selection: &OutputSelection,
         command: &str,
     ) -> Result<Vec<K>, String> {
+        self.selected_targets(selection, Some(command))
+    }
+
+    /// the outputs a live inspection names, chosen like a command's outputs
+    /// but without requiring any declared command.
+    pub(crate) fn output_targets(&self, selection: &OutputSelection) -> Result<Vec<K>, String> {
+        self.selected_targets(selection, None)
+    }
+
+    fn selected_targets(
+        &self,
+        selection: &OutputSelection,
+        command: Option<&str>,
+    ) -> Result<Vec<K>, String> {
         let name = |instance: &Instance<K>| {
             instance
                 .output
@@ -1110,13 +1124,15 @@ impl<K: Clone + Eq> Configurations<K> {
             }
             OutputSelection::All => self.instances.iter().collect(),
         };
-        if let Some(missing) = targets.iter().find(|instance| {
-            !instance
-                .runtime
-                .command_names()
-                .iter()
-                .any(|name| name == command)
-        }) {
+        if let Some(command) = command
+            && let Some(missing) = targets.iter().find(|instance| {
+                !instance
+                    .runtime
+                    .command_names()
+                    .iter()
+                    .any(|name| name == command)
+            })
+        {
             let declared = missing.runtime.command_names();
             return Err(if declared.is_empty() {
                 format!(

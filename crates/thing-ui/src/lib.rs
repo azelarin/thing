@@ -15,7 +15,7 @@ pub use editor::{
     TextInputCheckpoint, TextInputEditor, TextInputImeBatch, TextInputImeError,
     TextInputImeOutcome, TextInputPreedit, TextInputSurrounding,
 };
-pub use frame::{Interaction, PaintFrame};
+pub use frame::{InspectorHighlight, Interaction, PaintFrame};
 pub use layout::{Layout, Measurer, Placement, ScrollState, ScrollStep, SemanticPlacement, Size};
 pub use secret::{MAX_SECRET_BYTES, SecretBytes, SecretInputEditor};
 pub use skia::Painter;

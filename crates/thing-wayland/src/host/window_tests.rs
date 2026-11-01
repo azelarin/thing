@@ -51,6 +51,7 @@ use wayland_server::{
 use super::*;
 
 mod geometry;
+mod inspection;
 mod links;
 
 const WIDTH: u32 = 640;
@@ -893,6 +894,7 @@ impl Host {
             exit: false,
             error: None,
             commands: None,
+            inspector: None,
         };
         queue.roundtrip(&mut app).unwrap();
         app.initialize(&qh)?;

@@ -650,6 +650,7 @@ impl Host {
             exit: false,
             error: None,
             commands: None,
+            inspector: None,
         };
         queue.roundtrip(&mut app).unwrap();
         app.initialize(&qh).unwrap();
@@ -696,7 +697,7 @@ impl Host {
 
     /// sends one wheel frame at a surface point. deltas are in 120ths of a
     /// wheel step, as `axis_value120` carries them.
-    fn wheel(&mut self, x: f64, y: f64, horizontal: i32, vertical: i32) {
+    pub(super) fn wheel(&mut self, x: f64, y: f64, horizontal: i32, vertical: i32) {
         self.wayland
             .control
             .lock()

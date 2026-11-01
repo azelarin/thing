@@ -19,6 +19,7 @@ mod idle_notify;
 mod image_codec;
 mod input_method;
 mod inspect;
+mod inspection;
 mod keyboard;
 mod launch;
 mod lock;
@@ -61,9 +62,18 @@ pub struct RunOptions {
     pub system_tray: Option<SystemTrayMode>,
     /// whether thing may read and control the regular clipboard.
     pub clipboard: bool,
+    /// whether `thing inspect --live` may read presented layouts and highlight
+    /// widgets through the command socket.
+    pub inspector: bool,
 }
 
 impl RunOptions {
+    /// enable or disable live layout inspection.
+    pub fn with_inspector(mut self, enabled: bool) -> Self {
+        self.inspector = enabled;
+        self
+    }
+
     /// select the graphics backend.
     pub fn with_renderer(mut self, renderer: Renderer) -> Self {
         self.renderer = renderer;

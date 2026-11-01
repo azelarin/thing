@@ -113,6 +113,7 @@ use crate::output::{fallback_logical_size, valid_dimensions};
 
 mod dispatch;
 mod input;
+mod inspection;
 mod launching;
 mod protocol;
 mod services;
@@ -405,6 +406,7 @@ fn run_instance(
         exit: false,
         error: None,
         commands: None,
+        inspector: options.inspector.then(inspection::Inspector::default),
     };
     queue
         .roundtrip(&mut app)
@@ -620,6 +622,9 @@ impl App {
         if self.configurations.take_geometry_refresh() {
             self.refresh();
         }
+        // an expired or retired highlight marks its surface dirty, so this
+        // turn's draw removes it.
+        self.reconcile_highlight(Instant::now());
         self.draw(qh)?;
         // presented geometry may feed property functions. their surfaces draw
         // once a frame callback or another event wakes the loop again.
@@ -1121,6 +1126,9 @@ struct Surface {
     dirty: bool,
     waiting: bool,
     retry_at: Option<Instant>,
+    /// the last presented frame and the widget metadata it was painted
+    /// from, kept only while live inspection is enabled.
+    inspection: Option<crate::inspection::FrameSnapshot>,
 }
 
 struct ActiveTextInput {
@@ -1282,6 +1290,8 @@ pub(crate) struct App {
     error: Option<String>,
     /// the command socket. dropping the app closes it and unlinks the socket.
     commands: Option<CommandServer<App>>,
+    /// live inspection, present only with `thing run --inspector`.
+    inspector: Option<inspection::Inspector>,
 }
 
 impl Drop for App {
@@ -1312,6 +1322,11 @@ impl App {
         .into_iter()
         .chain(self.configurations.next_timer_deadline())
         .chain(self.sleep.next_deadline())
+        .chain(
+            self.inspector
+                .as_ref()
+                .and_then(inspection::Inspector::deadline),
+        )
         .min()
     }
 
@@ -1482,6 +1497,9 @@ impl App {
             }
         };
         self.configurations.commit_reload(configurations);
+        // a successful reload retires every widget identity; a rejected one
+        // returned above and keeps the highlight.
+        self.clear_highlight();
         self.reconcile_notification_expiry();
         self.cancel_pending_text_paste();
         // the replacement runtimes never inherit an in-flight pointer sequence.
