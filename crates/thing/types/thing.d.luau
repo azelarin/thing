@@ -9,6 +9,12 @@ export type ThingSignal<T> = {
     get: (self: ThingSignal<T>) -> T,
 }
 
+-- plain data passed to and returned from ui.command handlers.
+declare extern type ThingCallNull with
+end
+
+export type ThingCallValue = nil | ThingCallNull | boolean | number | string | { ThingCallValue } | { [string]: ThingCallValue }
+
 declare extern type ThingBoundsRect with
     read x: number
     read y: number
@@ -1147,6 +1153,8 @@ declare ui: {
     bounds: (widget: ThingWidget) -> ThingWidgetBounds?,
     geometry: (widget: ThingWidget) -> ThingGeometry,
     convert: (from: ThingWidget, x: number, y: number, to: ThingWidget) -> ThingConvertedPoint?,
+    command: (name: string, handler: (arguments: any) -> ThingCallValue) -> (),
+    null: ThingCallNull,
     state: <T>(initial: T & ThingStateValue) -> ThingState<T>,
     timer: (options: ThingTimerOptions) -> ThingTimer,
     motion: (initial: number, options: ThingMotionOptions) -> ThingMotion,

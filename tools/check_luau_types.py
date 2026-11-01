@@ -32,6 +32,14 @@ CASES = (
     Case("valid-motion.luau"),
     Case("valid-bounds.luau"),
     Case("valid-geometry.luau"),
+    Case("valid-commands.luau"),
+    Case(
+        "invalid-commands.luau",
+        (
+            "Expected this to be 'string', but got 'number'",
+            "Expected this to be '(any) -> t1 where t1 = ",
+        ),
+    ),
     Case("valid-clipping.luau"),
     Case("valid-scroll-axis.luau"),
     Case("valid-niri-controls.luau"),

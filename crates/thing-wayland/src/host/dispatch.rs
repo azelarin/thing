@@ -582,3 +582,68 @@ impl App {
         }
     }
 }
+
+impl App {
+    pub(super) fn call_command(&mut self, request: CommandRequest) -> CommandReply {
+        let outputs = match self
+            .configurations
+            .command_targets(&request.selection, &request.command)
+        {
+            Ok(outputs) => outputs,
+            Err(error) => return CommandReply::Failed(error),
+        };
+        let mut results = Vec::new();
+        for output in outputs {
+            let name = self
+                .configurations
+                .output(&output)
+                .and_then(|context| context.name.clone());
+            let consumer = self.configurations.consumer(&output).map(str::to_owned);
+            let Some(entry) = self.current_layout_validation_entry(&output) else {
+                results.push(OutputResult {
+                    output: name,
+                    result: Err("the output was removed".into()),
+                });
+                continue;
+            };
+            let preflight = LayoutPreflight::new(
+                &mut self.render,
+                self.layer_shell_version,
+                self.idle_inhibit.active().is_some(),
+                vec![entry],
+            );
+            let result = self.configurations.call_command_checked(
+                &output,
+                &request.command,
+                &request.arguments,
+                |surfaces| preflight.validate(&output, surfaces),
+            );
+            let prepared = preflight.into_prepared();
+            let result = match result {
+                Ok(Some((value, outcome))) => {
+                    self.finish_dispatch(output, consumer, Ok(outcome), None, prepared);
+                    Ok(value)
+                }
+                Ok(None) => Err(format!("the command {:?} is gone", request.command)),
+                Err(error) => {
+                    self.finish_dispatch(output, consumer, Err(error.clone()), None, prepared);
+                    Err(error)
+                }
+            };
+            results.push(OutputResult {
+                output: name,
+                result,
+            });
+            if self.error.is_some() {
+                break;
+            }
+        }
+        CommandReply::Ran(results)
+    }
+}
+
+impl CommandHost for App {
+    fn run_command(&mut self, request: CommandRequest) -> CommandReply {
+        self.call_command(request)
+    }
+}

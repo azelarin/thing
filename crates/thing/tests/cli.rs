@@ -489,3 +489,57 @@ fn inspect_reports_a_window_at_its_initial_content_size() {
         "{report}"
     );
 }
+
+#[test]
+fn call_reports_usage_errors_and_missing_instances_distinctly() {
+    let runtime = tempfile::tempdir().unwrap();
+    fs::set_permissions(
+        runtime.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let call = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_thing"))
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("WAYLAND_DISPLAY")
+            .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/does/not/exist")
+            .arg("call")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for (args, message) in [
+        (&[][..], "expected a command name"),
+        (&["toggle", "{"][..], "arguments are not valid json"),
+        (&["toggle", "1", "2"][..], "expected one json argument"),
+        (
+            &["--output", "DP-1", "--all-outputs", "toggle"][..],
+            "either --output or --all-outputs",
+        ),
+        (&["--timeout", "0", "toggle"][..], "--timeout"),
+        (&["--instance", "../x", "toggle"][..], "instance name"),
+        (&["has space"][..], "command name"),
+        (&["--frobnicate", "toggle"][..], "unknown call option"),
+    ] {
+        let output = call(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(message), "{args:?}: {stderr}");
+    }
+    let output = call(&["--instance", "bar", "toggle", r#"{"tab":"apps"}"#]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no thing instance named \"bar\" is running"),
+        "{stderr}"
+    );
+    let output = call(&["--help"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--all-outputs"));
+    let output = Command::new(env!("CARGO_BIN_EXE_thing"))
+        .args(["run", "--instance", "no/slash", "panel.luau"])
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+}

@@ -4,6 +4,7 @@
 //! surface trees to the renderer.
 
 mod bounds;
+mod command;
 mod geometry;
 mod idle;
 mod modules;
@@ -19,6 +20,10 @@ mod timer;
 mod transition;
 mod window;
 pub use bounds::{BoundsProvider, BoundsRect, MappedPoint, PresentedBounds, WidgetBounds};
+pub use command::{
+    CallValue, MAX_CALL_DEPTH, MAX_CALL_STRING_BYTES, MAX_CALL_VALUES, MAX_COMMANDS,
+    validate_command_name,
+};
 pub use geometry::{GeometryUpdate, MAX_FEEDBACK_ROUNDS};
 pub use idle::{IdleWatchDefinition, MAX_IDLE_TIMEOUT_MS, MAX_IDLE_WATCHES, MIN_IDLE_TIMEOUT_MS};
 pub use niri::{
@@ -246,6 +251,13 @@ impl UiTarget {
     }
 }
 
+/// a command's result and whether its updates changed the surfaces.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandCall {
+    pub value: CallValue,
+    pub changed: bool,
+}
+
 /// host-local actions produced by a successful event handler.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiAction {
@@ -385,6 +397,7 @@ pub struct Runtime {
     motions: Rc<RefCell<motion::Motions>>,
     bounds: Rc<RefCell<bounds::Bounds>>,
     geometry: Rc<RefCell<geometry::Geometry>>,
+    commands: Rc<RefCell<command::Commands>>,
     event_depth: usize,
     output: Option<OutputContext>,
     mode: ConfigurationMode,
@@ -497,14 +510,9 @@ impl Runtime {
         let motions = Rc::new(RefCell::new(motion::Motions::new(tracker.clone())));
         let bounds = Rc::new(RefCell::new(bounds::Bounds::default()));
         let geometry = Rc::new(RefCell::new(geometry::Geometry::default()));
+        let commands = Rc::new(RefCell::new(command::Commands::default()));
         let ui = install_ui(
-            &lua,
-            tracker.clone(),
-            &timers,
-            &motions,
-            &bounds,
-            &geometry,
-            &services,
+            &lua, &timers, &motions, &bounds, &geometry, &services, &commands,
         )?;
         lua.sandbox(true)?;
         let modules = modules::Modules::default();
@@ -536,7 +544,14 @@ impl Runtime {
                 ));
             }
             services.forbid_application_launches();
+            // commands would let other local processes drive the lock screen.
+            if !commands.borrow().is_empty() {
+                return Err(Error::runtime(
+                    "commands are unavailable in lock configurations",
+                ));
+            }
         }
+        commands.borrow_mut().freeze();
         services.freeze_declarations();
         timers.borrow_mut().freeze();
         motions.borrow_mut().freeze();
@@ -562,6 +577,7 @@ impl Runtime {
             motions,
             bounds,
             geometry,
+            commands,
             event_depth: 0,
             output,
             mode,
@@ -655,6 +671,55 @@ impl Runtime {
                         .borrow_mut()
                         .repeat_after_rejection(token, now.max(Instant::now()));
                     Err(annotate(error))
+                }
+            }
+        })
+    }
+
+    /// the commands this configuration declared, in name order.
+    pub fn command_names(&self) -> Vec<String> {
+        self.commands.borrow().names()
+    }
+
+    /// call a declared command with `arguments` and validate its candidate
+    /// surfaces before publication. `None` means no such command exists.
+    ///
+    /// a failed handler, result, or candidate discards the call's service
+    /// actions, ui actions, and timer and motion controls, as a failed event
+    /// handler does. state the handler already wrote stays written, and plain
+    /// luau variables it changed stay changed; they are not rolled back.
+    pub fn call_command_checked(
+        &mut self,
+        name: &str,
+        arguments: &CallValue,
+        validate: impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+    ) -> Result<Option<CommandCall>> {
+        let Some(handler) = self.commands.borrow().get(name) else {
+            return Ok(None);
+        };
+        arguments.validate().map_err(Error::runtime)?;
+        let now = Instant::now();
+        self.with_event_controls(Some(now), |runtime| {
+            let checkpoint = runtime.action_checkpoint();
+            runtime.begin_call();
+            let arguments = arguments.to_lua(&runtime.lua)?;
+            runtime.allow_actions(true);
+            let result = handler.call::<Value>(arguments);
+            runtime.allow_actions(false);
+            let result = result.and_then(CallValue::from_lua).and_then(|value| {
+                let changed = runtime.refresh_at_checked(now, &validate)?;
+                let cleaned = runtime.cancel_unavailable_presses_checked(now, &validate)?;
+                let pointer = runtime.reconcile_pointer_checked(&validate)?;
+                Ok(CommandCall {
+                    value,
+                    changed: changed || cleaned || pointer.changed,
+                })
+            });
+            match result {
+                Ok(call) => Ok(Some(call)),
+                Err(error) => {
+                    runtime.truncate_actions(checkpoint);
+                    Err(error.context(format!("command {name:?}")))
                 }
             }
         })
@@ -2810,13 +2875,14 @@ fn kind(name: &str) -> Result<Kind> {
 
 fn install_ui(
     lua: &Lua,
-    tracker: Rc<RefCell<Tracker>>,
     timers: &Rc<RefCell<timer::Timers>>,
     motions: &Rc<RefCell<motion::Motions>>,
     bounds: &Rc<RefCell<bounds::Bounds>>,
     geometry: &Rc<RefCell<geometry::Geometry>>,
     services: &services::Services,
+    commands: &Rc<RefCell<command::Commands>>,
 ) -> Result<Rc<RefCell<UiContext>>> {
+    let tracker = services.tracker().clone();
     let ui = lua.create_table()?;
     timer::Timers::install(timers, lua, &ui)?;
     motion::Motions::install(motions, lua, &ui)?;
@@ -2824,6 +2890,7 @@ fn install_ui(
     let context = Rc::new(RefCell::new(UiContext::default()));
     bounds::Bounds::install(bounds, &context, lua, &ui)?;
     geometry::install(lua, &ui, tracker.clone(), geometry.clone())?;
+    command::Commands::install(commands, lua, &ui)?;
     let next_id = Rc::new(Cell::new(1_u64));
     for name in [
         "panel",

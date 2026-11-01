@@ -1225,6 +1225,123 @@ entry, are reported in the terminal running thing.
 problem watching the directories, such as reaching the system's inotify limit.
 while watching fails, the service rescans every 30 seconds instead.
 
+## commands from shortcuts and scripts
+
+a configuration can declare commands that compositor shortcuts and scripts
+call while another application has focus. declare each one while the
+configuration loads:
+
+```luau
+local launcher_open = ui.state(false)
+local tab = ui.state('apps')
+
+ui.command('toggle-launcher', function(arguments)
+    if arguments and type(arguments.tab) == 'string' then
+        tab:set(arguments.tab)
+    end
+    launcher_open:set(not launcher_open:get())
+    return { open = launcher_open:get(), tab = tab:get() }
+end)
+
+local bar_visible = ui.state(true)
+ui.command('toggle-bar', function()
+    bar_visible:set(not bar_visible:get())
+    return bar_visible:get()
+end)
+
+return ui.panel {
+    visible = function() return bar_visible:get() end,
+    children = {
+        ui.text { text = function()
+            return if launcher_open:get() then `launcher: {tab:get()}` else 'closed'
+        end },
+    },
+}
+```
+
+start the shell, then call a command from a terminal, a script, or a niri
+binding:
+
+```sh
+thing run ./panel.luau
+thing call toggle-launcher '{"tab": "files"}'
+# {"open":true,"tab":"files"}
+```
+
+```kdl
+binds {
+    Mod+Space { spawn "thing" "call" "--output" "DP-1" "toggle-launcher"; }
+}
+```
+
+a command name is 1 to 64 letters, digits, `-`, `_`, or `.`. a configuration
+may declare 64 commands, each once, and only while loading. the handler
+receives one argument, the json value given to `thing call` converted to luau
+data, or `nil`. it returns luau data that `thing call` prints as one line of
+json: `nil`, booleans, finite numbers, utf-8 strings, lists (tables with keys
+`1` to `n`), and maps (tables with string keys). an empty table becomes `{}`.
+inside a list or map, json `null` becomes `ui.null`, so it keeps its place
+in the table. compare with `ui.null` to detect it, or return it to include
+`null` in a result. an omitted argument or a top-level `null` becomes `nil`.
+a value may nest 16 levels and hold 1024 items, strings may be 16 KiB, a
+request may be 64 KiB, and a reply 256 KiB. functions, userdata, metatables,
+cycles, mixed or sparse keys, and non-finite numbers are errors; `ui.null`
+is the only accepted userdata value.
+
+handlers run like event handlers. they may change state, start timers, and
+use services, and the result goes through the same validation as any other
+update. when the handler fails, returns unsupported data, or produces a
+layout the host rejects, the call reports the error, and its service actions,
+focus and reveal requests, and timer and motion controls are discarded. state
+the handler already wrote stays written, as with a failing event handler, and
+nothing rolls back plain luau variables.
+
+### choosing an instance and output
+
+each `thing run` is an instance, `default` unless you pass
+`--instance <name>`. `thing call --instance <name>` reaches it. a second
+`thing run` with the default name runs without commands and says so; an
+explicit `--instance` that is already taken refuses to start.
+
+each output runs its own copy of the configuration, so a call chooses outputs
+explicitly:
+
+| `thing call` | runs on |
+| --- | --- |
+| no option | the only output; an error when the instance has several |
+| `--output DP-1` | the output the compositor names `DP-1` |
+| `--all-outputs` | every output in turn, printing `[{ "output": ..., "value": ... }]` |
+
+every selected output must declare the command before any of them runs it.
+an unknown output, an ambiguous selection, a missing command, or a failing
+handler prints an error that names the outputs or commands available, and
+exits with 1. usage errors exit with 2. `--timeout <seconds>` changes the
+10-second limit for connecting, sending the request, and receiving the reply.
+reaching that limit does not cancel a handler that has already started.
+
+### lifecycle
+
+calls run on the ui thread between frames, one at a time, against the
+configuration that is current when the request arrives. a reload replaces
+the commands: an accepted reload calls the new handlers, a rejected reload
+keeps the running ones, and a handler from a replaced configuration never
+runs again. removing an output removes its commands from selection. when the
+shell exits, open connections close and the socket is removed.
+
+### the socket
+
+the socket is `$XDG_RUNTIME_DIR/thing/<instance>.sock`. thing refuses to use
+it unless the runtime directory and its `thing` directory belong to you with
+mode 0700. it only answers connections from your own user, never listens on
+a network, and serves up to 8 clients at once. a client gets 5 seconds to send
+its request and read the reply; a slow or silent client is disconnected
+without delaying the shell. a lock file next to the socket marks the live
+owner, so a new instance replaces only a stale socket, and an exiting instance
+removes only the socket it created.
+
+lock configurations cannot declare commands, and `thing lock` has no command
+socket.
+
 ## managed processes
 
 use `services.process` when a configuration needs to read a child process or

@@ -5,15 +5,16 @@ use std::{
     time::Instant,
 };
 
+use crate::command::OutputSelection;
 use thing_core::{Node, NodeId, Rect};
 use thing_runtime::{
     Action, ApplicationsSnapshot, AudioSnapshot, AuthenticationSnapshot, BoundsProvider,
-    BoundsRect, ClipboardSnapshot, Event, IdleWatchDefinition, KeyInput, ManagedProcessDefinition,
-    ManagedProcessSnapshot, ManagedProcessState, MappedPoint, MediaSnapshot, NiriState,
-    NotificationSnapshot, OutputContext, PointerDispatchOutcome as RuntimePointerOutcome,
-    PointerEvent, PowerSnapshot, PresentedBounds, Runtime, Scalar, ScrollInput, ServiceSnapshot,
-    SleepInhibitorDefinition, SleepInhibitorState, SurfaceKey, SurfaceTree, SystemTraySnapshot,
-    TimerToken, UiAction, UiTarget, WidgetBounds,
+    BoundsRect, CallValue, ClipboardSnapshot, Event, IdleWatchDefinition, KeyInput,
+    ManagedProcessDefinition, ManagedProcessSnapshot, ManagedProcessState, MappedPoint,
+    MediaSnapshot, NiriState, NotificationSnapshot, OutputContext,
+    PointerDispatchOutcome as RuntimePointerOutcome, PointerEvent, PowerSnapshot, PresentedBounds,
+    Runtime, Scalar, ScrollInput, ServiceSnapshot, SleepInhibitorDefinition, SleepInhibitorState,
+    SurfaceKey, SurfaceTree, SystemTraySnapshot, TimerToken, UiAction, UiTarget, WidgetBounds,
 };
 use thing_ui::Layout;
 
@@ -1052,6 +1053,116 @@ impl<K: Clone + Eq> Configurations<K> {
             actions: runtime.take_actions(),
             ui_actions: runtime.take_ui_actions(),
         }))
+    }
+
+    /// the outputs a command request selects. selection never guesses: an
+    /// unnamed request needs exactly one output, and every selected output
+    /// must declare the command before any of them runs it.
+    pub(crate) fn command_targets(
+        &self,
+        selection: &OutputSelection,
+        command: &str,
+    ) -> Result<Vec<K>, String> {
+        let name = |instance: &Instance<K>| {
+            instance
+                .output
+                .name
+                .clone()
+                .unwrap_or_else(|| "an unnamed output".into())
+        };
+        let names = || {
+            self.instances
+                .iter()
+                .map(name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let targets: Vec<&Instance<K>> = match selection {
+            _ if self.instances.is_empty() => {
+                return Err("this instance has no outputs yet".into());
+            }
+            OutputSelection::Implicit if self.instances.len() == 1 => {
+                self.instances.iter().collect()
+            }
+            OutputSelection::Implicit => {
+                return Err(format!(
+                    "this instance runs on {} outputs ({}); pass --output <name> or --all-outputs",
+                    self.instances.len(),
+                    names()
+                ));
+            }
+            OutputSelection::Named(wanted) => {
+                let matches: Vec<_> = self
+                    .instances
+                    .iter()
+                    .filter(|instance| instance.output.name.as_deref() == Some(wanted))
+                    .collect();
+                match matches.len() {
+                    1 => matches,
+                    0 => {
+                        return Err(format!(
+                            "no output named {wanted:?}; this instance runs on {}",
+                            names()
+                        ));
+                    }
+                    _ => return Err(format!("more than one output is named {wanted:?}")),
+                }
+            }
+            OutputSelection::All => self.instances.iter().collect(),
+        };
+        if let Some(missing) = targets.iter().find(|instance| {
+            !instance
+                .runtime
+                .command_names()
+                .iter()
+                .any(|name| name == command)
+        }) {
+            let declared = missing.runtime.command_names();
+            return Err(if declared.is_empty() {
+                format!(
+                    "the configuration on {} declares no commands; add one with ui.command",
+                    name(missing)
+                )
+            } else {
+                format!(
+                    "the configuration on {} has no command {command:?}; it declares {}",
+                    name(missing),
+                    declared.join(", ")
+                )
+            });
+        }
+        Ok(targets
+            .into_iter()
+            .map(|instance| instance.key.clone())
+            .collect())
+    }
+
+    /// runs a command on one output. `None` means the output or command is
+    /// gone, for example after a reload or output removal.
+    pub(crate) fn call_command_checked(
+        &mut self,
+        key: &K,
+        command: &str,
+        arguments: &CallValue,
+        validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
+    ) -> Result<Option<(CallValue, DispatchOutcome)>, String> {
+        let Some(runtime) = self.runtime_mut(key) else {
+            return Ok(None);
+        };
+        let Some(call) = runtime
+            .call_command_checked(command, arguments, validate)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            call.value,
+            DispatchOutcome {
+                changed: call.changed,
+                actions: runtime.take_actions(),
+                ui_actions: runtime.take_ui_actions(),
+            },
+        )))
     }
 
     /// each output's consumer with the idle watches its configuration
