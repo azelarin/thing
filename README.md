@@ -20,9 +20,9 @@ system libraries:
 if you use pipewire, its pulseaudio-compatible server handles the audio
 connection. you'll still need the pulseaudio development library to build thing.
 
-your wayland compositor needs to support `wlr-layer-shell`.
-this is the protocol that lets thing place a bar along the edge of your screen
-and reserve space for it.
+panels need a compositor that supports `wlr-layer-shell`. this protocol lets
+thing place a bar along the edge of your screen and reserve space for it.
+window-only configurations use the standard `xdg-shell` protocol.
 
 from the repository directory, install thing with cargo:
 
@@ -54,7 +54,7 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 ## roadmap
 
 - [x] luau configurations, reactive state, and reloads
-- [x] panels, popups, layout, text, and images
+- [x] panels, application windows, popups, layout, text, and images
 - [x] multiple independent surfaces on each output
 - [x] clock, power state, output audio controls, and niri workspaces and windows
 - [x] per-output configuration

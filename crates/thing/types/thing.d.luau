@@ -403,6 +403,28 @@ export type ThingPanelProperties = {
     children: ThingChildren?,
 }
 
+-- whole logical pixels from 1 through 16384.
+export type ThingWindowSize = { width: number, height: number }
+
+-- a compositor-managed toplevel. its size comes from size, the limits, and
+-- the compositor, so style width and height are not accepted.
+export type ThingWindowProperties = {
+    key: string?,
+    visible: ThingReactive<boolean>?,
+    enabled: ThingReactive<boolean>?,
+    style: ThingStyle?,
+    title: ThingReactive<string>?,
+    app_id: ThingReactive<string>?,
+    size: ThingReactive<ThingWindowSize>?,
+    min_size: ThingReactive<ThingWindowSize?>?,
+    max_size: ThingReactive<ThingWindowSize?>?,
+    idle_inhibit: ThingReactive<boolean>?,
+    on_close: (() -> ())?,
+    on_key: ((event: ThingKeyEvent) -> boolean)?,
+    on_scroll: ThingScrollHandler?,
+    children: ThingChildren?,
+}
+
 export type ThingLockProperties = {
     visible: ThingReactive<boolean>?,
     enabled: ThingReactive<boolean>?,
@@ -851,6 +873,22 @@ declare extern type ThingClockService with
     read date: ThingSignal<string>
 end
 
+-- what the compositor last configured for a window. requests are actions,
+-- available in event handlers, and the compositor may decline them.
+declare extern type ThingWindowState with
+    read open: ThingSignal<boolean>
+    read width: ThingSignal<number>
+    read height: ThingSignal<number>
+    read maximized: ThingSignal<boolean>
+    read fullscreen: ThingSignal<boolean>
+    read activated: ThingSignal<boolean>
+    read can_maximize: ThingSignal<boolean>
+    read can_fullscreen: ThingSignal<boolean>
+    read decorated: ThingSignal<boolean>
+    read set_maximized: (maximized: boolean) -> ()
+    read set_fullscreen: (fullscreen: boolean) -> ()
+end
+
 declare extern type ThingIdleWatch with
     read idle: ThingSignal<boolean>
 end
@@ -1030,6 +1068,8 @@ end
 
 declare ui: {
     panel: (properties: ThingPanelProperties) -> ThingWidget,
+    window: (properties: ThingWindowProperties) -> ThingWidget,
+    window_state: (key: string) -> ThingWindowState,
     lock: (properties: ThingLockProperties) -> ThingWidget,
     popup: (properties: ThingPopupProperties) -> ThingWidget,
     row: (properties: ThingContainerProperties) -> ThingWidget,

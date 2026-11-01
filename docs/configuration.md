@@ -157,7 +157,8 @@ resets each output's local state and closes its popups.
 ## multiple surfaces
 
 return an array when one output needs independent surfaces, such as a bar and a
-drawer. every panel in the array needs a unique, static `key`:
+drawer. every surface in the array, panel or [window](#windows), needs a
+unique, static `key`:
 
 ```luau
 local drawer_open = ui.state(false)
@@ -296,6 +297,125 @@ a true request is validated even for a currently hidden panel or closed popup,
 so opening it cannot reveal an unsupported request. if the compositor removes
 the protocol while a surface still requires inhibition, thing reports a fatal
 host error rather than pretending that the request remains active.
+
+## windows
+
+`ui.window` opens an ordinary compositor-managed window, for settings dialogs,
+search windows, or task views that should behave like applications rather than
+panels. it is a surface root like `ui.panel` and lives in the same array:
+
+```luau
+-- the output whose runtime owns the settings window.
+local home = 'DP-1'
+local here = services.output.name:get() == home
+local settings_open = ui.state(false)
+
+local surfaces = {
+    ui.panel {
+        key = 'bar',
+        style = { height = 32, padding = 4, background = '#191b22' },
+        children = {
+            here and ui.button {
+                on_click = function() settings_open:set(true) end,
+                children = { ui.text { text = 'settings' } },
+            } or ui.text { text = '' },
+        },
+    },
+}
+
+if here then
+    local settings = ui.window_state('settings')
+    table.insert(surfaces, ui.window {
+        key = 'settings',
+        title = 'shell settings',
+        app_id = 'org.example.shell-settings',
+        size = { width = 480, height = 360 },
+        min_size = { width = 320, height = 240 },
+        visible = function() return settings_open:get() end,
+        on_close = function() settings_open:set(false) end,
+        style = { background = '#202430' },
+        children = { ui.column { style = { padding = 16, gap = 8 }, children = {
+            ui.text { text = function()
+                return `{settings.width:get()} by {settings.height:get()}`
+            end },
+            ui.button {
+                enabled = function() return settings.can_maximize:get() end,
+                on_click = function() settings.set_maximized(not settings.maximized:get()) end,
+                children = { ui.text { text = 'maximize' } },
+            },
+        } } },
+    })
+end
+
+return surfaces
+```
+
+| property | default | meaning |
+| --- | --- | --- |
+| `title` | `''` | window title shown by the compositor |
+| `app_id` | absent | application id the compositor may use for icons and rules |
+| `size` | 640 by 480 | content size requested before the compositor suggests one |
+| `min_size`, `max_size` | absent | size limits sent to the compositor |
+| `visible` | `true` | whether the window exists |
+| `on_close` | absent | handles the compositor's close request |
+| `on_key`, `on_scroll`, `idle_inhibit` | | as on a panel |
+
+sizes are `{ width, height }` tables of whole logical pixels from 1 through
+16,384, and `size` must lie within the limits. all of these may be reactive.
+panel fields such as `layer`, `anchors`, `margins`, `exclusive_zone`,
+`keyboard_mode`, `input_region`, and `namespace` are rejected, as are style
+`width` and `height` on the window itself. the window's content is laid out at
+whatever size the compositor configures. like a panel root, the window lays
+its children out in a row, so put a `ui.column` inside for a form.
+
+**ownership.** a window belongs to the output runtime that declared it, and
+the configuration runs once per output. returning a window from every runtime
+opens one window per output; to open a single window, declare it from one
+runtime, as the example does by naming an output. thing never picks a primary
+output for you. the owning runtime keeps the window's state and handlers
+wherever the compositor shows it, but state in another output's runtime cannot
+open or change it: in the example only the owning output's bar gets the
+button. removing the owning output closes the window with its runtime.
+
+**sizing.** the compositor decides the size. thing asks for `size` first and
+then uses each size the compositor configures. when it suggests zero for an
+axis, the window keeps its current size, clamped to the limits. a maximized,
+fullscreen, or tiled size can exceed `max_size`, because the compositor
+decides those. layout that fails at a new size leaves the window drawing its
+last accepted layout. the render scale follows the compositor's preferred
+scale for the window, which may differ from the owning output's.
+
+**closing.** with `on_close`, a close request runs the handler as an event,
+and the handler decides: usually it sets the state behind `visible` to false.
+a window whose handler leaves it visible stays open, and a handler that fails
+publishes none of its actions. without `on_close`, the window closes and stays
+closed until its `visible` value becomes false and then true again, or the
+configuration reloads. other updates never reopen it. in both cases, opening
+it again means setting the visible state true from an event handler.
+
+an accepted reload keeps open windows, binds them to the replacement
+configuration, and resets their input and focus. a rejected reload leaves
+them alone. lock configurations reject windows.
+
+**state.** `ui.window_state(key)` returns a handle for a window the same
+configuration declares with that key. call it while the configuration loads.
+its read-only signals report what the compositor last configured: `open`,
+`width`, `height`, `maximized`, `fullscreen`, `activated`, `can_maximize`,
+`can_fullscreen`, and `decorated`. `set_maximized(boolean)` and
+`set_fullscreen(boolean)` are actions for event handlers. the compositor may
+ignore them, and the signals change only when it configures the window. a
+compositor that does not advertise its capabilities is assumed to allow both.
+
+**decorations.** thing asks for server-side decorations when the compositor
+offers xdg-decoration, and `decorated` reports whether it agreed. thing never
+draws a title bar, border, or resize handles of its own, so without
+server-side decorations the window has no frame. moving and resizing then
+depend on the compositor's own bindings.
+
+popups inside a window are parented to that window and positioned in its
+coordinates. an automatic popup opens below its button. a window does not
+take keyboard focus by itself; the compositor decides focus when it maps the
+window.
 
 ## widgets and children
 

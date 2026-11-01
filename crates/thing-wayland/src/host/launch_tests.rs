@@ -760,13 +760,14 @@ impl Host {
             hover: HoverStates::default(),
             surfaces: Vec::new(),
             closed_surfaces: Vec::new(),
+            pending_window_states: Vec::new(),
             registry: RegistryState::new(&globals),
             idle_inhibit: IdleInhibitState::default(),
             idle_notify: crate::idle_notify::State::default(),
             seats: SeatState::new(&globals, &qh),
             outputs: OutputState::new(&globals, &qh),
             compositor: CompositorState::bind(&globals, &qh).unwrap(),
-            layer_shell: LayerShell::bind(&globals, &qh).unwrap(),
+            layer_shell: Some(LayerShell::bind(&globals, &qh).unwrap()),
             layer_shell_version: 4,
             xdg_shell: XdgShell::bind(&globals, &qh).unwrap(),
             activation: globals.bind(&qh, 1..=1, ()).ok(),
@@ -1102,6 +1103,9 @@ fn popup_candidates_use_their_own_scale() {
         size: (320, 40),
         scroll: ScrollState::default(),
         focused: None,
+        // the popup already draws at its preferred scale, so there is no
+        // accepted scale to fall back to.
+        scale: Scale::from_120ths(360).unwrap(),
         preferred_scale: Scale::from_120ths(360).unwrap(),
     }];
     let error = prepare_candidate_layouts(&mut host.app.render, &surfaces, &output, &current)

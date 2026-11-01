@@ -73,6 +73,11 @@ pub enum Action {
         key: String,
         action: crate::SleepInhibitorAction,
     },
+    /// a request for the window this configuration declared with `key`.
+    Window {
+        key: String,
+        request: crate::WindowRequest,
+    },
 }
 
 /// a request to start an installed application from its desktop entry.
@@ -1627,6 +1632,7 @@ pub(crate) struct Services {
     managed_process_declarations_open: Rc<Cell<bool>>,
     idle_watches: Rc<RefCell<crate::idle::IdleWatches>>,
     sleep_inhibitors: Rc<RefCell<crate::sleep::SleepInhibitors>>,
+    window_states: Rc<RefCell<crate::window::WindowStates>>,
     application_launches_allowed: Rc<Cell<bool>>,
     niri: NiriData,
 }
@@ -1679,6 +1685,7 @@ impl Services {
             managed_process_declarations_open: Rc::new(Cell::new(true)),
             idle_watches: Rc::default(),
             sleep_inhibitors: Rc::default(),
+            window_states: Rc::default(),
             application_launches_allowed: Rc::new(Cell::new(true)),
             niri: niri_data,
         };
@@ -2437,6 +2444,27 @@ impl Services {
 
     pub(crate) fn tracker(&self) -> &Rc<RefCell<Tracker>> {
         &self.tracker
+    }
+
+    /// installs `ui.window_state`, which shares the declaration rule.
+    pub(crate) fn install_window_states(&self, lua: &Lua, ui: &Table) -> Result<()> {
+        crate::window::install(
+            lua,
+            ui,
+            self.tracker.clone(),
+            self.window_states.clone(),
+            self.actions.clone(),
+            self.allowed.clone(),
+            self.managed_process_declarations_open.clone(),
+        )
+    }
+
+    pub(crate) fn window_state_keys(&self) -> Vec<String> {
+        self.window_states.borrow().keys().cloned().collect()
+    }
+
+    pub(crate) fn set_window_state(&self, key: &str, state: crate::WindowState) -> Result<()> {
+        self.window_states.borrow().set(&self.tracker, key, state)
     }
 
     pub fn sleep_inhibitor_definitions(&self) -> Vec<crate::SleepInhibitorDefinition> {
