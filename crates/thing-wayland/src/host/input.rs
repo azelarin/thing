@@ -1,6 +1,24 @@
 use super::*;
 
 impl App {
+    fn presented_link_is_current(&self, index: usize, id: NodeId, link: u16) -> bool {
+        let Some(surface) = self.surfaces.get(index) else {
+            return false;
+        };
+        let Some(target) = surface
+            .layouts
+            .presented()
+            .and_then(|layout| layout.link_target(id, link))
+        else {
+            return false;
+        };
+        self.configurations
+            .surface_root(&surface.output, &surface.key)
+            .and_then(|root| root.find(id))
+            .and_then(|node| node.links.get(usize::from(link)))
+            .is_some_and(|current| current == target)
+    }
+
     /// shows the cursor of the presented layout under the pointer. only
     /// presented, accepted layouts decide, so a rejected candidate or reload
     /// never shows its cursor.
@@ -85,6 +103,7 @@ impl App {
                 let surface = &mut self.surfaces[index];
                 surface.input.pressed = None;
                 surface.pressed_target = None;
+                surface.pressed_link = None;
                 surface.pressed_button = None;
                 surface.press_serial = None;
                 surface.dirty = true;
@@ -152,6 +171,7 @@ impl App {
                 }
                 surface.pressed_button = None;
                 surface.pressed_target = None;
+                surface.pressed_link = None;
                 surface.press_serial = None;
                 surface.range_press = None;
                 surface.dirty = true;
@@ -580,6 +600,7 @@ impl App {
         let surface = &mut self.surfaces[index];
         surface.input.pressed = None;
         surface.pressed_target = None;
+        surface.pressed_link = None;
         surface.pressed_button = None;
         surface.press_serial = None;
         surface.dirty = true;
@@ -1838,6 +1859,7 @@ impl App {
             surface.press_serial = None;
             surface.pressed_button = None;
             surface.pressed_target = None;
+            surface.pressed_link = None;
             surface.dirty = true;
         }
         for (output, _, target) in pressed {
@@ -2187,6 +2209,46 @@ impl App {
             return false;
         };
         match action {
+            WidgetKeyAction::Link(step) => {
+                let surface = &mut self.surfaces[index];
+                let links = surface
+                    .layouts
+                    .presented()
+                    .map(|layout| visible_links(layout, id))
+                    .unwrap_or_default();
+                let current = surface
+                    .layouts
+                    .presented()
+                    .and_then(|layout| layout.selected_link(id, surface.input.focused_link));
+                surface.input.focused_link = step_link(&links, current, step);
+                surface.input.reveal_keyboard_focus();
+                surface.layouts.invalidate_input();
+                surface.prepared = None;
+                surface.dirty = true;
+                self.prepare_invalidated_input_layouts_now();
+            }
+            WidgetKeyAction::Activate if node.kind == Kind::Text => {
+                let surface = &mut self.surfaces[index];
+                let links = surface
+                    .layouts
+                    .presented()
+                    .map(|layout| visible_links(layout, id))
+                    .unwrap_or_default();
+                // the selected link if it is still visible, else the first.
+                let link = surface
+                    .input
+                    .focused_link
+                    .filter(|link| links.contains(link))
+                    .or_else(|| links.first().copied());
+                surface.input.focused_link = link;
+                surface.input.reveal_keyboard_focus();
+                surface.dirty = true;
+                if let Some(link) =
+                    link.filter(|link| self.presented_link_is_current(index, id, *link))
+                {
+                    self.dispatch(output, id, Event::Link(link), origin);
+                }
+            }
             WidgetKeyAction::Activate => {
                 let activated = self.surfaces[index]
                     .focus_target
@@ -2448,10 +2510,17 @@ impl PointerHandler for App {
                 {
                     self.clear_key_repeat();
                     let event_surface = self.surfaces[index].role.surface().clone();
+                    let pressed_link = hit.as_ref().and_then(|target| {
+                        let id = target.target.node();
+                        let layout = self.surfaces[index].layouts.presented()?;
+                        let link = layout.link_at(id, point)?;
+                        Some((link, layout.link_target(id, link)?.to_owned()))
+                    });
                     let surface = &mut self.surfaces[index];
                     surface.pointer_position = Some(point);
                     surface.input.pressed = hit.as_ref().map(|target| target.target.node());
                     surface.pressed_target = hit.clone();
+                    surface.pressed_link = pressed_link;
                     surface.pressed_button = Some(button);
                     surface.press_serial = Some(serial);
                     surface.dirty = true;
@@ -2535,6 +2604,7 @@ impl PointerHandler for App {
                     self.surfaces[index].pointer_position = Some(point);
                     self.surfaces[index].input.pressed = None;
                     let pressed = self.surfaces[index].pressed_target.take();
+                    let pressed_link = self.surfaces[index].pressed_link.take();
                     let range_press = self.surfaces[index].range_press.take();
                     let popup_serial = self.surfaces[index].press_serial.take();
                     let output = self.surfaces[index].output.clone();
@@ -2577,16 +2647,47 @@ impl PointerHandler for App {
                         })
                     }) {
                         let id = target.target.node();
-                        self.dispatch(
-                            output,
-                            id,
-                            match button {
+                        let is_text = self
+                            .configurations
+                            .surface_root(&output, &self.surfaces[index].key)
+                            .and_then(|root| root.find(id))
+                            .is_some_and(|node| node.kind == Kind::Text);
+                        let event = if is_text {
+                            // only the link under the release point activates,
+                            // as the presented frame shaped it.
+                            let link = self.surfaces[index]
+                                .layouts
+                                .presented()
+                                .and_then(|layout| layout.link_at(id, point));
+                            self.surfaces[index].input.focused_link = link;
+                            link.filter(|link| {
+                                button == 0x110
+                                    && self.presented_link_is_current(index, id, *link)
+                                    && pressed_link.as_ref().is_some_and(|(pressed, target)| {
+                                        pressed == link
+                                            && self.surfaces[index]
+                                                .layouts
+                                                .presented()
+                                                .and_then(|layout| layout.link_target(id, *link))
+                                                == Some(target.as_str())
+                                    })
+                            })
+                            .map(Event::Link)
+                        } else {
+                            Some(match button {
                                 0x111 => Event::SecondaryClick,
                                 0x112 => Event::MiddleClick,
                                 _ => Event::Click,
-                            },
-                            self.input_origin(event_surface.clone(), release_serial),
-                        );
+                            })
+                        };
+                        if let Some(event) = event {
+                            self.dispatch(
+                                output,
+                                id,
+                                event,
+                                self.input_origin(event_surface.clone(), release_serial),
+                            );
+                        }
                         if let Some((index, serial)) = self.index(&event_surface).zip(popup_serial)
                         {
                             self.sync_popup(

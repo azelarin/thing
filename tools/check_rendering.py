@@ -25,11 +25,13 @@ ARTIFACTS = ROOT / "target/render-tests"
 CASES = (
     "image-fit", "stencil", "gradients", "radial-gradients", "shadows", "shared-motion",
     "widget-bounds", "rounded-clips", "path-clips", "horizontal-scroll", "motion-lifecycle", "content-transitions", "windows",
+    "styled-text",
 )
 # these accept a state only after the same passing frame is captured twice.
 STABLE_FRAMES = {
     "windows": 2,
     "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2, "rounded-clips": 2, "horizontal-scroll": 2, "motion-lifecycle": 2, "content-transitions": 2,
+    "styled-text": 2,
 }
 RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
 # the runtime error each panel-invalid.luau must produce, in thing check and in
@@ -527,6 +529,48 @@ def verify_windows(image, stage, scale):
     actual = image.pixel(left + physical(16, scale), top + physical(height / 2, scale))
     if max(abs(a-b) for a, b in zip(actual, marker)) > 5:
         raise FixtureError(f"window child was {actual}; expected {marker}")
+def count_pixels(image, box, scale, matches):
+    left, top, right, bottom = (physical(value, scale) for value in box)
+    return sum(
+        1
+        for y in range(top, min(bottom, image.height))
+        for x in range(left, min(right, image.width))
+        if matches(image.pixel(x, y))
+    )
+
+
+def near(expected, tolerance=40):
+    return lambda actual: max(abs(a - b) for a, b in zip(actual, expected)) <= tolerance
+
+
+def verify_styled_text(image, stage, scale):
+    """text depends on installed fonts, so these probes count colored pixels
+    in generous regions instead of sampling single points."""
+    accent = (71, 209, 108) if stage == "reload" else (255, 48, 48)
+    stale = (255, 48, 48) if stage == "reload" else (71, 209, 108)
+    foreground = (121, 151, 255)
+    minimum = int(60 * scale * scale)
+    if count_pixels(image, (20, 10, 330, 70), scale, near(accent)) < minimum:
+        raise FixtureError("the colored span is missing or has the wrong color")
+    if count_pixels(image, (0, 0, 640, 200), scale, near(stale, 20)) > 0:
+        raise FixtureError("pixels from the other stage's span color remain")
+    if count_pixels(image, (200, 10, 640, 70), scale, near(foreground)) < minimum:
+        raise FixtureError("unstyled text lost the widget's foreground")
+    if count_pixels(image, (240, 10, 640, 70), scale, near(accent)) > 0:
+        raise FixtureError("the span color leaked past its range")
+    link = near((224, 164, 81))
+    rows = [
+        count_pixels(image, (20, y, 620, y + 1 / scale), scale, link)
+        for y in [80 + index / scale for index in range(int(40 * scale))]
+    ]
+    if count_pixels(image, (20, 80, 620, 120), scale, link) < minimum or max(rows, default=0) < 80 * scale:
+        raise FixtureError("the link is missing its color or its continuous underline")
+    white = near((255, 255, 255), 60)
+    if count_pixels(image, (20, 120, 220, 156), scale, white) < minimum:
+        raise FixtureError("the first two lines of the ellipsized text are missing")
+    if count_pixels(image, (20, 160, 220, 190), scale, white) > 0:
+        raise FixtureError("text painted beyond the two-line limit")
+    expect_color(image, (210, 185), scale, (40, 179, 161), "ellipsis box background", tolerance=3)
 
 
 def verify_capture(case, image, stage, scale):
@@ -556,6 +600,8 @@ def verify_capture(case, image, stage, scale):
         verify_motion_lifecycle(image, stage, scale)
     elif case == "content-transitions":
         verify_content_transitions(image, stage, scale)
+    elif case == "styled-text":
+        verify_styled_text(image, stage, scale)
     else:
         raise FixtureError(f"unknown renderer fixture: {case}")
 

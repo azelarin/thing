@@ -506,6 +506,27 @@ pub enum TextOverflow {
     Ellipsis,
 }
 
+/// the most styled spans one text widget may hold.
+pub const MAX_TEXT_SPANS: usize = 256;
+/// the most links one text widget may hold.
+pub const MAX_TEXT_LINKS: usize = 64;
+/// the longest link target.
+pub const MAX_LINK_BYTES: usize = 2048;
+
+/// styling for one byte range of a text widget's `text`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TextSpan {
+    /// a byte range on character boundaries. spans are sorted and disjoint;
+    /// text outside every span uses the widget's own style.
+    pub range: std::ops::Range<usize>,
+    pub weight: Option<f32>,
+    pub italic: bool,
+    pub underline: bool,
+    pub color: Option<Color>,
+    /// an index into the widget's `links`.
+    pub link: Option<u16>,
+}
+
 /// how an image is sized inside its content box.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ImageFit {
@@ -695,6 +716,8 @@ pub struct Style {
     pub font_family: String,
     pub text_align: TextAlign,
     pub tabular_digits: bool,
+    /// extra advance after each character, in logical pixels.
+    pub letter_spacing: f32,
     pub background: Brush,
     pub box_shadow: Option<Shadow>,
     pub foreground: Color,
@@ -746,6 +769,7 @@ impl Default for Style {
             font_family: "sans-serif".into(),
             text_align: TextAlign::Start,
             tabular_digits: false,
+            letter_spacing: 0.0,
             background: Brush::default(),
             box_shadow: None,
             foreground: Color::WHITE,
@@ -948,6 +972,13 @@ pub struct Node {
     pub placeholder: String,
     pub max_lines: Option<u32>,
     pub text_overflow: TextOverflow,
+    /// styled ranges of `text`; empty for plain text.
+    pub spans: std::sync::Arc<[TextSpan]>,
+    /// link targets that spans refer to by index. thing never opens them.
+    pub links: std::sync::Arc<[String]>,
+    /// whether the configuration handles link activation. a text widget with
+    /// a handler and at least one link takes pointer and keyboard input.
+    pub link_handler: bool,
     pub scroll_axis: ScrollAxis,
     pub image: Image,
     pub image_fit: ImageFit,
@@ -982,6 +1013,77 @@ struct ValidationScope {
 }
 
 impl Node {
+    /// whether this widget takes pointer activation and keyboard focus.
+    pub fn is_interactive(&self) -> bool {
+        self.kind.is_interactive()
+            || (self.kind == Kind::Text && self.link_handler && !self.links.is_empty())
+    }
+
+    /// the link under byte `index` of `text`, if any.
+    pub fn link_at_byte(&self, index: usize) -> Option<u16> {
+        self.spans
+            .iter()
+            .find(|span| span.range.contains(&index))
+            .and_then(|span| span.link)
+    }
+
+    fn validate_spans(&self) -> Result<(), TreeError> {
+        if self.spans.is_empty() && self.links.is_empty() {
+            return Ok(());
+        }
+        if self.kind != Kind::Text {
+            return Err(TreeError(
+                "spans and links are available only on text widgets".into(),
+            ));
+        }
+        if self.spans.len() > MAX_TEXT_SPANS {
+            return Err(TreeError(format!(
+                "a text widget may hold at most {MAX_TEXT_SPANS} spans"
+            )));
+        }
+        if self.links.len() > MAX_TEXT_LINKS {
+            return Err(TreeError(format!(
+                "a text widget may hold at most {MAX_TEXT_LINKS} links"
+            )));
+        }
+        if self
+            .links
+            .iter()
+            .any(|link| link.is_empty() || link.len() > MAX_LINK_BYTES || link.contains('\0'))
+        {
+            return Err(TreeError(format!(
+                "links must be 1 to {MAX_LINK_BYTES} bytes without NUL"
+            )));
+        }
+        let mut end = 0;
+        for span in self.spans.iter() {
+            if span.range.start < end
+                || span.range.start >= span.range.end
+                || span.range.end > self.text.len()
+                || !self.text.is_char_boundary(span.range.start)
+                || !self.text.is_char_boundary(span.range.end)
+            {
+                return Err(TreeError(
+                    "spans must be sorted, disjoint, nonempty character ranges of the text".into(),
+                ));
+            }
+            end = span.range.end;
+            if span
+                .weight
+                .is_some_and(|weight| !weight.is_finite() || !(1.0..=1000.0).contains(&weight))
+            {
+                return Err(TreeError("span weight must be between 1 and 1000".into()));
+            }
+            if span
+                .link
+                .is_some_and(|link| usize::from(link) >= self.links.len())
+            {
+                return Err(TreeError("span link refers to a missing link".into()));
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(id: NodeId, kind: Kind) -> Self {
         Self {
             id,
@@ -991,6 +1093,9 @@ impl Node {
             placeholder: String::new(),
             max_lines: None,
             text_overflow: TextOverflow::Clip,
+            spans: std::sync::Arc::from([]),
+            links: std::sync::Arc::from([]),
+            link_handler: false,
             scroll_axis: ScrollAxis::Vertical,
             image: Image::default(),
             image_fit: ImageFit::Contain,
@@ -1240,11 +1345,10 @@ impl Node {
                 "max_lines and overflow are available only on text widgets".into(),
             ));
         }
-        if self.text_overflow == TextOverflow::Ellipsis && self.max_lines != Some(1) {
-            return Err(TreeError(
-                "ellipsis currently requires max_lines = 1".into(),
-            ));
+        if self.text_overflow == TextOverflow::Ellipsis && self.max_lines.is_none() {
+            return Err(TreeError("ellipsis requires max_lines".into()));
         }
+        self.validate_spans()?;
         if matches!(self.kind, Kind::TextInput | Kind::SecretInput) {
             validate_single_line(&self.text, "text input value")?;
             validate_single_line(&self.placeholder, "text input placeholder")?;
@@ -1329,6 +1433,17 @@ impl Node {
         }
         if !style.font_weight.is_finite() || !(1.0..=1000.0).contains(&style.font_weight) {
             return Err(TreeError("font weight must be between 1 and 1000".into()));
+        }
+        if !style.letter_spacing.is_finite() || !(-100.0..=100.0).contains(&style.letter_spacing) {
+            return Err(TreeError(
+                "letter_spacing must be between -100 and 100".into(),
+            ));
+        }
+        // text fields place their caret with the editor's own shaping.
+        if style.letter_spacing != 0.0 && self.kind != Kind::Text {
+            return Err(TreeError(
+                "letter_spacing is available only on text widgets".into(),
+            ));
         }
         if [style.translate_x, style.translate_y]
             .into_iter()
@@ -1856,6 +1971,78 @@ mod tests {
     }
 
     #[test]
+    fn validates_spans_links_and_letter_spacing() {
+        let mut text = Node::new(NodeId(1), Kind::Text);
+        text.text = "héllo world".into();
+        text.links = Arc::from(["https://example.org".to_owned()]);
+        text.spans = Arc::from([
+            TextSpan {
+                range: 0..6,
+                weight: Some(700.0),
+                ..TextSpan::default()
+            },
+            TextSpan {
+                range: 7..12,
+                link: Some(0),
+                ..TextSpan::default()
+            },
+        ]);
+        assert!(text.validate().is_ok());
+        assert!(!text.is_interactive());
+        text.link_handler = true;
+        assert!(text.is_interactive());
+        assert_eq!(
+            (text.link_at_byte(8), text.link_at_byte(2)),
+            (Some(0), None)
+        );
+
+        for (spans, message) in [
+            (&[(2, 3)][..], "character ranges"),
+            (&[(0, 6), (5, 8)][..], "disjoint"),
+            (&[(3, 3)][..], "nonempty"),
+            (&[(0, 40)][..], "character ranges"),
+        ] {
+            let mut broken = text.clone();
+            broken.spans = spans
+                .iter()
+                .map(|&(start, end)| TextSpan {
+                    range: start..end,
+                    ..TextSpan::default()
+                })
+                .collect();
+            let error = broken.validate().unwrap_err().to_string();
+            assert!(error.contains("sorted, disjoint"), "{message}: {error}");
+        }
+        let mut missing = text.clone();
+        missing.links = Arc::from([]);
+        assert!(
+            missing
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("missing link")
+        );
+        let mut long = text.clone();
+        long.links = Arc::from(["x".repeat(MAX_LINK_BYTES + 1)]);
+        assert!(long.validate().is_err());
+        let mut row = Node::new(NodeId(2), Kind::Row);
+        row.links = text.links.clone();
+        assert!(
+            row.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("only on text")
+        );
+        text.style.letter_spacing = 101.0;
+        assert!(
+            text.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("letter_spacing")
+        );
+    }
+
+    #[test]
     fn validates_text_line_limits_and_ellipsis() {
         let mut text = Node::new(NodeId(1), Kind::Text);
         text.max_lines = Some(0);
@@ -1864,13 +2051,16 @@ mod tests {
             "max_lines must be a positive whole number"
         );
 
-        text.max_lines = Some(2);
+        text.max_lines = None;
         text.text_overflow = TextOverflow::Ellipsis;
         assert_eq!(
             text.validate().unwrap_err().to_string(),
-            "ellipsis currently requires max_lines = 1"
+            "ellipsis requires max_lines"
         );
 
+        // multiline ellipsis is supported.
+        text.max_lines = Some(3);
+        assert!(text.validate().is_ok());
         text.max_lines = Some(1);
         assert!(text.validate().is_ok());
 

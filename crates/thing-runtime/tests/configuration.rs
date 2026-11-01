@@ -1569,7 +1569,7 @@ fn rejects_invalid_text_layout_options() {
         "return ui.panel { children = { ui.text { max_lines = 1.5 } } }",
         "return ui.panel { children = { ui.text { overflow = 'fade' } } }",
         "return ui.panel { children = { ui.text { overflow = 'ellipsis' } } }",
-        "return ui.panel { children = { ui.text { max_lines = 2, overflow = 'ellipsis' } } }",
+        "return ui.panel { children = { ui.text { style = { letter_spacing = 'wide' } } } }",
         "return ui.panel { children = { ui.text { style = { text_align = 'right' } } } }",
         "return ui.panel { children = { ui.text { style = { tabular_digits = 1 } } } }",
     ] {

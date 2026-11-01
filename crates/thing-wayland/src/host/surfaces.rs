@@ -278,6 +278,7 @@ impl App {
             surface.press_serial = None;
             surface.pressed_button = None;
             surface.pressed_target = None;
+            surface.pressed_link = None;
             surface.range_press = None;
         }
         if limits || replaced {
@@ -345,6 +346,7 @@ impl App {
             press_serial: None,
             pressed_button: None,
             pressed_target: None,
+            pressed_link: None,
             range_press: None,
             configured: false,
             dirty: true,
@@ -525,6 +527,7 @@ impl App {
             surface.press_serial = None;
             surface.pressed_button = None;
             surface.pressed_target = None;
+            surface.pressed_link = None;
             surface.range_press = None;
         }
         surface.dirty = true;
@@ -819,7 +822,9 @@ impl App {
                 match action {
                     HostUiAction::Focus(_) => {
                         if layout.focus_order().any(|candidate| candidate == id) {
-                            changed |= layout.reveal(id, &mut scroll);
+                            let input = self.surfaces[index].input;
+                            let selected = input.focused_link.filter(|_| input.focused == Some(id));
+                            changed |= layout.reveal_focus(id, selected, &mut scroll);
                             focus = Some(target);
                         }
                     }
@@ -889,7 +894,8 @@ impl App {
                 &mut scroll,
             )?;
             let focused = self.surfaces[index].input.keyboard_focused();
-            if focused.is_some_and(|id| layout.reveal(id, &mut scroll)) {
+            let selected = self.surfaces[index].input.focused_link;
+            if focused.is_some_and(|id| layout.reveal_focus(id, selected, &mut scroll)) {
                 layout = self.render.layout(
                     &root,
                     Size {

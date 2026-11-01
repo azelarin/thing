@@ -802,6 +802,8 @@ impl Host {
                     )
                     .unwrap(),
             ));
+            // inject input only after the server knows the replacement pointer.
+            host.connection.roundtrip().unwrap();
         }
         host
     }

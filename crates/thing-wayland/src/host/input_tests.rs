@@ -20,8 +20,8 @@ use super::{
     prepare_text_input_submit, reconcile_controlled_text_edit, repeat_action_is_current,
     reset_active_text_input_generation, retain_non_focus_actions, reveal_text_input_focus,
     root_key_input, runtime_pointer_event, runtime_scroll_input, scroll_distance, scroll_steps,
-    scroll_view_axis_matches, semantic_pointer_target, surface_action_route, text_clipboard_action,
-    text_key_action, viewport_scroll_delta, widget_key_action,
+    scroll_view_axis_matches, semantic_pointer_target, step_link, surface_action_route,
+    text_clipboard_action, text_key_action, viewport_scroll_delta, widget_key_action,
 };
 
 struct FixedMeasurer;
@@ -1143,4 +1143,31 @@ fn physical_repeatability_controls_session_replacement() {
     );
     assert!(session.key.is_none());
     assert!(!session.host_is_armed());
+}
+
+#[test]
+fn linked_text_keys_select_and_activate_links() {
+    assert_eq!(
+        widget_key_action(Kind::Text, Keysym::Return, true),
+        Some(WidgetKeyAction::Activate)
+    );
+    assert_eq!(widget_key_action(Kind::Text, Keysym::Return, false), None);
+    assert_eq!(
+        widget_key_action(Kind::Text, Keysym::Right, false),
+        Some(WidgetKeyAction::Link(1))
+    );
+    assert_eq!(
+        widget_key_action(Kind::Text, Keysym::Up, false),
+        Some(WidgetKeyAction::Link(-1))
+    );
+    assert!(WidgetKeyAction::Link(1).repeats());
+    // stepping stops at either end; a stale selection restarts at an end.
+    let links = [2, 5, 7];
+    assert_eq!(step_link(&links, None, 1), Some(2));
+    assert_eq!(step_link(&links, None, -1), Some(7));
+    assert_eq!(step_link(&links, Some(5), 1), Some(7));
+    assert_eq!(step_link(&links, Some(7), 1), Some(7));
+    assert_eq!(step_link(&links, Some(2), -1), Some(2));
+    assert_eq!(step_link(&links, Some(9), 1), Some(2));
+    assert_eq!(step_link(&[], None, 1), None);
 }

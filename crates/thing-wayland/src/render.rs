@@ -308,6 +308,11 @@ impl Measurer for TestMeasurer {
     fn measure(&mut self, _: &Node, _: Option<f32>) -> Size {
         Size::default()
     }
+
+    fn links(&mut self, node: &Node, max_width: Option<f32>) -> Vec<(u16, thing_core::Rect)> {
+        // fixed-size host fixtures still need the real shaped link boxes.
+        thing_ui::TextSystem::default().links(node, max_width)
+    }
 }
 
 fn prepare_open_gl_drop(graphics: &egl::Graphics, painter: &mut Option<Box<Painter>>) {

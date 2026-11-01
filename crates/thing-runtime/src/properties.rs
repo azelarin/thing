@@ -49,6 +49,16 @@ fn boolean(value: Value, name: &str) -> Result<bool> {
     }
 }
 
+pub(crate) fn parse_color(value: Value, name: &str) -> Result<thing_core::Color> {
+    color(value, name)
+}
+
+fn set_rich_text(node: &mut Node, rich: crate::rich_text::RichText) {
+    node.text = rich.text;
+    node.spans = rich.spans.into();
+    node.links = rich.links.into();
+}
+
 fn color(value: Value, name: &str) -> Result<thing_core::Color> {
     string(value, name)?.parse().map_err(Error::external)
 }
@@ -772,7 +782,17 @@ pub(crate) fn apply_animation_frame(node: &mut Node, name: &str, value: Resolved
 pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
     match name {
         "axis" if node.kind == Kind::Scroll => node.scroll_axis = scroll_axis(value, name)?,
-        "text" if node.kind == Kind::Text => node.text = string(value, name)?,
+        "text" if node.kind == Kind::Text => {
+            node.text = string(value, name)?;
+            node.spans = std::sync::Arc::from([]);
+            node.links = std::sync::Arc::from([]);
+        }
+        "spans" if node.kind == Kind::Text => {
+            set_rich_text(node, crate::rich_text::spans(value)?);
+        }
+        "markup" if node.kind == Kind::Text => {
+            set_rich_text(node, crate::rich_text::markup(&string(value, name)?)?);
+        }
         "value" if node.kind == Kind::TextInput => node.text = string(value, name)?,
         "placeholder" if matches!(node.kind, Kind::TextInput | Kind::SecretInput) => {
             node.placeholder = string(value, name)?
@@ -916,6 +936,7 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "style.font_size" => node.style.font_size = number(value, name)? as f32,
         "style.font_weight" => node.style.font_weight = number(value, name)? as f32,
         "style.font_family" => node.style.font_family = string(value, name)?,
+        "style.letter_spacing" => node.style.letter_spacing = number(value, name)? as f32,
         "style.text_align"
             if matches!(node.kind, Kind::Text | Kind::TextInput | Kind::SecretInput) =>
         {

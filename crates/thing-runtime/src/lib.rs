@@ -13,6 +13,7 @@ mod niri;
 mod notification_expiry;
 mod properties;
 mod reconcile;
+mod rich_text;
 mod services;
 mod sleep;
 mod state;
@@ -135,6 +136,8 @@ pub enum Event {
     Submit(String),
     Hover(bool),
     Close,
+    /// activate the link at this index of a text widget's `links`.
+    Link(u16),
 }
 
 /// one keyboard press delivered to a panel or popup handler.
@@ -248,7 +251,7 @@ impl UiTarget {
         let mut within_surface = false;
         self.lineage.iter().filter_map(move |identity| {
             within_surface |= identity.node == root;
-            (within_surface && identity.kind.is_interactive()).then_some(identity.node)
+            (within_surface && identity.interactive).then_some(identity.node)
         })
     }
 }
@@ -281,6 +284,8 @@ struct UiIdentity {
     source: u64,
     key: Option<Rc<str>>,
     kind: Kind,
+    /// whether the widget takes focus and activation, as `Node::is_interactive`.
+    interactive: bool,
 }
 
 fn ui_target_identity_matches(current: &UiTarget, previous: &UiTarget) -> bool {
@@ -325,7 +330,7 @@ impl UiContext {
             && !target
                 .lineage
                 .last()
-                .is_some_and(|identity| identity.kind.is_interactive())
+                .is_some_and(|identity| identity.interactive)
         {
             return Err(Error::runtime("ui.focus target must be interactive"));
         }
@@ -1099,7 +1104,7 @@ impl Runtime {
 
     pub fn focus_target(&self, id: NodeId) -> Option<UiTarget> {
         self.find(id)
-            .is_some_and(|node| node.kind.is_interactive())
+            .is_some_and(Node::is_interactive)
             .then(|| self.ui_target(id))
             .flatten()
     }
@@ -1124,9 +1129,7 @@ impl Runtime {
         let target = action.target();
         self.ui_target_is_current(target)
             && (!matches!(action, UiAction::Focus(_))
-                || self
-                    .find(target.node)
-                    .is_some_and(|node| node.kind.is_interactive()))
+                || self.find(target.node).is_some_and(Node::is_interactive))
     }
 
     pub fn autofocus_target(&self, surface_root: NodeId) -> Option<UiTarget> {
@@ -1699,9 +1702,21 @@ impl Runtime {
             Event::TextChange(_) => return Err(Error::runtime("invalid text input value")),
             Event::Submit(value) if valid_text_input_event(value) => "on_submit",
             Event::Submit(_) => return Err(Error::runtime("invalid text input value")),
+            Event::Link(_) => "on_link",
         };
         let Some(handler) = self.handlers.get(&(id, name)).cloned() else {
             return Ok(false);
+        };
+        // a link index from an older frame must still name a current link.
+        let link = match &event {
+            Event::Link(index) => match self
+                .find(id)
+                .and_then(|node| node.links.get(usize::from(*index)).cloned())
+            {
+                Some(target) => Some(target),
+                None => return Ok(false),
+            },
+            _ => None,
         };
         self.begin_call();
         let checkpoint = self.action_checkpoint();
@@ -1715,6 +1730,9 @@ impl Runtime {
             Event::TextChange(value) | Event::Submit(value) => handler.call::<()>(value),
             Event::Hover(inside) => handler.call::<()>(inside),
             Event::Pressed(_) => unreachable!("press events are handled above"),
+            Event::Link(index) => {
+                handler.call::<()>((link.expect("the link was resolved above"), index + 1))
+            }
         };
         self.allow_actions(false);
         let now = now.unwrap_or_else(Instant::now);
@@ -2338,6 +2356,7 @@ impl Runtime {
                 source,
                 key: node.key.as_deref().map(Rc::from),
                 kind: node.kind,
+                interactive: node.is_interactive(),
             });
             targets.insert(
                 source,
@@ -2503,6 +2522,15 @@ impl Runtime {
             .ok_or_else(|| Error::runtime("too many widget identities"))?;
         self.sources.insert(id, source);
         let mut node = Node::new(id, kind);
+        let content = ["text", "spans", "markup"]
+            .into_iter()
+            .map(|key| table.raw_get::<Value>(key).map(|value| !value.is_nil()))
+            .collect::<Result<Vec<_>>>()?;
+        if content.into_iter().filter(|present| *present).count() > 1 {
+            return Err(Error::runtime(
+                "text, spans, and markup are mutually exclusive",
+            ));
+        }
         for pair in table.clone().pairs::<String, Value>() {
             let (key, value) = pair?;
             match key.as_str() {
@@ -2525,7 +2553,7 @@ impl Runtime {
                 }
                 "on_click" | "on_middle_click" | "on_secondary_click" | "on_scroll"
                 | "on_change" | "on_pressed" | "on_submit" | "on_hover" | "on_close" | "on_key"
-                | "on_pointer" => {
+                | "on_pointer" | "on_link" => {
                     if (matches!(
                         key.as_str(),
                         "on_click" | "on_middle_click" | "on_secondary_click"
@@ -2544,6 +2572,7 @@ impl Runtime {
                             ))
                         || (key == "on_pointer"
                             && !matches!(kind, Kind::Button | Kind::PointerArea))
+                        || (key == "on_link" && kind != Kind::Text)
                     {
                         return Err(Error::runtime(format!(
                             "{key} is not supported on {kind:?}"
@@ -2564,8 +2593,12 @@ impl Runtime {
                         "on_close" => "on_close",
                         "on_key" => "on_key",
                         "on_pointer" => "on_pointer",
+                        "on_link" => "on_link",
                         _ => unreachable!("event name was accepted above"),
                     };
+                    if key == "on_link" {
+                        node.link_handler = true;
+                    }
                     if key == "on_pointer" {
                         node.pointer_events = true;
                     } else if key == "on_scroll" {
@@ -3000,6 +3033,7 @@ mod ui_action_tests {
             source,
             key: None,
             kind: Kind::Button,
+            interactive: true,
         };
         let mut context = UiContext::default();
         context.targets.insert(

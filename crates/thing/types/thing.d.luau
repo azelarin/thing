@@ -343,6 +343,7 @@ export type ThingTextStyle = {
     font_family: ThingReactive<string>?,
     text_align: ThingReactive<ThingTextAlign>?,
     tabular_digits: ThingReactive<boolean>?,
+    letter_spacing: ThingReactive<number>?,
     background: ThingAnimatedBrush?,
     box_shadow: ThingReactive<ThingShadow?>?,
     foreground: ThingAnimatedColor?,
@@ -502,13 +503,32 @@ export type ThingScrollProperties = {
     on_scroll: ThingScrollHandler?,
 }
 
+-- one styled run of a text widget.
+export type ThingStyledSpan = {
+    text: string,
+    bold: boolean?,
+    weight: number?,
+    italic: boolean?,
+    underline: boolean?,
+    color: string?,
+    -- passed to on_link when activated; thing never opens it.
+    link: string?,
+}
+
+-- plain text, or a styled run.
+export type ThingTextSpan = ThingStyledSpan | string
+
 export type ThingTextProperties = {
     key: string?,
     visible: ThingReactive<boolean>?,
     cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingTextStyle?,
+    -- text, spans, and markup are mutually exclusive.
     text: ThingReactive<string>?,
+    spans: ThingReactive<{ ThingTextSpan }>?,
+    markup: ThingReactive<string>?,
+    on_link: ((target: string, index: number) -> ())?,
     max_lines: ThingReactive<number?>?,
     overflow: ThingReactive<ThingTextOverflow>?,
 }

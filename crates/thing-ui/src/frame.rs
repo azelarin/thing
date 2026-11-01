@@ -8,16 +8,24 @@ pub struct Interaction {
     pub hovered: Option<NodeId>,
     pub pressed: Option<NodeId>,
     pub focused: Option<NodeId>,
+    /// the link the keyboard selected inside a focused text widget.
+    pub focused_link: Option<u16>,
     focus_visible: bool,
 }
 
 impl Interaction {
     pub fn focus_from_pointer(&mut self, focused: Option<NodeId>) {
+        if self.focused != focused {
+            self.focused_link = None;
+        }
         self.focused = focused;
         self.focus_visible = false;
     }
 
     pub fn focus_from_keyboard(&mut self, focused: NodeId) {
+        if self.focused != Some(focused) {
+            self.focused_link = None;
+        }
         self.focused = Some(focused);
         self.focus_visible = true;
     }

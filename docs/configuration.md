@@ -449,7 +449,7 @@ widget kind; unkeyed children match by position and kind.
 
 | widget | additional properties |
 | --- | --- |
-| `text` | `text`: utf-8 string; optional `max_lines` and `overflow` |
+| `text` | one of `text` (a utf-8 string), `spans`, or `markup`; optional `on_link`, `max_lines`, and `overflow` |
 | `text_input` | controlled `value` and `on_change`; optional `placeholder` and `on_submit` |
 | `secret_input` | host-owned lock input; optional `placeholder`; never exposes its value or a submit callback |
 | `image` | one of `source`, `icon`, `app_id`; optional `icon_theme` and `fit` |
@@ -463,17 +463,101 @@ widget kind; unkeyed children match by position and kind.
 | containers | `children`: array of widgets, or a function returning one; optional `on_scroll` |
 
 use a positive `max_lines` to limit a text widget. omitted lines are clipped by
-default. `overflow = 'ellipsis'` adds an ellipsis, but currently supports only
-`max_lines = 1`:
+default. `overflow = 'ellipsis'` ends the last allowed line with an ellipsis
+instead:
 
 ```luau
 ui.text {
-    text = 'a long device description',
-    max_lines = 1,
+    text = 'a long device description that wraps onto a second line',
+    max_lines = 2,
     overflow = 'ellipsis',
     style = { width = 96 },
 }
 ```
+
+lines before the last stay exactly as they wrap. the last line is shortened
+with the real shaped text, never cutting an emoji, a combining mark, or another
+cluster, and an rtl paragraph keeps its direction. the ellipsis continues the
+style of the text it follows. the shortened text is what thing both measures
+and paints, so the box size always matches what you see. `style.letter_spacing`
+adds that many logical pixels after each character of a text widget.
+
+### styled text and links
+
+`spans` styles parts of a text widget. each entry is a string, or a table with
+`text` and any of `bold`, `weight`, `italic`, `underline`, `color`, and `link`:
+
+```luau
+local opened = ui.state('')
+
+ui.text {
+    spans = {
+        'read ',
+        { text = 'the guide', bold = true, link = 'https://example.org/guide' },
+        ' or ',
+        { text = 'the index', italic = true, color = '#89b4fa', link = 'https://example.org/index' },
+    },
+    on_link = function(target, index)
+        opened:set(target)
+        services.launch({ 'xdg-open', target })
+    end,
+    max_lines = 2,
+    overflow = 'ellipsis',
+    style = { width = 240 },
+}
+```
+
+link text is underlined unless its span sets `underline = false`. a link is
+data: thing never opens, fetches, or follows it. activation calls `on_link`
+with the link and its 1-based position in the widget's distinct links. what
+happens next is up to the handler, such as launching a browser as above. a
+text widget with `on_link` and at least one link takes input like a button:
+
+- clicking runs `on_link` only when the press and release land on the same
+  link and its destination has not changed during the press.
+- the widget is a tab stop. left and up, or right and down, move between its
+  links, with a focus ring around the selected one. enclosing scroll views
+  bring that link into view. enter or space activates the selected link, or
+  the first one.
+
+activation uses the destination from the presented frame. if an update changes
+that destination before its new frame appears, the old link ignores input.
+
+link geometry comes from the shaped glyph runs, so it follows wrapping, bidi
+text, ligatures, letter spacing, transforms, and scrolling. it covers each
+run's advance across the full line height, not the glyphs' ink. text an
+ellipsis removed, text beyond `max_lines`, and hidden widgets have no link
+area, and the widget's clipping applies as for any other input.
+
+`markup` accepts a small, safe subset of html, enough for notification bodies:
+
+```luau
+ui.text {
+    markup = '<b>ada</b> sent <i>two</i> files &amp; a <a href="https://example.org/share">link</a>',
+    on_link = function(target) services.launch({ 'xdg-open', target }) end,
+}
+```
+
+`<b>`, `<strong>`, `<i>`, `<em>`, `<u>`, `<a href="...">`, and `<br>` are
+supported, with the `&amp;`, `&lt;`, `&gt;`, `&quot;`, and `&apos;` entities and
+numeric references like `&#x1F600;`. `<img alt="...">` shows only its alt text;
+images are never fetched. other tags are dropped and their text kept, and an
+unknown entity stays as written. markup that is malformed, such as a
+mismatched closing tag or an unquoted attribute, is shown as its literal source
+rather than guessed at. so is markup nested deeper than 16 tags or beyond the
+limits below. tags left open at the end close there.
+
+use `markup` only for text that is meant as markup. plain text through it
+turns `<` and `&` sequences into tags and entities. thing's notification
+server does not advertise `body-markup`, so notification bodies arrive as
+plain text; show them with `text`.
+
+`text`, `spans`, and `markup` are mutually exclusive. a text widget holds at
+most 256 spans and 64 distinct links, a link is at most 2048 bytes, and
+markup is at most 64 kib. spans with an unknown property or an invalid value
+reject the update and keep the published text. in `--!strict` files, give a
+span list its type, such as `local spans: { ThingTextSpan } = { ... }`. luau
+cannot infer a list that mixes strings and tables.
 
 `text_input` is a controlled, single-line field. keep its value in `ui.state`
 and return that state from the `value` property. `on_change` receives each
