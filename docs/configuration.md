@@ -1805,8 +1805,8 @@ background, border, and shadow are not clipped, so a circular clip on a square
 button keeps the square background. clips follow transforms, scrolling, and
 fractional scale, and nested clips intersect. the value may be reactive. a
 malformed path, or one over 64 kib or 1,024 segments, rejects the update. one
-surface may carry at most 16,384 path clip segments; beyond that its layout is
-rejected.
+surface may carry at most 16,384 path clip segments, including offscreen
+geometry retained for focus and shadows; beyond that its layout is rejected.
 
 ### shadows
 

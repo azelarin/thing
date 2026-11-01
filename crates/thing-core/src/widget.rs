@@ -602,7 +602,7 @@ pub enum ClipMode {
     Bounds,
     Rounded,
     /// a vector shape fitted into the widget's border box. contents and input
-    /// outside both the shape and the box are clipped.
+    /// stay inside both the shape and the box.
     Path(std::sync::Arc<ClipPath>),
 }
 

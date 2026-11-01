@@ -193,6 +193,8 @@ impl ClipRegion {
             return false;
         }
         if let Some(path) = &self.path {
+            #[cfg(test)]
+            PATH_CLIP_QUERIES.with(|count| count.set(count.get() + 1));
             return path.contains((point.x, point.y));
         }
         if self.radius == 0.0 {
@@ -212,9 +214,14 @@ impl ClipRegion {
     }
 }
 
-/// the most path clip segments one surface may hit test, so a pointer event
-/// costs a bounded walk however many clips are nested.
+/// the maximum path clip geometry retained for one surface, including
+/// offscreen geometry used by focus and descendant shadows.
 const MAX_CLIP_SEGMENTS: usize = 16 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static PATH_CLIP_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 fn clip_radius(node: &Node, bounds: Rect) -> f32 {
     if node.style.clip == ClipMode::Rounded {
@@ -263,6 +270,7 @@ pub struct Layout {
     scroll_areas: Vec<ScrollArea>,
     reveal_regions: Vec<RevealRegion>,
     clip_segments: usize,
+    fitted_clips: BTreeMap<NodeId, skia_safe::Path>,
 }
 
 impl Layout {
@@ -450,25 +458,27 @@ impl Layout {
 
     /// hit test from front to back. text inside a button does not hide its parent.
     pub fn hit_test(&self, point: Point) -> Option<NodeId> {
+        let mut clip_hits = self.clip_hits();
         self.placements
             .iter()
             .enumerate()
             .rev()
             .find(|(index, placement)| {
-                placement.interactive && self.placement_contains(*index, point)
+                placement.interactive && self.placement_contains(*index, point, &mut clip_hits)
             })
             .map(|(_, placement)| placement.id)
     }
 
     /// find the deepest semantic control or custom pointer target under a point.
     pub fn pointer_event_target(&self, point: Point) -> Option<NodeId> {
+        let mut clip_hits = self.clip_hits();
         self.placements
             .iter()
             .enumerate()
             .rev()
             .find(|(index, placement)| {
                 (placement.interactive || placement.pointer_events)
-                    && self.placement_contains(*index, point)
+                    && self.placement_contains(*index, point, &mut clip_hits)
             })
             .map(|(_, placement)| placement.id)
     }
@@ -484,14 +494,15 @@ impl Layout {
     /// ancestors. a widget's handler comes before its own viewport scrolling.
     /// every stop contains the point after transforms and clipping.
     pub fn scroll_route(&self, point: Point) -> Vec<ScrollStep> {
+        let mut clip_hits = self.clip_hits();
         let mut route = Vec::new();
         let mut current = (0..self.placements.len())
             .rev()
-            .find(|index| self.placement_contains(*index, point));
+            .find(|index| self.placement_contains(*index, point, &mut clip_hits));
         while let Some(index) = current {
             let placement = &self.placements[index];
             let region = &self.pointer_regions[index];
-            if self.placement_contains(index, point) {
+            if self.placement_contains(index, point, &mut clip_hits) {
                 if placement.scroll_events {
                     route.push(ScrollStep::Handler(placement.id));
                 }
@@ -509,9 +520,10 @@ impl Layout {
     /// nearest ancestor's. hidden widgets have no placement, so they never
     /// decide. a point outside every widget shows the default.
     pub fn cursor_at(&self, point: Point) -> thing_core::Cursor {
+        let mut clip_hits = self.clip_hits();
         let current = (0..self.placements.len())
             .rev()
-            .find(|index| self.placement_contains(*index, point));
+            .find(|index| self.placement_contains(*index, point, &mut clip_hits));
         self.inherited_cursor(current)
     }
 
@@ -642,43 +654,57 @@ impl Layout {
         changed
     }
 
-    fn placement_contains(&self, index: usize, point: Point) -> bool {
+    fn clip_hits(&self) -> Vec<Option<bool>> {
+        if self.fitted_clips.is_empty() {
+            Vec::new()
+        } else {
+            vec![None; self.clip_regions.len()]
+        }
+    }
+
+    fn placement_contains(
+        &self,
+        index: usize,
+        point: Point,
+        clip_hits: &mut [Option<bool>],
+    ) -> bool {
         let Some(placement) = self.placements.get(index) else {
             return false;
         };
         placement
             .surface_to_local(point)
             .is_some_and(|local| placement.local_bounds().contains(local))
-            && self.clip_contains(placement.clip_chain, point)
+            && self.clip_contains(placement.clip_chain, point, clip_hits)
     }
 
     /// fits a node's path clip into its local box, within the surface budget.
-    fn clip_path(
-        &mut self,
-        node: &Node,
-        bounds: Rect,
-        count: bool,
-    ) -> Result<Option<skia_safe::Path>, String> {
+    fn clip_path(&mut self, node: &Node, bounds: Rect) -> Result<Option<skia_safe::Path>, String> {
         let ClipMode::Path(clip) = &node.style.clip else {
             return Ok(None);
         };
-        if count {
-            self.clip_segments = self.clip_segments.saturating_add(clip.segments.len());
+        if let Some(path) = self.fitted_clips.get(&node.id) {
+            return Ok(Some(path.clone()));
         }
+        self.clip_segments = self.clip_segments.saturating_add(clip.segments.len());
         if self.clip_segments > MAX_CLIP_SEGMENTS {
             return Err(format!(
                 "path clips on one surface exceed {MAX_CLIP_SEGMENTS} segments"
             ));
         }
-        crate::skia::fitted_clip(clip, bounds)
-            .map(Some)
-            .map_err(|error| format!("clip path on widget {}: {error}", node.id.0))
+        let path = crate::skia::fitted_clip(clip, bounds)
+            .map_err(|error| format!("clip path on widget {}: {error}", node.id.0))?;
+        self.fitted_clips.insert(node.id, path.clone());
+        Ok(Some(path))
     }
 
-    fn clip_contains(&self, mut index: usize, point: Point) -> bool {
-        loop {
+    fn clip_contains(&self, mut index: usize, point: Point, hits: &mut [Option<bool>]) -> bool {
+        let start = index;
+        let inside = loop {
+            if let Some(inside) = hits.get(index).copied().flatten() {
+                break inside;
+            }
             let Some(region) = self.clip_regions.get(index) else {
-                return false;
+                break false;
             };
             if !region.aabb.contains(point)
                 || region
@@ -686,13 +712,32 @@ impl Layout {
                     .and_then(|inverse| inverse.point(point))
                     .is_none_or(|local| !region.contains(local))
             {
-                return false;
+                break false;
             }
             let Some(parent) = region.parent else {
-                return true;
+                break true;
             };
             index = parent;
+        };
+        // one region may clip many overlapping descendants. share its winding
+        // result within this query instead of walking its path for every child.
+        let stop = index;
+        let mut current = Some(start);
+        while let Some(index) = current
+            && let Some(slot) = hits.get_mut(index)
+            && slot.is_none()
+        {
+            *slot = Some(inside);
+            // a rejected child says nothing about the rest of its parent's box.
+            if index == stop {
+                break;
+            }
+            current = self
+                .clip_regions
+                .get(index)
+                .and_then(|region| region.parent);
         }
+        inside
     }
 
     pub(crate) fn clip_region(&self, index: usize) -> Option<&ClipRegion> {
@@ -822,8 +867,7 @@ impl Layout {
         let (shadow_clip_chain, shadow_clip) =
             if node.kind == Kind::Scroll || node.style.clip.is_shaped() {
                 let index = self.clip_regions.len();
-                // the placement pass already counted this path.
-                let path = self.clip_path(node, local_bounds, false)?;
+                let path = self.clip_path(node, local_bounds)?;
                 self.clip_regions.push(ClipRegion {
                     bounds: local_bounds,
                     radius: clip_radius(node, local_bounds),
@@ -910,7 +954,7 @@ impl Layout {
         let disabled_opacity = semantic.disabled_opacity;
         crate::brush::validate(node, local_bounds)?;
         let child_clip_chain = self.clip_regions.len();
-        let path = self.clip_path(node, local_bounds, true)?;
+        let path = self.clip_path(node, local_bounds)?;
         self.clip_regions.push(ClipRegion {
             bounds: local_bounds,
             radius: clip_radius(node, local_bounds),
@@ -3410,5 +3454,111 @@ mod tests {
         assert!(error.contains("exceed 16384 segments"), "{error}");
         root.children.truncate(16);
         assert!(Layout::compute(&root, size, &mut FixedText).is_ok());
+    }
+
+    #[test]
+    fn path_clips_budget_includes_descendants_outside_the_viewport() {
+        use thing_core::{PathFillRule, PathFit};
+        let mut data = String::from("M0 0");
+        for index in 0..999 {
+            data.push_str(&format!(" L{} {}", index % 100, (index * 7) % 100));
+        }
+        let shape = clip(&data, (100.0, 100.0), PathFit::Fill, PathFillRule::NonZero);
+        let mut root = fixed(1, Kind::Stack, 100.0, 100.0);
+        for index in 0..17 {
+            let mut parent = fixed(2 + index * 2, Kind::Row, 10.0, 10.0);
+            parent.style.translate_x = 200.0;
+            let mut child = fixed(3 + index * 2, Kind::Row, 10.0, 10.0);
+            child.style.clip = shape.clone();
+            parent.children.push(child);
+            root.children.push(parent);
+        }
+        let size = Size {
+            width: 100.0,
+            height: 100.0,
+        };
+        let result = Layout::compute(&root, size, &mut FixedText);
+        assert!(
+            result.is_err(),
+            "offscreen clip geometry escaped the surface budget"
+        );
+        assert!(result.unwrap_err().contains("exceed 16384 segments"));
+        root.children.last_mut().unwrap().visible = false;
+        assert!(Layout::compute(&root, size, &mut FixedText).is_ok());
+    }
+
+    #[test]
+    fn path_clips_queries_do_not_repeat_a_shared_winding_test() {
+        let mut root = fixed(1, Kind::Stack, 100.0, 100.0);
+        root.style.clip = ring(thing_core::PathFillRule::EvenOdd);
+        for id in 2..=101 {
+            root.children.push(fixed(id, Kind::Button, 100.0, 100.0));
+        }
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 100.0,
+                height: 100.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        let hole = Point { x: 50.0, y: 50.0 };
+        for query in 0..4 {
+            super::PATH_CLIP_QUERIES.with(|count| count.set(0));
+            match query {
+                0 => assert_eq!(layout.hit_test(hole), None),
+                1 => assert_eq!(layout.pointer_event_target(hole), None),
+                2 => assert!(layout.scroll_route(hole).is_empty()),
+                _ => assert_eq!(layout.cursor_at(hole), thing_core::Cursor::Default),
+            }
+            super::PATH_CLIP_QUERIES.with(|count| {
+                assert!(
+                    count.get() <= 1,
+                    "query {query} repeated the same winding test {} times",
+                    count.get()
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn path_clips_holes_leave_siblings_underneath_reachable() {
+        let mut root = fixed(1, Kind::Stack, 100.0, 100.0);
+        let mut underneath = fixed(2, Kind::Button, 100.0, 100.0);
+        underneath.cursor = Some(thing_core::Cursor::Crosshair);
+        underneath.scroll_events = true;
+        let mut overlay = fixed(3, Kind::Stack, 100.0, 100.0);
+        overlay.style.clip = ring(thing_core::PathFillRule::EvenOdd);
+        let mut content = fixed(4, Kind::Button, 100.0, 100.0);
+        content.scroll_events = true;
+        overlay.children.push(content);
+        root.children = vec![underneath, overlay];
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 100.0,
+                height: 100.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        for (point, id, cursor) in [
+            (
+                Point { x: 50.0, y: 50.0 },
+                NodeId(2),
+                thing_core::Cursor::Crosshair,
+            ),
+            (
+                Point { x: 50.0, y: 20.0 },
+                NodeId(4),
+                thing_core::Cursor::Pointer,
+            ),
+        ] {
+            assert_eq!(layout.hit_test(point), Some(id));
+            assert_eq!(layout.pointer_event_target(point), Some(id));
+            assert_eq!(layout.scroll_route(point), vec![ScrollStep::Handler(id)]);
+            assert_eq!(layout.cursor_at(point), cursor);
+        }
     }
 }
