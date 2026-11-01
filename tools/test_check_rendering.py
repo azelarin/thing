@@ -86,6 +86,54 @@ class AssetTest(unittest.TestCase):
 
 
 class EnvironmentTest(unittest.TestCase):
+    def test_fixture_owns_a_runtime_until_its_process_group_has_stopped(self):
+        with tempfile.TemporaryDirectory(prefix="thing-render-parent-") as directory:
+            parent = Path(directory)
+            wayland = parent / "wayland-parent"
+            run = parent / "artifacts"
+            run.mkdir()
+            launched = {}
+            values = {
+                "XDG_RUNTIME_DIR": directory,
+                "WAYLAND_DISPLAY": wayland.name,
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/tmp/parent-bus",
+                "WAYLAND_SOCKET": "17",
+            }
+
+            def launch(*args, env, **kwargs):
+                launched.update(env)
+                runtime = Path(env["XDG_RUNTIME_DIR"])
+                self.assertNotEqual(runtime, parent)
+                self.assertTrue(runtime.is_dir())
+                self.assertEqual(runtime.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(env["WAYLAND_DISPLAY"], str(wayland))
+                self.assertNotIn("WAYLAND_SOCKET", env)
+                return mock.Mock()
+
+            def complete(*args):
+                atomic_json(run / "result.json", {"ok": True})
+
+            def stop(process):
+                self.assertTrue(Path(launched["XDG_RUNTIME_DIR"]).is_dir())
+
+            with socket.socket(socket.AF_UNIX) as endpoint:
+                endpoint.bind(str(wayland))
+                with (
+                    mock.patch.dict(os.environ, values, clear=True),
+                    mock.patch.object(check_rendering, "prepare_run_directory", return_value=run),
+                    mock.patch.object(check_rendering, "validate_configs"),
+                    mock.patch.object(check_rendering, "checked"),
+                    mock.patch.object(check_rendering.subprocess, "Popen", side_effect=launch),
+                    mock.patch.object(check_rendering, "wait_for_result", side_effect=complete),
+                    mock.patch.object(check_rendering, "stop_process_group", side_effect=stop),
+                ):
+                    check_rendering.run_case(
+                        Path("/unused/thing"), "opengl", "stencil",
+                        {name: name for name in ("dbus-run-session", "niri", "grim")}, True,
+                    )
+            self.assertFalse(Path(launched["XDG_RUNTIME_DIR"]).exists())
+            self.assertTrue(parent.is_dir())
+
     def test_accepts_only_nested_wayland_niri_and_dbus_endpoints(self):
         with tempfile.TemporaryDirectory(prefix="thing-render-sockets-") as directory:
             root = Path(directory)
@@ -103,10 +151,17 @@ class EnvironmentTest(unittest.TestCase):
                         "THING_RENDER_PARENT_WAYLAND": str(root / "wayland-parent"),
                         "THING_RENDER_PARENT_NIRI": str(root / "niri-parent.sock"),
                         "THING_RENDER_PARENT_BUS": "unix:path=/tmp/parent-bus",
+                        "THING_RENDER_PARENT_RUNTIME": str(root / "parent-runtime"),
                     }
                     with mock.patch.dict(os.environ, values, clear=True):
                         environment = check_rendering.private_environment()
                     self.assertEqual(environment["NIRI_SOCKET"], str(niri_path))
+
+                    values["THING_RENDER_PARENT_RUNTIME"] = directory
+                    with mock.patch.dict(os.environ, values, clear=True):
+                        with self.assertRaisesRegex(FixtureError, "runtime directory matches"):
+                            check_rendering.private_environment()
+                    values["THING_RENDER_PARENT_RUNTIME"] = str(root / "parent-runtime")
 
                     values["THING_RENDER_PARENT_NIRI"] = str(niri_path)
                     with mock.patch.dict(os.environ, values, clear=True):

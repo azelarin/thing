@@ -676,12 +676,15 @@ def private_environment():
         "THING_RENDER_PARENT_WAYLAND",
         "THING_RENDER_PARENT_NIRI",
         "THING_RENDER_PARENT_BUS",
+        "THING_RENDER_PARENT_RUNTIME",
     )
     if any(marker not in environment for marker in markers):
         raise FixtureError("nested fixture is missing its parent endpoint markers")
     runtime = environment.get("XDG_RUNTIME_DIR")
     if not runtime:
         raise FixtureError("XDG_RUNTIME_DIR is required")
+    if Path(runtime).resolve() == Path(environment["THING_RENDER_PARENT_RUNTIME"]).resolve():
+        raise FixtureError("nested runtime directory matches the desktop session")
     wayland = require_socket(environment.get("WAYLAND_DISPLAY"), runtime, "WAYLAND_DISPLAY")
     niri = require_socket(environment.get("NIRI_SOCKET"), runtime, "NIRI_SOCKET")
     parent_wayland = environment.get("THING_RENDER_PARENT_WAYLAND")
@@ -1073,9 +1076,11 @@ def parent_environment():
         parent_niri = str(require_socket(parent_niri, runtime, "NIRI_SOCKET"))
     environment["THING_RENDER_PARENT_WAYLAND"] = str(wayland)
     environment["THING_RENDER_PARENT_NIRI"] = parent_niri
+    environment["THING_RENDER_PARENT_RUNTIME"] = str(Path(runtime).resolve())
     environment["THING_RENDER_PARENT_BUS"] = environment.pop(
         "DBUS_SESSION_BUS_ADDRESS", ""
     )
+    environment.pop("WAYLAND_SOCKET", None)
     return environment
 
 
@@ -1117,6 +1122,7 @@ def run_case(binary, renderer, case, programs, keep_artifacts):
     run_directory = prepare_run_directory(case, renderer)
     process = None
     log = None
+    runtime = None
     succeeded = False
     try:
         deadline = time.monotonic() + OUTER_TIMEOUT
@@ -1127,6 +1133,9 @@ def run_case(binary, renderer, case, programs, keep_artifacts):
         )
         result_path = run_directory / "result.json"
         environment = parent_environment()
+        runtime = tempfile.TemporaryDirectory(prefix="thing-render-runtime-")
+        environment["XDG_RUNTIME_DIR"] = runtime.name
+        environment["WAYLAND_DISPLAY"] = environment["THING_RENDER_PARENT_WAYLAND"]
         command = [
             programs["dbus-run-session"],
             "--",
@@ -1175,6 +1184,8 @@ def run_case(binary, renderer, case, programs, keep_artifacts):
             stop_process_group(process)
             if log is not None:
                 log.close()
+            if runtime is not None:
+                runtime.cleanup()
             if succeeded and not keep_artifacts:
                 shutil.rmtree(run_directory)
 
