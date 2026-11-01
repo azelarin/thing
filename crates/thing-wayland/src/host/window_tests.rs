@@ -780,6 +780,8 @@ impl Host {
             fractional: None,
             viewporter: None,
             pointer: None,
+            shm: globals.bind(&qh, 1..=1, ()).ok(),
+            cursor: crate::cursor::CursorState::default(),
             pointer_capture: None,
             keyboard: None,
             seat: None,

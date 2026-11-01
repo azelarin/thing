@@ -239,6 +239,16 @@ CASES = (
             "Key 'set' not found in table 'ThingSignal<number>'",
         ),
     ),
+    Case("valid-cursors.luau"),
+    Case(
+        "invalid-cursors.luau",
+        (
+            "invalid-cursors.luau(3,1): TypeError",
+            "invalid-cursors.luau(7,19): TypeError",
+            "invalid-cursors.luau(8,38): TypeError",
+            "Property 'cursor' is not compatible.",
+        ),
+    ),
     Case("valid-container-scroll.luau"),
     Case(
         "invalid-container-scroll.luau",

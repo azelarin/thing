@@ -6,6 +6,7 @@ pub mod authentication;
 mod clipboard;
 mod clock;
 mod configuration;
+mod cursor;
 mod data_transfer;
 mod egl;
 mod focus;

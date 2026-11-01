@@ -25,7 +25,7 @@ use smithay_client_toolkit::{
         keyboard::{
             KeyEvent, KeyboardHandler, Keymap, Keysym, Modifiers, RawModifiers, RepeatInfo,
         },
-        pointer::{AxisScroll, PointerEvent, PointerEventKind, PointerHandler},
+        pointer::{AxisScroll, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec},
     },
     shell::{
         WaylandSurface,
@@ -41,8 +41,8 @@ use smithay_client_toolkit::{
     },
 };
 use thing_core::{
-    HorizontalRange, KeyboardMode, Kind, Node, NodeId, PanelInputRegion, Point, Rect, Scale,
-    ScrollAxis, SurfaceLayer,
+    Cursor, HorizontalRange, KeyboardMode, Kind, Node, NodeId, PanelInputRegion, Point, Rect,
+    Scale, ScrollAxis, SurfaceLayer,
 };
 use thing_runtime::{
     Action, Event, KeyInput, ManagedProcessAction, ManagedProcessDefinition,
@@ -112,6 +112,8 @@ use xkbcommon::xkb;
 use crate::output::{fallback_logical_size, valid_dimensions};
 
 #[cfg(test)]
+mod cursor_tests;
+#[cfg(test)]
 mod idle_sleep_tests;
 #[cfg(test)]
 mod launch_tests;
@@ -120,7 +122,6 @@ mod wheel_tests;
 #[cfg(test)]
 mod window_tests;
 
-#[cfg(test)]
 delegate_noop!(App: ignore wayland_client::protocol::wl_shm::WlShm);
 #[cfg(test)]
 delegate_noop!(App: ignore wayland_client::protocol::wl_shm_pool::WlShmPool);
@@ -136,6 +137,7 @@ use crate::{
         Configurations, DispatchOutcome, PointerHandlerOutcome, RemovedConfiguration,
         ScrollHandlerOutcome,
     },
+    cursor::{CursorState, SeatPointer},
     focus::{LayoutSnapshot, ScopedUiTarget, SurfaceLayouts},
     focused_clipboard::{FocusedClipboard, PasteId},
     hover::{Command as HoverCommand, HoverKey, HoverStates, HoverTarget},
@@ -243,6 +245,8 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
     let layer_shell = LayerShell::bind(&globals, &qh).ok();
     let xdg_shell = XdgShell::bind(&globals, &qh).map_err(|error| error.to_string())?;
     let activation: Option<XdgActivationV1> = globals.bind(&qh, 1..=1, ()).ok();
+    // the cursor theme fallback draws into shared memory.
+    let shm: Option<wayland_client::protocol::wl_shm::WlShm> = globals.bind(&qh, 1..=1, ()).ok();
     let (image_ping, image_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let wake = image_ping.clone();
     let gpu_wake = image_ping.clone();
@@ -351,6 +355,8 @@ pub fn run_with_options(entry: &Path, options: RunOptions) -> Result<(), String>
         fractional: globals.bind(&qh, 1..=1, ()).ok(),
         viewporter: globals.bind(&qh, 1..=1, ()).ok(),
         pointer: None,
+        shm,
+        cursor: CursorState::default(),
         pointer_capture: None,
         keyboard: None,
         seat: None,
@@ -568,6 +574,9 @@ impl App {
             self.update_sleep();
         }
         self.draw(qh)?;
+        // drawing installs newly accepted layouts, which can change what is
+        // under a pointer that has not moved.
+        self.reconcile_cursor(connection);
         self.process_hover(qh);
         connection.flush().map_err(|error| error.to_string())?;
         let timeout = self
@@ -1186,7 +1195,9 @@ pub(crate) struct App {
     activation: Option<XdgActivationV1>,
     fractional: Option<WpFractionalScaleManagerV1>,
     viewporter: Option<WpViewporter>,
-    pointer: Option<wl_pointer::WlPointer>,
+    pointer: Option<SeatPointer>,
+    shm: Option<wayland_client::protocol::wl_shm::WlShm>,
+    cursor: CursorState,
     pointer_capture: Option<CustomPointerCapture>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     seat: Option<wl_seat::WlSeat>,
@@ -1417,6 +1428,53 @@ impl App {
                 self.finish_dispatch(output, Some(consumer), Err(error), None, prepared);
             }
         }
+    }
+
+    /// shows the cursor of the presented layout under the pointer. only
+    /// presented, accepted layouts decide, so a rejected candidate or reload
+    /// never shows its cursor.
+    fn reconcile_cursor(&mut self, connection: &Connection) {
+        let Some(pointer) = &self.pointer else {
+            return;
+        };
+        let Some(surface) = self
+            .surfaces
+            .iter()
+            .find(|surface| surface.pointer_position.is_some())
+        else {
+            self.cursor.reset();
+            return;
+        };
+        let point = surface
+            .pointer_position
+            .expect("the surface was found by its pointer");
+        let wl = surface.role.surface().clone();
+        let owner = self
+            .pointer_capture
+            .as_ref()
+            .filter(|capture| capture.surface == wl)
+            .map(|capture| capture.target.target.node())
+            .or_else(|| {
+                surface
+                    .pressed_target
+                    .as_ref()
+                    .map(|target| target.target.node())
+            });
+        let cursor = surface
+            .layouts
+            .presented()
+            .map_or(Cursor::Default, |layout| {
+                owner
+                    .and_then(|id| layout.cursor_for(id))
+                    .unwrap_or_else(|| layout.cursor_at(point))
+            });
+        let held = owner.is_none()
+            && (surface.pressed_button.is_some()
+                || self
+                    .pointer_capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.surface == wl));
+        self.cursor.show(connection, pointer, &wl, cursor, held);
     }
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -7376,7 +7434,21 @@ impl SeatHandler for App {
         self.focused_clipboard.attach_seat(&seat, qh);
         match capability {
             Capability::Pointer if self.pointer.is_none() => {
-                match self.seats.get_pointer(qh, &seat) {
+                self.cursor.reset();
+                let pointer = match &self.shm {
+                    Some(shm) => self
+                        .seats
+                        .get_pointer_with_theme::<_, smithay_client_toolkit::compositor::SurfaceData>(
+                            qh,
+                            &seat,
+                            shm,
+                            self.compositor.create_surface(qh),
+                            ThemeSpec::System,
+                        )
+                        .map(SeatPointer::Themed),
+                    None => self.seats.get_pointer(qh, &seat).map(SeatPointer::Plain),
+                };
+                match pointer {
                     Ok(pointer) => self.pointer = Some(pointer),
                     Err(error) => self.error = Some(error.to_string()),
                 }
@@ -7410,6 +7482,7 @@ impl SeatHandler for App {
             && let Some(pointer) = self.pointer.take()
         {
             pointer.release();
+            self.cursor.reset();
             self.clear_pointer_state(true);
         }
         if capability == Capability::Keyboard {
@@ -7437,6 +7510,7 @@ impl SeatHandler for App {
             if let Some(pointer) = self.pointer.take() {
                 pointer.release();
             }
+            self.cursor.reset();
             if let Some(keyboard) = self.keyboard.take() {
                 keyboard.release();
             }
@@ -7462,7 +7536,7 @@ impl SeatHandler for App {
 impl PointerHandler for App {
     fn pointer_frame(
         &mut self,
-        _: &Connection,
+        connection: &Connection,
         qh: &QueueHandle<Self>,
         _: &wl_pointer::WlPointer,
         events: &[PointerEvent],
@@ -7733,6 +7807,7 @@ impl PointerHandler for App {
         }
         self.reconcile_pointer();
         self.reconcile_input_method(InputMethodChangeCause::Other);
+        self.reconcile_cursor(connection);
     }
 }
 

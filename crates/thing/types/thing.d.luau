@@ -384,9 +384,23 @@ declare extern type ThingKeyEvent with
     read repeated: boolean
 end
 
+-- standard cursor names. controls show pointer or text unless they set
+-- their own; other widgets inherit the nearest ancestor's cursor.
+export type ThingCursor =
+    "default" | "context_menu" | "help" | "pointer"
+    | "progress" | "wait" | "cell" | "crosshair"
+    | "text" | "vertical_text" | "alias" | "copy"
+    | "move" | "no_drop" | "not_allowed" | "grab"
+    | "grabbing" | "e_resize" | "n_resize" | "ne_resize"
+    | "nw_resize" | "s_resize" | "se_resize" | "sw_resize"
+    | "w_resize" | "ew_resize" | "ns_resize" | "nesw_resize"
+    | "nwse_resize" | "col_resize" | "row_resize" | "all_scroll"
+    | "zoom_in" | "zoom_out"
+
 export type ThingPanelProperties = {
     key: string?,
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
     namespace: string?,
@@ -411,6 +425,7 @@ export type ThingWindowSize = { width: number, height: number }
 export type ThingWindowProperties = {
     key: string?,
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
     title: ThingReactive<string>?,
@@ -427,6 +442,7 @@ export type ThingWindowProperties = {
 
 export type ThingLockProperties = {
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
     on_key: ((event: ThingKeyEvent) -> boolean)?,
@@ -436,6 +452,7 @@ export type ThingLockProperties = {
 export type ThingContainerProperties = {
     key: string?,
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
     children: ThingChildren?,
@@ -446,6 +463,7 @@ export type ThingScrollProperties = {
     axis: ThingReactive<ThingScrollAxis>?,
     key: string?,
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
     children: ThingChildren?,
@@ -455,6 +473,7 @@ export type ThingScrollProperties = {
 export type ThingTextProperties = {
     key: string?,
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingTextStyle?,
     text: ThingReactive<string>?,
@@ -466,6 +485,7 @@ export type ThingTextInputProperties = {
     key: string?,
     autofocus: boolean?,
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingTextInputStyle?,
     value: ThingReactive<string>,
@@ -479,6 +499,7 @@ export type ThingSecretInputProperties = {
     key: string?,
     autofocus: boolean?,
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingTextInputStyle?,
     placeholder: ThingReactive<string>?,
@@ -488,6 +509,7 @@ export type ThingSecretInputProperties = {
 export type ThingImageProperties = {
     key: string?,
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
     source: ThingReactive<ThingImageSourceValue?>?,
@@ -500,6 +522,7 @@ export type ThingImageProperties = {
 export type ThingPathProperties = {
     key: string?,
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
     data: ThingReactive<string>,
@@ -518,6 +541,7 @@ export type ThingButtonProperties = {
     key: string?,
     autofocus: boolean?,
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
     children: ThingChildren?,
@@ -532,6 +556,7 @@ export type ThingButtonProperties = {
 export type ThingPointerAreaProperties = {
     key: string?,
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
     children: ThingChildren?,
@@ -543,6 +568,7 @@ export type ThingSliderProperties = {
     key: string?,
     autofocus: boolean?,
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
     min: ThingReactive<number>?,
@@ -557,6 +583,7 @@ export type ThingRangeProperties = {
     key: string?,
     autofocus: boolean?,
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
     children: ThingChildren?,
@@ -573,6 +600,7 @@ export type ThingRangeProperties = {
 export type ThingPopupProperties = {
     key: string?,
     visible: ThingReactive<boolean>?,
+    cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
     style: ThingStyle?,
     children: ThingChildren?,

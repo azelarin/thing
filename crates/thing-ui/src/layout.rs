@@ -35,6 +35,8 @@ pub struct Placement {
     pub pointer_events: bool,
     pub scroll_events: bool,
     pub enabled: bool,
+    /// the cursor this widget contributes before inheritance.
+    pub cursor: Option<thing_core::Cursor>,
     pub opacity: f32,
     pub(crate) disabled_opacity: f32,
     pub(crate) inverse: Option<Affine>,
@@ -491,6 +493,35 @@ impl Layout {
         route
     }
 
+    /// the cursor at `point`: the topmost painted widget that contains it,
+    /// after transforms and clipping, decides through its own cursor or the
+    /// nearest ancestor's. hidden widgets have no placement, so they never
+    /// decide. a point outside every widget shows the default.
+    pub fn cursor_at(&self, point: Point) -> thing_core::Cursor {
+        let current = (0..self.placements.len())
+            .rev()
+            .find(|index| self.placement_contains(*index, point));
+        self.inherited_cursor(current)
+    }
+
+    /// resolves a presented widget's cursor without requiring the pointer to
+    /// be inside it, for a widget that owns an active press or capture.
+    pub fn cursor_for(&self, id: NodeId) -> Option<thing_core::Cursor> {
+        self.placement_indices
+            .get(&id)
+            .map(|index| self.inherited_cursor(Some(*index)))
+    }
+
+    fn inherited_cursor(&self, mut current: Option<usize>) -> thing_core::Cursor {
+        while let Some(index) = current {
+            if let Some(cursor) = self.placements[index].cursor {
+                return cursor;
+            }
+            current = self.pointer_regions[index].parent;
+        }
+        thing_core::Cursor::Default
+    }
+
     /// scroll the viewports on the route at `point`, innermost first. a
     /// viewport at its limit lets the movement continue outward.
     pub fn scroll_y(&self, point: Point, delta: f32, state: &mut ScrollState) -> bool {
@@ -868,6 +899,7 @@ impl Layout {
             pointer_events: enabled && node.pointer_events,
             scroll_events: enabled && node.scroll_events,
             enabled,
+            cursor: thing_core::own_cursor(node.cursor, node.kind, enabled),
             opacity,
             disabled_opacity,
             inverse,
@@ -2981,5 +3013,174 @@ mod tests {
             assert!((bounds.y - expected_y).abs() < 0.01);
         }
         assert_eq!(layout.hit_test(Point { x: 90.0, y: 20.0 }), Some(NodeId(2)));
+    }
+
+    fn cursor(id: u64, kind: Kind, size: (f32, f32), cursor: Option<thing_core::Cursor>) -> Node {
+        let mut node = fixed(id, kind, size.0, size.1);
+        node.cursor = cursor;
+        node
+    }
+
+    fn cursors_at(
+        root: &Node,
+        size: Size,
+        state: &mut ScrollState,
+        points: &[(f32, f32)],
+    ) -> Vec<thing_core::Cursor> {
+        let layout = scrolled(root, size, state);
+        points
+            .iter()
+            .map(|&(x, y)| layout.cursor_at(Point { x, y }))
+            .collect()
+    }
+
+    #[test]
+    fn cursors_inherit_while_enabled_controls_keep_their_defaults() {
+        use thing_core::Cursor;
+        let mut root = cursor(1, Kind::Panel, (400.0, 100.0), Some(Cursor::Grab));
+        root.style.align = CrossAlign::Start;
+        let mut button = fixed(2, Kind::Button, 100.0, 100.0);
+        button.children.push(Node::new(NodeId(3), Kind::Text));
+        let field = fixed(4, Kind::TextInput, 100.0, 100.0);
+        let mut disabled = fixed(5, Kind::Button, 100.0, 100.0);
+        disabled.enabled = false;
+        let mut nested = cursor(6, Kind::Row, (100.0, 100.0), Some(Cursor::Crosshair));
+        nested
+            .children
+            .push(cursor(7, Kind::Button, (50.0, 100.0), Some(Cursor::Move)));
+        nested.children.push(fixed(8, Kind::TextInput, 50.0, 100.0));
+        root.children = vec![button, field, disabled, nested];
+        let size = Size {
+            width: 400.0,
+            height: 100.0,
+        };
+        assert_eq!(
+            cursors_at(
+                &root,
+                size,
+                &mut ScrollState::default(),
+                &[
+                    (50.0, 50.0),
+                    (150.0, 50.0),
+                    (250.0, 50.0),
+                    (325.0, 50.0),
+                    (375.0, 50.0)
+                ],
+            ),
+            [
+                // text inside a button shows the button's cursor.
+                Cursor::Pointer,
+                Cursor::Text,
+                // a disabled control has no default and inherits.
+                Cursor::Grab,
+                // an explicit cursor beats the control default.
+                Cursor::Move,
+                // a control default beats the inherited crosshair.
+                Cursor::Text,
+            ]
+        );
+        root.cursor = None;
+        let layout = scrolled(&root, size, &mut ScrollState::default());
+        assert_eq!(
+            layout.cursor_at(Point { x: 250.0, y: 50.0 }),
+            Cursor::Default
+        );
+        assert_eq!(
+            layout.cursor_at(Point { x: 500.0, y: 50.0 }),
+            Cursor::Default
+        );
+    }
+
+    #[test]
+    fn cursors_follow_clipping_scrolling_transforms_and_visibility() {
+        use thing_core::Cursor;
+        let size = Size {
+            width: 300.0,
+            height: 100.0,
+        };
+        let root = |children: Vec<Node>| {
+            let mut root = fixed(1, Kind::Panel, 300.0, 100.0);
+            root.style.align = CrossAlign::Start;
+            root.style.justify = MainAlign::Start;
+            root.children = children;
+            root
+        };
+
+        // the overflow of a clipping container is not hit.
+        let mut clip = cursor(2, Kind::Row, (100.0, 100.0), Some(Cursor::Cell));
+        let mut wide = cursor(3, Kind::Row, (300.0, 100.0), Some(Cursor::Wait));
+        wide.style.shrink = Some(0.0);
+        clip.children.push(wide);
+        assert_eq!(
+            cursors_at(
+                &root(vec![clip]),
+                size,
+                &mut ScrollState::default(),
+                &[(50.0, 50.0), (150.0, 50.0)]
+            ),
+            [Cursor::Wait, Cursor::Default]
+        );
+
+        // a scrolled viewport shows the row that moved under the point.
+        let mut viewport = fixed(2, Kind::Scroll, 100.0, 100.0);
+        let mut column = fixed(3, Kind::Column, 100.0, 300.0);
+        column.style.shrink = Some(0.0);
+        for (index, shape) in [Cursor::Crosshair, Cursor::Move, Cursor::Help]
+            .into_iter()
+            .enumerate()
+        {
+            column.children.push(cursor(
+                4 + index as u64,
+                Kind::Row,
+                (100.0, 100.0),
+                Some(shape),
+            ));
+        }
+        viewport.children.push(column);
+        let tree = root(vec![viewport]);
+        let mut state = ScrollState::default();
+        assert_eq!(
+            cursors_at(&tree, size, &mut state, &[(50.0, 50.0)]),
+            [Cursor::Crosshair]
+        );
+        state.set(NodeId(2), ScrollAxis::Vertical, 100.0);
+        assert_eq!(
+            cursors_at(&tree, size, &mut state, &[(50.0, 50.0)]),
+            [Cursor::Move]
+        );
+
+        // a mirrored row swaps where its children are hit.
+        let mut mirrored = fixed(2, Kind::Row, 200.0, 100.0);
+        mirrored.style.scale_x = -1.0;
+        mirrored
+            .children
+            .push(cursor(3, Kind::Row, (100.0, 100.0), Some(Cursor::Help)));
+        mirrored
+            .children
+            .push(cursor(4, Kind::Row, (100.0, 100.0), Some(Cursor::Move)));
+        assert_eq!(
+            cursors_at(
+                &root(vec![mirrored]),
+                size,
+                &mut ScrollState::default(),
+                &[(50.0, 50.0), (150.0, 50.0)]
+            ),
+            [Cursor::Move, Cursor::Help]
+        );
+
+        // a hidden overlay never decides; the widget beneath it does.
+        let mut stack = cursor(2, Kind::Stack, (100.0, 100.0), Some(Cursor::ZoomIn));
+        let mut overlay = cursor(3, Kind::Row, (100.0, 100.0), Some(Cursor::NotAllowed));
+        overlay.visible = false;
+        stack.children.push(overlay);
+        assert_eq!(
+            cursors_at(
+                &root(vec![stack]),
+                size,
+                &mut ScrollState::default(),
+                &[(50.0, 50.0)]
+            ),
+            [Cursor::ZoomIn]
+        );
     }
 }
