@@ -2267,7 +2267,155 @@ setup cannot call `ui.bounds`; this avoids a layout loop in which a widget
 continually resizes itself from its own measurement.
 
 `ui.bounds` cannot measure unconstrained content or return dimensions for an
-unopened popup.
+unopened popup. use `ui.geometry` when property functions need to follow
+measurements, or need the size content asks for.
+
+## reactive geometry
+
+`ui.geometry(widget)` returns a handle that property functions can read. the
+handle follows the frames thing presents, and every function that read it runs
+again when one of its measurements changes:
+
+```luau
+local entries = { 'open settings', 'lock the screen', 'log out of this session' }
+local labels = {}
+local measured = {}
+for index, entry in entries do
+    labels[index] = ui.text { text = entry }
+    measured[index] = ui.geometry(labels[index])
+end
+
+-- the popup grows to its widest entry, and never below 120 pixels.
+local menu = ui.popup {
+    style = {
+        padding = 12,
+        width = function()
+            local width = 120
+            for _, geometry in measured do
+                local content = geometry:content()
+                if content then
+                    width = math.max(width, content.width + 24)
+                end
+            end
+            return width
+        end,
+    },
+    children = { ui.column { children = labels } },
+}
+```
+
+a handle has five methods, and each returns `nil`, or `false` for `available`,
+until a presented frame has measured the widget:
+
+| method | returns |
+| --- | --- |
+| `available()` | whether the latest presented frame placed the widget |
+| `layout()` | `{ x, y, width, height }`: the box layout allocated, before transforms |
+| `visual()` | the axis-aligned box around the transformed border box |
+| `content()` | `{ width, height }`: the size the widget asks for with unlimited space |
+| `surface()` | the same opaque surface identifier as `ui.bounds` |
+
+these are three different sizes. `content()` is intrinsic: the text and layout
+engines measure the widget's content without a width limit, so a label reports
+its unwrapped line even while its allocated box wraps it. it includes the
+widget's own padding and fixed sizes. `layout()` is what the parent allocated.
+`visual()` adds transforms such as scale and rotation, and scroll offsets move
+both `layout()` and `visual()`. only widgets a handle observes are measured
+without constraints, at most 64 per surface; measuring never changes the
+allocated layout.
+
+measurements come from the accepted, presented tree. a property function
+change, event, or reload that fails validation never reaches layout, so the
+handle keeps its last presented values. a frame that never reached the
+compositor publishes nothing. a hidden widget, the widgets of a closed popup or
+window, and a widget that has not been presented yet are unavailable. a
+successful reload starts with new, unavailable handles.
+
+### ownership
+
+a handle belongs to one widget identity. create handles while the
+configuration loads or in an event handler; property functions cannot create
+them. at most 64 handles may be in use at once. a handle stays in use while
+anything references it or one of its methods; once nothing does, thing
+reclaims it, so a shell can keep observing new widgets for as long as it runs.
+repeated calls for the same widget share measurements until that identity
+retires. a keyed widget that a list re-creates under the same key keeps its
+handle. when the widget leaves the tree, or an unkeyed list puts a different
+widget in its place, the handle becomes unavailable for good, and never reads the
+replacement, even when it reuses the same internal id. call `ui.geometry` with
+the widget again after it returns to observe it once more.
+
+### feedback
+
+geometry that changes its own layout can loop: a width that depends on a
+measured width may never settle, alone or through another surface. thing
+counts frames whose geometry changed because a property function that read
+geometry changed the tree, while nothing else changed: no state write,
+service update, or animation step. an animation whose target geometry keeps
+moving is part of the loop, not an outside change. geometry that moves because
+a surface was resized or scrolled is not. after 8 counted frames, the changing
+handles keep their last values and thing logs it. the next outside change
+starts again. a converging dependency, such as the popup above, settles in one
+or two extra frames, with or without a transition.
+
+### converting points
+
+`ui.convert(from, x, y, to)` maps a point in `from`'s untransformed border box,
+with its origin at the top left, into `to`'s. call it from an event handler or
+timer callback, like `ui.bounds`. it returns `{ x, y }`, or `nil` while either
+widget is unmeasured. both widgets may be on the same surface, or related
+through popups: a popup's widgets convert to and from its parent's through the
+position the compositor gave the popup. converting between independent
+surfaces, such as two panels, is an error, and so is converting into a widget
+whose transform collapses it, such as a zero scale. this places a badge in a
+shared overlay under whichever button was clicked:
+
+```luau
+local badge_x = ui.state(0)
+local badge_y = ui.state(0)
+local overlay = ui.stack {
+    style = { width = 600, height = 32 },
+    children = {
+        ui.text {
+            text = 'new',
+            style = {
+                translate_x = function() return badge_x:get() end,
+                translate_y = function() return badge_y:get() end,
+            },
+        },
+    },
+}
+
+local function anchored(label: string): ThingWidget
+    local button: ThingWidget
+    local measured: ThingGeometry
+    button = ui.button {
+        children = { ui.text { text = label } },
+        on_click = function()
+            local box = measured:layout()
+            local point = box and ui.convert(button, 0, box.height, overlay)
+            if point then
+                badge_x:set(point.x)
+                badge_y:set(point.y)
+            end
+        end,
+    }
+    measured = ui.geometry(button)
+    return button
+end
+
+return ui.panel {
+    style = { height = 32 },
+    children = {
+        ui.stack {
+            children = {
+                ui.row { children = { anchored('mail'), anchored('chat') } },
+                overlay,
+            },
+        },
+    },
+}
+```
 
 ## imports
 

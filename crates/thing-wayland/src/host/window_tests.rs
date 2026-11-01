@@ -1,7 +1,7 @@
 //! `ui.window` through the real host. a private compositor serves xdg-shell,
 //! records every toplevel, popup, and layer request in order, and sends the
-//! configures, closes, scales, and clicks a test asks for. assertions wait
-//! for a positive protocol witness, never for a quiet interval.
+//! configures, closes, scales, and clicks a test asks for. event assertions
+//! wait for a positive protocol witness.
 
 use std::{
     collections::HashMap,
@@ -50,6 +50,8 @@ use wayland_server::{
 
 use super::*;
 
+mod geometry;
+
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
 const WAIT: Duration = Duration::from_secs(10);
@@ -85,12 +87,25 @@ enum Record {
         parent: Option<u32>,
     },
     DestroyPopup(u32),
+    /// the host asked to move a popup, and the server configured it at the
+    /// current popup position.
+    Reposition {
+        surface: u32,
+        token: u32,
+    },
     LayerPopup,
     Layer(u32),
     DestroyLayer(u32),
 }
 
 enum Command {
+    /// a compositor-initiated move of a mapped popup.
+    ConfigurePopup {
+        surface: u32,
+        position: (i32, i32),
+    },
+    /// completes every frame callback held while `hold_callbacks` was set.
+    ReleaseCallbacks,
     Configure {
         toplevel: u32,
         size: (i32, i32),
@@ -113,7 +128,15 @@ enum Command {
 struct Control {
     commands: Vec<Command>,
     records: Vec<Record>,
+    /// where popups are placed in their parent when first configured or
+    /// repositioned.
+    popup_position: (i32, i32),
+    /// keeps frame callbacks pending, as a compositor does for a surface it
+    /// is not showing.
+    hold_callbacks: bool,
 }
+
+const POPUP_SIZE: (i32, i32) = (100, 60);
 
 struct ServerState {
     control: Arc<Mutex<Control>>,
@@ -127,11 +150,21 @@ struct ServerState {
     layers: HashMap<u32, (ServerLayer, bool)>,
     pending_buffers: HashMap<ObjectId, ServerBuffer>,
     frame_callbacks: HashMap<ObjectId, Vec<ServerCallback>>,
+    held_callbacks: Vec<ServerCallback>,
 }
 
 impl ServerState {
     fn record(&self, record: Record) {
         self.control.lock().unwrap().records.push(record);
+    }
+
+    fn configure_popup(&mut self, surface: u32, position: (i32, i32)) {
+        let Some((popup, xdg, _)) = self.popups.get(&surface).cloned() else {
+            return;
+        };
+        popup.configure(position.0, position.1, POPUP_SIZE.0, POPUP_SIZE.1);
+        let serial = self.next_serial();
+        xdg.configure(serial);
     }
 
     fn next_serial(&mut self) -> u32 {
@@ -143,6 +176,14 @@ impl ServerState {
         let commands = std::mem::take(&mut self.control.lock().unwrap().commands);
         for command in commands {
             match command {
+                Command::ConfigurePopup { surface, position } => {
+                    self.configure_popup(surface, position);
+                }
+                Command::ReleaseCallbacks => {
+                    for callback in std::mem::take(&mut self.held_callbacks) {
+                        callback.done(1);
+                    }
+                }
                 Command::Configure {
                     toplevel,
                     size,
@@ -350,9 +391,23 @@ impl ServerDispatch<ServerPopup, u32> for ServerState {
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
-        if let server_popup::Request::Destroy = request {
-            state.popups.remove(surface);
-            state.record(Record::DestroyPopup(*surface));
+        match request {
+            server_popup::Request::Destroy => {
+                state.popups.remove(surface);
+                state.record(Record::DestroyPopup(*surface));
+            }
+            server_popup::Request::Reposition { token, .. } => {
+                if let Some((popup, _, _)) = state.popups.get(surface) {
+                    popup.repositioned(token);
+                }
+                let position = state.control.lock().unwrap().popup_position;
+                state.configure_popup(*surface, position);
+                state.record(Record::Reposition {
+                    surface: *surface,
+                    token,
+                });
+            }
+            _ => {}
         }
     }
 }
@@ -464,17 +519,20 @@ impl ServerDispatch<ServerSurface, ()> for ServerState {
                     let serial = state.next_serial();
                     layer.configure(serial, WIDTH, 40);
                 }
-                if let Some((popup, xdg, configured)) = state.popups.get_mut(&id)
+                if let Some((_, _, configured)) = state.popups.get_mut(&id)
                     && !*configured
                 {
                     *configured = true;
-                    let (popup, xdg) = (popup.clone(), xdg.clone());
-                    popup.configure(0, 0, 100, 60);
-                    let serial = state.next_serial();
-                    xdg.configure(serial);
+                    let position = state.control.lock().unwrap().popup_position;
+                    state.configure_popup(id, position);
                 }
-                for callback in state.frame_callbacks.remove(&object).unwrap_or_default() {
-                    callback.done(1);
+                let callbacks = state.frame_callbacks.remove(&object).unwrap_or_default();
+                if state.control.lock().unwrap().hold_callbacks {
+                    state.held_callbacks.extend(callbacks);
+                } else {
+                    for callback in callbacks {
+                        callback.done(1);
+                    }
                 }
             }
             server_surface::Request::Destroy => {
@@ -631,6 +689,7 @@ impl PrivateWayland {
                 layers: HashMap::new(),
                 pending_buffers: HashMap::new(),
                 frame_callbacks: HashMap::new(),
+                held_callbacks: Vec::new(),
             };
             while !server_stop.load(Ordering::Relaxed) {
                 match display
@@ -879,6 +938,39 @@ impl Host {
 
     fn has(&self, record: &Record) -> bool {
         self.records().contains(record)
+    }
+
+    /// commits of `surface` that attached a buffer, so each is one frame.
+    fn frames(&self, surface: u32) -> usize {
+        self.records()
+            .iter()
+            .filter(|record| {
+                **record
+                    == Record::Commit {
+                        surface,
+                        buffer: true,
+                    }
+            })
+            .count()
+    }
+
+    /// popup surfaces in creation order.
+    fn popups(&self) -> Vec<u32> {
+        self.records()
+            .into_iter()
+            .filter_map(|record| match record {
+                Record::Popup { surface, .. } => Some(surface),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn set_popup_position(&self, position: (i32, i32)) {
+        self.wayland.control.lock().unwrap().popup_position = position;
+    }
+
+    fn hold_callbacks(&self, hold: bool) {
+        self.wayland.control.lock().unwrap().hold_callbacks = hold;
     }
 
     fn position(&self, record: &Record) -> usize {

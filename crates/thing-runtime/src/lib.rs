@@ -4,6 +4,7 @@
 //! surface trees to the renderer.
 
 mod bounds;
+mod geometry;
 mod idle;
 mod modules;
 mod motion;
@@ -17,7 +18,8 @@ mod state;
 mod timer;
 mod transition;
 mod window;
-pub use bounds::{BoundsProvider, BoundsRect, PresentedBounds, WidgetBounds};
+pub use bounds::{BoundsProvider, BoundsRect, MappedPoint, PresentedBounds, WidgetBounds};
+pub use geometry::{GeometryUpdate, MAX_FEEDBACK_ROUNDS};
 pub use idle::{IdleWatchDefinition, MAX_IDLE_TIMEOUT_MS, MAX_IDLE_WATCHES, MIN_IDLE_TIMEOUT_MS};
 pub use niri::{
     NiriAction, NiriCast, NiriCastKind, NiriCastTarget, NiriKeyboardLayouts, NiriLayoutTarget,
@@ -382,6 +384,7 @@ pub struct Runtime {
     timers: Rc<RefCell<timer::Timers>>,
     motions: Rc<RefCell<motion::Motions>>,
     bounds: Rc<RefCell<bounds::Bounds>>,
+    geometry: Rc<RefCell<geometry::Geometry>>,
     event_depth: usize,
     output: Option<OutputContext>,
     mode: ConfigurationMode,
@@ -493,7 +496,16 @@ impl Runtime {
         let timers = Rc::new(RefCell::new(timer::Timers::default()));
         let motions = Rc::new(RefCell::new(motion::Motions::new(tracker.clone())));
         let bounds = Rc::new(RefCell::new(bounds::Bounds::default()));
-        let ui = install_ui(&lua, tracker.clone(), &timers, &motions, &bounds, &services)?;
+        let geometry = Rc::new(RefCell::new(geometry::Geometry::default()));
+        let ui = install_ui(
+            &lua,
+            tracker.clone(),
+            &timers,
+            &motions,
+            &bounds,
+            &geometry,
+            &services,
+        )?;
         lua.sandbox(true)?;
         let modules = modules::Modules::default();
         let exported = modules.load(&lua, path)?;
@@ -549,6 +561,7 @@ impl Runtime {
             timers,
             motions,
             bounds,
+            geometry,
             event_depth: 0,
             output,
             mode,
@@ -565,6 +578,14 @@ impl Runtime {
             }
         }
         let _ = runtime.sync_ui_targets();
+        runtime.sync_geometry()?;
+        let mut surfaces = std::mem::take(&mut runtime.surfaces);
+        let marked = runtime.mark_measured(&mut surfaces, &runtime.sources);
+        runtime.surfaces = surfaces;
+        let mut geometry = runtime.geometry.borrow_mut();
+        geometry.marks_stale = false;
+        geometry.marked = marked;
+        drop(geometry);
         Ok(runtime)
     }
 
@@ -922,18 +943,90 @@ impl Runtime {
         root: NodeId,
         provider: Rc<dyn BoundsProvider>,
     ) -> Result<Rc<PresentedBounds>> {
-        let is_surface = self.surfaces.iter().any(|surface| {
-            surface
-                .root
-                .find(root)
-                .is_some_and(|node| root == surface.root.id || node.kind == Kind::Popup)
-        });
-        if !is_surface {
+        if !self.is_surface_root(root) {
             return Err(Error::runtime(
                 "presented bounds have no current surface root",
             ));
         }
         self.bounds.borrow_mut().record(root, provider)
+    }
+
+    /// publish one presented frame's geometry to the `ui.geometry` handles
+    /// on surface `root`. call it after `record_presented_bounds` with the
+    /// same frame, and refresh when `take_geometry_refresh` reports changes.
+    pub fn publish_geometry(
+        &self,
+        root: NodeId,
+        provider: &dyn BoundsProvider,
+    ) -> Result<GeometryUpdate> {
+        if !self.is_surface_root(root) {
+            return Err(Error::runtime(
+                "presented geometry has no current surface root",
+            ));
+        }
+        self.geometry
+            .borrow_mut()
+            .publish(&self.tracker, &self.ui.borrow(), root, provider)
+    }
+
+    /// a surface that stopped presenting, such as a closed popup, makes its
+    /// widgets' geometry unavailable.
+    pub fn forget_presented_geometry(&self, root: NodeId) -> Result<()> {
+        self.geometry
+            .borrow_mut()
+            .forget_surface(&self.tracker, root)
+    }
+
+    /// whether geometry changed since the last call, so dependent property
+    /// functions need a refresh.
+    pub fn take_geometry_refresh(&self) -> bool {
+        std::mem::take(&mut self.geometry.borrow_mut().refresh_pending)
+    }
+
+    fn is_surface_root(&self, root: NodeId) -> bool {
+        self.surfaces.iter().any(|surface| {
+            surface
+                .root
+                .find(root)
+                .is_some_and(|node| root == surface.root.id || node.kind == Kind::Popup)
+        })
+    }
+
+    fn sync_geometry(&self) -> Result<()> {
+        self.geometry
+            .borrow_mut()
+            .sync(&self.tracker, &self.ui.borrow())
+    }
+
+    /// sets `measure_content` on exactly the widgets a live geometry handle
+    /// observes, and returns whether any widget may be flagged. a tree that
+    /// never had handles is not walked.
+    fn mark_measured(&self, surfaces: &mut [SurfaceTree], sources: &BTreeMap<NodeId, u64>) -> bool {
+        fn mark(
+            node: &mut Node,
+            nodes: &BTreeSet<NodeId>,
+            wanted: &BTreeSet<u64>,
+            sources: &BTreeMap<NodeId, u64>,
+        ) {
+            node.measure_content = nodes.contains(&node.id)
+                || sources
+                    .get(&node.id)
+                    .is_some_and(|source| wanted.contains(source));
+            for child in &mut node.children {
+                mark(child, nodes, wanted, sources);
+            }
+        }
+        let geometry = self.geometry.borrow();
+        if !geometry.wants_marks() {
+            return false;
+        }
+        let (nodes, wanted) = geometry.measured();
+        let nodes: BTreeSet<_> = nodes.into_iter().collect();
+        let wanted: BTreeSet<_> = wanted.into_iter().collect();
+        for surface in surfaces {
+            mark(&mut surface.root, &nodes, &wanted, sources);
+        }
+        !nodes.is_empty() || !wanted.is_empty()
     }
 
     pub fn focus_target(&self, id: NodeId) -> Option<UiTarget> {
@@ -1727,7 +1820,8 @@ impl Runtime {
         advance: bool,
     ) -> Result<bool> {
         let mut dirty = std::mem::take(&mut self.tracker.borrow_mut().dirty);
-        if dirty.is_empty() && (!advance || !self.has_active_transitions()) {
+        let marks_stale = self.geometry.borrow().marks_stale;
+        if dirty.is_empty() && !marks_stale && (!advance || !self.has_active_transitions()) {
             return Ok(self.motions.borrow().has_controls());
         }
         let previous_deferred = if advance {
@@ -1740,6 +1834,18 @@ impl Runtime {
         // retry a failed batch when another dependency changes. retaining the
         // whole batch prevents unrelated, valid changes from being lost.
         self.deferred = dirty.clone();
+        let evaluates = !dirty.is_empty();
+        // a refresh that only geometry caused feeds back when it moves where
+        // the ui is heading. compare against the accepted animation targets,
+        // since a retarget also advances the displayed value.
+        let previous_target = (evaluates
+            && self
+                .geometry
+                .borrow()
+                .only_geometry_since_refresh(&self.tracker.borrow()))
+        .then(|| self.target_surfaces());
+        let mut final_target = None;
+        let mut marked = false;
         self.begin_call();
         let mut candidate = self.surfaces.clone();
         let checkpoint = self.next_binding;
@@ -1892,6 +1998,8 @@ impl Runtime {
                     }
                 }
             }
+            // geometry handles ask layout to measure their widgets' content.
+            marked = self.mark_measured(&mut candidate, &sources);
             for surface in &candidate {
                 surface.root.validate().map_err(Error::external)?;
             }
@@ -1922,6 +2030,7 @@ impl Runtime {
                 validate(&target).map_err(Error::runtime)?;
             }
             validate(&candidate).map_err(Error::runtime)?;
+            final_target = Some(target);
             Ok(())
         })();
         if let Err(error) = result {
@@ -1950,6 +2059,25 @@ impl Runtime {
         let changed = candidate != self.surfaces;
         self.surfaces = candidate;
         let ui_identity_changed = ui_structure_changed && self.sync_ui_targets();
+        {
+            let mut geometry = self.geometry.borrow_mut();
+            geometry.marks_stale = false;
+            geometry.marked = marked;
+            if changed || ui_identity_changed {
+                geometry.commits += 1;
+            }
+            if evaluates {
+                let fed_back = match previous_target {
+                    None => false,
+                    Some(None) => true,
+                    Some(Some(previous)) => final_target.as_ref() != Some(&previous),
+                };
+                geometry.finish_refresh(&self.tracker.borrow(), fed_back);
+            }
+        }
+        if ui_structure_changed {
+            self.sync_geometry()?;
+        }
         self.deferred = previous_deferred
             .into_iter()
             .filter(|index| self.bindings.contains_key(index))
@@ -1975,6 +2103,16 @@ impl Runtime {
         match self.refresh_frame_checked(now, &validate, true) {
             Ok(changed) => {
                 self.motions.borrow_mut().commit_frame(frame);
+                let active = self.has_active_transitions();
+                let mut geometry = self.geometry.borrow_mut();
+                // animation frames are outside changes to geometry chains,
+                // unless geometry itself keeps retargeting the animation.
+                if changed && !geometry.driven {
+                    geometry.advances += 1;
+                }
+                if !active {
+                    geometry.driven = false;
+                }
                 Ok(changed)
             }
             Err(error) => {
@@ -2028,6 +2166,26 @@ impl Runtime {
             }
         }
         ids.into_iter().any(|id| active.contains(&id))
+    }
+
+    /// the accepted surfaces with every running animation at its target, or
+    /// `None` when a target no longer applies.
+    fn target_surfaces(&self) -> Option<Vec<SurfaceTree>> {
+        let mut target = self.surfaces.clone();
+        for binding in self.bindings.values() {
+            let Some(state) = binding
+                .transition
+                .as_ref()
+                .filter(|state| state.is_active())
+            else {
+                continue;
+            };
+            let node = target
+                .iter_mut()
+                .find_map(|surface| surface.root.find_mut(binding.node))?;
+            properties::apply_transition(node, &binding.property, state.target()).ok()?;
+        }
+        Some(target)
     }
 
     fn has_active_transitions(&self) -> bool {
@@ -2656,6 +2814,7 @@ fn install_ui(
     timers: &Rc<RefCell<timer::Timers>>,
     motions: &Rc<RefCell<motion::Motions>>,
     bounds: &Rc<RefCell<bounds::Bounds>>,
+    geometry: &Rc<RefCell<geometry::Geometry>>,
     services: &services::Services,
 ) -> Result<Rc<RefCell<UiContext>>> {
     let ui = lua.create_table()?;
@@ -2664,6 +2823,7 @@ fn install_ui(
     services.install_window_states(lua, &ui)?;
     let context = Rc::new(RefCell::new(UiContext::default()));
     bounds::Bounds::install(bounds, &context, lua, &ui)?;
+    geometry::install(lua, &ui, tracker.clone(), geometry.clone())?;
     let next_id = Rc::new(Cell::new(1_u64));
     for name in [
         "panel",

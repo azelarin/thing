@@ -964,6 +964,9 @@ pub struct Node {
     /// the explicit pointer cursor, which descendants inherit unless they set
     /// their own or are enabled controls with a default.
     pub cursor: Option<crate::Cursor>,
+    /// set by the runtime for widgets a geometry handle observes, so layout
+    /// also measures their content without constraints.
+    pub measure_content: bool,
     pub pointer_events: bool,
     pub scroll_events: bool,
     pub key: Option<String>,
@@ -1002,6 +1005,7 @@ impl Node {
             visible: true,
             autofocus: false,
             cursor: None,
+            measure_content: false,
             pointer_events: false,
             scroll_events: false,
             key: None,

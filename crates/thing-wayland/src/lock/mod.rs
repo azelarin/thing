@@ -321,6 +321,10 @@ pub fn run(entry: &Path, renderer: Renderer) -> Result<(), String> {
         }
         app.dispatch_due_timers(Instant::now());
         app.draw(&qh);
+        // presented geometry may feed property functions.
+        if app.configurations.take_geometry_refresh() {
+            app.refresh();
+        }
         connection.flush().map_err(|error| error.to_string())?;
         let timeout = app
             .next_deadline()
@@ -427,6 +431,9 @@ struct Surface {
     layouts: SurfaceLayouts,
     prepared: Option<PreparedLockLayout>,
     scroll: ScrollState,
+    /// the logical size and scroll offsets of the last presented frame, so
+    /// geometry can tell a resize or scroll from feedback.
+    presented_input: Option<((u32, u32), ScrollState)>,
     input: Interaction,
     focus_target: Option<ScopedUiTarget>,
     secret_guarded: bool,
@@ -694,6 +701,7 @@ impl App {
             layouts: SurfaceLayouts::default(),
             prepared: None,
             scroll: ScrollState::default(),
+            presented_input: None,
             input: Interaction::default(),
             focus_target: None,
             secret_guarded: false,
@@ -1592,15 +1600,23 @@ impl App {
             match result {
                 FrameResult::Presented { redraw } => {
                     let animating = configurations.layout_is_animating(&surface.output, &layout);
+                    let frame_input = (surface.size, scroll.clone());
+                    let moved = surface
+                        .presented_input
+                        .as_ref()
+                        .is_some_and(|previous| *previous != frame_input);
+                    surface.presented_input = Some(frame_input);
                     surface.waiting = true;
                     surface.scroll = scroll;
                     let (consumer, targets) = presented_ui;
                     let layout = Rc::new(layout);
-                    let bounds = configurations.record_presented_bounds(
+                    let bounds = configurations.record_presented_frame(
                         &surface.output,
                         &consumer,
                         root.id,
                         layout.clone(),
+                        None,
+                        moved,
                     );
                     surface
                         .layouts

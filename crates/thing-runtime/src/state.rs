@@ -44,6 +44,9 @@ pub(crate) struct Tracker {
     evaluating: Option<usize>,
     reads: BTreeSet<usize>,
     pub dirty: BTreeSet<usize>,
+    /// how many writes changed a value, so callers can tell whether anything
+    /// happened between two points.
+    pub changes: u64,
 }
 
 impl Tracker {
@@ -57,6 +60,16 @@ impl Tracker {
 
     pub(crate) fn subscribers(&self, id: usize) -> impl Iterator<Item = usize> + '_ {
         self.subscribers.get(&id).into_iter().flatten().copied()
+    }
+
+    pub(crate) fn is_evaluating(&self) -> bool {
+        self.evaluating.is_some()
+    }
+
+    /// drops every subscription to a value, so a recycled value starts with
+    /// no dependents.
+    pub(crate) fn clear_subscribers(&mut self, id: usize) {
+        self.subscribers.remove(&id);
     }
 
     pub fn insert(&mut self, value: Scalar) -> Result<usize> {
@@ -111,6 +124,7 @@ impl Tracker {
         for (id, value) in values {
             if self.values[id] != value {
                 self.values[id] = value;
+                self.changes += 1;
                 if let Some(bindings) = self.subscribers.get(&id) {
                     self.dirty.extend(bindings);
                 }
