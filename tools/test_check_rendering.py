@@ -637,6 +637,53 @@ class GroupOpacityOracleTest(unittest.TestCase):
             self.verify(group_opacity(1.25, reload=True), "rejected")
 
 
+def crossfade_frame(scale, *, reload=False):
+    canvas = Canvas(scale).rect(0, 0, 560, 230, (24, 24, 24))
+    mixed = (64, 0, 191) if reload else (191, 0, 64)
+    faded = (34, 18, 66) if reload else (66, 18, 34)
+    for point, color in (
+        ((40, 40), mixed), ((80, 40), mixed), ((120, 40), mixed),
+        ((160, 90), (0, 255, 0)),
+        ((235, 40), (53, 21, 21) if reload else (111, 15, 15)),
+        ((265, 40), (35, 3, 194) if reload else (105, 9, 73)),
+        ((295, 40), (6, 6, 197) if reload else (18, 18, 82)),
+        ((40, 150), faded), ((80, 150), faded),
+        ((450, 150), (40, 179, 161)),
+    ):
+        patch(canvas, point, color)
+    return canvas
+
+
+class CrossfadeOracleTest(unittest.TestCase):
+    def verify(self, frame, stage="scale-1"):
+        check_rendering.verify_capture("crossfade", frame.image(), stage, frame.scale)
+
+    def test_accepts_both_scales_and_reload_states(self):
+        for scale in (1, 1.25):
+            self.verify(crossfade_frame(scale))
+            self.verify(crossfade_frame(scale), "rejected")
+            self.verify(crossfade_frame(scale, reload=True), "reload")
+
+    def test_rejects_missing_isolation_transparency_and_sibling_leaks(self):
+        for point, color, label in (
+            ((40, 40), (143, 48, 64), "complete source blend"),
+            ((80, 40), (120, 0, 135), "overlapping child shapes"),
+            ((40, 40), (191, 255, 64), "complete source blend"),
+            ((235, 40), (167, 8, 8), "translucent outgoing footprint"),
+            ((265, 40), (155, 10, 75), "overlapping translucent sources"),
+            ((80, 150), (102, 12, 45), "inherited opacity at overlap"),
+            ((450, 150), (28, 63, 60), "following sibling"),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(FixtureError, label):
+                frame = crossfade_frame(1)
+                patch(frame, point, color)
+                self.verify(frame)
+
+    def test_reload_cannot_keep_the_old_mixture(self):
+        with self.assertRaisesRegex(FixtureError, "complete source blend"):
+            self.verify(crossfade_frame(1.25), "reload")
+
+
 class StableCaptureTest(unittest.TestCase):
     def capture(self, frames, required, case="shadows", scale=1.0):
         calls = []

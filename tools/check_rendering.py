@@ -25,13 +25,13 @@ ARTIFACTS = ROOT / "target/render-tests"
 CASES = (
     "image-fit", "stencil", "gradients", "radial-gradients", "shadows", "shared-motion",
     "widget-bounds", "rounded-clips", "path-clips", "horizontal-scroll", "motion-lifecycle", "content-transitions", "windows",
-    "styled-text", "live-inspector", "image-effects", "group-opacity",
+    "styled-text", "live-inspector", "image-effects", "group-opacity", "crossfade",
 )
 # these accept a state only after the same passing frame is captured twice.
 STABLE_FRAMES = {
     "windows": 2,
     "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2, "rounded-clips": 2, "horizontal-scroll": 2, "motion-lifecycle": 2, "content-transitions": 2,
-    "styled-text": 2, "live-inspector": 2, "image-effects": 2, "group-opacity": 2,
+    "styled-text": 2, "live-inspector": 2, "image-effects": 2, "group-opacity": 2, "crossfade": 2,
 }
 RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
 # the runtime error each panel-invalid.luau must produce, in thing check and in
@@ -40,6 +40,7 @@ INVALID_RELOADS = {
     "shadows": "shadow blur must be between 0 and 32",
     "image-effects": "between 0 and 64",
     "group-opacity": "style.composite must be a boolean",
+    "crossfade": "between 0 and 1",
 }
 MAX_LOG_BYTES = 1024 * 1024
 COMMAND_TIMEOUT = 8.0
@@ -683,8 +684,29 @@ def verify_group_opacity(image, stage, scale):
     color("f: following sibling stays opaque", (310, 150), GROUP_BLUE, tolerance=3)
 
 
+def verify_crossfade(image, stage, scale):
+    reloaded = stage == "reload"
+    mixed = (64, 0, 191) if reloaded else (191, 0, 64)
+    faded = (34, 18, 66) if reloaded else (66, 18, 34)
+    for point, expected, label in (
+        ((40, 40), mixed, "complete source blend"),
+        ((80, 40), mixed, "overlapping child shapes"),
+        ((120, 40), mixed, "complete target blend"),
+        ((160, 90), (0, 255, 0), "container background stays outside the blend"),
+        ((235, 40), (53, 21, 21) if reloaded else (111, 15, 15), "translucent outgoing footprint"),
+        ((265, 40), (35, 3, 194) if reloaded else (105, 9, 73), "overlapping translucent sources"),
+        ((295, 40), (6, 6, 197) if reloaded else (18, 18, 82), "incoming footprint"),
+        ((40, 150), faded, "inherited opacity"),
+        ((80, 150), faded, "inherited opacity at overlap"),
+        ((450, 150), (40, 179, 161), "following sibling"),
+    ):
+        expect_color(image, point, scale, expected, label, tolerance=3)
+
+
 def verify_capture(case, image, stage, scale):
-    if case == "group-opacity":
+    if case == "crossfade":
+        verify_crossfade(image, stage, scale)
+    elif case == "group-opacity":
         verify_group_opacity(image, stage, scale)
     elif case == "image-effects":
         verify_image_effects(image, stage, scale)
