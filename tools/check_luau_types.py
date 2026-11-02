@@ -30,6 +30,8 @@ CASES = (
     Case("valid.luau"),
     Case("valid-timers.luau"),
     Case("valid-motion.luau"),
+    Case("valid-compositing.luau"),
+    Case("invalid-compositing.luau", ("Property 'composite' is not compatible.",)),
     Case("valid-bounds.luau"),
     Case("valid-geometry.luau"),
     Case("valid-commands.luau"),

@@ -2055,6 +2055,7 @@ fn prepare_surface_layout(
     );
     thing_ui::validate_shadows(root, &layout, physical, scale.factor())?;
     thing_ui::validate_image_effects(root, &layout, physical, scale.factor())?;
+    thing_ui::validate_compositing(root, &layout, physical)?;
     Ok(PreparedSurfaceLayout {
         key,
         root: root.clone(),

@@ -526,6 +526,117 @@ class ImageEffectsOracleTest(unittest.TestCase):
             self.verify(canvas, "reload")
 
 
+GROUP_BACKGROUND = check_rendering.GROUP_BACKGROUND
+# colors for each stage's group opacity: one faded box, two separately faded
+# boxes, a group under a half-opaque or disabled ancestor, and a faded shadow.
+GROUP_COLORS = {
+    False: {"single": (248, 120, 120), "double": (251, 60, 60),
+            "half": (244, 180, 180), "shadow": (120, 120, 120)},
+    True: {"single": (244, 180, 180), "double": (247, 135, 135),
+           "half": (242, 210, 210), "shadow": (180, 180, 180)},
+}
+GROUP_PAIRS = {
+    "a": ((40, 45), (80, 45), (120, 45)),
+    "b": ((180, 45), (220, 45), (260, 45)),
+    "c": ((320, 45), (360, 45), (400, 45)),
+    "d": ((460, 45), (500, 45), (540, 45)),
+    "e": ((55, 125), (120, 130), (185, 140)),
+}
+
+
+def group_opacity(scale, *, reload=False):
+    """probe patches for a plausible frame; clipped corners and escaping
+    content are left as the panel background."""
+    colors = GROUP_COLORS[reload]
+    canvas = Canvas(scale).rect(0, 0, 580, 240, GROUP_BACKGROUND)
+    left, overlap, right = GROUP_PAIRS["a"]
+    patches = [(left, colors["single"]), (overlap, colors["double"]), (right, colors["single"])]
+    patches += [(point, colors["single"]) for cell in "be" for point in GROUP_PAIRS[cell]]
+    patches += [(point, colors["half"]) for cell in "cd" for point in GROUP_PAIRS[cell]]
+    patches += [((130, 192), colors["shadow"])]
+    for point, color in patches:
+        patch(canvas, point, color)
+    return canvas.rect(260, 100, 360, 200, (0, 0, 255))
+
+
+def patch(canvas, point, color):
+    x, y = point
+    return canvas.rect(x - 1, y - 1, x + 2, y + 2, color)
+
+
+class GroupOpacityOracleTest(unittest.TestCase):
+    def verify(self, canvas, stage="scale-1"):
+        check_rendering.verify_capture("group-opacity", canvas.image(), stage, canvas.scale)
+
+    def test_accepts_both_scales_the_rejected_reload_and_the_valid_reload(self):
+        for scale in (1, 1.25):
+            with self.subTest(scale=scale):
+                for stage in ("scale-1", "scale-1.25", "rejected"):
+                    self.verify(group_opacity(scale), stage)
+                self.verify(group_opacity(scale, reload=True), "reload")
+
+    def test_rejects_a_blank_frame(self):
+        with self.assertRaises(FixtureError):
+            self.verify(Canvas(1).rect(0, 0, 580, 240, GROUP_BACKGROUND))
+
+    def test_rejects_isolation_clip_and_inherited_opacity_mistakes(self):
+        single = GROUP_COLORS[False]["single"]
+        double = GROUP_COLORS[False]["double"]
+        for scale in (1, 1.25):
+            cases = (
+                # the group overlap compounds like two separate fades.
+                ("b: group overlap", [((220, 45), double)]),
+                ("e: clipped group overlap", [((120, 130), double)]),
+                # grouping the plain cell removes the compounding it shows.
+                ("a: ungrouped overlap is not darker", [((80, 45), single)]),
+                # the ancestor opacity of 0.5 applied twice or not at all.
+                ("c: inherited opacity left box", [((320, 45), (242, 210, 210))]),
+                ("c: inherited opacity left box", [((320, 45), single)]),
+                # the inner disabled opacity of 0.1 repeated, or disabled opacity lost.
+                ("d: disabled opacity left box", [((460, 45), (241, 234, 234))]),
+                ("d: disabled opacity left box", [((460, 45), single)]),
+                # a bounds clip or a missing clip leaves square corners and overflow.
+                ("e: rounded clip cuts the corner", [((26, 106), single)]),
+                ("e: rounded clip cuts the shadow corner",
+                 [((214, 199), GROUP_COLORS[False]["shadow"])]),
+                ("e: clip contains the overflowing box", [((235, 135), single)]),
+                ("e: clip contains the escaping shadow",
+                 [((130, 218), GROUP_COLORS[False]["shadow"])]),
+                # a shadow painted outside the group's fade.
+                ("e: shadow inside the clip", [((130, 192), (0, 0, 0))]),
+                # the sibling drawn inside a layer that was never closed.
+                ("f: following sibling stays opaque", [((310, 150), (120, 120, 248))]),
+            )
+            for message, patches in cases:
+                with self.subTest(scale=scale, message=message):
+                    canvas = group_opacity(scale)
+                    for point, color in patches:
+                        patch(canvas, point, color)
+                    with self.assertRaisesRegex(FixtureError, message):
+                        self.verify(canvas, "scale-1.25" if scale == 1.25 else "scale-1")
+
+    def test_a_group_that_ignores_child_overlap_cannot_pass_as_uniform(self):
+        # each probe is within the color tolerance, but the overlap differs.
+        canvas = group_opacity(1)
+        patch(canvas, (220, 45), (251, 116, 116))
+        patch(canvas, (180, 45), (245, 124, 124))
+        with self.assertRaisesRegex(FixtureError, "b: group overlap .* differs"):
+            self.verify(canvas)
+
+    def test_stale_opacity_does_not_pass_either_reload(self):
+        with self.assertRaisesRegex(FixtureError, "a: ungrouped left box"):
+            self.verify(group_opacity(1.25), "reload")
+        # a reload that kept the old group fades but updated the plain cell.
+        canvas = group_opacity(1.25, reload=True)
+        for point in GROUP_PAIRS["b"]:
+            patch(canvas, point, GROUP_COLORS[False]["single"])
+        with self.assertRaisesRegex(FixtureError, "b: group left box"):
+            self.verify(canvas, "reload")
+        # the rejected configuration must not change the accepted frame.
+        with self.assertRaisesRegex(FixtureError, "a: ungrouped left box"):
+            self.verify(group_opacity(1.25, reload=True), "rejected")
+
+
 class StableCaptureTest(unittest.TestCase):
     def capture(self, frames, required, case="shadows", scale=1.0):
         calls = []
@@ -575,6 +686,17 @@ class StableCaptureTest(unittest.TestCase):
             self.capture([good, broken, good], 2)
         self.assertEqual(self.capture([good, broken, good, good], 2), 4)
 
+
+    def test_group_opacity_needs_two_identical_passing_frames(self):
+        required = check_rendering.STABLE_FRAMES["group-opacity"]
+        self.assertEqual(required, 2)
+        frame = group_opacity(1.0)
+        # a passing frame that still differs outside every probe.
+        settling = group_opacity(1.0).rect(600, 300, 640, 480, BLACK)
+        self.assertEqual(self.capture([settling, frame, frame], required, "group-opacity"), 3)
+        leaked = patch(group_opacity(1.0), (310, 150), (120, 120, 248))
+        with self.assertRaisesRegex(FixtureError, "waiting for 2 identical frames"):
+            self.capture([frame, leaked, frame], required, "group-opacity")
 
     def test_radial_gradients_need_two_identical_passing_frames(self):
         required = check_rendering.STABLE_FRAMES["radial-gradients"]
@@ -798,6 +920,24 @@ class StageTest(unittest.TestCase):
             ],
         )
         self.assertEqual(result["rejected_reload"], "logged rejection")
+
+    def test_group_opacity_rejects_a_bad_flag_before_reloading_the_new_opacity(self):
+        events, result, texts = self.run_stages("group-opacity")
+        self.assertEqual(
+            events,
+            [
+                ("scale-1", texts["panel"], 2),
+                ("scale-1.25", texts["panel"], 2),
+                ("witness", texts["panel-invalid"], True),
+                ("rejected", texts["panel-invalid"], 2),
+                ("reload", texts["panel-reload"], 2),
+            ],
+        )
+        self.assertEqual(result["rejected_reload"], "logged rejection")
+        self.assertIn("'wrong'", texts["panel-invalid"])
+        self.assertEqual(
+            check_rendering.INVALID_RELOADS["group-opacity"], "style.composite must be a boolean"
+        )
 
     def test_windows_resize_close_and_reopen_with_stable_frames(self):
         with mock.patch.object(check_rendering, "fixture_window", side_effect=[

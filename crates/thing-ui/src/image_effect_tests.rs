@@ -221,6 +221,30 @@ fn blur_and_opacity_apply_opacity_once() {
 }
 
 #[test]
+fn a_composited_group_fades_filtered_images_once_and_keeps_child_opacity() {
+    for (child_opacity, outside_alpha, overlap_alpha) in [(1.0, 128, 128), (0.5, 64, 96)] {
+        let mut left = picture(
+            solid("composited-blur", [255, 255, 255, 255]),
+            60.0,
+            40.0,
+            effects(6.0, 0.5),
+        );
+        left.style.opacity = child_opacity;
+        let mut right = left.clone();
+        right.id = NodeId(3);
+        right.style.translate_x = 30.0;
+        let mut group = stack(4, vec![left, right]);
+        group.style.width = Some(100.0);
+        group.style.height = Some(40.0);
+        group.style.opacity = 0.5;
+        group.style.composite = true;
+        let mut surface = render(&stack(1, vec![group]), (100, 40), 1.0);
+        near(pixel(&mut surface, 15, 20).a(), outside_alpha, 2);
+        near(pixel(&mut surface, 45, 20).a(), overlap_alpha, 2);
+    }
+}
+
+#[test]
 fn blurred_images_stay_inside_rounded_and_ancestor_clips() {
     let mut rounded = picture(
         solid("rounded", [255, 0, 0, 255]),
