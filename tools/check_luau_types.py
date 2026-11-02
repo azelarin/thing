@@ -267,6 +267,15 @@ CASES = (
             "Property 'text' is not compatible.",
         ),
     ),
+    Case("valid-shared-state.luau"),
+    Case(
+        "invalid-shared-state.luau",
+        (
+            "Function 'count.get' expects 1 argument",
+            "Expected this to be 'number', but got 'string'",
+            "Cannot add property 'value' to table",
+        ),
+    ),
     Case("valid-windows.luau"),
     Case(
         "invalid-windows.luau",

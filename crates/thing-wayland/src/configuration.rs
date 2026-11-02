@@ -18,6 +18,12 @@ use thing_runtime::{
 };
 use thing_ui::Layout;
 
+mod shared_state;
+#[cfg(test)]
+mod shared_state_tests;
+
+use shared_state::{project_added, project_replaced};
+
 /// one presented layout, the popup origin it was presented at, and whether
 /// the surface was resized or scrolled since its previous frame.
 struct LayoutBounds(Rc<Layout>, Option<(f64, f64)>, bool);
@@ -299,7 +305,15 @@ impl<K: Clone + Eq> Configurations<K> {
                 .map(|instance| &instance.runtime)
                 .chain(std::iter::once(&runtime)),
         )?;
+        let shared = project_added(
+            self.services.shared_states(),
+            self.instances
+                .iter()
+                .map(|instance| &instance.runtime)
+                .chain(std::iter::once(&runtime)),
+        )?;
         let mut services = self.services.clone();
+        services.set_shared_states(shared);
         let snapshot = reconciled_managed_processes(services.managed_processes(), &definitions);
         services
             .set_managed_processes(snapshot)
@@ -366,12 +380,20 @@ impl<K: Clone + Eq> Configurations<K> {
                 .map(|instance| &instance.runtime)
                 .chain(std::iter::once(&runtime)),
         )?;
+        let shared = project_added(
+            self.services.shared_states(),
+            self.instances
+                .iter()
+                .map(|instance| &instance.runtime)
+                .chain(std::iter::once(&runtime)),
+        )?;
         let snapshot =
             reconciled_managed_processes(self.services.managed_processes(), &definitions);
         runtime
             .set_managed_processes(snapshot.clone())
             .map_err(|error| error.to_string())?;
         let mut services = self.services.clone();
+        services.set_shared_states(shared);
         services
             .set_managed_processes(snapshot)
             .map_err(|error| error.to_string())?;
@@ -1372,6 +1394,11 @@ impl<K: Clone + Eq> Configurations<K> {
             candidates.iter().map(|instance| &instance.runtime),
         )?;
         collect_sleep_inhibitor_definitions(candidates.iter().map(|instance| &instance.runtime))?;
+        let shared = project_replaced(
+            self.services.shared_states(),
+            candidates.iter().map(|instance| &instance.runtime),
+        )?;
+        services.set_shared_states(shared);
         Ok(PreparedConfigurations {
             services,
             instances: candidates,
@@ -1446,6 +1473,11 @@ impl<K: Clone + Eq> Configurations<K> {
             candidates.iter().map(|instance| &instance.runtime),
         )?;
         collect_sleep_inhibitor_definitions(candidates.iter().map(|instance| &instance.runtime))?;
+        let shared = project_replaced(
+            self.services.shared_states(),
+            candidates.iter().map(|instance| &instance.runtime),
+        )?;
+        services.set_shared_states(shared);
         let snapshot = ManagedProcessSnapshot {
             states: definitions
                 .iter()

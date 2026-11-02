@@ -1022,6 +1022,18 @@ declare extern type ThingSleepInhibitor with
     read stop: () -> ()
 end
 
+export type ThingSharedStateOptions<T> = {
+    key: string,
+    initial: T,
+}
+
+-- one structured value shared by every output. get returns a read-only snapshot;
+-- set queues a replacement from an event handler.
+export type ThingSharedState<T> = {
+    get: (self: ThingSharedState<T>) -> T,
+    set: (self: ThingSharedState<T>, value: T) -> (),
+}
+
 declare extern type ThingApplicationsService with
     read available: ThingSignal<boolean>
     read error: ThingSignal<string>
@@ -1165,6 +1177,7 @@ declare extern type ThingServices with
         & ((options: ThingManagedProcessOptions) -> ThingManagedProcess)
     )
     read sleep_inhibitor: (options: ThingSleepInhibitorOptions) -> ThingSleepInhibitor
+    read shared_state: <T>(options: ThingSharedStateOptions<T>) -> ThingSharedState<T>
     read launch: (arguments: { string }, working_directory: string?) -> ()
 end
 

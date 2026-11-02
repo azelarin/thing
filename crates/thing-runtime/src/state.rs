@@ -37,7 +37,7 @@ impl Scalar {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Tracker {
     values: Vec<Scalar>,
     subscribers: BTreeMap<usize, BTreeSet<usize>>,
