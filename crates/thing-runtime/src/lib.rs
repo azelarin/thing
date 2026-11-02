@@ -15,6 +15,7 @@ mod properties;
 mod reconcile;
 mod rich_text;
 mod services;
+mod shared_state;
 mod sleep;
 mod state;
 mod timer;
@@ -44,6 +45,11 @@ pub use services::{
     NotificationSnapshot, NotificationUrgency, PowerDevice, PowerSnapshot, ServiceSnapshot,
     SystemTrayAction, SystemTrayItem, SystemTrayMenu, SystemTrayMenuAction, SystemTrayMenuItem,
     SystemTraySnapshot, clipboard_image_pixmap, is_local_file, uri_scheme,
+};
+pub use shared_state::{
+    MAX_QUEUED_SHARED_STATE_BYTES, MAX_SHARED_STATE_BYTES, MAX_SHARED_STATE_KEY_BYTES,
+    MAX_SHARED_STATE_TOTAL_BYTES, MAX_SHARED_STATES, PreparedSharedState, SharedStateDefinition,
+    SharedStateEntry, SharedStates, shared_state_bytes,
 };
 pub use sleep::{
     MAX_SLEEP_INHIBITOR_KEY_BYTES, MAX_SLEEP_INHIBITOR_REASON_BYTES, MAX_SLEEP_INHIBITORS,
@@ -361,6 +367,27 @@ struct Binding {
 
 type Handlers = BTreeMap<(NodeId, &'static str), Function>;
 
+struct PreparedFrame {
+    commit: Option<FrameCommit>,
+    changed: bool,
+}
+
+struct FrameCommit {
+    candidate: Vec<SurfaceTree>,
+    retired: BTreeSet<usize>,
+    removed: BTreeSet<NodeId>,
+    handlers: Handlers,
+    sources: BTreeMap<NodeId, u64>,
+    staged_transitions: BTreeMap<usize, transition::State>,
+    previous_deferred: BTreeSet<usize>,
+    previous_target: Option<Option<Vec<SurfaceTree>>>,
+    final_target: Option<Vec<SurfaceTree>>,
+    marked: bool,
+    evaluates: bool,
+    ui_structure_changed: bool,
+    advance: bool,
+}
+
 struct ActivePointer {
     target: UiTarget,
     handler: Function,
@@ -510,6 +537,10 @@ impl Runtime {
             states: snapshot.managed_processes,
         })?;
         services.set_sleep_inhibitors(snapshot.sleep_inhibitors)?;
+        services
+            .shared_states()
+            .borrow_mut()
+            .load(snapshot.shared_states);
         services.set_niri(snapshot.niri)?;
         if let Some(output) = &output {
             services.set_output(output)?;
@@ -544,6 +575,13 @@ impl Runtime {
             if !services.sleep_inhibitor_definitions().is_empty() {
                 return Err(Error::runtime(
                     "sleep inhibitors are unavailable in lock configurations",
+                ));
+            }
+            // lock surfaces cannot publish actions, and their state would
+            // otherwise outlive the lock in another process.
+            if !services.shared_states().borrow().definitions().is_empty() {
+                return Err(Error::runtime(
+                    "shared states are unavailable in lock configurations",
                 ));
             }
             if !services.window_state_keys().is_empty() {
@@ -864,6 +902,20 @@ impl Runtime {
     /// afterward.
     pub fn set_sleep_inhibitors(&mut self, states: Vec<SleepInhibitorState>) -> Result<()> {
         self.services.set_sleep_inhibitors(states)
+    }
+
+    /// the shared state keys declared while this configuration loaded.
+    pub fn shared_state_definitions(&self) -> Vec<SharedStateDefinition> {
+        self.services.shared_states().borrow().definitions()
+    }
+
+    /// shows the accepted shared values. a declared key changes only when the
+    /// entry belongs to the same declaration. call [`Self::refresh`] afterward.
+    pub fn set_shared_states(&mut self, states: &SharedStates) -> Result<()> {
+        self.services
+            .shared_states()
+            .borrow_mut()
+            .set_states(self.services.tracker(), states)
     }
 
     /// the idle watches declared while this configuration loaded, in order.
@@ -1905,10 +1957,23 @@ impl Runtime {
         validate: &impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
         advance: bool,
     ) -> Result<bool> {
+        let prepared = self.prepare_frame_checked(now, validate, advance)?;
+        Ok(self.commit_frame(prepared))
+    }
+
+    fn prepare_frame_checked(
+        &mut self,
+        now: Instant,
+        validate: &impl Fn(&[SurfaceTree]) -> std::result::Result<(), String>,
+        advance: bool,
+    ) -> Result<PreparedFrame> {
         let mut dirty = std::mem::take(&mut self.tracker.borrow_mut().dirty);
         let marks_stale = self.geometry.borrow().marks_stale;
         if dirty.is_empty() && !marks_stale && (!advance || !self.has_active_transitions()) {
-            return Ok(self.motions.borrow().has_controls());
+            return Ok(PreparedFrame {
+                commit: None,
+                changed: self.motions.borrow().has_controls(),
+            });
         }
         let previous_deferred = if advance {
             // animation ticks do not retry unrelated rejected event updates.
@@ -2128,6 +2193,45 @@ impl Runtime {
             self.deferred.extend(previous_deferred);
             return Err(error);
         }
+        Ok(PreparedFrame {
+            commit: Some(FrameCommit {
+                candidate,
+                retired,
+                removed,
+                handlers,
+                sources,
+                staged_transitions,
+                previous_deferred,
+                previous_target,
+                final_target,
+                marked,
+                evaluates,
+                ui_structure_changed,
+                advance,
+            }),
+            changed: false,
+        })
+    }
+
+    fn commit_frame(&mut self, prepared: PreparedFrame) -> bool {
+        let Some(FrameCommit {
+            candidate,
+            retired,
+            removed,
+            handlers,
+            sources,
+            mut staged_transitions,
+            previous_deferred,
+            previous_target,
+            final_target,
+            marked,
+            evaluates,
+            ui_structure_changed,
+            advance,
+        }) = prepared.commit
+        else {
+            return prepared.changed;
+        };
         for index in retired {
             self.bindings.remove(&index);
             self.tracker.borrow_mut().forget(index);
@@ -2162,16 +2266,18 @@ impl Runtime {
             }
         }
         if ui_structure_changed {
-            self.sync_geometry()?;
+            // preparation has finished every property call; committing a frame
+            // cannot reenter luau or make the tracker read-only again.
+            self.sync_geometry()
+                .expect("frame commits run outside property evaluation");
         }
         self.deferred = previous_deferred
             .into_iter()
             .filter(|index| self.bindings.contains_key(index))
             .collect();
-        Ok(changed
+        changed
             || ui_identity_changed
-            || (!advance
-                && (self.has_active_transitions() || self.motions.borrow().has_controls())))
+            || (!advance && (self.has_active_transitions() || self.motions.borrow().has_controls()))
     }
 
     /// advance style and shared animations to a monotonic point in time.

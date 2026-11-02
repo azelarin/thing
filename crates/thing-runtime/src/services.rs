@@ -82,6 +82,11 @@ pub enum Action {
         key: String,
         request: crate::WindowRequest,
     },
+    /// replace the accepted value of a declared shared state on every output.
+    SharedState {
+        key: String,
+        value: Arc<crate::CallValue>,
+    },
 }
 
 /// a request to start an installed application from its desktop entry.
@@ -1128,6 +1133,7 @@ pub struct ServiceSnapshot {
     pub(crate) system_tray_items: Vec<SystemTrayItem>,
     pub(crate) managed_processes: Vec<ManagedProcessState>,
     pub(crate) sleep_inhibitors: Vec<crate::SleepInhibitorState>,
+    pub(crate) shared_states: crate::SharedStates,
     pub(crate) niri: NiriState,
     pub(crate) clipboard_formats: Vec<String>,
     pub(crate) clipboard_image: Option<ImageSource>,
@@ -1245,6 +1251,15 @@ impl ServiceSnapshot {
         ManagedProcessSnapshot {
             states: self.managed_processes.clone(),
         }
+    }
+
+    /// replaces the accepted shared states new runtimes start with.
+    pub fn set_shared_states(&mut self, states: crate::SharedStates) {
+        self.shared_states = states;
+    }
+
+    pub fn shared_states(&self) -> &crate::SharedStates {
+        &self.shared_states
     }
 
     pub fn set_authentication(&mut self, authentication: AuthenticationSnapshot) -> Result<()> {
@@ -1764,6 +1779,7 @@ pub(crate) struct Services {
     managed_process_declarations_open: Rc<Cell<bool>>,
     idle_watches: Rc<RefCell<crate::idle::IdleWatches>>,
     sleep_inhibitors: Rc<RefCell<crate::sleep::SleepInhibitors>>,
+    pub(crate) shared_states: Rc<RefCell<crate::shared_state::SharedStateHandles>>,
     window_states: Rc<RefCell<crate::window::WindowStates>>,
     application_launches_allowed: Rc<Cell<bool>>,
     niri: NiriData,
@@ -1821,6 +1837,7 @@ impl Services {
             managed_process_declarations_open: Rc::new(Cell::new(true)),
             idle_watches: Rc::default(),
             sleep_inhibitors: Rc::default(),
+            shared_states: Rc::default(),
             window_states: Rc::default(),
             application_launches_allowed: Rc::new(Cell::new(true)),
             niri: niri_data,
@@ -2589,6 +2606,15 @@ impl Services {
             result.allowed.clone(),
             result.managed_process_declarations_open.clone(),
         )?;
+        crate::shared_state::install(
+            lua,
+            &services,
+            result.tracker.clone(),
+            result.shared_states.clone(),
+            result.actions.clone(),
+            result.allowed.clone(),
+            result.managed_process_declarations_open.clone(),
+        )?;
         services.set("applications", applications)?;
         services.set("audio", audio)?;
         services.set("authentication", authentication)?;
@@ -2618,6 +2644,7 @@ impl Services {
     /// inhibitors.
     pub fn freeze_declarations(&self) {
         self.managed_process_declarations_open.set(false);
+        self.shared_states.borrow_mut().finish_loading();
     }
 
     pub(crate) fn idle_watches(&self) -> &Rc<RefCell<crate::idle::IdleWatches>> {
@@ -2657,6 +2684,10 @@ impl Services {
         self.sleep_inhibitors
             .borrow_mut()
             .set_states(&self.tracker, states)
+    }
+
+    pub(crate) fn shared_states(&self) -> &Rc<RefCell<crate::shared_state::SharedStateHandles>> {
+        &self.shared_states
     }
 
     pub fn managed_process_definitions(&self) -> Vec<ManagedProcessDefinition> {
@@ -3158,6 +3189,7 @@ impl Services {
                 .values()
                 .cloned()
                 .collect(),
+            shared_states: self.shared_states.borrow().snapshot(),
             niri: self.niri.snapshot(),
             clipboard_formats: self.clipboard_formats.borrow().clone(),
             clipboard_image: self.clipboard_image.borrow().clone(),

@@ -311,6 +311,57 @@ impl App {
         self.pending_paste = None;
         self.focused_clipboard.cancel_pending_paste();
     }
+    /// publishes the shared values one accepted event queued on `output` to
+    /// every output, and installs the layouts of the outputs that changed.
+    pub(super) fn publish_shared_states(
+        &mut self,
+        output: &wl_output::WlOutput,
+        consumer: Option<&str>,
+        updates: Vec<(String, std::sync::Arc<thing_runtime::CallValue>)>,
+    ) {
+        let Some(consumer) = consumer else {
+            return;
+        };
+        let layer_shell_version = self.layer_shell_version;
+        let configured_outputs: Vec<_> = self.configurations.keys().cloned().collect();
+        let entries = configured_outputs
+            .iter()
+            .filter_map(|output| {
+                self.configurations
+                    .output(output)
+                    .cloned()
+                    .map(|context| self.layout_validation_entry(output.clone(), context))
+            })
+            .collect();
+        let preflight = LayoutPreflight::new(
+            &mut self.render,
+            layer_shell_version,
+            self.idle_inhibit.active().is_some(),
+            entries,
+        );
+        let publication = self.configurations.publish_shared_states_checked(
+            output,
+            consumer,
+            updates,
+            |output, surfaces| preflight.validate(output, surfaces),
+        );
+        let prepared: Vec<_> = preflight
+            .into_prepared()
+            .into_iter()
+            .filter(|prepared| publication.refreshed.contains(&prepared.output))
+            .collect();
+        if let Err(error) = &publication.result {
+            eprintln!("thing: shared state was not published: {error}");
+        }
+        self.update_watch();
+        for output in &publication.refreshed {
+            self.invalidate_output(output);
+        }
+        self.install_prepared_layouts(prepared);
+        for output in configured_outputs {
+            self.reconcile_custom_pointer(&output);
+        }
+    }
     pub(super) fn reconcile_notification_expiry(&self) {
         if let Some(server) = &self.notifications {
             server.set_expiry_holds(self.configurations.notification_expiry_holds());

@@ -1413,3 +1413,38 @@ fn catalog_publication_refuses_replaced_and_removed_waiting_launches() {
         }
     }
 }
+
+fn a_pointer_event_publishes_shared_state_and_updates_the_panel() {
+    let mut host = Host::start_with_panel(
+        None,
+        r#"
+        local count = services.shared_state { key = 'count', initial = 0 }
+        return ui.panel { style = { width = 320, height = 40 }, children = {
+            ui.button {
+                style = { width = 320, height = 40 },
+                on_click = function() count:set(count:get() + 1) end,
+                children = { ui.text { text = function() return tostring(count:get()) end } },
+            },
+        } }
+    "#,
+    );
+    host.wayland.control().clicks.push(Button::Plain);
+    host.wait_until("the shared counter publication", |host| {
+        host.app
+            .configurations
+            .shared_states()
+            .get("count")
+            .is_some_and(|entry| entry.value.as_ref() == &thing_runtime::CallValue::Number(1.0))
+    });
+    let output = &host.app.surfaces[0].output;
+    let root = host.app.configurations.root(output).unwrap();
+    assert_eq!(root.children[0].children[0].text, "1");
+}
+
+#[test]
+fn pointer_events_publish_shared_state_through_the_host() {
+    isolated(
+        "pointer_events_publish_shared_state_through_the_host",
+        a_pointer_event_publishes_shared_state_and_updates_the_panel,
+    );
+}

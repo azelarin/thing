@@ -241,10 +241,18 @@ impl App {
                 return false;
             }
         };
+        // shared values publish to every output after this output's own
+        // candidate is installed, so its refresh cannot be overwritten by
+        // the older layouts prepared for the event.
+        let mut shared_states = Vec::new();
         // a successful handler can remove its own popup. request activation
         // before invalidation destroys the surface that received the input.
         for action in outcome.actions {
             let result = match action {
+                Action::SharedState { key, value } => {
+                    shared_states.push((key, value));
+                    Ok(())
+                }
                 Action::Niri(action) => self.niri.send(action),
                 Action::Media { action, player } => self
                     .media
@@ -363,12 +371,15 @@ impl App {
                 eprintln!("thing: {error}");
             }
         }
-        if let Some(consumer) = consumer {
-            self.queue_ui_actions(output.clone(), consumer, outcome.ui_actions);
+        if let Some(consumer) = &consumer {
+            self.queue_ui_actions(output.clone(), consumer.clone(), outcome.ui_actions);
         }
         if outcome.changed {
             self.invalidate_output(&output);
             self.install_prepared_layouts(prepared);
+        }
+        if !shared_states.is_empty() {
+            self.publish_shared_states(&output, consumer.as_deref(), shared_states);
         }
         self.reconcile_custom_pointer(&output);
         self.reconcile_published_configuration();

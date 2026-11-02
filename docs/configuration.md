@@ -1483,6 +1483,65 @@ removes only the socket it created.
 lock configurations cannot declare commands, and `thing lock` has no command
 socket.
 
+## shared state
+
+each output runs its own copy of the configuration, so `ui.state` belongs to
+one output. `services.shared_state` declares a value that every output of the
+running instance shares:
+
+```luau
+local weather = services.shared_state {
+    key = 'weather',
+    initial = { temperature = 18, conditions = {} },
+}
+
+ui.command('weather', function(arguments)
+    weather:set(arguments)
+    return nil
+end)
+
+return ui.panel { children = {
+    ui.text { text = function()
+        return `{weather:get().temperature}°`
+    end },
+} }
+```
+
+a script can then publish a new value through any one output:
+
+```sh
+thing call --output DP-1 weather '{"temperature": 21, "conditions": ["rain"]}'
+```
+
+declare shared state while the configuration loads. a key is 1 to 64 ascii
+letters, digits, `-`, `_`, or `.`. outputs that declare the same key share one
+value, and they must declare the same `initial`; a conflicting declaration
+rejects the output or the reload before anything changes. a key that includes
+the output name gives each output its own value.
+
+`:get()` returns a read-only snapshot, and property functions that call it update
+when the value changes. `:set(value)` works only in event handlers, timer and
+idle callbacks, and commands. it queues the value, so `:get()` in the same
+handler still returns the previous one. after the handler succeeds, thing
+publishes the value to every output at once. if any output rejects the
+resulting layout, no output shows the value and it is not kept. a failing
+handler publishes nothing. setting an equal value changes nothing. the value
+a command returns does not confirm the publication; a rejected one is logged.
+
+values use the same data as commands: `nil`, booleans, finite numbers, utf-8
+strings, lists, and maps, nested at most 16 levels with 1024 items and 16 KiB
+strings. inside a list or map, `nil` reads back as `ui.null`. thing counts 16
+bytes for each item and map key plus the bytes of each string and key. one
+value may hold 128 KiB. defaults and current values together may hold 1 MiB,
+and one event may queue 1 MiB. an instance may have 64 keys.
+
+an accepted reload keeps the value of a key whose declaration is unchanged.
+a changed `initial` starts from the new value, and a key the new
+configuration no longer declares is dropped. a rejected reload changes
+nothing. when an output disconnects, its values stay, so an output that
+returns finds them again, unless keeping them would pass the limits when
+another output connects. lock configurations cannot declare shared state.
+
 ## managed processes
 
 use `services.process` when a configuration needs to read a child process or
