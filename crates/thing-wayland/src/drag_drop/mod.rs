@@ -554,10 +554,10 @@ impl<T: Clone> DragDrop<T> {
         let Some(reading) = self.reading.take() else {
             return;
         };
-        if let ReadState::Reading { transfer } = reading.state {
-            if let Err(error) = self.worker.cancel(transfer) {
-                eprintln!("thing: cannot cancel a stale drop transfer: {error}");
-            }
+        if let ReadState::Reading { transfer } = reading.state
+            && let Err(error) = self.worker.cancel(transfer)
+        {
+            eprintln!("thing: cannot cancel a stale drop transfer: {error}");
         }
         let result = Err("the drop was replaced or its target went away".into());
         if let Some(queued) = self
