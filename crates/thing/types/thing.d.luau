@@ -1065,6 +1065,17 @@ declare extern type ThingSleepInhibitor with
     read stop: () -> ()
 end
 
+export type ThingFileWatchEvent =
+    { status: 'ready', text: string }
+    | { status: 'missing' }
+    | { status: 'failed', error: string }
+
+export type ThingFileWatchOptions = {
+    key: string,
+    path: string,
+    on_change: (event: ThingFileWatchEvent) -> (),
+}
+
 export type ThingSharedStateOptions<T> = {
     key: string,
     initial: T,
@@ -1220,6 +1231,7 @@ declare extern type ThingServices with
         & ((options: ThingManagedProcessOptions) -> ThingManagedProcess)
     )
     read sleep_inhibitor: (options: ThingSleepInhibitorOptions) -> ThingSleepInhibitor
+    read watch_file: (options: ThingFileWatchOptions) -> ()
     read shared_state: <T>(options: ThingSharedStateOptions<T>) -> ThingSharedState<T>
     read launch: (arguments: { string }, working_directory: string?) -> ()
 end

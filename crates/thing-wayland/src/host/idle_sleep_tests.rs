@@ -636,6 +636,7 @@ impl Host {
             input_method: InputMethod::bind(&globals, &qh),
             launcher: Launcher::for_tests(),
             managed_processes: None,
+            file_watches: None,
             pending_launches: PendingLaunches::new(),
             pending_ui_actions: Vec::new(),
             watch,

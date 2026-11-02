@@ -19,6 +19,7 @@ use thing_runtime::{
 };
 use thing_ui::Layout;
 
+mod file_watch;
 mod shared_state;
 #[cfg(test)]
 mod shared_state_tests;
@@ -306,6 +307,12 @@ impl<K: Clone + Eq> Configurations<K> {
                 .map(|instance| &instance.runtime)
                 .chain(std::iter::once(&runtime)),
         )?;
+        file_watch::validate(
+            self.instances
+                .iter()
+                .map(|instance| &instance.runtime)
+                .chain(std::iter::once(&runtime)),
+        )?;
         let shared = project_added(
             self.services.shared_states(),
             self.instances
@@ -376,6 +383,12 @@ impl<K: Clone + Eq> Configurations<K> {
                 .chain(std::iter::once(&runtime)),
         )?;
         collect_sleep_inhibitor_definitions(
+            self.instances
+                .iter()
+                .map(|instance| &instance.runtime)
+                .chain(std::iter::once(&runtime)),
+        )?;
+        file_watch::validate(
             self.instances
                 .iter()
                 .map(|instance| &instance.runtime)
@@ -1504,6 +1517,7 @@ impl<K: Clone + Eq> Configurations<K> {
             candidates.iter().map(|instance| &instance.runtime),
         )?;
         collect_sleep_inhibitor_definitions(candidates.iter().map(|instance| &instance.runtime))?;
+        file_watch::validate(candidates.iter().map(|instance| &instance.runtime))?;
         let shared = project_replaced(
             self.services.shared_states(),
             candidates.iter().map(|instance| &instance.runtime),
@@ -1583,6 +1597,7 @@ impl<K: Clone + Eq> Configurations<K> {
             candidates.iter().map(|instance| &instance.runtime),
         )?;
         collect_sleep_inhibitor_definitions(candidates.iter().map(|instance| &instance.runtime))?;
+        file_watch::validate(candidates.iter().map(|instance| &instance.runtime))?;
         let shared = project_replaced(
             self.services.shared_states(),
             candidates.iter().map(|instance| &instance.runtime),

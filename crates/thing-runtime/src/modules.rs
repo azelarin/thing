@@ -115,6 +115,7 @@ impl Modules {
             .ok_or_else(|| Error::runtime("entry file needs a parent directory"))?
             .to_owned();
         environment.set("ui", self.module_ui(lua, &parent)?)?;
+        environment.set("services", self.module_services(lua, &parent)?)?;
         let modules = self.clone();
         environment.set(
             "require",
@@ -135,6 +136,39 @@ impl Modules {
             .set_name(format!("@{}", path.display()))
             .set_environment(environment)
             .eval()
+    }
+
+    fn module_services(&self, lua: &Lua, parent: &Path) -> Result<Table> {
+        let shared: Table = lua.globals().get("services")?;
+        let declare: mlua::Function = shared.get("watch_file")?;
+        let services = lua.create_table()?;
+        let parent = parent.to_owned();
+        services.set(
+            "watch_file",
+            lua.create_function(move |lua, options: Table| {
+                crate::file_watch::validate_options(&options)?;
+                let path = crate::file_watch::string(&options, "path")?;
+                if !(path.starts_with('/') || path.starts_with("./") || path.starts_with("../")) {
+                    return Err(Error::runtime(
+                        "file watches expect an absolute path or a path starting \
+                         with './' or '../'",
+                    ));
+                }
+                let path = resolve_path(&parent, &path, PathParents::Preserve)?;
+                let copied = lua.create_table()?;
+                for key in ["key", "on_change"] {
+                    copied.raw_set(key, options.raw_get::<Value>(key)?)?;
+                }
+                copied.raw_set("path", path)?;
+                declare.call::<()>(copied)
+            })?,
+        )?;
+        let metatable = lua.create_table()?;
+        metatable.set("__index", shared)?;
+        metatable.set_readonly(true);
+        services.set_metatable(Some(metatable))?;
+        services.set_readonly(true);
+        Ok(services)
     }
 
     fn module_ui(&self, lua: &Lua, parent: &Path) -> Result<Table> {
@@ -168,30 +202,7 @@ impl Modules {
         if relative.len() > MAX_ASSET_PATH_BYTES {
             return Err(Error::runtime("asset paths must be at most 4096 bytes"));
         }
-        let mut path = parent.to_owned();
-        for component in Path::new(relative).components() {
-            match component {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    path.pop();
-                }
-                Component::Normal(component) => path.push(component),
-                Component::Prefix(_) | Component::RootDir => {
-                    return Err(Error::runtime(
-                        "ui.asset expects a relative path, for example './corner.svg'",
-                    ));
-                }
-            }
-        }
-        let path = path
-            .to_str()
-            .ok_or_else(|| Error::runtime("asset paths must be UTF-8"))?
-            .to_owned();
-        if path.len() > MAX_ASSET_PATH_BYTES {
-            return Err(Error::runtime(
-                "resolved asset paths must be at most 4096 bytes",
-            ));
-        }
+        let path = resolve_path(parent, relative, PathParents::Normalize)?;
         let mut dependencies = self.0.borrow_mut();
         if !dependencies.assets.contains(Path::new(&path))
             && dependencies.assets.len() >= MAX_ASSET_FILES
@@ -203,6 +214,44 @@ impl Modules {
         dependencies.assets.insert(PathBuf::from(&path));
         Ok(path)
     }
+}
+
+enum PathParents {
+    Normalize,
+    Preserve,
+}
+
+fn resolve_path(parent: &Path, name: &str, parents: PathParents) -> Result<String> {
+    if name.len() > MAX_ASSET_PATH_BYTES || name.contains('\0') {
+        return Err(Error::runtime(
+            "paths must be at most 4096 bytes without nul",
+        ));
+    }
+    let mut path = parent.to_owned();
+    for component in Path::new(name).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match parents {
+                PathParents::Normalize => {
+                    path.pop();
+                }
+                // a preceding component can be a symlink. the filesystem,
+                // rather than lexical normalization, determines its parent.
+                PathParents::Preserve => path.push(".."),
+            },
+            Component::Normal(name) => path.push(name),
+            Component::RootDir => path = PathBuf::from("/"),
+            Component::Prefix(_) => return Err(Error::runtime("unsupported path prefix")),
+        }
+    }
+    let path = path
+        .to_str()
+        .ok_or_else(|| Error::runtime("paths must be utf-8"))?
+        .to_owned();
+    if path.len() > MAX_ASSET_PATH_BYTES {
+        return Err(Error::runtime("resolved paths must be at most 4096 bytes"));
+    }
+    Ok(path)
 }
 
 #[cfg(test)]
