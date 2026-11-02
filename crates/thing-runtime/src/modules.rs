@@ -2,7 +2,7 @@ use mlua::{Error, Lua, Result, Table, Value};
 use std::{
     cell::RefCell,
     collections::BTreeSet,
-    fs::File,
+    fs::OpenOptions,
     io::Read,
     path::{Component, Path, PathBuf},
     rc::Rc,
@@ -79,10 +79,24 @@ impl Modules {
     }
 
     fn evaluate(&self, lua: &Lua, path: &Path) -> Result<Value> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // opening a fifo must not wait for a writer before we can inspect
+            // the descriptor. regular files ignore O_NONBLOCK.
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+        }
+        let file = options.open(path).map_err(Error::external)?;
+        if !file.metadata().map_err(Error::external)?.is_file() {
+            return Err(Error::runtime(format!(
+                "{}: configuration source must be a regular file",
+                path.display()
+            )));
+        }
         let mut source = Vec::new();
-        File::open(path)
-            .map_err(Error::external)?
-            .take(MAX_SOURCE_BYTES + 1)
+        file.take(MAX_SOURCE_BYTES + 1)
             .read_to_end(&mut source)
             .map_err(Error::external)?;
         if source.len() as u64 > MAX_SOURCE_BYTES {
