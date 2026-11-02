@@ -98,6 +98,27 @@ pub(crate) struct DropDelivery<T> {
     pub(crate) result: Result<DragData, String>,
 }
 
+/// owns the offer while an accepted delivery runs its callback. removing the
+/// target surface during that callback must not cancel its acknowledgement.
+#[must_use = "finish the claimed drop after its callback returns"]
+pub(crate) struct DropCompletion {
+    offer: WlDataOffer,
+}
+
+impl DropCompletion {
+    pub(crate) fn finish(self, accepted: bool) {
+        if accepted {
+            self.offer.finish();
+        }
+    }
+}
+
+impl Drop for DropCompletion {
+    fn drop(&mut self) {
+        self.offer.destroy();
+    }
+}
+
 struct Incoming {
     session: u64,
     device: WlDataDevice,
@@ -350,15 +371,20 @@ impl<T: Clone> DragDrop<T> {
     /// lets a move source remove its data; a rejected one is destroyed, so
     /// the source sees a cancellation. each offer is answered once.
     pub(crate) fn finish_drop(&mut self, session: u64, accepted: bool) {
-        let Some(reading) = self.reading.take_if(|reading| {
-            reading.session == session && matches!(reading.state, ReadState::Delivered)
-        }) else {
-            return;
-        };
-        if accepted {
-            reading.offer.finish();
+        if let Some(completion) = self.claim_drop(session) {
+            completion.finish(accepted);
         }
-        reading.offer.destroy();
+    }
+
+    /// claims a still-current delivery immediately before its callback. a
+    /// queued result that was retired in the meantime cannot be claimed.
+    pub(crate) fn claim_drop(&mut self, session: u64) -> Option<DropCompletion> {
+        let reading = self.reading.take_if(|reading| {
+            reading.session == session && matches!(reading.state, ReadState::Delivered)
+        })?;
+        Some(DropCompletion {
+            offer: reading.offer,
+        })
     }
 
     /// starts an outgoing drag from `origin` with the implicit grab of the
@@ -532,14 +558,25 @@ impl<T: Clone> DragDrop<T> {
             if let Err(error) = self.worker.cancel(transfer) {
                 eprintln!("thing: cannot cancel a stale drop transfer: {error}");
             }
+        }
+        let result = Err("the drop was replaced or its target went away".into());
+        if let Some(queued) = self
+            .retired
+            .iter_mut()
+            .find(|delivery| delivery.session == reading.session)
+        {
+            // a completed read may still be waiting for the host. replace
+            // its payload rather than delivering it after retirement.
+            queued.result = result;
+        } else {
             self.retired.push(DropDelivery {
                 session: reading.session,
                 owner: reading.owner,
                 action: reading.action,
-                result: Err("the drop was replaced or its target went away".into()),
+                result,
             });
-            self.wake.ping();
         }
+        self.wake.ping();
         reading.offer.destroy();
     }
 

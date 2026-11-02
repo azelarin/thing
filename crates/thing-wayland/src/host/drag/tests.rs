@@ -322,3 +322,30 @@ fn stale_and_wrong_seat_sequences_cannot_start_drags() {
     host.settle();
     assert!(host.observed().drags.is_empty());
 }
+
+#[test]
+fn an_accepted_drop_finishes_when_its_callback_hides_the_owning_panel() {
+    let mut host = Host::start(
+        r#"
+        local shown = ui.state(true)
+        return ui.panel {
+            visible = function() return shown:get() end,
+            style = { width=80, height=80 },
+            children = { ui.pointer_area {
+                style = { width=80, height=80 },
+                on_drag_over = function() return 'copy' end,
+                on_drop = function()
+                    shown:set(false)
+                    return true
+                end,
+            } },
+        }
+    "#,
+    );
+    host.command(enter(20.0, 30.0, &[TEXT], b"accepted", false));
+    host.command(Command::Drop);
+    host.until("the hidden panel", |host| host.app.surfaces.is_empty());
+    host.settle();
+    let observed = host.observed();
+    assert_eq!((observed.finishes, observed.offer_destroys), (1, 1));
+}

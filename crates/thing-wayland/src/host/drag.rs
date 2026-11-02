@@ -125,6 +125,9 @@ impl App {
             let owner = delivery.owner;
             match delivery.result {
                 Ok(data) => {
+                    let Some(completion) = self.drag.manager.claim_drop(delivery.session) else {
+                        continue;
+                    };
                     let accepted = owner.target.clone().is_some_and(|target| {
                         self.dispatch_drop(
                             owner.output.clone(),
@@ -139,7 +142,7 @@ impl App {
                             },
                         ) == Some(true)
                     });
-                    self.drag.manager.finish_drop(delivery.session, accepted);
+                    completion.finish(accepted);
                 }
                 Err(error) => {
                     eprintln!("thing: dropped data was not delivered: {error}");

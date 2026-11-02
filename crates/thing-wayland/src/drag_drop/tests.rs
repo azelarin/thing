@@ -1025,3 +1025,66 @@ fn older_managers_never_negotiate_or_start_drags() {
     drop(observed);
     let _ = &fixture.globals;
 }
+
+#[test]
+fn retiring_a_completed_read_cancels_its_queued_delivery() {
+    let mut fixture = Fixture::new(3);
+    let session = fixture.enter(&["text/plain"], COPY, b"retired", false);
+    fixture
+        .state
+        .drag
+        .negotiate(session, Some((DropType::Text, DragAction::Copy)));
+    fixture.command(Command::OfferAction(COPY));
+    fixture.command(Command::Drop);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        // outgoing sends can collect incoming completions before the host
+        // drains them. retire the owner in that interval.
+        fixture.state.drag.process_completions();
+        if fixture
+            .state
+            .drag
+            .reading
+            .as_ref()
+            .is_some_and(|reading| matches!(reading.state, ReadState::Delivered))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the read did not complete");
+        thread::sleep(Duration::from_millis(2));
+    }
+    fixture.state.drag.retire_drop(|_| true);
+    let deliveries = fixture.state.drag.take_deliveries();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].session, session);
+    assert!(
+        deliveries[0].result.is_err(),
+        "a retired drop must not deliver its payload"
+    );
+    fixture.sync();
+    let observed = fixture.observed();
+    assert_eq!((observed.finishes, observed.offer_destroys), (0, 1));
+}
+
+#[test]
+fn a_taken_delivery_cannot_be_claimed_after_its_owner_is_retired() {
+    let mut fixture = Fixture::new(3);
+    let session = fixture.enter(&["text/plain"], COPY, b"taken", false);
+    fixture
+        .state
+        .drag
+        .negotiate(session, Some((DropType::Text, DragAction::Copy)));
+    fixture.command(Command::OfferAction(COPY));
+    fixture.command(Command::Drop);
+    let deliveries = fixture.deliveries(1);
+    assert!(deliveries[0].result.is_ok());
+    fixture.state.drag.retire_drop(|_| true);
+    assert!(fixture.state.drag.claim_drop(session).is_none());
+    let cancelled = fixture.state.drag.take_deliveries();
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(cancelled[0].session, session);
+    assert!(cancelled[0].result.is_err());
+    fixture.sync();
+    let observed = fixture.observed();
+    assert_eq!((observed.finishes, observed.offer_destroys), (0, 1));
+}
