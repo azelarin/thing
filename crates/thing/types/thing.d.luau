@@ -561,6 +561,10 @@ export type ThingSecretInputProperties = {
     on_hover: ((inside: boolean) -> ())?,
 }
 
+export type ThingCrossfadeProperties = ThingContainerProperties & {
+    progress: ThingAnimatedNumber?,
+}
+
 export type ThingImageProperties = {
     key: string?,
     visible: ThingReactive<boolean>?,
@@ -1174,6 +1178,7 @@ declare ui: {
     centerbox: (properties: ThingContainerProperties) -> ThingWidget,
     column: (properties: ThingContainerProperties) -> ThingWidget,
     stack: (properties: ThingContainerProperties) -> ThingWidget,
+    crossfade: (properties: ThingCrossfadeProperties) -> ThingWidget,
     scroll: (properties: ThingScrollProperties) -> ThingWidget,
     text: (properties: ThingTextProperties) -> ThingWidget,
     text_input: (properties: ThingTextInputProperties) -> ThingWidget,

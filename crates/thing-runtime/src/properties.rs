@@ -766,7 +766,7 @@ pub(crate) fn apply_animation_frame(node: &mut Node, name: &str, value: Resolved
     // values the widget tree can represent.
     let value = match value {
         Resolved::Number(value) => Resolved::Number(match name {
-            "style.opacity" => value.clamp(0.0, 1.0),
+            "style.opacity" | "progress" => value.clamp(0.0, 1.0),
             "style.translate_x" | "style.translate_y" => value.clamp(-100_000.0, 100_000.0),
             "style.scale_x" | "style.scale_y" => value.clamp(-100.0, 100.0),
             "style.rotation" => value.clamp(-1_000_000.0, 1_000_000.0),
@@ -784,6 +784,9 @@ pub(crate) fn apply_animation_frame(node: &mut Node, name: &str, value: Resolved
 
 pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
     match name {
+        "progress" if node.kind == Kind::Crossfade => {
+            node.crossfade_progress = effect_number(value, name, 0.0, 1.0)?;
+        }
         "axis" if node.kind == Kind::Scroll => node.scroll_axis = scroll_axis(value, name)?,
         "text" if node.kind == Kind::Text => {
             node.text = string(value, name)?;

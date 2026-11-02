@@ -1033,27 +1033,30 @@ impl Layout {
             } else {
                 (inherited.shadow_clip_chain, inherited.shadow_clip)
             };
-        for child in &node.children {
-            if child.kind != Kind::Popup {
-                self.collect_semantic_regions(
-                    child,
-                    tree,
-                    ids,
-                    state,
-                    RevealInherited {
-                        origin: child_origin,
-                        transform: child_transform,
-                        enabled,
-                        parent: Some(node.id),
-                        scroll_parent: child_scroll_parent,
-                        reveal_scroll_parent: child_reveal_scroll_parent,
-                        opacity,
-                        disabled_opacity,
-                        shadow_clip_chain,
-                        shadow_clip,
-                    },
-                )?;
-            }
+        for (index, child) in node
+            .children
+            .iter()
+            .filter(|child| child.kind != Kind::Popup)
+            .enumerate()
+        {
+            self.collect_semantic_regions(
+                child,
+                tree,
+                ids,
+                state,
+                RevealInherited {
+                    origin: child_origin,
+                    transform: child_transform,
+                    enabled,
+                    parent: Some(node.id),
+                    scroll_parent: child_scroll_parent,
+                    reveal_scroll_parent: child_reveal_scroll_parent,
+                    opacity: opacity * node.child_weight(index),
+                    disabled_opacity,
+                    shadow_clip_chain,
+                    shadow_clip,
+                },
+            )?;
         }
         Ok(())
     }
@@ -1296,7 +1299,7 @@ fn build(
                 tree,
                 child,
                 ids,
-                matches!(node.kind, Kind::Stack | Kind::CenterBox),
+                matches!(node.kind, Kind::Stack | Kind::Crossfade | Kind::CenterBox),
             )?;
             if node.kind == Kind::CenterBox {
                 let mut style = tree.style(id)?.clone();

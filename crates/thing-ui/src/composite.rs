@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 
-use skia_safe::{Canvas, ClipOp, M44, Rect as SkiaRect, canvas::SaveLayerRec};
-use thing_core::{Node, NodeId};
+use skia_safe::{BlendMode, Canvas, ClipOp, M44, Rect as SkiaRect, canvas::SaveLayerRec};
+use thing_core::{Kind, Node, NodeId};
 
 use crate::{Layout, skia::fill};
 
@@ -21,7 +21,7 @@ pub fn validate_compositing(
     physical: (u32, u32),
 ) -> Result<(), String> {
     fn requested(node: &Node) -> bool {
-        node.style.composite
+        (node.style.composite || node.kind == Kind::Crossfade)
             || node
                 .children
                 .iter()
@@ -38,11 +38,12 @@ struct Layer {
     end: usize,
     opacity: f32,
     base: f32,
+    blend: BlendMode,
 }
 
 #[derive(Default)]
 pub(crate) struct Plan {
-    layers: BTreeMap<usize, Layer>,
+    layers: BTreeMap<usize, Vec<Layer>>,
 }
 
 impl Plan {
@@ -52,7 +53,10 @@ impl Plan {
         physical: (u32, u32),
     ) -> Result<Self, String> {
         let mut result = Self::default();
-        if !nodes.values().any(|node| node.style.composite) {
+        if !nodes
+            .values()
+            .any(|node| node.style.composite || node.kind == Kind::Crossfade)
+        {
             return Ok(result);
         }
         let placements = layout.semantic_placements();
@@ -67,15 +71,82 @@ impl Plan {
             }
             ancestors.push(index);
         }
+        let indices: BTreeMap<_, _> = placements
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id, i))
+            .collect();
+        let mut scheduled: BTreeMap<usize, Vec<Layer>> = BTreeMap::new();
+        for (index, placement) in placements.iter().enumerate() {
+            let Some(node) = nodes
+                .get(&placement.id)
+                .filter(|node| node.kind == Kind::Crossfade)
+            else {
+                continue;
+            };
+            if !node.crossfade_progress.is_finite()
+                || !(0.0..=1.0).contains(&node.crossfade_progress)
+            {
+                return Err("crossfade progress must be between 0 and 1".into());
+            }
+            // endpoints draw the one active child directly, preserving its
+            // pixels without an extra round trip through a temporary layer.
+            if node.crossfade_progress == 0.0 || node.crossfade_progress == 1.0 {
+                continue;
+            }
+            let base = placement.opacity * placement.disabled_opacity;
+            if base == 0.0 {
+                continue;
+            }
+            let mut first = true;
+            for (slot, child) in node
+                .children
+                .iter()
+                .filter(|child| child.kind != Kind::Popup)
+                .enumerate()
+            {
+                let Some(&child_index) = indices.get(&child.id) else {
+                    continue;
+                };
+                let weight = node.child_weight(slot);
+                if base * weight == 0.0 {
+                    continue;
+                }
+                let layers = scheduled.entry(child_index).or_default();
+                if first {
+                    // the widget's own background and decorations have already
+                    // painted. only its children enter the transparent sum.
+                    layers.push(Layer {
+                        end: ends[index],
+                        opacity: 1.0,
+                        base,
+                        blend: BlendMode::SrcOver,
+                    });
+                    first = false;
+                }
+                // layout includes the weight so invisible effects are culled.
+                // remove it while painting this child, then weight its complete
+                // source image once when it is added to the transparent sum.
+                layers.push(Layer {
+                    end: ends[child_index],
+                    opacity: weight,
+                    base: base * weight,
+                    blend: BlendMode::Plus,
+                });
+            }
+        }
         let mut active: Vec<(usize, f32)> = Vec::new();
-        let mut bytes = 0_u64;
+        let mut budget = Budget::default();
         for (index, placement) in placements.iter().enumerate() {
             while active.last().is_some_and(|(end, _)| *end <= index) {
                 active.pop();
             }
+            for layer in scheduled.remove(&index).unwrap_or_default() {
+                result.add(index, layer, &mut active, &mut budget, physical)?;
+            }
             if !nodes
                 .get(&placement.id)
-                .is_some_and(|node| node.style.composite)
+                .is_some_and(|node| node.style.composite || node.kind == Kind::Crossfade)
             {
                 continue;
             }
@@ -88,47 +159,74 @@ impl Plan {
             }
             let parent = active.last().map_or(1.0, |(_, opacity)| *opacity);
             let opacity = (base / parent).clamp(0.0, 1.0);
-            // an opaque group of source-over draws needs no temporary layer.
             if opacity == 1.0 {
                 continue;
             }
-            if physical.0 == 0
-                || physical.1 == 0
-                || physical.0 > MAX_LAYER_SIDE
-                || physical.1 > MAX_LAYER_SIDE
-            {
-                return Err(
-                    "composited surfaces must be between 1 and 16384 physical pixels per side"
-                        .into(),
-                );
-            }
-            let layer_bytes = u64::from(physical.0)
-                .checked_mul(u64::from(physical.1))
-                .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
-                .ok_or("compositing scratch estimate exceeds renderer limits")?;
-            bytes = bytes
-                .checked_add(layer_bytes)
-                .ok_or("compositing scratch estimate exceeds renderer limits")?;
-            if layer_bytes > MAX_LAYER_BYTES
-                || bytes > MAX_FRAME_BYTES
-                || result.layers.len() == MAX_LAYERS
-                || active.len() == MAX_NESTING
-            {
-                return Err(
-                    "compositing scratch estimate exceeds the frame rendering budget".into(),
-                );
-            }
-            result.layers.insert(
+            result.add(
                 index,
                 Layer {
                     end: ends[index],
                     opacity,
                     base,
+                    blend: BlendMode::SrcOver,
                 },
-            );
-            active.push((ends[index], base));
+                &mut active,
+                &mut budget,
+                physical,
+            )?;
         }
         Ok(result)
+    }
+
+    fn add(
+        &mut self,
+        index: usize,
+        layer: Layer,
+        active: &mut Vec<(usize, f32)>,
+        budget: &mut Budget,
+        physical: (u32, u32),
+    ) -> Result<(), String> {
+        budget.charge(physical, active.len())?;
+        active.push((layer.end, layer.base));
+        self.layers.entry(index).or_default().push(layer);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct Budget {
+    bytes: u64,
+    layers: usize,
+}
+
+impl Budget {
+    fn charge(&mut self, physical: (u32, u32), depth: usize) -> Result<(), String> {
+        if physical.0 == 0
+            || physical.1 == 0
+            || physical.0 > MAX_LAYER_SIDE
+            || physical.1 > MAX_LAYER_SIDE
+        {
+            return Err(
+                "composited surfaces must be between 1 and 16384 physical pixels per side".into(),
+            );
+        }
+        let layer_bytes = u64::from(physical.0)
+            .checked_mul(u64::from(physical.1))
+            .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
+            .ok_or("compositing scratch estimate exceeds renderer limits")?;
+        self.bytes = self
+            .bytes
+            .checked_add(layer_bytes)
+            .ok_or("compositing scratch estimate exceeds renderer limits")?;
+        if layer_bytes > MAX_LAYER_BYTES
+            || self.bytes > MAX_FRAME_BYTES
+            || self.layers == MAX_LAYERS
+            || depth == MAX_NESTING
+        {
+            return Err("compositing scratch estimate exceeds the frame rendering budget".into());
+        }
+        self.layers += 1;
+        Ok(())
     }
 }
 
@@ -163,23 +261,26 @@ impl Layers {
         while self.active.last().is_some_and(|layer| layer.end <= index) {
             self.close(canvas, clips);
         }
-        let Some(layer) = self.plan.layers.get(&index) else {
+        let Some(layers) = self.plan.layers.get(&index) else {
             return;
         };
-        // clip saves belong to the innermost layer. discard them before a
-        // layer boundary so clip reconciliation cannot restore a layer.
-        clear_clips(canvas, clips);
-        let restore = canvas.save();
-        canvas.reset_matrix();
-        canvas.clip_rect(self.physical, ClipOp::Intersect, false);
-        canvas.set_matrix(matrix);
-        let paint = fill(skia_safe::Color::WHITE, layer.opacity);
-        canvas.save_layer(&SaveLayerRec::default().paint(&paint));
-        self.active.push(ActiveLayer {
-            end: layer.end,
-            restore,
-            base: layer.base,
-        });
+        for layer in layers {
+            // clip saves belong to the innermost layer. discard them before a
+            // layer boundary so clip reconciliation cannot restore a layer.
+            clear_clips(canvas, clips);
+            let restore = canvas.save();
+            canvas.reset_matrix();
+            canvas.clip_rect(self.physical, ClipOp::Intersect, false);
+            canvas.set_matrix(matrix);
+            let mut paint = fill(skia_safe::Color::WHITE, layer.opacity);
+            paint.set_blend_mode(layer.blend);
+            canvas.save_layer(&SaveLayerRec::default().paint(&paint));
+            self.active.push(ActiveLayer {
+                end: layer.end,
+                restore,
+                base: layer.base,
+            });
+        }
     }
 
     pub(crate) fn opacity(&self, inherited: f32) -> f32 {

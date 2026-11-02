@@ -483,3 +483,30 @@ fn changing_effects_reuses_the_decoded_source() {
     }
     assert!(changed.iter().all(|pixels| *pixels != bytes(&mut plain)));
 }
+
+#[test]
+fn crossfades_mix_filtered_images_with_their_original_transparency() {
+    let left = picture(
+        solid("blend-red", [255, 0, 0, 255]),
+        40.0,
+        20.0,
+        effects(6.0, 1.0),
+    );
+    let mut right = picture(
+        solid("blend-blue", [0, 0, 255, 128]),
+        40.0,
+        20.0,
+        effects(6.0, 1.0),
+    );
+    right.id = NodeId(3);
+    let mut fade = stack(4, vec![left, right]);
+    fade.kind = Kind::Crossfade;
+    fade.crossfade_progress = 0.5;
+    fade.style.width = Some(40.0);
+    fade.style.height = Some(20.0);
+    let mut surface = render(&stack(1, vec![fade]), (40, 20), 1.0);
+    let actual = pixel(&mut surface, 20, 10);
+    near(actual.a(), 192, 2);
+    near(actual.r(), 170, 2);
+    near(actual.b(), 85, 2);
+}

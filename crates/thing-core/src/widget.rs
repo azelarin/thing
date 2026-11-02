@@ -17,6 +17,7 @@ pub enum Kind {
     CenterBox,
     Column,
     Stack,
+    Crossfade,
     Scroll,
     Text,
     TextInput,
@@ -573,6 +574,7 @@ impl Kind {
                 | Self::Column
                 | Self::CenterBox
                 | Self::Stack
+                | Self::Crossfade
                 | Self::Scroll
         )
     }
@@ -588,6 +590,7 @@ impl Kind {
                 | Self::CenterBox
                 | Self::Column
                 | Self::Stack
+                | Self::Crossfade
                 | Self::Scroll
                 | Self::Button
                 | Self::PointerArea
@@ -609,6 +612,7 @@ impl Kind {
                 | Self::CenterBox
                 | Self::Column
                 | Self::Stack
+                | Self::Crossfade
                 | Self::Text
                 | Self::Image
                 | Self::Path
@@ -985,6 +989,8 @@ pub struct Node {
     pub scroll_axis: ScrollAxis,
     pub image: Image,
     pub image_fit: ImageFit,
+    /// blend from the first child to the second in a crossfade container.
+    pub crossfade_progress: f32,
     /// blur and saturation applied when painting an image's pixels.
     pub image_effects: crate::ImageEffects,
     pub path: VectorPath,
@@ -1022,6 +1028,17 @@ impl Node {
     pub fn is_interactive(&self) -> bool {
         self.kind.is_interactive()
             || (self.kind == Kind::Text && self.link_handler && !self.links.is_empty())
+    }
+
+    /// the painting weight of a non-popup child in tree order.
+    pub fn child_weight(&self, index: usize) -> f32 {
+        if self.kind != Kind::Crossfade {
+            1.0
+        } else if index == 0 {
+            1.0 - self.crossfade_progress
+        } else {
+            self.crossfade_progress
+        }
     }
 
     /// the link under byte `index` of `text`, if any.
@@ -1104,6 +1121,7 @@ impl Node {
             scroll_axis: ScrollAxis::Vertical,
             image: Image::default(),
             image_fit: ImageFit::Contain,
+            crossfade_progress: 0.0,
             image_effects: crate::ImageEffects::default(),
             path: VectorPath::default(),
             popup: PopupOptions::default(),
@@ -1239,6 +1257,30 @@ impl Node {
         }
         if self.kind != Kind::Scroll && self.scroll_axis != ScrollAxis::Vertical {
             return Err(TreeError("axis is available only on scroll widgets".into()));
+        }
+        if self.kind == Kind::Crossfade {
+            if !self.crossfade_progress.is_finite()
+                || !(0.0..=1.0).contains(&self.crossfade_progress)
+            {
+                return Err(TreeError(
+                    "crossfade progress must be between 0 and 1".into(),
+                ));
+            }
+            if self
+                .children
+                .iter()
+                .filter(|child| child.kind != Kind::Popup)
+                .count()
+                != 2
+            {
+                return Err(TreeError(
+                    "crossfade requires exactly two non-popup children".into(),
+                ));
+            }
+        } else if self.crossfade_progress != 0.0 {
+            return Err(TreeError(
+                "progress is available only on crossfade widgets".into(),
+            ));
         }
         self.panel.validate(&self.style)?;
         if !self.kind.is_container() && !self.children.is_empty() {

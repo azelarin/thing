@@ -452,6 +452,7 @@ widget kind; unkeyed children match by position and kind.
 | `text` | one of `text` (a utf-8 string), `spans`, or `markup`; optional `on_link`, `max_lines`, and `overflow` |
 | `text_input` | controlled `value` and `on_change`; optional `placeholder` and `on_submit` |
 | `secret_input` | host-owned lock input; optional `placeholder`; never exposes its value or a submit callback |
+| `crossfade` | exactly two non-popup children; optional `progress` from 0 to 1 |
 | `image` | one of `source`, `icon`, `app_id`; optional `icon_theme`, `fit`, `blur`, and `saturation` |
 | `path` | `data`, `view_box`; optional fit, fill, and stroke controls |
 | `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll`, `on_hover`, `on_pointer` |
@@ -1921,6 +1922,41 @@ per layer and 1 gib across a frame, with at most eight nested layers and 256
 layers per frame. a reload or output change that exceeds these limits keeps
 the previous frame. use compositing on the group you want to fade rather than
 on every child.
+
+### crossfading content
+
+`ui.crossfade` blends two complete widget groups. unlike two overlapping fades,
+its midpoint keeps the background out of opaque content and preserves the alpha
+of translucent content and antialiased edges:
+
+```luau
+ui.crossfade {
+    progress = ui.transition(function()
+        return if services.media.playing:get() then 1 else 0
+    end, { duration = 200 }),
+    style = { width = 96, height = 24, align = 'center', justify = 'center' },
+    children = {
+        ui.text { text = 'paused' },
+        ui.text { text = 'playing' },
+    },
+}
+```
+
+its children overlap as in a stack. `progress` defaults to 0, showing the first
+child; 1 shows the second. it accepts reactive values, transitions, springs, and
+motion readers. springs clamp published progress to 0 through 1. the two child
+slots remain present throughout the animation, including hidden children;
+popups use separate surfaces and do not take a slot.
+
+each child keeps its own opacity and clips. the crossfade's background and
+border stay beneath the mixture, and its opacity and disabled opacity fade the
+complete result once. blending changes painting, without changing input or focus:
+use reactive `enabled` or `visible` on the children when switching controls.
+
+between endpoints, the two children and their mixture use temporary layers,
+charged against the same [compositing limits](#fading-a-group). faded containers
+and nested groups may need additional layers. the endpoints skip the mixing
+layers and paint the selected child directly.
 
 rows, panels, popups, buttons, pointer areas, and stacks have a horizontal main
 axis and a vertical cross axis. columns and vertical scrolls swap those axes.

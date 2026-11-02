@@ -465,6 +465,7 @@ pub(crate) fn kind_name(kind: Kind) -> &'static str {
         Kind::CenterBox => "centerbox",
         Kind::Column => "column",
         Kind::Stack => "stack",
+        Kind::Crossfade => "crossfade",
         Kind::Scroll => "scroll",
         Kind::Text => "text",
         Kind::TextInput => "text_input",

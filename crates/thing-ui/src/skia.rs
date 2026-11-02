@@ -3000,3 +3000,7 @@ mod tests {
 #[cfg(test)]
 #[path = "composite_tests.rs"]
 mod composite_tests;
+
+#[cfg(test)]
+#[path = "crossfade_tests.rs"]
+mod crossfade_tests;
