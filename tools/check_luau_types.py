@@ -347,6 +347,7 @@ CASES = (
             "because the former is missing field 'color'",
             "Expected this to be exactly 'string', but got 'number'",
             "Property 'blur' is not compatible.",
+            "but got\n\t'{| color: boolean |}'",
             "Expected this to be 'ThingShadow?', but got 'string'",
             "but got\n\t'{| color: string, offset_x: boolean |}'",
         ),

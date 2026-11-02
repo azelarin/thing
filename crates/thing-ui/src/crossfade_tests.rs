@@ -162,11 +162,11 @@ fn layout(root: &Node) -> Layout {
 #[test]
 fn a_fully_opaque_crossfade_still_needs_bounded_isolation() {
     let mut root = fade();
-    let error = validate_compositing(&root, &layout(&root), (20_000, 20_000)).unwrap_err();
+    let error = validate_compositing(&root, &layout(&root), (20_000, 20_000), 1.0).unwrap_err();
     assert!(error.contains("physical pixels"), "{error}");
     for progress in [0.0, 1.0] {
         root.crossfade_progress = progress;
-        validate_compositing(&root, &layout(&root), (20_000, 20_000)).unwrap();
+        validate_compositing(&root, &layout(&root), (20_000, 20_000), 1.0).unwrap();
     }
 }
 

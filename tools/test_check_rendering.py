@@ -684,6 +684,24 @@ class CrossfadeOracleTest(unittest.TestCase):
             self.verify(crossfade_frame(1.25), "reload")
 
 
+class GroupShadowOracleTest(unittest.TestCase):
+    def test_a_blank_frame_or_missing_image_hole_cannot_pass(self):
+        for scale in (1, 1.25):
+            frame = Canvas(scale).rect(0,0,580,240,(255,255,255))
+            with self.assertRaisesRegex(FixtureError,"source opacity"):
+                check_rendering.verify_capture("group-shadow",frame.image(),"scale-1",scale)
+            # make all earlier probes correct, then fill the transparent hole.
+            for point,color in (
+                ((30,30),(255,128,128)),((65,30),(255,128,128)),
+                ((30,70),(128,128,128)),((65,70),(128,128,128)),
+                ((235,50),(128,128,128)),((25,170),(128,128,128)),
+                ((35,170),(128,128,128)),
+            ):
+                patch(frame,point,color)
+            with self.assertRaisesRegex(FixtureError,"image hole"):
+                check_rendering.verify_capture("group-shadow",frame.image(),"scale-1",scale)
+
+
 class StableCaptureTest(unittest.TestCase):
     def capture(self, frames, required, case="shadows", scale=1.0):
         calls = []

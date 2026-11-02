@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     ffi::{CStr, c_void},
 };
 
@@ -17,8 +17,8 @@ use skia_safe::{
 };
 use skrifa::MetadataProvider;
 use thing_core::{
-    HorizontalRange, ImageFit, Kind, Node, PathFillRule, PathFit, PathStrokeCap, PathStrokeJoin,
-    Rect, TextAlign, VectorSegment, ViewBox,
+    HorizontalRange, ImageFit, Kind, Node, NodeId, PathFillRule, PathFit, PathStrokeCap,
+    PathStrokeJoin, Rect, TextAlign, VectorSegment, ViewBox,
 };
 
 use crate::{
@@ -373,23 +373,21 @@ impl Scene<'_> {
             inspector,
         } = frame;
         let nodes = crate::shadow::node_index(root);
-        let shadows = crate::shadow::ShadowPlan::prepare(&nodes, layout, physical, scale)?;
+        let plan = crate::composite::Plan::prepare(&nodes, layout, physical, scale)?;
+        let shadows = crate::shadow::ShadowPlan::prepare(&nodes, layout, physical, scale, &plan)?;
         let image_effects =
-            crate::image_effects::ImageEffectPlan::prepare(&nodes, layout, physical, scale)?;
-        let mut layers = crate::composite::Layers::new(
-            crate::composite::Plan::prepare(&nodes, layout, physical)?,
-            physical,
-        );
+            crate::image_effects::ImageEffectPlan::prepare(&nodes, layout, physical, scale, &plan)?;
+        let mut layers = crate::composite::Layers::new(plan);
         self.images.collect();
         canvas.clear(SkiaColor::TRANSPARENT);
         canvas.reset_matrix();
         canvas.scale((scale, scale));
         let surface_matrix = canvas.local_to_device();
         self.text.retain(root);
-        let mut active_clips = Vec::new();
+        let mut active_clips = Clips::default();
 
         for (index, semantic) in layout.semantic_placements().iter().enumerate() {
-            layers.before(index, canvas, &mut active_clips, &surface_matrix);
+            layers.before(index, canvas, layout, &mut active_clips, &surface_matrix)?;
             let Some(node) = nodes.get(&semantic.id).copied() else {
                 continue;
             };
@@ -534,9 +532,7 @@ impl Scene<'_> {
             drawn?;
         }
         layers.finish(canvas, &mut active_clips);
-        while active_clips.pop().is_some() {
-            canvas.restore();
-        }
+        active_clips.clear(canvas);
         if let Some(highlight) = inspector {
             draw_inspector_highlight(canvas, layout, highlight, &surface_matrix)?;
         }
@@ -738,7 +734,7 @@ fn draw_shadow(
     shadow: &crate::shadow::PreparedShadow,
     opacity: f32,
     surface_matrix: &M44,
-    active: &mut Vec<usize>,
+    active: &mut Clips,
 ) -> Result<(), String> {
     sync_clip_chain(
         canvas,
@@ -754,35 +750,50 @@ fn draw_shadow(
     result
 }
 
-fn sync_clip_chain(
+#[derive(Default)]
+pub(crate) struct Clips {
+    active: Vec<usize>,
+    pub(crate) excluded: BTreeSet<Option<NodeId>>,
+}
+
+impl Clips {
+    pub(crate) fn clear(&mut self, canvas: &Canvas) {
+        while self.active.pop().is_some() {
+            canvas.restore();
+        }
+    }
+}
+
+pub(crate) fn sync_clip_chain(
     canvas: &Canvas,
     layout: &Layout,
     target: usize,
     surface_matrix: &M44,
-    active: &mut Vec<usize>,
+    active: &mut Clips,
 ) -> Result<(), String> {
     let mut cursor = Some(target);
-    let mut tail = Vec::new();
+    let mut chain = Vec::new();
     while let Some(index) = cursor {
         let region = layout
             .clip_region(index)
             .ok_or("layout refers to a missing clip region")?;
-        while active.len() > region.depth + 1 {
-            active.pop();
-            canvas.restore();
+        if !active.excluded.contains(&region.owner) {
+            chain.push(index);
         }
-        if active.get(region.depth) == Some(&index) {
-            break;
-        }
-        tail.push(index);
         cursor = region.parent;
     }
-    if cursor.is_none() {
-        while active.pop().is_some() {
-            canvas.restore();
-        }
+    chain.reverse();
+    let common = active
+        .active
+        .iter()
+        .zip(&chain)
+        .take_while(|(a, b)| a == b)
+        .count();
+    while active.active.len() > common {
+        active.active.pop();
+        canvas.restore();
     }
-    for index in tail.into_iter().rev() {
+    for index in chain.into_iter().skip(common) {
         let region = layout
             .clip_region(index)
             .ok_or("layout refers to a missing clip region")?;
@@ -801,7 +812,7 @@ fn sync_clip_chain(
             canvas.clip_rect(to_skia_rect(region.bounds), ClipOp::Intersect, false);
         }
         canvas.set_matrix(surface_matrix);
-        active.push(index);
+        active.active.push(index);
     }
     Ok(())
 }
@@ -3004,3 +3015,7 @@ mod composite_tests;
 #[cfg(test)]
 #[path = "crossfade_tests.rs"]
 mod crossfade_tests;
+
+#[cfg(test)]
+#[path = "drop_shadow_tests.rs"]
+mod drop_shadow_tests;

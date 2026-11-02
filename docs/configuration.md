@@ -1934,6 +1934,7 @@ put layout and paint values in `style`. dimensions use logical pixels.
 | `tabular_digits` | `false`; requests equal-width digits from fonts that support them |
 | `background` | transparent |
 | `box_shadow` | none; an outside shadow, described in [shadows](#shadows) |
+| `drop_shadow` | none; a shadow of this widget and its children's combined pixels |
 | `foreground` | white |
 | `opacity` | `1` |
 | `composite` | `false`; applies opacity to the combined widget and its children |
@@ -2257,6 +2258,40 @@ on one surface, or a path shadow's geometry is too complex. negative spread on
 detailed paths is the most expensive case. path shadows also accept simpler
 paths than `ui.path` itself. a rejected reactive update leaves the current tree
 in place. simplify the path, or reduce its spread, blur, or scale.
+
+`style.drop_shadow` uses the same table, with `spread` left at zero. it casts
+one shadow from the widget and its children's combined pixels, including text,
+strokes, image transparency, and descendant shadows:
+
+```luau
+ui.row {
+    style = {
+        drop_shadow = { color = '#00000080', blur = 8, offset_y = 4 },
+    },
+    children = {
+        ui.text { text = 'now playing' },
+        ui.image { icon = 'audio-x-generic', style = { width = 20, height = 20 } },
+    },
+}
+```
+
+a transparent pixel casts no shadow. translucent pixels cast a fainter one,
+which can show through translucent content. overlapping children contribute
+their combined alpha. the group's opacity and disabled opacity apply once to
+both the content and its shadow; `composite = true` is implied while the shadow
+is active. a crossfade's shadow follows its mixed pixels. popups have separate
+surfaces and are excluded.
+
+ancestor clips contain the finished shadow without cutting its source first.
+clips inside the group still shape that source. offsets follow the widget's
+transform. blur is circular after transformation, using skia's radius mapping;
+nonuniform scale or shear therefore uses an approximation. spread is unsupported.
+
+drop shadows share the compositing limits: eight nested layers, 256 layers per
+frame, at most 512 MiB of estimated scratch space for one layer, and 1 GiB for
+the frame. the estimate includes the filter's offscreen input and work buffers.
+a device blur sigma above 128 pixels also rejects the layout. these limits
+apply at full opacity too. a transparent shadow needs no extra layer.
 
 ### visual transforms
 

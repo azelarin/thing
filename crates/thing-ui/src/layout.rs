@@ -188,6 +188,8 @@ pub enum ScrollStep {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ClipRegion {
+    /// the widget that introduced this clip; `None` is the surface boundary.
+    pub(crate) owner: Option<NodeId>,
     pub(crate) bounds: Rect,
     pub(crate) radius: f32,
     /// a path clip in local coordinates, inside `bounds`.
@@ -289,6 +291,7 @@ pub struct Layout {
     scroll_areas: Vec<ScrollArea>,
     reveal_regions: Vec<RevealRegion>,
     clip_segments: usize,
+    retain_shadow_sources: bool,
     fitted_clips: BTreeMap<NodeId, skia_safe::Path>,
     content_sizes: BTreeMap<NodeId, Size>,
     /// visible link boxes of interactive text, in each widget's local space.
@@ -347,7 +350,17 @@ impl Layout {
             height: size.height,
         };
         let mut result = Self::default();
+        fn has_drop_shadow(node: &Node) -> bool {
+            node.style.drop_shadow.is_some()
+                || node
+                    .children
+                    .iter()
+                    .filter(|child| child.kind != Kind::Popup)
+                    .any(has_drop_shadow)
+        }
+        result.retain_shadow_sources = has_drop_shadow(root);
         result.clip_regions.push(ClipRegion {
+            owner: None,
             bounds: clip,
             radius: 0.0,
             path: None,
@@ -1014,6 +1027,7 @@ impl Layout {
                 let index = self.clip_regions.len();
                 let path = self.clip_path(node, local_bounds)?;
                 self.clip_regions.push(ClipRegion {
+                    owner: Some(node.id),
                     bounds: local_bounds,
                     radius: clip_radius(node, local_bounds),
                     path,
@@ -1104,6 +1118,7 @@ impl Layout {
         let child_clip_chain = self.clip_regions.len();
         let path = self.clip_path(node, local_bounds)?;
         self.clip_regions.push(ClipRegion {
+            owner: Some(node.id),
             bounds: local_bounds,
             radius: clip_radius(node, local_bounds),
             path,
@@ -1141,8 +1156,12 @@ impl Layout {
             parent,
             viewport: enabled && node.kind == Kind::Scroll,
         });
-        let Some(child_clip_aabb) = border_aabb.intersection(clip_aabb) else {
-            return Ok(());
+        let child_clip_aabb = match border_aabb.intersection(clip_aabb) {
+            Some(clip) => clip,
+            // filtered subtrees can cast onto a clipped area from outside it.
+            // keep their paint geometry; input still uses the original clips.
+            None if self.retain_shadow_sources => Rect::default(),
+            None => return Ok(()),
         };
         let mut child_origin = Point {
             x: bounds.x,
@@ -1757,6 +1776,7 @@ mod tests {
     fn subnormal_rounded_clip_does_not_underflow_to_a_rectangle() {
         let radius = f32::from_bits(16);
         let region = ClipRegion {
+            owner: None,
             bounds: Rect {
                 x: 0.0,
                 y: 0.0,

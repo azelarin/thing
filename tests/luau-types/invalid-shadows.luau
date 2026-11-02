@@ -9,6 +9,7 @@ local _text_blur: ThingShadow = { color = '#000000', blur = '4' }
 
 return ui.panel {
     style = {
+        drop_shadow = { color = true },
         box_shadow = function()
             return '#000000'
         end,

@@ -47,7 +47,9 @@ pub fn validate_shadows(
     physical: (u32, u32),
     scale: f32,
 ) -> Result<(), String> {
-    ShadowPlan::prepare(&node_index(root), layout, physical, scale).map(|_| ())
+    let nodes = node_index(root);
+    let plan = crate::composite::Plan::prepare(&nodes, layout, physical, scale)?;
+    ShadowPlan::prepare(&nodes, layout, physical, scale, &plan).map(|_| ())
 }
 
 #[derive(Default)]
@@ -156,6 +158,7 @@ impl Reach {
         placement: &SemanticPlacement,
         physical: (u32, u32),
         scale: f32,
+        capture_clip: Option<Rect>,
     ) -> Result<Option<Self>, String> {
         if value.color.0[3] == 0
             || placement.opacity * placement.disabled_opacity == 0.0
@@ -191,17 +194,25 @@ impl Reach {
         let device = placement.transform.rect_aabb(local)?;
         let scale = f64::from(scale);
         let pad = (3.0 * f64::from(sigma)).ceil() + 1.0;
-        let clip = placement.shadow_clip;
+        let clip = capture_clip.unwrap_or_else(|| {
+            placement
+                .shadow_clip
+                .intersection(Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: physical.0 as f32 / scale as f32,
+                    height: physical.1 as f32 / scale as f32,
+                })
+                .unwrap_or_default()
+        });
         let left = f64::from(device.x) * scale - pad;
         let top = f64::from(device.y) * scale - pad;
         let right = (f64::from(device.x) + f64::from(device.width)) * scale + pad;
         let bottom = (f64::from(device.y) + f64::from(device.height)) * scale + pad;
-        let clip_left = (f64::from(clip.x) * scale).max(0.0);
-        let clip_top = (f64::from(clip.y) * scale).max(0.0);
-        let clip_right =
-            ((f64::from(clip.x) + f64::from(clip.width)) * scale).min(f64::from(physical.0));
-        let clip_bottom =
-            ((f64::from(clip.y) + f64::from(clip.height)) * scale).min(f64::from(physical.1));
+        let clip_left = f64::from(clip.x) * scale;
+        let clip_top = f64::from(clip.y) * scale;
+        let clip_right = (f64::from(clip.x) + f64::from(clip.width)) * scale;
+        let clip_bottom = (f64::from(clip.y) + f64::from(clip.height)) * scale;
         if clip_right <= clip_left
             || clip_bottom <= clip_top
             || right <= clip_left
@@ -234,6 +245,7 @@ impl Budget {
         placement: &SemanticPlacement,
         physical: (u32, u32),
         scale: f32,
+        capture_clip: Option<Rect>,
     ) -> Result<bool, String> {
         let Some(Reach {
             sigma,
@@ -246,7 +258,14 @@ impl Budget {
             clip_top,
             clip_right,
             clip_bottom,
-        }) = Reach::measure(shape.bounds(), value, placement, physical, scale)?
+        }) = Reach::measure(
+            shape.bounds(),
+            value,
+            placement,
+            physical,
+            scale,
+            capture_clip,
+        )?
         else {
             return Ok(false);
         };
@@ -284,6 +303,7 @@ impl ShadowPlan {
         layout: &Layout,
         physical: (u32, u32),
         scale: f32,
+        composites: &crate::composite::Plan,
     ) -> Result<Self, String> {
         if !scale.is_finite() || scale <= 0.0 {
             return Err("shadow output scale must be finite and positive".into());
@@ -297,6 +317,8 @@ impl ShadowPlan {
             if placement.opacity * placement.disabled_opacity == 0.0 || !placement.is_invertible() {
                 continue;
             }
+            let capture_clip =
+                composites.clip_bounds(layout, placement.id, placement.shadow_clip_chain, scale);
             let mut shadows = NodeShadows::default();
             let prepare = |budget: &mut Budget,
                            source,
@@ -304,7 +326,7 @@ impl ShadowPlan {
                            value|
              -> Result<Option<PreparedShadow>, String> {
                 budget
-                    .charge(&source, value, placement, physical, scale)
+                    .charge(&source, value, placement, physical, scale, capture_clip)
                     .map(|visible| {
                         visible.then_some(PreparedShadow {
                             source,
@@ -341,6 +363,7 @@ impl ShadowPlan {
                     placement,
                     physical,
                     scale,
+                    capture_clip,
                 )
                 .map_err(|error| format!("shadow on widget {}: {error}", node.id.0))?
             {
@@ -420,8 +443,10 @@ fn reaches_surface(
     placement: &SemanticPlacement,
     physical: (u32, u32),
     scale: f32,
+    capture_clip: Option<Rect>,
 ) -> Result<bool, String> {
-    Reach::measure(local, value, placement, physical, scale).map(|reach| reach.is_some())
+    Reach::measure(local, value, placement, physical, scale, capture_clip)
+        .map(|reach| reach.is_some())
 }
 
 /// the round-join stroke whose removal shrinks a path by `spread`.

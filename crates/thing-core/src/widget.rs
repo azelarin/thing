@@ -724,6 +724,8 @@ pub struct Style {
     pub letter_spacing: f32,
     pub background: Brush,
     pub box_shadow: Option<Shadow>,
+    /// a shadow of this widget's combined pixels, including its descendants.
+    pub drop_shadow: Option<Shadow>,
     pub foreground: Color,
     pub opacity: f32,
     /// composite this widget and its descendants before applying opacity.
@@ -778,6 +780,7 @@ impl Default for Style {
             letter_spacing: 0.0,
             background: Brush::default(),
             box_shadow: None,
+            drop_shadow: None,
             foreground: Color::WHITE,
             opacity: 1.0,
             composite: false,
@@ -1312,6 +1315,12 @@ impl Node {
         style.background.validate()?;
         if let Some(shadow) = style.box_shadow {
             shadow.validate()?;
+        }
+        if let Some(shadow) = style.drop_shadow {
+            shadow.validate()?;
+            if shadow.spread != 0.0 {
+                return Err(TreeError("drop shadows do not support spread".into()));
+            }
         }
         if (self.kind == Kind::Popup
             || (depth == 0 && matches!(self.kind, Kind::Panel | Kind::Lock | Kind::Window)))
