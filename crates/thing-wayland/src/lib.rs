@@ -9,6 +9,7 @@ pub mod command;
 mod configuration;
 mod cursor;
 mod data_transfer;
+mod drag_drop;
 mod egl;
 mod focus;
 mod focused_clipboard;

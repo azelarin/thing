@@ -1,7 +1,10 @@
 use std::{
     io,
     os::fd::{FromRawFd, OwnedFd},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
@@ -13,9 +16,28 @@ pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
 pub(crate) struct OfferData {
     choice: Mutex<Option<MimeChoice>>,
     mime_types: Mutex<Vec<String>>,
+    /// raw `wl_data_offer` source_actions and action masks for drag offers.
+    source_actions: AtomicU32,
+    action: AtomicU32,
 }
 
 impl OfferData {
+    pub(crate) fn set_source_actions(&self, actions: u32) {
+        self.source_actions.store(actions, Ordering::Relaxed);
+    }
+
+    pub(crate) fn source_actions(&self) -> u32 {
+        self.source_actions.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_action(&self, action: u32) {
+        self.action.store(action, Ordering::Relaxed);
+    }
+
+    pub(crate) fn action(&self) -> u32 {
+        self.action.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn offer(&self, mime_type: String) {
         {
             let mut mime_types = lock(&self.mime_types);

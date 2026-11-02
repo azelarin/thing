@@ -112,6 +112,7 @@ use xkbcommon::xkb;
 use crate::output::{fallback_logical_size, valid_dimensions};
 
 mod dispatch;
+mod drag;
 mod input;
 mod inspection;
 mod launching;
@@ -335,6 +336,9 @@ fn run_instance(
         calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let focused_clipboard = FocusedClipboard::bind(&globals, &qh, focused_clipboard_ping)
         .map_err(|error| format!("cannot start text field clipboard support: {error}"))?;
+    let (drag_ping, drag_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
+    let drag = drag::HostDrag::new(drag_ping)
+        .map_err(|error| format!("cannot start drag and drop support: {error}"))?;
     let input_method = InputMethod::bind(&globals, &qh);
     let mut event_loop: EventLoop<'static, App> =
         EventLoop::try_new().map_err(|error| error.to_string())?;
@@ -368,6 +372,7 @@ fn run_instance(
         clipboard,
         focused_clipboard,
         pending_paste: None,
+        drag,
         input_method,
         launcher,
         managed_processes: None,
@@ -480,6 +485,10 @@ fn run_instance(
         .insert_source(focused_clipboard_source, |_, _, app| {
             app.update_focused_clipboard()
         })
+        .map_err(|e| e.to_string())?;
+    event_loop
+        .handle()
+        .insert_source(drag_source, |_, _, app| app.update_drag_drop())
         .map_err(|e| e.to_string())?;
     WaylandSource::new(connection.clone(), queue)
         .insert(event_loop.handle())
@@ -1247,6 +1256,7 @@ pub(crate) struct App {
     clipboard: Option<Clipboard>,
     focused_clipboard: FocusedClipboard,
     pending_paste: Option<PendingPaste>,
+    drag: drag::HostDrag,
     input_method: InputMethod,
     launcher: Launcher,
     managed_processes: Option<ProcessManager>,
@@ -1431,6 +1441,7 @@ impl App {
         self.prepare_invalidated_input_layouts_now();
         self.reconcile_layout_focus();
         self.reconcile_input_method(InputMethodChangeCause::Other);
+        self.reconcile_drags();
     }
 
     fn reload(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {

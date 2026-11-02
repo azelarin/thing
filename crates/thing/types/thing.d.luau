@@ -120,6 +120,18 @@ export type ThingPointerPhase = "press" | "move" | "release" | "cancel"
 export type ThingPointerButton = "primary" | "middle" | "secondary"
 export type ThingScrollSource = "wheel" | "finger" | "continuous" | "wheel_tilt" | "unknown"
 
+export type ThingDragAction = "copy" | "move"
+export type ThingDragResult = "copy" | "move" | "cancelled"
+export type ThingDropType = "text" | "files"
+
+export type ThingDragOptions = {
+    text: string?,
+    files: { string }?,
+    -- list literals infer as `{ string }`; the runtime accepts "copy" and "move".
+    actions: { string }?,
+    on_end: ((result: ThingDragResult) -> ())?,
+}
+
 declare extern type ThingPointerEvent with
     read phase: ThingPointerPhase
     read button: ThingPointerButton
@@ -131,6 +143,30 @@ declare extern type ThingPointerEvent with
     read ctrl: boolean
     read alt: boolean
     read logo: boolean
+    function start_drag(self, options: ThingDragOptions): ()
+end
+
+export type ThingDragOverPhase = "enter" | "move" | "leave" | "cancel"
+
+declare extern type ThingDragOverEvent with
+    read phase: ThingDragOverPhase
+    read x: number
+    read y: number
+    read surface_x: number
+    read surface_y: number
+    read types: { ThingDropType }
+    read actions: { ThingDragAction }
+end
+
+declare extern type ThingDropEvent with
+    read x: number
+    read y: number
+    read surface_x: number
+    read surface_y: number
+    read action: ThingDragAction
+    read type: ThingDropType
+    read text: string?
+    read files: { string }?
 end
 
 declare extern type ThingScrollEvent with
@@ -630,6 +666,10 @@ export type ThingPointerAreaProperties = {
     children: ThingChildren?,
     on_pointer: ((event: ThingPointerEvent) -> boolean?)?,
     on_scroll: ThingScrollHandler?,
+    -- list literals infer as `{ string }`; the runtime accepts "text" and "files".
+    drop_types: { string }?,
+    on_drag_over: ((event: ThingDragOverEvent) -> ThingDragAction?)?,
+    on_drop: ((event: ThingDropEvent) -> boolean?)?,
 }
 
 export type ThingSliderProperties = {

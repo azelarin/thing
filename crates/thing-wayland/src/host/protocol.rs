@@ -429,12 +429,16 @@ impl Dispatch<WlDataDevice, ()> for App {
     ) {
         match event {
             wl_data_device::Event::DataOffer { .. } => {}
-            wl_data_device::Event::Enter { serial, id, .. } => {
-                app.focused_clipboard.drag_enter(device, serial, id);
-            }
-            wl_data_device::Event::Leave | wl_data_device::Event::Drop => {
-                app.focused_clipboard.drag_finished(device);
-            }
+            wl_data_device::Event::Enter {
+                serial,
+                surface,
+                x,
+                y,
+                id,
+            } => app.drag_enter(device, serial, surface, x, y, id),
+            wl_data_device::Event::Motion { x, y, .. } => app.drag_motion(device, x, y),
+            wl_data_device::Event::Leave => app.drag_leave(device),
+            wl_data_device::Event::Drop => app.drag_dropped(device),
             wl_data_device::Event::Selection { id } => {
                 app.focused_clipboard.selection(device, id);
             }
@@ -452,9 +456,29 @@ impl Dispatch<WlDataOffer, ClipboardOfferData> for App {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_data_offer::Event::Offer { mime_type } = event {
-            data.offer(mime_type);
+        match event {
+            wl_data_offer::Event::Offer { mime_type } => data.offer(mime_type),
+            wl_data_offer::Event::SourceActions { source_actions } => {
+                data.set_source_actions(crate::drag_drop::action_bits(source_actions));
+            }
+            wl_data_offer::Event::Action { dnd_action } => {
+                data.set_action(crate::drag_drop::action_bits(dnd_action));
+            }
+            _ => {}
         }
+    }
+}
+
+impl Dispatch<WlDataSource, crate::drag_drop::DragSourceData> for App {
+    fn event(
+        app: &mut Self,
+        _: &WlDataSource,
+        event: wl_data_source::Event,
+        data: &crate::drag_drop::DragSourceData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        app.drag_source_event(data, event);
     }
 }
 

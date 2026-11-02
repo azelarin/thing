@@ -456,7 +456,7 @@ widget kind; unkeyed children match by position and kind.
 | `image` | one of `source`, `icon`, `app_id`; optional `icon_theme`, `fit`, `blur`, and `saturation` |
 | `path` | `data`, `view_box`; optional fit, fill, and stroke controls |
 | `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll`, `on_hover`, `on_pointer` |
-| `pointer_area` | `children`, with at least one of `on_pointer` or `on_scroll` |
+| `pointer_area` | `children`, `drop_types`, with at least one of `on_pointer`, `on_scroll`, or `on_drag_over` and `on_drop` together |
 | `slider` | `min`, `max`, `value`, `step`, `on_change`, `on_hover` |
 | `range` | `children`, `min`, `max`, `value`, `step`, `inset`, `on_change`, `on_hover`, `on_pressed` |
 | `popup` | `visible`, `open_on_hover`, `open_on_click`, `open_delay`, `close_delay`, `anchor`, `alignment`, `offset`, `constraints`, `on_key`, `on_scroll`, `on_hover`, `on_close` |
@@ -833,6 +833,92 @@ reload drops the old runtime without calling its handlers. returning `true`
 from any phase suppresses a button's ordinary click for the rest of that
 sequence; `false` or `nil` leaves it available. the release callback runs before
 that ordinary click.
+
+## drag and drop
+
+a pointer area with `on_drag_over` and `on_drop` receives drags from other
+applications and from thing itself. its children stay ordinary widgets, and
+widgets inside it do not hide it from drags.
+
+```luau
+local files = ui.state({} :: { string })
+
+ui.pointer_area {
+    drop_types = { 'files', 'text' },
+    on_drag_over = function(event)
+        if event.phase == 'leave' or event.phase == 'cancel' then return nil end
+        if #event.types == 0 then return nil end
+        return 'copy'
+    end,
+    on_drop = function(event)
+        if event.files then files:set(event.files) end
+        return event.files ~= nil
+    end,
+    children = { ui.text { text = 'drop files here' } },
+}
+```
+
+`on_drag_over(event)` runs with phase `enter` when a drag reaches the area,
+`move` as it moves, `leave` when it moves away or its source ends it, and
+`cancel` when a drop on the area could not be delivered. `x` and `y` are local
+coordinates, `surface_x` and `surface_y` surface coordinates. `types` lists the
+data the drag carries that the area accepts, in the area's preference order:
+`drop_types` when given, otherwise `files` before `text`. `actions` lists the
+actions the source allows, `copy` and `move`. during `enter` and `move`, return
+`copy` or `move` to accept the drag with that action and the first entry of
+`types`, or `nil` to refuse it. returning an action that the source does not
+allow is an error, and refusing is the same as returning nothing. the return
+value of `leave` and `cancel` is ignored.
+
+when an accepted drag is dropped, thing reads the data in the background and
+then calls `on_drop(event)` with `action`, `type`, and either `text` or `files`,
+plus the same coordinates. text must be valid utf-8 without nul bytes and at
+most 1 mib. files arrive as a `text/uri-list` of at most 256 local `file:` uris
+within 1 mib, and are given as normalized absolute paths. a remote host, any
+other scheme, a query or fragment, or a `..` component rejects the whole drop,
+and nothing is fetched or opened. a read that fails, carries invalid data, or
+takes longer than five seconds becomes a `cancel` phase instead of a drop.
+
+return `true` from `on_drop` once the area has used the data. only then does
+thing tell the source the drop finished, which is what allows a `move` source to
+delete its original. returning `false`, `nil`, or raising an error refuses the
+drop, and the source treats it as cancelled.
+
+a pointer handler starts a drag from inside its own primary press or move
+callback with `event:start_drag(options)`:
+
+```luau
+ui.pointer_area {
+    on_pointer = function(event)
+        if event.phase == 'move' then
+            event:start_drag {
+                files = { '/tmp/report.txt' },
+                actions = { 'copy', 'move' },
+                on_end = function(result) print(result) end,
+            }
+        end
+        return true
+    end,
+}
+```
+
+`options` has exactly one of `text` or `files`. `files` is a list of 1 to 256
+absolute paths or local `file:` uris; they are normalized but not checked
+against the filesystem. `actions` defaults to `{ 'copy' }`. the call fails when
+it does not use the event it was given, outside a primary `press` or `move`, or
+while another drag from the same configuration is active. once the callback
+returns, the drag starts with that press, the handler receives `cancel` because
+the compositor now owns the pointer, and `on_end(result)` runs once with `copy`
+or `move` after the destination finished the drop, or `cancelled` otherwise. a
+`move` result means the destination accepted the data, so the source may remove
+its original then. a drag whose `actions` leave out `move` never ends as `move`.
+
+each press starts at most one drag. a drag also ends as `cancelled` when its
+surface closes or the seat goes away. a configuration reload ends drags and
+drops that belong to the old runtime without calling its handlers. lock
+configurations cannot use drag and drop. the compositor needs version 3 of
+`wl_data_device_manager`; with an older one, drop areas never receive drags and
+every `start_drag` ends as `cancelled`. drags do not show a custom icon yet.
 
 ## pointer cursors
 

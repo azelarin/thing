@@ -264,16 +264,8 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for ClientState {
         _: &QueueHandle<Self>,
     ) {
         let clipboard = state.clipboard.as_mut().unwrap();
-        match event {
-            wl_data_device::Event::DataOffer { .. } => {}
-            wl_data_device::Event::Enter { serial, id, .. } => {
-                clipboard.drag_enter(device, serial, id);
-            }
-            wl_data_device::Event::Leave | wl_data_device::Event::Drop => {
-                clipboard.drag_finished(device);
-            }
-            wl_data_device::Event::Selection { id } => clipboard.selection(device, id),
-            _ => {}
+        if let wl_data_device::Event::Selection { id } = event {
+            clipboard.selection(device, id);
         }
     }
 }

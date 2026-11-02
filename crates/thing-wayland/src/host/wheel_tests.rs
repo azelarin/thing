@@ -609,6 +609,7 @@ impl Host {
             clipboard: None,
             focused_clipboard: FocusedClipboard::bind(&globals, &qh, clipboard_ping).unwrap(),
             pending_paste: None,
+            drag: super::drag::HostDrag::new(calloop::ping::make_ping().unwrap().0).unwrap(),
             input_method: InputMethod::bind(&globals, &qh),
             launcher: Launcher::for_tests(),
             managed_processes: None,

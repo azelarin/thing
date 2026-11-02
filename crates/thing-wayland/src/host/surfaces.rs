@@ -713,6 +713,7 @@ impl App {
             self.queue_window_state(owner.clone(), WindowState::default());
         }
         self.surfaces.remove(index);
+        self.retire_drags_for_surface(&wl);
         // a closed window or panel may stay in the tree, but nothing presents
         // it any more.
         self.configurations

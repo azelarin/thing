@@ -339,6 +339,15 @@ CASES = (
             "Expected this to be 'number', but got",
         ),
     ),
+    Case("valid-drag-and-drop.luau"),
+    Case(
+        "invalid-drag-and-drop.luau",
+        (
+            "invalid-drag-and-drop.luau(8,",
+            "invalid-drag-and-drop.luau(17,",
+            "invalid-drag-and-drop.luau(24,",
+        ),
+    ),
     Case("valid-shadows.luau"),
     Case(
         "invalid-shadows.luau",
