@@ -86,6 +86,11 @@ return ui.lock {
             width = 40, height = 20, scale_x = 4, scale_y = 4,
             box_shadow = { color = '#000000', blur = 32 },
         } },
+        ui.image {
+            source = 'missing.png',
+            blur = 32,
+            style = { width = 40, height = 20, scale_x = 4, scale_y = 4 },
+        },
     },
 }
 "#;
@@ -800,6 +805,22 @@ fn run_host_probe() {
         fractional.factor(),
     )
     .unwrap();
+    thing_ui::validate_image_effects(
+        &prepared.root,
+        &prepared.layout,
+        physical,
+        fractional.factor(),
+    )
+    .unwrap();
+    // the blurred image alone also rules out the rejected density.
+    let error = thing_ui::validate_image_effects(
+        &prepared.root,
+        &prepared.layout,
+        (WIDTH * 3, HEIGHT * 3),
+        3.0,
+    )
+    .unwrap_err();
+    assert!(error.contains("128 pixel device sigma"), "{error}");
     assert_eq!(
         app.surfaces[0].secret_input.as_ref().unwrap().editor.len(),
         2

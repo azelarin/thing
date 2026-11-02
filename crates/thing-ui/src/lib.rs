@@ -3,6 +3,7 @@
 mod brush;
 mod editor;
 mod frame;
+mod image_effects;
 mod images;
 mod layout;
 pub mod png;
@@ -22,4 +23,5 @@ pub use skia::Painter;
 pub use text::{TextBrush, TextSystem, link_regions};
 pub use visual::Affine;
 
+pub use image_effects::validate_image_effects;
 pub use shadow::validate_shadows;

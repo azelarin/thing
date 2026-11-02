@@ -982,6 +982,8 @@ pub struct Node {
     pub scroll_axis: ScrollAxis,
     pub image: Image,
     pub image_fit: ImageFit,
+    /// blur and saturation applied when painting an image's pixels.
+    pub image_effects: crate::ImageEffects,
     pub path: VectorPath,
     pub popup: PopupOptions,
     pub slider: Slider,
@@ -1099,6 +1101,7 @@ impl Node {
             scroll_axis: ScrollAxis::Vertical,
             image: Image::default(),
             image_fit: ImageFit::Contain,
+            image_effects: crate::ImageEffects::default(),
             path: VectorPath::default(),
             popup: PopupOptions::default(),
             slider: Slider::default(),
@@ -1303,6 +1306,12 @@ impl Node {
                 "image accepts only one of a file source, image handle, icon, or app_id".into(),
             ));
         }
+        if self.kind != Kind::Image && self.image_effects != crate::ImageEffects::default() {
+            return Err(TreeError(
+                "blur and saturation are available only on images".into(),
+            ));
+        }
+        self.image_effects.validate()?;
         if self.kind == Kind::CenterBox
             && (self.children.len() != 3 || self.children.iter().any(|n| n.kind == Kind::Popup))
         {

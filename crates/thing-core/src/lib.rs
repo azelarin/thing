@@ -4,6 +4,7 @@ mod brush;
 mod color;
 mod cursor;
 mod geometry;
+mod image_effects;
 mod shadow;
 mod vector;
 mod widget;
@@ -12,6 +13,7 @@ pub use brush::{Brush, GradientPoint, GradientStop, LinearGradient, RadialGradie
 pub use color::{Color, ParseColorError};
 pub use cursor::{Cursor, own_cursor};
 pub use geometry::{HorizontalRange, Point, Rect, Scale};
+pub use image_effects::{ImageEffects, MAX_IMAGE_BLUR, MAX_IMAGE_SATURATION};
 pub use shadow::{MAX_SHADOW_BLUR, MAX_SHADOW_OFFSET, MAX_SHADOW_SPREAD, Shadow};
 pub use widget::{
     ClipMode, ClipPath, CrossAlign, Image, ImageCandidate, ImageFit, ImagePixmap, ImageSource,

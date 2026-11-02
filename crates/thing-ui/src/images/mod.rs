@@ -640,6 +640,16 @@ impl Images {
     fn resident_bytes(&self) -> usize {
         self.bytes.saturating_add(self.retired_bytes)
     }
+
+    /// the number of cached requests and whether all of them have finished.
+    #[cfg(test)]
+    pub(crate) fn request_state(&self) -> (usize, bool) {
+        let settled = self
+            .cache
+            .values()
+            .all(|entry| !matches!(entry.state, State::Pending));
+        (self.cache.len(), settled)
+    }
 }
 
 fn request_dimensions(bounds: Rect, scale: f64) -> (u32, u32) {

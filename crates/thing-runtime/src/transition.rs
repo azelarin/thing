@@ -613,6 +613,8 @@ fn numeric_property(property: &str) -> bool {
             | "style.scale_x"
             | "style.scale_y"
             | "style.rotation"
+            | "blur"
+            | "saturation"
     )
 }
 

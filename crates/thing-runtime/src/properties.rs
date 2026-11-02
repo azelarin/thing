@@ -1,9 +1,10 @@
 use mlua::{Error, Result, Table, Value};
 use thing_core::{
-    ClipMode, Color, CrossAlign, ImageFit, ImageSource, KeyboardMode, Kind, MainAlign, Node,
-    PanelEdge, PanelInputRect, PanelInputRegion, PanelMargins, PathFillRule, PathFit,
-    PathStrokeCap, PathStrokeJoin, PopupAlignment, PopupAnchor, PopupConstraints, PopupOffset,
-    ScrollAxis, SurfaceAnchors, SurfaceLayer, TextAlign, TextOverflow, TransformOrigin, ViewBox,
+    ClipMode, Color, CrossAlign, ImageFit, ImageSource, KeyboardMode, Kind, MAX_IMAGE_BLUR,
+    MAX_IMAGE_SATURATION, MainAlign, Node, PanelEdge, PanelInputRect, PanelInputRegion,
+    PanelMargins, PathFillRule, PathFit, PathStrokeCap, PathStrokeJoin, PopupAlignment,
+    PopupAnchor, PopupConstraints, PopupOffset, ScrollAxis, SurfaceAnchors, SurfaceLayer,
+    TextAlign, TextOverflow, TransformOrigin, ViewBox,
 };
 
 use crate::services::ImageHandle;
@@ -772,6 +773,8 @@ pub(crate) fn apply_animation_frame(node: &mut Node, name: &str, value: Resolved
             "style.width" | "style.height" | "style.padding" | "style.padding_x"
             | "style.padding_y" | "style.gap" | "style.grow" | "style.radius"
             | "style.border_width" => value.clamp(0.0, 100_000.0),
+            "blur" => value.clamp(0.0, MAX_IMAGE_BLUR),
+            "saturation" => value.clamp(0.0, MAX_IMAGE_SATURATION),
             _ => value,
         }),
         color => color,
@@ -809,6 +812,12 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
         "icon_theme" if node.kind == Kind::Image => node.image.theme = string(value, name)?,
         "revision" if node.kind == Kind::Image => node.image.revision = image_revision(value)?,
         "fit" if node.kind == Kind::Image => node.image_fit = image_fit(value, name)?,
+        "blur" if node.kind == Kind::Image => {
+            node.image_effects.blur = effect_number(value, name, 0.0, MAX_IMAGE_BLUR)?
+        }
+        "saturation" if node.kind == Kind::Image => {
+            node.image_effects.saturation = effect_number(value, name, 0.0, MAX_IMAGE_SATURATION)?
+        }
         "data" if node.kind == Kind::Path => node
             .path
             .set_data(string(value, name)?)
@@ -982,6 +991,16 @@ fn apply_color(node: &mut Node, name: &str, color: Color) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn effect_number(value: Value, name: &str, min: f32, max: f32) -> Result<f32> {
+    let value = number(value, name)? as f32;
+    if !value.is_finite() || !(min..=max).contains(&value) {
+        return Err(Error::runtime(format!(
+            "{name} must be a finite number between {min} and {max}"
+        )));
+    }
+    Ok(value)
 }
 
 fn optional_number(value: Value, name: &str) -> Result<Option<f32>> {

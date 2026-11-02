@@ -25,18 +25,21 @@ ARTIFACTS = ROOT / "target/render-tests"
 CASES = (
     "image-fit", "stencil", "gradients", "radial-gradients", "shadows", "shared-motion",
     "widget-bounds", "rounded-clips", "path-clips", "horizontal-scroll", "motion-lifecycle", "content-transitions", "windows",
-    "styled-text", "live-inspector",
+    "styled-text", "live-inspector", "image-effects",
 )
 # these accept a state only after the same passing frame is captured twice.
 STABLE_FRAMES = {
     "windows": 2,
     "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2, "rounded-clips": 2, "horizontal-scroll": 2, "motion-lifecycle": 2, "content-transitions": 2,
-    "styled-text": 2, "live-inspector": 2,
+    "styled-text": 2, "live-inspector": 2, "image-effects": 2,
 }
 RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
 # the runtime error each panel-invalid.luau must produce, in thing check and in
 # the log of the running host.
-INVALID_RELOADS = {"shadows": "shadow blur must be between 0 and 32"}
+INVALID_RELOADS = {
+    "shadows": "shadow blur must be between 0 and 32",
+    "image-effects": "between 0 and 64",
+}
 MAX_LOG_BYTES = 1024 * 1024
 COMMAND_TIMEOUT = 8.0
 INNER_TIMEOUT = 35.0
@@ -593,8 +596,38 @@ def verify_live_inspector(image, stage, scale):
             raise FixtureError("the clipped rotated child is missing")
 
 
+def verify_image_effects(image, stage, scale):
+    reloaded = stage == "reload"
+    background = (24, 24, 24)
+    for point, color, label, tolerance in (
+        ((25, 15), background, "contain letterbox", 3),
+        ((25, 45), (227, 75, 75), "unchanged source", 3),
+        ((110, 45), (49, 79, 120), "source transparency", 3),
+        ((146, 11), background, "rounded image corner", 3),
+        ((146, 50), (227, 75, 75), "opaque blurred edge", 6),
+        ((295, 50), (167, 91, 91) if reloaded else (107, 107, 107), "saturation", 5),
+        ((385, 50), (62, 77, 97) if reloaded else (75, 75, 75), "filtered transparency", 5),
+        ((12, 140), background, "image padding", 3),
+        ((40, 140), (255, 43, 43), "increased saturation", 6),
+        ((160, 140), (126, 50, 50), "transformed image opacity", 15),
+        ((290, 140), (227, 75, 75), "clipped image content", 8),
+        ((345, 140), background, "ancestor clip", 3),
+    ):
+        expect_color(image, point, scale, color, label, tolerance)
+    # a sharp color boundary cannot satisfy this mixture. farther from the
+    # boundary, the wider reload blur must soften pixels the first blur kept red.
+    edge = image.pixel(physical(178, scale), physical(50, scale))
+    if not (110 < edge[0] < 200 and 95 < edge[1] < 165):
+        raise FixtureError(f"image color boundary is not blurred: {edge}")
+    reach = image.pixel(physical(167, scale), physical(50, scale))
+    if not ((86 < reach[1] < 125) if reloaded else (70 < reach[1] < 85)):
+        raise FixtureError(f"image blur radius did not match the current stage: {reach}")
+
+
 def verify_capture(case, image, stage, scale):
-    if case == "live-inspector":
+    if case == "image-effects":
+        verify_image_effects(image, stage, scale)
+    elif case == "live-inspector":
         verify_live_inspector(image, stage, scale)
     elif case == "windows":
         verify_windows(image, stage, scale)

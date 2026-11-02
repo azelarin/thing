@@ -374,6 +374,8 @@ impl Scene<'_> {
         } = frame;
         let nodes = crate::shadow::node_index(root);
         let shadows = crate::shadow::ShadowPlan::prepare(&nodes, layout, physical, scale)?;
+        let image_effects =
+            crate::image_effects::ImageEffectPlan::prepare(&nodes, layout, physical, scale)?;
         self.images.collect();
         canvas.clear(SkiaColor::TRANSPARENT);
         canvas.reset_matrix();
@@ -512,16 +514,14 @@ impl Scene<'_> {
                     draw_slider(canvas, node, bounds, opacity);
                     Ok(())
                 }
-                Kind::Image => {
-                    self.draw_image(
-                        canvas,
-                        node,
-                        bounds,
-                        f64::from(scale) * placement.magnification(),
-                        opacity,
-                    );
-                    Ok(())
-                }
+                Kind::Image => self.draw_image(
+                    canvas,
+                    node,
+                    bounds,
+                    f64::from(scale) * placement.magnification(),
+                    opacity,
+                    &image_effects,
+                ),
                 Kind::Path => draw_path(canvas, node, bounds, opacity),
                 _ => Ok(()),
             };
@@ -667,12 +667,25 @@ impl Scene<'_> {
         )
     }
 
-    fn draw_image(&mut self, canvas: &Canvas, node: &Node, bounds: Rect, scale: f64, opacity: f32) {
+    fn draw_image(
+        &mut self,
+        canvas: &Canvas,
+        node: &Node,
+        bounds: Rect,
+        scale: f64,
+        opacity: f32,
+        effects: &crate::image_effects::ImageEffectPlan,
+    ) -> Result<(), String> {
+        let effect = effects.get(node.id);
+        if effect.is_none() && !node.image_effects.is_neutral() {
+            // the plan found nothing of this effect that can reach the surface.
+            return Ok(());
+        }
         let area = image_area(node, bounds);
         let Some((image, width, height)) =
             self.images.get(&node.image, node.image_fit, area, scale)
         else {
-            return;
+            return Ok(());
         };
         let geometry = image_geometry(area, width, height, node.image_fit);
         let saved = canvas.save();
@@ -684,14 +697,21 @@ impl Scene<'_> {
             ClipOp::Intersect,
             true,
         );
-        canvas.draw_image_rect_with_sampling_options(
-            &image,
-            None,
-            to_skia_rect(geometry.paint),
-            SamplingOptions::from(skia_safe::FilterMode::Linear),
-            &fill(SkiaColor::WHITE, opacity),
-        );
+        let drawn = match effect {
+            Some(effect) => effect.draw(canvas, &image, geometry.paint, geometry.clip, opacity),
+            None => {
+                canvas.draw_image_rect_with_sampling_options(
+                    &image,
+                    None,
+                    to_skia_rect(geometry.paint),
+                    SamplingOptions::from(skia_safe::FilterMode::Linear),
+                    &fill(SkiaColor::WHITE, opacity),
+                );
+                Ok(())
+            }
+        };
         canvas.restore_to_count(saved);
+        drawn
     }
 }
 
@@ -1170,7 +1190,7 @@ struct ImageGeometry {
     clip: Rect,
 }
 
-fn image_area(node: &Node, bounds: Rect) -> Rect {
+pub(crate) fn image_area(node: &Node, bounds: Rect) -> Rect {
     let padding_x = node.style.padding_x.unwrap_or(node.style.padding);
     let padding_y = node.style.padding_y.unwrap_or(node.style.padding);
     Rect {
@@ -1214,7 +1234,7 @@ pub(crate) fn rounded_rect(bounds: Rect, radius: f32) -> RRect {
     RRect::new_rect_xy(to_skia_rect(bounds), radius, radius)
 }
 
-fn to_skia_rect(bounds: Rect) -> SkiaRect {
+pub(crate) fn to_skia_rect(bounds: Rect) -> SkiaRect {
     SkiaRect::from_xywh(bounds.x, bounds.y, bounds.width, bounds.height)
 }
 
@@ -1303,6 +1323,10 @@ fn focus_ring(node: &Node, input: Interaction) -> Option<(thing_core::Color, f32
         && node.style.focus_ring_color.0[3] > 0)
         .then_some((node.style.focus_ring_color, node.style.focus_ring_width))
 }
+
+#[cfg(test)]
+#[path = "image_effect_tests.rs"]
+mod image_effect_tests;
 
 #[cfg(test)]
 mod tests {
