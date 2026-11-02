@@ -796,6 +796,66 @@ fn a_new_drop_retires_a_stalled_read_and_discards_its_result() {
 }
 
 #[test]
+fn a_burst_of_replaced_drops_keeps_the_delivery_queue_bounded() {
+    // every drop below replaces a stalled read, so each one queues a
+    // cancellation. nothing drains the queue during the burst.
+    const BOUND: usize = MAX_PENDING_DELIVERIES;
+    let mut fixture = Fixture::new(3);
+    let mut sessions = Vec::new();
+    for _ in 0..BOUND * 4 {
+        let session = fixture.enter(&["text/plain"], COPY, b"", true);
+        fixture
+            .state
+            .drag
+            .negotiate(session, Some((DropType::Text, DragAction::Copy)));
+        fixture.command(Command::OfferAction(COPY));
+        fixture.command(Command::Drop);
+        sessions.push(session);
+    }
+    // once the queue is full, new drops are refused before the running read
+    // is replaced, so its owner keeps it.
+    let drops = &fixture.state.events.drops;
+    assert!(drops[..=BOUND].iter().all(|drop| *drop == "reading"));
+    assert!(drops[BOUND + 1..].iter().all(|drop| *drop == "rejected"));
+    let deliveries = fixture.state.drag.take_deliveries();
+    assert_eq!(
+        deliveries
+            .iter()
+            .map(|delivery| delivery.session)
+            .collect::<Vec<_>>(),
+        sessions[..BOUND]
+    );
+    assert!(deliveries.iter().all(|delivery| delivery.result.is_err()));
+    fixture.sync();
+    {
+        let observed = fixture.observed();
+        assert_eq!(observed.offer_destroys, BOUND * 4 - 1);
+        assert_eq!(observed.finishes, 0);
+    }
+
+    // a drained queue admits drops again; the kept read is retired once.
+    let session = fixture.enter(&["text/plain"], COPY, b"late", false);
+    fixture
+        .state
+        .drag
+        .negotiate(session, Some((DropType::Text, DragAction::Copy)));
+    fixture.command(Command::OfferAction(COPY));
+    fixture.command(Command::Drop);
+    let deliveries = fixture.deliveries(2);
+    assert_eq!(deliveries[0].session, sessions[BOUND]);
+    assert!(deliveries[0].result.is_err());
+    assert_eq!(
+        deliveries[1].result.as_ref().unwrap(),
+        &DragData::Text("late".into())
+    );
+    fixture.state.drag.finish_drop(session, true);
+    fixture.sync();
+    let observed = fixture.observed();
+    assert_eq!(observed.finishes, 1);
+    assert_eq!(observed.offer_destroys, BOUND * 4 + 1);
+}
+
+#[test]
 fn leave_surface_and_seat_retirement_destroy_each_offer_once() {
     let mut fixture = Fixture::new(3);
     fixture.enter(&["text/plain"], COPY, b"x", false);
@@ -886,6 +946,37 @@ fn outgoing_drags_serve_data_and_report_move_only_after_finish() {
         [DragResult::Move, DragResult::Cancelled]
     );
     assert!(fixture.state.drag.cancel_outgoing(|_| true).is_none());
+}
+
+#[test]
+fn a_copy_only_drag_never_reports_move() {
+    let mut fixture = Fixture::new(3);
+    let copy_only = DragActions {
+        copy: true,
+        moves: false,
+    };
+    fixture
+        .start(DragData::Text("payload".into()), copy_only)
+        .unwrap();
+    assert_eq!(fixture.observed().source_actions, [COPY]);
+    // a compositor that selects an action the drag did not offer, even after
+    // a valid one, leaves no selected action.
+    fixture.command(Command::SourceAction(COPY));
+    fixture.command(Command::SourceAction(MOVE));
+    fixture.command(Command::SourceFinished);
+    assert_eq!(fixture.state.events.ended, [DragResult::Cancelled]);
+
+    fixture
+        .start(DragData::Text("payload".into()), copy_only)
+        .unwrap();
+    fixture.command(Command::SourceAction(MOVE));
+    fixture.command(Command::SourceAction(COPY));
+    fixture.command(Command::SourceFinished);
+    assert_eq!(
+        fixture.state.events.ended,
+        [DragResult::Cancelled, DragResult::Copy]
+    );
+    assert_eq!(fixture.observed().source_destroys, 2);
 }
 
 #[test]

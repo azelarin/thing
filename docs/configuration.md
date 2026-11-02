@@ -911,7 +911,7 @@ returns, the drag starts with that press, the handler receives `cancel` because
 the compositor now owns the pointer, and `on_end(result)` runs once with `copy`
 or `move` after the destination finished the drop, or `cancelled` otherwise. a
 `move` result means the destination accepted the data, so the source may remove
-its original then.
+its original then. a drag whose `actions` leave out `move` never ends as `move`.
 
 each press starts at most one drag. a drag also ends as `cancelled` when its
 surface closes or the seat goes away. a configuration reload ends drags and

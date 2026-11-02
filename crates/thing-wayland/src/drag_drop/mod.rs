@@ -50,6 +50,10 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ACTIVE_WRITES: usize = 4;
 /// the most bytes the worker may buffer for dropped data at once.
 const READ_BUDGET: usize = 2 * 1024 * 1024;
+/// undelivered drop results and cancellations. a drop that would replace a
+/// running read is refused while this many wait, so a burst of drops cannot
+/// grow the queue; the running read and its owner are kept.
+const MAX_PENDING_DELIVERIES: usize = 8;
 
 /// user data for an outgoing drag source.
 pub(crate) struct DragSourceData {
@@ -129,6 +133,8 @@ struct Outgoing<T> {
     kind: DropType,
     bytes: Arc<[u8]>,
     owner: T,
+    /// the actions the drag offered; the compositor may select only these.
+    offered: DragActions,
     action: Option<DragAction>,
 }
 
@@ -136,13 +142,15 @@ pub(crate) struct DragDrop<T> {
     incoming: Option<Incoming>,
     reading: Option<Reading<T>>,
     outgoing: Option<Outgoing<T>>,
-    /// readings retired before their data arrived; their owners still need a
-    /// cancellation callback.
+    /// finished reads and readings retired before their data arrived, in
+    /// order. at most [`MAX_PENDING_DELIVERIES`] plus the running read.
     retired: Vec<DropDelivery<T>>,
     /// active writes by transfer id, with the source key they serve.
     writes: BTreeMap<u64, u64>,
     next_id: u64,
     worker: Worker,
+    /// wakes the owner for a retirement, which the worker never reports.
+    wake: Ping,
 }
 
 impl<T: Clone> DragDrop<T> {
@@ -154,7 +162,8 @@ impl<T: Clone> DragDrop<T> {
             retired: Vec::new(),
             writes: BTreeMap::new(),
             next_id: 1,
-            worker: Worker::with_read_budget(ping, READ_BUDGET)?,
+            worker: Worker::with_read_budget(ping.clone(), READ_BUDGET)?,
+            wake: ping,
         })
     }
 
@@ -298,6 +307,10 @@ impl<T: Clone> DragDrop<T> {
         } else {
             DropType::Text
         };
+        if self.retired.len() >= MAX_PENDING_DELIVERIES {
+            incoming.offer.destroy();
+            return DropStart::Rejected(owner);
+        }
         // a new drop replaces a read that is still running, so one stalled
         // source cannot hold more than one transfer.
         self.retire_reading();
@@ -389,6 +402,7 @@ impl<T: Clone> DragDrop<T> {
             kind: data.kind(),
             bytes: Arc::from(model::encode(data)),
             owner,
+            offered: actions,
             action: None,
         });
         Ok(())
@@ -423,14 +437,16 @@ impl<T: Clone> DragDrop<T> {
         }
     }
 
-    /// the destination's chosen action for the outgoing drag.
+    /// the destination's chosen action for the outgoing drag. an action the
+    /// drag did not offer counts as none, so the drag cannot end with it.
     pub(crate) fn source_action(&mut self, key: u64, mask: u32) {
         if let Some(outgoing) = self
             .outgoing
             .as_mut()
             .filter(|outgoing| outgoing.key == key)
         {
-            outgoing.action = model::selected_action(mask);
+            outgoing.action =
+                model::selected_action(mask).filter(|action| outgoing.offered.contains(*action));
         }
     }
 
@@ -522,6 +538,7 @@ impl<T: Clone> DragDrop<T> {
                 action: reading.action,
                 result: Err("the drop was replaced or its target went away".into()),
             });
+            self.wake.ping();
         }
         reading.offer.destroy();
     }

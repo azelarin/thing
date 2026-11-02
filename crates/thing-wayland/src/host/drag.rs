@@ -14,6 +14,9 @@ use thing_runtime::{
 use super::*;
 use crate::drag_drop::{DragDrop, DragPosition, DragSourceData, DropStart};
 
+#[cfg(test)]
+mod tests;
+
 /// the configuration generation and surface a drop or an outgoing drag
 /// belongs to.
 #[derive(Clone)]
