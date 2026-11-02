@@ -10,6 +10,9 @@ license.workspace = true
 thing-core = { path = "../thing-core" }
 mlua = { version = "0.12.2", features = ["luau"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3.27"
 

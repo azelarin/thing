@@ -2844,7 +2844,8 @@ return ui.panel {
 `require('./theme')` loads `theme.luau` relative to the importing file. `../` paths
 and explicit file extensions are supported. modules must return a non-`nil` value.
 each canonical file path is evaluated once per configuration load. circular imports and
-more than 64 nested imports are errors. files are limited to 1 mib each.
+more than 64 nested imports are errors. source files must be regular utf-8 files
+and are limited to 1 mib each; named pipes and devices are rejected.
 
 imports may read files outside the configuration directory. treat configurations
 as local code you trust; the runtime is not a security boundary for hostile code.

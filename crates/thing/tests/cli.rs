@@ -648,3 +648,51 @@ fn an_offline_output_name_can_be_the_literal_live_flag() {
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).starts_with("output \"--live\" size=640x480"));
 }
+
+#[cfg(unix)]
+#[test]
+fn check_rejects_fifo_sources_without_waiting_for_a_writer() {
+    use std::{
+        ffi::CString,
+        os::unix::{ffi::OsStrExt, fs::symlink},
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let fifo = directory.path().join("stream.luau");
+    let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: name is a live nul-terminated path; mkfifo retains no pointers.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let alias = directory.path().join("alias.luau");
+    symlink(&fifo, &alias).unwrap();
+    let import = directory.path().join("panel.luau");
+    fs::write(&import, "return require('./stream')").unwrap();
+
+    for entry in [&fifo, &alias, &import] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_thing"))
+            .arg("check")
+            .arg(entry)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                result => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("checking {} did not finish: {result:?}", entry.display());
+                }
+            }
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("source must be a regular file"), "{error}");
+    }
+}
