@@ -1586,6 +1586,8 @@ impl App {
                     input,
                     text_input: None,
                     secret_input,
+                    // the session lock never offers live inspection.
+                    inspector: None,
                 },
                 || {
                     if let Some(viewport) = &viewport {

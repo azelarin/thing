@@ -352,6 +352,7 @@ impl App {
             dirty: true,
             waiting: false,
             retry_at: None,
+            inspection: None,
         })
     }
     pub(super) fn output_context(&self, output: &wl_output::WlOutput) -> Option<OutputContext> {
@@ -990,6 +991,8 @@ impl App {
         );
         let keyboard_surface = self.keyboard_surface.clone();
         let mut presented = Vec::new();
+        let inspector = self.inspector.as_ref();
+        let mut highlight_gone = false;
         for (index, surface) in self.surfaces.iter_mut().enumerate() {
             if !surface.configured || !surface.dirty || surface.waiting {
                 continue;
@@ -1047,6 +1050,15 @@ impl App {
             let viewport = surface.viewport.clone();
             let logical = surface.size;
             let buffer_scale = surface.scale.factor().round() as i32;
+            let highlight =
+                match super::inspection::highlight_for(inspector, configurations, surface, &layout)
+                {
+                    Ok(highlight) => highlight,
+                    Err(()) => {
+                        highlight_gone = true;
+                        None
+                    }
+                };
             let text_input = (keyboard_surface.as_ref() == Some(surface.role.surface())
                 && surface.text_input.as_ref().is_some_and(|active| {
                     Some(active.id) == surface.input.focused
@@ -1079,6 +1091,7 @@ impl App {
                     input,
                     text_input,
                     secret_input: None,
+                    inspector: highlight,
                 },
                 || {
                     if let Some(viewport) = &viewport {
@@ -1115,6 +1128,23 @@ impl App {
                         origin,
                         moved,
                     );
+                    // the metadata comes from the tree this frame painted,
+                    // never from a newer accepted one.
+                    surface.inspection = if inspector.is_some() {
+                        Some(super::inspection::snapshot(
+                            root,
+                            layout.clone(),
+                            surface.size,
+                            surface.scale.factor(),
+                            origin,
+                            configurations
+                                .runtime(&surface.output)
+                                .ok_or("inspected output has no configuration")?,
+                            consumer.clone(),
+                        ))
+                    } else {
+                        None
+                    };
                     surface.presented_input = Some(frame_input);
                     surface.waiting = true;
                     surface.scroll = scroll;
@@ -1133,6 +1163,9 @@ impl App {
                     surface.retry_at = Some(Instant::now() + delay);
                 }
             }
+        }
+        if highlight_gone {
+            self.clear_highlight();
         }
         let mut presented_outputs = Vec::new();
         for output in presented

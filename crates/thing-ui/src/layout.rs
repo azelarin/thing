@@ -583,6 +583,19 @@ impl Layout {
             .map(|(_, placement)| placement.id)
     }
 
+    /// the frontmost painted widget under a point, interactive or not, after
+    /// its transform and every ancestor's rectangle, rounded, or path clip.
+    /// only the live inspector uses it; ordinary input keeps `hit_test`.
+    pub fn paint_target(&self, point: Point) -> Option<NodeId> {
+        let mut clip_hits = self.clip_hits();
+        self.placements
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(index, _)| self.placement_contains(*index, point, &mut clip_hits))
+            .map(|(_, placement)| placement.id)
+    }
+
     /// find the deepest semantic control or custom pointer target under a point.
     pub fn pointer_event_target(&self, point: Point) -> Option<NodeId> {
         let mut clip_hits = self.clip_hits();
@@ -3983,5 +3996,56 @@ mod tests {
         assert!(point.y < 40.0);
         assert_eq!(after.link_at(NodeId(6), point), Some(0));
         assert_eq!(after.hit_test(point), Some(NodeId(6)));
+    }
+
+    #[test]
+    fn paint_target_finds_painted_widgets_without_changing_hit_tests() {
+        let mut root = Node::new(NodeId(1), Kind::Row);
+        root.style.align = CrossAlign::Start;
+        root.style.justify = MainAlign::Start;
+        let mut card = Node::new(NodeId(2), Kind::Stack);
+        card.style.width = Some(80.0);
+        card.style.height = Some(80.0);
+        card.style.radius = 40.0;
+        card.style.clip = ClipMode::Rounded;
+        let mut label = Node::new(NodeId(3), Kind::Row);
+        label.style.width = Some(80.0);
+        label.style.height = Some(80.0);
+        card.children.push(label);
+        let mut moved = Node::new(NodeId(4), Kind::Row);
+        moved.style.width = Some(10.0);
+        moved.style.height = Some(10.0);
+        moved.style.translate_x = 100.0;
+        root.children.push(card);
+        root.children.push(moved);
+        let layout = Layout::compute(
+            &root,
+            Size {
+                width: 200.0,
+                height: 100.0,
+            },
+            &mut FixedText,
+        )
+        .unwrap();
+        let center = Point { x: 40.0, y: 40.0 };
+        assert_eq!(layout.paint_target(center), Some(NodeId(3)));
+        // nothing here is interactive, so ordinary hit testing still misses.
+        assert_eq!(layout.hit_test(center), None);
+        assert_eq!(layout.pointer_event_target(center), None);
+        // the card's rounded clip hides its child's corner.
+        assert_eq!(
+            layout.paint_target(Point { x: 3.0, y: 3.0 }),
+            Some(NodeId(1))
+        );
+        // the moved widget is found where it paints, not where it was laid out.
+        assert_eq!(
+            layout.paint_target(Point { x: 185.0, y: 5.0 }),
+            Some(NodeId(4))
+        );
+        assert_eq!(
+            layout.paint_target(Point { x: 85.0, y: 5.0 }),
+            Some(NodeId(1))
+        );
+        assert_eq!(layout.paint_target(Point { x: 250.0, y: 5.0 }), None);
     }
 }

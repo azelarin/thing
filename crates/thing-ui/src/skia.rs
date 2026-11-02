@@ -370,6 +370,7 @@ impl Scene<'_> {
             input,
             mut text_input,
             mut secret_input,
+            inspector,
         } = frame;
         let nodes = crate::shadow::node_index(root);
         let shadows = crate::shadow::ShadowPlan::prepare(&nodes, layout, physical, scale)?;
@@ -529,6 +530,9 @@ impl Scene<'_> {
         }
         while active_clips.pop().is_some() {
             canvas.restore();
+        }
+        if let Some(highlight) = inspector {
+            draw_inspector_highlight(canvas, layout, highlight, &surface_matrix)?;
         }
         Ok(())
     }
@@ -773,6 +777,51 @@ fn sync_clip_chain(
         canvas.set_matrix(surface_matrix);
         active.push(index);
     }
+    Ok(())
+}
+
+/// the inspector's fixed colors: the clip that limits the widget's painting,
+/// its own transformed border box, and the box of a widget whose painting is
+/// clipped away entirely.
+pub(crate) const INSPECTOR_CLIP: SkiaColor = SkiaColor::from_argb(255, 255, 0, 200);
+pub(crate) const INSPECTOR_BOUNDS: SkiaColor = SkiaColor::from_argb(255, 0, 200, 255);
+pub(crate) const INSPECTOR_HIDDEN: SkiaColor = SkiaColor::from_argb(255, 255, 170, 0);
+const INSPECTOR_CLIP_FILL_ALPHA: u8 = 48;
+const INSPECTOR_LINE_WIDTH: f32 = 2.0;
+
+fn draw_inspector_highlight(
+    canvas: &Canvas,
+    layout: &Layout,
+    highlight: crate::InspectorHighlight,
+    surface_matrix: &M44,
+) -> Result<(), String> {
+    let saved = canvas.save();
+    canvas.set_matrix(surface_matrix);
+    let line = |color| {
+        let mut paint = stroke(color, INSPECTOR_LINE_WIDTH, 1.0);
+        paint.set_anti_alias(false);
+        paint
+    };
+    if let Some(placement) = layout.get(highlight.node) {
+        let clip = to_skia_rect(placement.clip);
+        canvas.draw_rect(
+            clip,
+            &fill(INSPECTOR_CLIP.with_a(INSPECTOR_CLIP_FILL_ALPHA), 1.0),
+        );
+        canvas.draw_rect(clip, &line(INSPECTOR_CLIP));
+        set_surface_transform(canvas, surface_matrix, placement.transform)?;
+        canvas.draw_rect(
+            to_skia_rect(placement.local_bounds()),
+            &line(INSPECTOR_BOUNDS),
+        );
+    } else if let Some(semantic) = layout.semantic_placement(highlight.node) {
+        set_surface_transform(canvas, surface_matrix, semantic.transform)?;
+        canvas.draw_rect(
+            to_skia_rect(semantic.local_bounds()),
+            &line(INSPECTOR_HIDDEN),
+        );
+    }
+    canvas.restore_to_count(saved);
     Ok(())
 }
 
@@ -1408,6 +1457,17 @@ mod tests {
         scale: f32,
         input: Interaction,
     ) -> Result<skia_safe::Surface, String> {
+        raster_scene_with_inspector(root, width, height, scale, input, None)
+    }
+
+    fn raster_scene_with_inspector(
+        root: &Node,
+        width: i32,
+        height: i32,
+        scale: f32,
+        input: Interaction,
+        inspector: Option<crate::InspectorHighlight>,
+    ) -> Result<skia_safe::Surface, String> {
         let mut text = TextSystem::default();
         let layout = Layout::compute(
             root,
@@ -1434,9 +1494,83 @@ mod tests {
                 input,
                 text_input: None,
                 secret_input: None,
+                inspector,
             },
         )?;
         Ok(surface)
+    }
+
+    fn inspector_scene() -> Node {
+        // a 100x100 surface with a rounded clipping card at (20,20) 60x60 and a
+        // child that overflows the card to the right.
+        let mut root = Node::new(NodeId(1), Kind::Stack);
+        root.style.align = thing_core::CrossAlign::Start;
+        root.style.justify = thing_core::MainAlign::Start;
+        root.style.padding = 20.0;
+        let mut card = Node::new(NodeId(2), Kind::Stack);
+        card.style.width = Some(60.0);
+        card.style.height = Some(60.0);
+        card.style.radius = 30.0;
+        card.style.clip = thing_core::ClipMode::Rounded;
+        card.style.align = thing_core::CrossAlign::Start;
+        card.style.justify = thing_core::MainAlign::Start;
+        card.style.padding = 20.0;
+        let mut child = Node::new(NodeId(3), Kind::Row);
+        child.style.width = Some(70.0);
+        child.style.height = Some(20.0);
+        child.style.background = thing_core::Color::WHITE.into();
+        card.children.push(child);
+        root.children.push(card);
+        root
+    }
+
+    #[test]
+    fn inspector_highlight_paints_clip_and_bounds_over_the_scene() {
+        let root = inspector_scene();
+        let plain = raster_scene(&root, 100, 100, 1.0).unwrap();
+        let mut highlighted = raster_scene_with_inspector(
+            &root,
+            100,
+            100,
+            1.0,
+            Interaction::default(),
+            Some(crate::InspectorHighlight { node: NodeId(3) }),
+        )
+        .unwrap();
+        let pixels = highlighted.peek_pixels().unwrap();
+        // the child's own box reaches past the card, where it is clipped away.
+        assert_eq!(pixels.get_color((95, 40)), INSPECTOR_BOUNDS);
+        // the card's box bounds the child's painting.
+        assert_eq!(pixels.get_color((20, 30)), INSPECTOR_CLIP);
+        // inside the clip the overlay tints the white child but keeps it.
+        let tinted = pixels.get_color((50, 50));
+        assert!(tinted.r() == 255 && tinted.g() < 255 && tinted.b() > 200);
+        // the overlay never changes pixels outside its lines and clip.
+        let mut plain = plain;
+        assert_eq!(
+            plain.peek_pixels().unwrap().get_color((5, 95)),
+            pixels.get_color((5, 95))
+        );
+    }
+
+    #[test]
+    fn inspector_highlight_marks_a_fully_clipped_widget() {
+        let mut root = inspector_scene();
+        // a zero-sized clip leaves the child with geometry but no painting.
+        root.children[0].style.width = Some(0.0);
+        root.children[0].style.padding = 0.0;
+        let mut surface = raster_scene_with_inspector(
+            &root,
+            100,
+            100,
+            1.0,
+            Interaction::default(),
+            Some(crate::InspectorHighlight { node: NodeId(3) }),
+        )
+        .unwrap();
+        let pixels = surface.peek_pixels().unwrap();
+        assert_eq!(pixels.get_color((60, 20)), INSPECTOR_HIDDEN);
+        assert_ne!(pixels.get_color((60, 30)), SkiaColor::WHITE);
     }
 
     #[test]

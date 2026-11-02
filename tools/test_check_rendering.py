@@ -958,5 +958,41 @@ class WindowProbes(unittest.TestCase):
             check_rendering.verify_capture("windows", self.frame(1, "reload"), "closed", 1)
 
 
+class LiveInspectorOracleTest(unittest.TestCase):
+    def frame(self, scale, *, highlighted=False, outside=True):
+        canvas = Canvas(scale)
+        canvas.rect(0, 0, 640, 240, (13, 17, 23))
+        canvas.rect(40, 40, 260, 200, (40, 179, 161))
+        canvas.rect(90, 100, 220, 140, (224, 164, 81))
+        canvas.rect(380, 40, 600, 200, (121, 151, 255))
+        if highlighted:
+            canvas.rect(39, 39, 261, 41, (255, 0, 200))
+            left, right = (270, 330) if outside else (100, 160)
+            canvas.rect(left, 80, right, 82, (0, 200, 255))
+        return canvas.image()
+
+    def test_checks_selection_and_expiry_at_both_scales(self):
+        for scale in (1, 1.25):
+            with self.subTest(scale=scale):
+                check_rendering.verify_capture(
+                    "live-inspector", self.frame(scale), "scale-1", scale,
+                )
+                check_rendering.verify_capture(
+                    "live-inspector", self.frame(scale, highlighted=True), "highlight-1", scale,
+                )
+                check_rendering.verify_capture(
+                    "live-inspector", self.frame(scale), "expired-1", scale,
+                )
+
+    def test_rejects_a_clipped_outline_and_an_overlay_that_never_expires(self):
+        with self.assertRaisesRegex(FixtureError, "bounds outside the clip"):
+            check_rendering.verify_capture(
+                "live-inspector", self.frame(1, highlighted=True, outside=False), "highlight-1", 1,
+            )
+        with self.assertRaisesRegex(FixtureError, "remained after expiry"):
+            check_rendering.verify_capture(
+                "live-inspector", self.frame(1, highlighted=True), "expired-1", 1,
+            )
+
 if __name__ == "__main__":
     unittest.main()

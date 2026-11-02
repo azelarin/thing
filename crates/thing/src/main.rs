@@ -5,7 +5,7 @@ use std::{env, ffi::OsStr, path::PathBuf, process::ExitCode};
 use thing_runtime::Runtime;
 use thing_wayland::{Renderer, RunOptions, SystemTrayMode, authentication};
 
-const HELP: &str = "thing — a programmable Wayland shell\n\nUsage:\n  thing run [--instance <name>] [--renderer <opengl|vulkan>] [--notification-server] [--system-tray <host|own-watcher>] [--clipboard] <entry.luau>\n  thing call [--instance <name>] [--output <name> | --all-outputs] [--timeout <seconds>] <command> [<json-arguments>]\n  thing lock [--renderer <opengl|vulkan>] <entry.luau>\n  thing check [--lock] <entry.luau>\n  thing inspect --output-size <WIDTHxHEIGHT> [--output-name <NAME>] [--scale <FACTOR>] <entry.luau>\n  thing types\n\nCommands:\n  run      Open panels and windows on each Wayland output\n  call     Run a command a running configuration declared with ui.command\n  lock     Lock the current Wayland session\n  check    Evaluate a configuration and validate its widget tree\n  inspect  Report initial widget bounds and clipping without a display\n  types    Write Luau editor definitions to standard output\n\nOptions:\n      --instance             Name the running instance for run and call (default: default)\n      --renderer             Select the graphics backend for run or lock (default: opengl)\n      --notification-server  Provide the desktop notification service\n      --system-tray          Enable status notifier support in host or own-watcher mode\n      --clipboard            Read and control the regular Wayland clipboard\n      --lock                 Validate a session-lock configuration with check\n  -h, --help                 Show this help\n  -V, --version              Show the version\n";
+const HELP: &str = "thing — a programmable Wayland shell\n\nUsage:\n  thing run [--instance <name>] [--renderer <opengl|vulkan>] [--notification-server] [--system-tray <host|own-watcher>] [--clipboard] [--inspector] <entry.luau>\n  thing call [--instance <name>] [--output <name> | --all-outputs] [--timeout <seconds>] <command> [<json-arguments>]\n  thing lock [--renderer <opengl|vulkan>] <entry.luau>\n  thing check [--lock] <entry.luau>\n  thing inspect --output-size <WIDTHxHEIGHT> [--output-name <NAME>] [--scale <FACTOR>] <entry.luau>\n  thing inspect --live [--instance <name>] [--output <name> | --all-outputs] [--timeout <seconds>] [<live options>]\n  thing types\n\nCommands:\n  run      Open panels and windows on each Wayland output\n  call     Run a command a running configuration declared with ui.command\n  lock     Lock the current Wayland session\n  check    Evaluate a configuration and validate its widget tree\n  inspect  Report widget bounds and clipping, offline or from a running instance\n  types    Write Luau editor definitions to standard output\n\nOptions:\n      --instance             Name the running instance for run and call (default: default)\n      --renderer             Select the graphics backend for run or lock (default: opengl)\n      --notification-server  Provide the desktop notification service\n      --system-tray          Enable status notifier support in host or own-watcher mode\n      --clipboard            Read and control the regular Wayland clipboard\n      --inspector            Let 'thing inspect --live' read and highlight presented layouts\n      --lock                 Validate a session-lock configuration with check\n  -h, --help                 Show this help\n  -V, --version              Show the version\n";
 const LUAU_TYPES: &str = include_str!("../types/thing.d.luau");
 
 fn main() -> ExitCode {
@@ -69,6 +69,7 @@ fn run() -> Result<(), (u8, String)> {
     let mut notification_server = false;
     let mut system_tray = None;
     let mut clipboard = false;
+    let mut inspector = false;
     let mut check_lock = false;
     let mut instance = None;
     let mut path = None;
@@ -120,6 +121,10 @@ fn run() -> Result<(), (u8, String)> {
             clipboard = true;
             continue;
         }
+        if command == "run" && !positional_only && argument == OsStr::new("--inspector") {
+            inspector = true;
+            continue;
+        }
         if command == "check" && !positional_only && argument == OsStr::new("--lock") {
             check_lock = true;
             continue;
@@ -165,7 +170,8 @@ fn run() -> Result<(), (u8, String)> {
             .with_renderer(renderer)
             .with_notification_server(notification_server)
             .with_system_tray(system_tray)
-            .with_clipboard(clipboard);
+            .with_clipboard(clipboard)
+            .with_inspector(inspector);
         return match instance {
             Some(instance) => {
                 thing_wayland::command::validate_instance_name(&instance)

@@ -657,4 +657,11 @@ impl CommandHost for App {
     fn run_command(&mut self, request: CommandRequest) -> CommandReply {
         self.call_command(request)
     }
+
+    fn inspect(
+        &mut self,
+        request: crate::inspection::InspectRequest,
+    ) -> crate::inspection::InspectReply {
+        self.inspect_request(request)
+    }
 }

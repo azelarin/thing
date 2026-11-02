@@ -38,6 +38,9 @@ use thing_runtime::{
     CallValue, MAX_CALL_DEPTH, MAX_CALL_STRING_BYTES, MAX_CALL_VALUES, validate_command_name,
 };
 
+pub use crate::inspection::InspectQuery;
+use crate::inspection::{InspectReply, InspectRequest};
+
 /// the instance `thing run` and `thing call` use without `--instance`.
 pub const DEFAULT_INSTANCE: &str = "default";
 /// the wire protocol version in every request.
@@ -281,10 +284,26 @@ pub(crate) enum CommandReply {
     Ran(Vec<OutputResult>),
 }
 
+/// one request line: a declared command, or a live layout inspection.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum HostRequest {
+    Command(CommandRequest),
+    Inspect(InspectRequest),
+}
+
 /// what the event loop's data does with a parsed request.
 pub(crate) trait CommandHost: 'static {
     fn run_command(&mut self, request: CommandRequest) -> CommandReply;
+
+    /// inspection reads presented frames and never runs configuration code.
+    fn inspect(&mut self, _request: InspectRequest) -> InspectReply {
+        InspectReply::Failed(INSPECTOR_DISABLED.into())
+    }
 }
+
+/// the reply when an instance was started without `--inspector`.
+pub(crate) const INSPECTOR_DISABLED: &str =
+    "live inspection is disabled; start the instance with 'thing run --inspector'";
 
 fn json_to_call(value: Json, depth: usize, count: &mut usize) -> Result<CallValue, String> {
     *count += 1;
@@ -395,17 +414,29 @@ pub(crate) fn encode_request(
     bytes
 }
 
+#[cfg(test)]
 pub(crate) fn parse_request(line: &[u8]) -> Result<CommandRequest, String> {
+    match parse_host_request(line)? {
+        HostRequest::Command(request) => Ok(request),
+        HostRequest::Inspect(_) => Err("the request is an inspection".into()),
+    }
+}
+
+pub(crate) fn parse_host_request(line: &[u8]) -> Result<HostRequest, String> {
     let text = std::str::from_utf8(line).map_err(|_| "the request is not utf-8")?;
     let Json::Object(mut object) =
         serde_json::from_str(text).map_err(|error| format!("malformed request: {error}"))?
     else {
         return Err("the request must be a json object".into());
     };
+    let inspect = object.contains_key("inspect");
+    if inspect && (object.contains_key("command") || object.contains_key("arguments")) {
+        return Err("a request names either a command or an inspection, not both".into());
+    }
     if let Some(key) = object.keys().find(|key| {
         !matches!(
             key.as_str(),
-            "version" | "command" | "arguments" | "output" | "all_outputs"
+            "version" | "output" | "all_outputs" | "command" | "arguments" | "inspect"
         )
     }) {
         return Err(format!("unknown request field {key:?}"));
@@ -415,11 +446,25 @@ pub(crate) fn parse_request(line: &[u8]) -> Result<CommandRequest, String> {
             "unsupported request version; this instance speaks version {PROTOCOL_VERSION}"
         ));
     }
+    if let Some(query) = object.remove("inspect") {
+        let selection = parse_selection(&mut object)?;
+        let query = crate::inspection::parse_query(query, &selection)?;
+        return Ok(HostRequest::Inspect(InspectRequest { selection, query }));
+    }
     let Some(Json::String(command)) = object.remove("command") else {
         return Err("the request needs a command name".into());
     };
     validate_command_name(&command)?;
     let arguments = json_to_call(object.remove("arguments").unwrap_or(Json::Null), 0, &mut 0)?;
+    let selection = parse_selection(&mut object)?;
+    Ok(HostRequest::Command(CommandRequest {
+        command,
+        arguments,
+        selection,
+    }))
+}
+
+fn parse_selection(object: &mut Map<String, Json>) -> Result<OutputSelection, String> {
     let all = match object.remove("all_outputs") {
         None | Some(Json::Bool(false)) => false,
         Some(Json::Bool(true)) => true,
@@ -434,11 +479,7 @@ pub(crate) fn parse_request(line: &[u8]) -> Result<CommandRequest, String> {
         }
         (Some(_), _) => return Err("output must be a string".into()),
     };
-    Ok(CommandRequest {
-        command,
-        arguments,
-        selection,
-    })
+    Ok(selection)
 }
 
 pub(crate) fn encode_reply(reply: &CommandReply) -> Vec<u8> {
@@ -662,13 +703,15 @@ fn reader<D: CommandHost>(
             _ => None,
         };
         let reply = match line {
-            Some(line) => match parse_request(line) {
-                Ok(request) => data.run_command(request),
-                Err(error) => CommandReply::Failed(error),
+            Some(line) => match parse_host_request(line) {
+                Ok(HostRequest::Command(request)) => encode_reply(&data.run_command(request)),
+                Ok(HostRequest::Inspect(request)) => {
+                    crate::inspection::encode_reply(&data.inspect(request))
+                }
+                Err(error) => encode_reply(&CommandReply::Failed(error)),
             },
-            None if input.len() >= MAX_REQUEST_BYTES => CommandReply::Failed(format!(
-                "the request exceeds {} KiB",
-                MAX_REQUEST_BYTES / 1024
+            None if input.len() >= MAX_REQUEST_BYTES => encode_reply(&CommandReply::Failed(
+                format!("the request exceeds {} KiB", MAX_REQUEST_BYTES / 1024),
             )),
             None if ended => {
                 finish(&handle, &clients, id);
@@ -676,7 +719,6 @@ fn reader<D: CommandHost>(
             }
             None => return Ok(PostAction::Continue),
         };
-        let reply = encode_reply(&reply);
         let written = write_some(stream, &reply);
         match written {
             Some(written) if written < reply.len() => {
@@ -765,6 +807,76 @@ pub(crate) fn call_at(
     validate_command_name(&options.command).map_err(|error| (2, error))?;
     options.arguments.validate().map_err(|error| (2, error))?;
     let request = encode_request(&options.command, &options.arguments, &options.selection);
+    exchange(
+        runtime_directory,
+        &options.instance,
+        &request,
+        &options.selection,
+        options.timeout,
+    )
+}
+
+/// one `thing inspect --live` invocation.
+#[derive(Clone, Debug)]
+pub struct InspectOptions {
+    pub instance: String,
+    pub selection: OutputSelection,
+    pub query: InspectQuery,
+    /// how long to wait to connect, send, and read the reply.
+    pub timeout: Duration,
+}
+
+/// inspects the presented layout of a running instance, returning the json
+/// to print. errors carry an exit status like `call`.
+pub fn inspect(options: &InspectOptions) -> Result<String, (u8, String)> {
+    let directory = runtime_directory().map_err(|error| (1, error))?;
+    inspect_at(&directory, options)
+}
+
+pub(crate) fn inspect_at(
+    runtime_directory: &Path,
+    options: &InspectOptions,
+) -> Result<String, (u8, String)> {
+    validate_instance_name(&options.instance).map_err(|error| (2, error))?;
+    options
+        .query
+        .validate(&options.selection)
+        .map_err(|error| (2, error))?;
+    let mut object = Map::new();
+    object.insert("version".into(), Json::from(PROTOCOL_VERSION));
+    object.insert(
+        "inspect".into(),
+        crate::inspection::encode_query(&options.query),
+    );
+    match &options.selection {
+        OutputSelection::Implicit => {}
+        OutputSelection::Named(name) => {
+            object.insert("output".into(), Json::String(name.clone()));
+        }
+        OutputSelection::All => {
+            object.insert("all_outputs".into(), Json::Bool(true));
+        }
+    }
+    let mut request = serde_json::to_vec(&Json::Object(object)).expect("json values serialize");
+    request.push(b'\n');
+    exchange(
+        runtime_directory,
+        &options.instance,
+        &request,
+        &options.selection,
+        options.timeout,
+    )
+}
+
+/// sends one request line and formats its reply, within one deadline for
+/// connecting, writing, and reading.
+fn exchange(
+    runtime_directory: &Path,
+    instance: &str,
+    request: &[u8],
+    selection: &OutputSelection,
+    timeout: Duration,
+) -> Result<String, (u8, String)> {
     if request.len() > MAX_REQUEST_BYTES {
         return Err((
             2,
@@ -772,10 +884,9 @@ pub(crate) fn call_at(
         ));
     }
     let deadline = Instant::now()
-        .checked_add(options.timeout.max(Duration::from_millis(1)))
+        .checked_add(timeout.max(Duration::from_millis(1)))
         .ok_or_else(|| (2, "the call timeout is too large".to_owned()))?;
     let uid = current_uid();
-    let instance = &options.instance;
     let failed = |message: String| (1, message);
     let path = socket_path(runtime_directory, instance);
     match command_directory(runtime_directory, uid, false) {
@@ -823,7 +934,7 @@ pub(crate) fn call_at(
     };
     // a busy instance may reply and close before reading the request, so a
     // failed write still reads whatever reply arrived.
-    let sent = send_request(&stream, &request, deadline);
+    let sent = send_request(&stream, request, deadline);
     let _ = stream.shutdown(std::net::Shutdown::Write);
     let mut reply = Vec::new();
     let received = receive_reply(&stream, &mut reply, deadline);
@@ -835,7 +946,7 @@ pub(crate) fn call_at(
             "instance {instance:?} closed the connection without replying"
         )));
     }
-    format_reply(&reply, &options.selection).map_err(failed)
+    format_reply(&reply, selection).map_err(failed)
 }
 
 fn remaining(deadline: Instant) -> io::Result<Duration> {
