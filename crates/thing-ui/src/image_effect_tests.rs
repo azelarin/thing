@@ -510,3 +510,68 @@ fn crossfades_mix_filtered_images_with_their_original_transparency() {
     near(actual.r(), 170, 2);
     near(actual.b(), 85, 2);
 }
+
+#[test]
+fn a_group_shadow_preserves_image_holes_and_translucent_alpha() {
+    for alpha in [128, 255] {
+        let source = image("shadow-hole", 40, 20, |x, _| {
+            if (10..20).contains(&x) {
+                [0, 0, 0, 0]
+            } else {
+                [255, 0, 0, alpha]
+            }
+        });
+        let mut group = stack(
+            2,
+            vec![picture(source, 40.0, 20.0, ImageEffects::default())],
+        );
+        group.children[0].id = NodeId(3);
+        group.style.width = Some(40.0);
+        group.style.height = Some(20.0);
+        group.style.drop_shadow = Some(thing_core::Shadow {
+            color: thing_core::Color([0, 0, 0, 255]),
+            offset: thing_core::Point { x: 0.0, y: 40.0 },
+            blur: 0.0,
+            spread: 0.0,
+        });
+        let mut root = stack(1, vec![group]);
+        root.style.background = thing_core::Color::WHITE.into();
+        let mut images = Images::new(|| {}).unwrap();
+        let mut surface = paint(&root, (100, 80), 1.0, &mut images);
+        let pixels = surface.peek_pixels().unwrap();
+        assert_eq!(pixels.get_color((15, 50)), SkiaColor::WHITE);
+        assert!((i32::from(pixels.get_color((5, 50)).r()) - i32::from(255 - alpha)).abs() <= 1);
+        assert_eq!(pixels.get_color((5, 50)), pixels.get_color((25, 50)));
+    }
+}
+
+#[test]
+fn filtered_images_outside_the_surface_remain_shadow_sources() {
+    let mut group = stack(
+        2,
+        vec![picture(
+            solid("offsurface-shadow", [255, 0, 0, 255]),
+            30.0,
+            20.0,
+            effects(2.0, 0.0),
+        )],
+    );
+    group.children[0].id = NodeId(3);
+    group.style.width = Some(30.0);
+    group.style.height = Some(20.0);
+    group.style.translate_x = -40.0;
+    group.style.translate_y = 20.0;
+    group.style.drop_shadow = Some(thing_core::Shadow {
+        color: thing_core::Color([0, 0, 0, 255]),
+        offset: thing_core::Point { x: 60.0, y: 0.0 },
+        blur: 0.0,
+        spread: 0.0,
+    });
+    let mut root = stack(1, vec![group]);
+    root.style.background = thing_core::Color::WHITE.into();
+    let mut images = Images::new(|| {}).unwrap();
+    let mut surface = paint(&root, (100, 80), 1.0, &mut images);
+    let pixels = surface.peek_pixels().unwrap();
+    assert_eq!(pixels.get_color((30, 30)), SkiaColor::BLACK);
+    assert_eq!(pixels.get_color((60, 30)), SkiaColor::WHITE);
+}

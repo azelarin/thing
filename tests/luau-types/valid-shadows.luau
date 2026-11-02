@@ -10,6 +10,7 @@ return ui.panel {
             on_click = function() raised:set(not raised:get()) end,
             style = {
                 radius = 8,
+                drop_shadow = card,
                 box_shadow = function()
                     return if raised:get() then card else nil
                 end,

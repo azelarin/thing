@@ -956,8 +956,8 @@ fn scale_change_keeps_a_renderable_composited_frame() {
         surface.scale.physical_size(surface.size.1).unwrap(),
     );
     let layout = surface.layouts.presented().unwrap();
-    thing_ui::validate_compositing(root, layout, physical).unwrap();
-    assert!(thing_ui::validate_compositing(root, layout, (5120, 640)).is_err());
+    thing_ui::validate_compositing(root, layout, physical, 1.0).unwrap();
+    assert!(thing_ui::validate_compositing(root, layout, (5120, 640), 1.0).is_err());
     prefer_scale(&mut host, 2);
     assert_eq!(host.app.surfaces[0].scale.factor(), 2.0);
 }

@@ -27,7 +27,9 @@ pub fn validate_image_effects(
     physical: (u32, u32),
     scale: f32,
 ) -> Result<(), String> {
-    ImageEffectPlan::prepare(&crate::shadow::node_index(root), layout, physical, scale).map(|_| ())
+    let nodes = crate::shadow::node_index(root);
+    let plan = crate::composite::Plan::prepare(&nodes, layout, physical, scale)?;
+    ImageEffectPlan::prepare(&nodes, layout, physical, scale, &plan).map(|_| ())
 }
 
 /// the effects that can reach the surface this frame. a non-neutral image
@@ -50,6 +52,7 @@ impl ImageEffectPlan {
         layout: &Layout,
         physical: (u32, u32),
         scale: f32,
+        composites: &crate::composite::Plan,
     ) -> Result<Self, String> {
         if !scale.is_finite() || scale <= 0.0 {
             return Err("image effect output scale must be finite and positive".into());
@@ -64,7 +67,13 @@ impl ImageEffectPlan {
                 continue;
             }
             let prepared = budget
-                .charge(node, placement, physical, scale)
+                .charge(
+                    node,
+                    placement,
+                    physical,
+                    scale,
+                    composites.clip_bounds(layout, placement.id, placement.clip_chain, scale),
+                )
                 .map_err(|error| format!("image effect on widget {}: {error}", node.id.0))?;
             if let Some(prepared) = prepared {
                 result.nodes.insert(node.id, prepared);
@@ -91,6 +100,7 @@ impl Budget {
         placement: &Placement,
         physical: (u32, u32),
         scale: f32,
+        capture_clip: Option<Rect>,
     ) -> Result<Option<PreparedImageEffect>, String> {
         let image = &node.image;
         if (image.source.is_none()
@@ -143,13 +153,21 @@ impl Budget {
         let top = f64::from(device.y) * scale;
         let right = (f64::from(device.x) + f64::from(device.width)) * scale;
         let bottom = (f64::from(device.y) + f64::from(device.height)) * scale;
-        let clip = placement.clip;
-        let clip_left = (f64::from(clip.x) * scale).max(0.0);
-        let clip_top = (f64::from(clip.y) * scale).max(0.0);
-        let clip_right =
-            ((f64::from(clip.x) + f64::from(clip.width)) * scale).min(f64::from(physical.0));
-        let clip_bottom =
-            ((f64::from(clip.y) + f64::from(clip.height)) * scale).min(f64::from(physical.1));
+        let clip = capture_clip.unwrap_or_else(|| {
+            placement
+                .clip
+                .intersection(Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: physical.0 as f32 / scale as f32,
+                    height: physical.1 as f32 / scale as f32,
+                })
+                .unwrap_or_default()
+        });
+        let clip_left = f64::from(clip.x) * scale;
+        let clip_top = f64::from(clip.y) * scale;
+        let clip_right = (f64::from(clip.x) + f64::from(clip.width)) * scale;
+        let clip_bottom = (f64::from(clip.y) + f64::from(clip.height)) * scale;
         let visible = |pad: f64| {
             clip_right > clip_left
                 && clip_bottom > clip_top

@@ -27,4 +27,4 @@ pub use visual::Affine;
 pub use image_effects::validate_image_effects;
 pub use shadow::validate_shadows;
 
-pub use composite::validate_compositing;
+pub use composite::{validate_compositing, validate_effects};

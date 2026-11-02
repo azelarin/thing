@@ -25,13 +25,13 @@ ARTIFACTS = ROOT / "target/render-tests"
 CASES = (
     "image-fit", "stencil", "gradients", "radial-gradients", "shadows", "shared-motion",
     "widget-bounds", "rounded-clips", "path-clips", "horizontal-scroll", "motion-lifecycle", "content-transitions", "windows",
-    "styled-text", "live-inspector", "image-effects", "group-opacity", "crossfade",
+    "styled-text", "live-inspector", "image-effects", "group-opacity", "crossfade", "group-shadow",
 )
 # these accept a state only after the same passing frame is captured twice.
 STABLE_FRAMES = {
     "windows": 2,
     "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2, "rounded-clips": 2, "horizontal-scroll": 2, "motion-lifecycle": 2, "content-transitions": 2,
-    "styled-text": 2, "live-inspector": 2, "image-effects": 2, "group-opacity": 2, "crossfade": 2,
+    "styled-text": 2, "live-inspector": 2, "image-effects": 2, "group-opacity": 2, "crossfade": 2, "group-shadow": 2,
 }
 RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
 # the runtime error each panel-invalid.luau must produce, in thing check and in
@@ -41,6 +41,7 @@ INVALID_RELOADS = {
     "image-effects": "between 0 and 64",
     "group-opacity": "style.composite must be a boolean",
     "crossfade": "between 0 and 1",
+    "group-shadow": "do not support spread",
 }
 MAX_LOG_BYTES = 1024 * 1024
 COMMAND_TIMEOUT = 8.0
@@ -703,8 +704,37 @@ def verify_crossfade(image, stage, scale):
         expect_color(image, point, scale, expected, label, tolerance=3)
 
 
+def verify_group_shadow(image, stage, scale):
+    opacity = 0.25 if stage == "reload" else 0.5
+    dark = round(255 * (1 - opacity))
+    half = round(255 * (1 - opacity / 2))
+    for point, expected, label in (
+        ((30,30), (255,dark,dark), "source opacity"),
+        ((65,30), (255,dark,dark), "source overlap"),
+        ((30,70), (dark,dark,dark), "combined shadow"),
+        ((65,70), (dark,dark,dark), "shadow overlap"),
+        ((115,70), (255,255,255), "empty source casts nothing"),
+        ((235,50), (dark,dark,dark), "clipped offscreen source"),
+        ((262,50), (255,255,255), "ancestor contains the result"),
+        ((275,50), (255,255,255), "ancestor hides the original"),
+        ((25,170), (dark,dark,dark), "image alpha"),
+        ((35,170), (255,255,255), "image hole"),
+        ((45,170), (dark,dark,dark), "image far side"),
+        ((370,70), (half,half,half), "outgoing-only alpha"),
+        ((390,70), (dark,dark,dark), "crossfade overlap alpha"),
+        ((430,70), (half,half,half), "incoming-only alpha"),
+        ((540,50), (dark,dark,dark), "bounds clip keeps inward shadow"),
+        ((555,50), (255,dark,dark), "bounds clip keeps source"),
+        ((570,50), (255,255,255), "bounds clip contains filtered content"),
+        ((530,130), (0,0,255), "following sibling"),
+    ):
+        expect_color(image,point,scale,expected,label,tolerance=3)
+
+
 def verify_capture(case, image, stage, scale):
-    if case == "crossfade":
+    if case == "group-shadow":
+        verify_group_shadow(image, stage, scale)
+    elif case == "crossfade":
         verify_crossfade(image, stage, scale)
     elif case == "group-opacity":
         verify_group_opacity(image, stage, scale)

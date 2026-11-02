@@ -156,3 +156,29 @@ fn the_guide_example_toggles_a_box_shadow_and_keeps_its_path_shadow() {
     runtime.dispatch(button.id, Event::Click).unwrap();
     assert_eq!(runtime.root().unwrap().children[0].style.box_shadow, None);
 }
+
+#[test]
+fn drop_shadows_are_reactive_and_reject_spread_without_changing_the_tree() {
+    let (_directory, loaded) = runtime(
+        r#"
+        local spread=ui.state(0)
+        return ui.panel { children={ ui.button {
+            on_click=function() spread:set(1) end,
+            style={ drop_shadow=function()
+                return { color='#00000080', blur=4, spread=spread:get() }
+            end },
+        } } }
+    "#,
+    );
+    let mut runtime = loaded.unwrap();
+    let before = runtime.root().unwrap().children[0].clone();
+    assert_eq!(before.style.drop_shadow.unwrap().blur, 4.0);
+    assert!(
+        runtime
+            .dispatch(before.id, Event::Click)
+            .unwrap_err()
+            .to_string()
+            .contains("do not support spread")
+    );
+    assert_eq!(runtime.root().unwrap().children[0], before);
+}

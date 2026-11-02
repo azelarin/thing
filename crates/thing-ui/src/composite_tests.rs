@@ -211,7 +211,7 @@ fn layout(root: &Node) -> Layout {
 #[test]
 fn oversized_or_deep_layers_are_refused_before_allocation() {
     let root = overlapping(true);
-    let error = validate_compositing(&root, &layout(&root), (16_384, 16_384)).unwrap_err();
+    let error = validate_compositing(&root, &layout(&root), (16_384, 16_384), 1.0).unwrap_err();
     assert!(error.contains("budget"), "{error}");
     let mut root = stack(1, 100.0, 100.0);
     let mut nested = stack(2, 100.0, 100.0);
@@ -225,17 +225,17 @@ fn oversized_or_deep_layers_are_refused_before_allocation() {
         nested = parent;
     }
     root.children.push(nested);
-    let error = validate_compositing(&root, &layout(&root), (160, 100)).unwrap_err();
+    let error = validate_compositing(&root, &layout(&root), (160, 100), 1.0).unwrap_err();
     assert!(error.contains("budget"), "{error}");
     root.children[0].visible = false;
-    validate_compositing(&root, &layout(&root), (16_384, 16_384)).unwrap();
+    validate_compositing(&root, &layout(&root), (16_384, 16_384), 1.0).unwrap();
 }
 
 #[test]
 fn opacity_one_needs_no_temporary_layer_and_does_not_change_pixels() {
     let mut root = overlapping(true);
     root.children[0].style.opacity = 1.0;
-    validate_compositing(&root, &layout(&root), (20_000, 20_000)).unwrap();
+    validate_compositing(&root, &layout(&root), (20_000, 20_000), 1.0).unwrap();
     let mut grouped = raster_scene(&root, 160, 100, 1.0).unwrap();
     let expected = grouped.peek_pixels().unwrap().bytes().unwrap().to_vec();
     root.children[0].style.composite = false;
