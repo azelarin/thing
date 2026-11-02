@@ -1043,6 +1043,53 @@ fn a_later_handler_adopts_a_rejected_scale() {
     .unwrap();
 }
 
+fn scale_change_keeps_a_renderable_image_blur_frame() {
+    // a 32 logical sigma scaled by 4 reaches the 128 pixel limit at scale 1,
+    // so any larger output scale must be rejected before it is adopted. the
+    // source need not exist: the limit depends only on geometry.
+    let mut host = Host::start_with_panel(
+        None,
+        r#"
+        return ui.panel {
+            style = { width = 320, height = 40 },
+            children = { ui.image {
+                source = 'missing.png',
+                blur = 64,
+                saturation = 0,
+                style = { width = 40, height = 20, scale_x = 4, scale_y = 4 },
+            } },
+        }
+        "#,
+    );
+    let accepted = host.app.surfaces[0].scale;
+    assert_eq!(accepted, Scale::default());
+    prefer_scale(&mut host, 2);
+    assert_eq!(host.app.surfaces[0].scale, accepted);
+    let surface = &host.app.surfaces[0];
+    let root = host
+        .app
+        .configurations
+        .surface_root(&surface.output, &surface.key)
+        .unwrap();
+    let layout = surface.layouts.presented().unwrap();
+    let physical = (
+        surface.scale.physical_size(surface.size.0).unwrap(),
+        surface.scale.physical_size(surface.size.1).unwrap(),
+    );
+    thing_ui::validate_image_effects(root, layout, physical, surface.scale.factor())
+        .expect("the accepted frame must remain renderable after a scale change");
+    let error = thing_ui::validate_image_effects(root, layout, (640, 80), 2.0).unwrap_err();
+    assert!(error.contains("128 pixel device sigma"), "{error}");
+}
+
+#[test]
+fn a_preferred_scale_change_cannot_leave_an_unrenderable_image_blur_frame() {
+    isolated(
+        "a_preferred_scale_change_cannot_leave_an_unrenderable_image_blur_frame",
+        scale_change_keeps_a_renderable_image_blur_frame,
+    );
+}
+
 #[test]
 fn an_output_scale_dependent_shadow_can_accept_its_preference() {
     isolated(

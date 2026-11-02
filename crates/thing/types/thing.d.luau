@@ -571,6 +571,10 @@ export type ThingImageProperties = {
     fit: ThingReactive<ThingImageFit>?,
     -- a different value loads the same source again.
     revision: ThingReactive<(string | number)?>?,
+    -- blur radius in logical pixels, 0 to 64; the gaussian sigma is half of it.
+    blur: ThingAnimatedNumber?,
+    -- 0 is grayscale, 1 keeps the colors, and 2 doubles their saturation.
+    saturation: ThingAnimatedNumber?,
 }
 
 export type ThingPathProperties = {

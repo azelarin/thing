@@ -294,6 +294,13 @@ CASES = (
             "Property 'revision' is not compatible.",
         ),
     ),
+    Case("valid-image-effects.luau"),
+    Case(
+        "invalid-image-effects.luau",
+        (
+            "Property 'blur' is not compatible.",
+            "invalid-image-effects.luau(6,62): TypeError: Expected this to be 'number', but got 'boolean'",        ),
+    ),
     Case("valid-path-clips.luau"),
     Case(
         "invalid-path-clips.luau",

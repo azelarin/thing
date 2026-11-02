@@ -2094,6 +2094,7 @@ fn prepare_lock_layout(
         scale.physical_size(size.1).unwrap_or(0),
     );
     thing_ui::validate_shadows(root, &layout, physical, scale.factor())?;
+    thing_ui::validate_image_effects(root, &layout, physical, scale.factor())?;
     Ok(PreparedLockLayout {
         root: root.clone(),
         size,

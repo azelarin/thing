@@ -475,6 +475,57 @@ class StyledTextOracleTest(unittest.TestCase):
             self.verify(styled_text(1), "reload")
 
 
+def image_effects(scale, *, reload=False):
+    """probe patches for a plausible frame, without simulating a blur."""
+    canvas = Canvas(scale).rect(0, 0, 410, 190, (24, 24, 24))
+    for (x, y), color in (
+        ((25, 45), (227, 75, 75)),
+        ((110, 45), (49, 79, 120)),
+        ((146, 50), (227, 75, 75)),
+        ((295, 50), (167, 91, 91) if reload else (107, 107, 107)),
+        ((385, 50), (62, 77, 97) if reload else (75, 75, 75)),
+        ((40, 140), (255, 43, 43)),
+        ((160, 140), (126, 50, 50)),
+        ((290, 140), (227, 75, 75)),
+        ((178, 50), (154, 130, 94)),
+        ((167, 50), (200, 96, 82) if reload else (227, 75, 75)),
+    ):
+        canvas.rect(x - 1, y - 1, x + 2, y + 2, color)
+    return canvas
+
+
+class ImageEffectsOracleTest(unittest.TestCase):
+    def verify(self, canvas, stage="scale-1"):
+        check_rendering.verify_capture("image-effects", canvas.image(), stage, canvas.scale)
+
+    def test_accepts_both_scales_and_reload(self):
+        for scale in (1, 1.25):
+            self.verify(image_effects(scale))
+            self.verify(image_effects(scale), "rejected")
+            self.verify(image_effects(scale, reload=True), "reload")
+
+    def test_rejects_missing_effects_and_clip_or_opacity_errors(self):
+        for (x, y), color, message in (
+            ((178, 50), (227, 75, 75), "not blurred"),
+            ((295, 50), (227, 75, 75), "saturation"),
+            ((385, 50), (126, 126, 126), "filtered transparency"),
+            ((160, 140), (75, 37, 37), "transformed image opacity"),
+            ((345, 140), (81, 184, 112), "ancestor clip"),
+            ((25, 15), (227, 75, 75), "contain letterbox"),
+            ((146, 50), (126, 50, 50), "opaque blurred edge"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(FixtureError, message):
+                canvas = image_effects(1).rect(x - 1, y - 1, x + 2, y + 2, color)
+                self.verify(canvas)
+
+    def test_reload_requires_both_effect_updates(self):
+        with self.assertRaisesRegex(FixtureError, "saturation"):
+            self.verify(image_effects(1), "reload")
+        canvas = image_effects(1, reload=True).rect(166, 49, 169, 52, (227, 75, 75))
+        with self.assertRaisesRegex(FixtureError, "blur radius"):
+            self.verify(canvas, "reload")
+
+
 class StableCaptureTest(unittest.TestCase):
     def capture(self, frames, required, case="shadows", scale=1.0):
         calls = []

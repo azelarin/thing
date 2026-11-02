@@ -452,7 +452,7 @@ widget kind; unkeyed children match by position and kind.
 | `text` | one of `text` (a utf-8 string), `spans`, or `markup`; optional `on_link`, `max_lines`, and `overflow` |
 | `text_input` | controlled `value` and `on_change`; optional `placeholder` and `on_submit` |
 | `secret_input` | host-owned lock input; optional `placeholder`; never exposes its value or a submit callback |
-| `image` | one of `source`, `icon`, `app_id`; optional `icon_theme` and `fit` |
+| `image` | one of `source`, `icon`, `app_id`; optional `icon_theme`, `fit`, `blur`, and `saturation` |
 | `path` | `data`, `view_box`; optional fit, fill, and stroke controls |
 | `button` | `children`, `on_click`, `on_middle_click`, `on_secondary_click`, `on_scroll`, `on_hover`, `on_pointer` |
 | `pointer_area` | `children`, with at least one of `on_pointer` or `on_scroll` |
@@ -939,6 +939,62 @@ limited to 4096 bytes and each output configuration may reference 10,000 distinc
 asset files. thing watches files registered by `ui.asset`; creating or changing one
 reloads the configuration and clears the image cache. other source paths are not
 watched.
+
+### blur and saturation
+
+`blur` and `saturation` change how an image's own pixels are painted. they never
+blur other widgets or windows behind the image. a soft, muted backdrop from the
+current artwork, and a cover that grays out while playback is paused:
+
+```luau
+local media = services.media
+local function art()
+    local url = media.art_url:get()
+    return if url ~= '' then url else nil
+end
+
+ui.stack { children = {
+    ui.image {
+        source = art,
+        fit = 'cover',
+        blur = 24,
+        saturation = 0.6,
+        style = { width = 320, height = 120, radius = 12, opacity = 0.7 },
+    },
+    ui.image {
+        source = art,
+        saturation = ui.transition(function()
+            return if media.playing:get() then 1 else 0
+        end, { duration = 200 }),
+        style = { width = 96, height = 96, radius = 8 },
+    },
+} }
+```
+
+`blur` is a radius in logical pixels from 0 to 64 and defaults to 0. like
+shadow blur, the gaussian's standard deviation is half the radius. the blur
+extends the image's edge pixels rather than fading the edges into
+transparency, then `style.radius`, padding, and ancestor clips cut the result
+as they cut an unblurred image. `saturation` runs from 0, grayscale, through 1,
+the default, to 2, twice the color. it keeps the image's transparency.
+opacity applies once, after both effects.
+
+both properties accept plain values, functions, `ui.transition`, and
+`ui.spring`, and may follow a `ui.motion`. changing them only repaints: the
+image is not read, downloaded, or decoded again. a value outside its range is
+an error, and a reactive update to one keeps the previous tree.
+
+a blur is measured in device pixels after the output scale and every transform,
+using the largest scale factor of the widget, and may not exceed a standard
+deviation of 128 device pixels. a 64 pixel blur on an image scaled 2× reaches
+that limit on a 2× output. each blurred image also reserves temporary pixels for
+its visible box plus the blur's reach; one blur may reserve about one surface,
+and one frame about four surfaces, up to 512 mib and 1 gib. a frame,
+reload, or output scale beyond these limits is rejected and the previous frame
+stays on screen. blurs that are fully clipped, fully transparent, or that have
+no image source cost nothing. rotated or sheared images also count the temporary
+layer before it is rotated into place; a narrow clip can still need a large
+layer. nearly singular transforms that cannot be safely decomposed are rejected.
 
 ### refreshing and remote images
 
