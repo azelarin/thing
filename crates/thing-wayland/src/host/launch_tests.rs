@@ -925,6 +925,51 @@ const SCALE_SHADOW_PANEL: &str = r#"
         }
     "#;
 
+fn scale_change_keeps_a_renderable_composited_frame() {
+    let mut host = Host::start_with_panel(
+        None,
+        r#"
+        local children = {}
+        for _ = 1, 24 do
+            table.insert(children, ui.stack {
+                style = { width = 1, height = 1, opacity = 0.5, composite = true },
+            })
+        end
+        return ui.panel {
+            style = { width = 320, height = 40 },
+            children = { ui.stack { style = { width = 320, height = 40 }, children = children } },
+        }
+        "#,
+    );
+    let accepted = host.app.surfaces[0].scale;
+    prefer_scale(&mut host, 16);
+    let surface = &host.app.surfaces[0];
+    assert_eq!(surface.scale, accepted);
+    assert_eq!(surface.preferred_scale.factor(), 16.0);
+    let root = host
+        .app
+        .configurations
+        .surface_root(&surface.output, &surface.key)
+        .unwrap();
+    let physical = (
+        surface.scale.physical_size(surface.size.0).unwrap(),
+        surface.scale.physical_size(surface.size.1).unwrap(),
+    );
+    let layout = surface.layouts.presented().unwrap();
+    thing_ui::validate_compositing(root, layout, physical).unwrap();
+    assert!(thing_ui::validate_compositing(root, layout, (5120, 640)).is_err());
+    prefer_scale(&mut host, 2);
+    assert_eq!(host.app.surfaces[0].scale.factor(), 2.0);
+}
+
+#[test]
+fn a_preferred_scale_change_keeps_the_accepted_composited_frame() {
+    isolated(
+        "a_preferred_scale_change_keeps_the_accepted_composited_frame",
+        scale_change_keeps_a_renderable_composited_frame,
+    );
+}
+
 fn dispatch_protocol_events(host: &mut Host) {
     // the fixed shared-memory buffer only supports the original scale, so
     // scale assertions dispatch events without asking the test renderer to draw.

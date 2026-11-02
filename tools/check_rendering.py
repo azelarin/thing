@@ -25,13 +25,13 @@ ARTIFACTS = ROOT / "target/render-tests"
 CASES = (
     "image-fit", "stencil", "gradients", "radial-gradients", "shadows", "shared-motion",
     "widget-bounds", "rounded-clips", "path-clips", "horizontal-scroll", "motion-lifecycle", "content-transitions", "windows",
-    "styled-text", "live-inspector", "image-effects",
+    "styled-text", "live-inspector", "image-effects", "group-opacity",
 )
 # these accept a state only after the same passing frame is captured twice.
 STABLE_FRAMES = {
     "windows": 2,
     "radial-gradients": 2, "shadows": 2, "shared-motion": 2, "widget-bounds": 2, "rounded-clips": 2, "horizontal-scroll": 2, "motion-lifecycle": 2, "content-transitions": 2,
-    "styled-text": 2, "live-inspector": 2, "image-effects": 2,
+    "styled-text": 2, "live-inspector": 2, "image-effects": 2, "group-opacity": 2,
 }
 RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
 # the runtime error each panel-invalid.luau must produce, in thing check and in
@@ -39,6 +39,7 @@ RELOAD_REJECTED = "reload failed; keeping the previous surfaces"
 INVALID_RELOADS = {
     "shadows": "shadow blur must be between 0 and 32",
     "image-effects": "between 0 and 64",
+    "group-opacity": "style.composite must be a boolean",
 }
 MAX_LOG_BYTES = 1024 * 1024
 COMMAND_TIMEOUT = 8.0
@@ -624,8 +625,68 @@ def verify_image_effects(image, stage, scale):
         raise FixtureError(f"image blur radius did not match the current stage: {reach}")
 
 
+GROUP_BACKGROUND = (240, 240, 240)
+GROUP_RED = (255, 0, 0)
+GROUP_BLUE = (0, 0, 255)
+
+
+def faded(color, alpha, base=GROUP_BACKGROUND):
+    """an opaque color drawn over `base` with `alpha`, blended in 8-bit srgb."""
+    return tuple(round(c * alpha + b * (1 - alpha)) for c, b in zip(color, base))
+
+
+def verify_group_opacity(image, stage, scale):
+    opacity = 0.25 if stage == "reload" else 0.5
+
+    def color(label, point, expected, tolerance=4):
+        actual = image.pixel(physical(point[0], scale), physical(point[1], scale))
+        if max(abs(channel - target) for channel, target in zip(actual, expected)) > tolerance:
+            raise FixtureError(f"{label} at logical {point} was {actual}; expected {expected}")
+        return actual
+
+    def uniform(label, cell, alpha):
+        # the left box, the overlap, and the right box of one composited pair.
+        expected = faded(GROUP_RED, alpha)
+        left, overlap, right = (
+            color(f"{label} {part}", point, expected)
+            for part, point in zip(("left box", "overlap", "right box"), cell)
+        )
+        if max(abs(a - b) for side in (left, right) for a, b in zip(overlap, side)) > 3:
+            raise FixtureError(f"{label} overlap {overlap} differs from its boxes {left}, {right}")
+
+    def pair(left):
+        return ((left + 20, 45), (left + 60, 45), (left + 100, 45))
+
+    color("panel background", (450, 150), GROUP_BACKGROUND, tolerance=3)
+    # a: two separately faded boxes compound where they overlap.
+    single = color("a: ungrouped left box", (40, 45), faded(GROUP_RED, opacity))
+    color("a: ungrouped right box", (120, 45), faded(GROUP_RED, opacity))
+    overlap = image.pixel(physical(80, scale), physical(45, scale))
+    if overlap[1] > single[1] - 20:
+        raise FixtureError(f"a: ungrouped overlap is not darker: {overlap} beside {single}")
+    color("a: ungrouped overlap compounds", (80, 45),
+          faded(GROUP_RED, 1 - (1 - opacity) ** 2), tolerance=5)
+    # b: one group fades both boxes once.
+    uniform("b: group", pair(160), opacity)
+    # c and d: a plain half-opaque ancestor and a disabled ancestor each scale
+    # the group once; the inner disabled opacity of 0.1 is not repeated.
+    uniform("c: inherited opacity", pair(300), 0.5 * opacity)
+    uniform("d: disabled opacity", pair(440), 0.5 * opacity)
+    # e: a rounded 200 by 105 ancestor at (20, 100) clips the group.
+    uniform("e: clipped group", ((55, 125), (120, 130), (185, 140)), opacity)
+    color("e: shadow inside the clip", (130, 192), faded((0, 0, 0), opacity))
+    color("e: rounded clip cuts the corner", (26, 106), GROUP_BACKGROUND, tolerance=3)
+    color("e: rounded clip cuts the shadow corner", (214, 199), GROUP_BACKGROUND, tolerance=3)
+    color("e: clip contains the overflowing box", (235, 135), GROUP_BACKGROUND, tolerance=3)
+    color("e: clip contains the escaping shadow", (130, 218), GROUP_BACKGROUND, tolerance=3)
+    # f: the next sibling is outside every group.
+    color("f: following sibling stays opaque", (310, 150), GROUP_BLUE, tolerance=3)
+
+
 def verify_capture(case, image, stage, scale):
-    if case == "image-effects":
+    if case == "group-opacity":
+        verify_group_opacity(image, stage, scale)
+    elif case == "image-effects":
         verify_image_effects(image, stage, scale)
     elif case == "live-inspector":
         verify_live_inspector(image, stage, scale)

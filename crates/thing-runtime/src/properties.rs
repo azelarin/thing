@@ -957,6 +957,7 @@ pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
             node.style.tabular_digits = boolean(value, name)?
         }
         "style.opacity" => node.style.opacity = number(value, name)? as f32,
+        "style.composite" => node.style.composite = boolean(value, name)?,
         "style.box_shadow" => node.style.box_shadow = shadow(value)?,
         "style.background" => node.style.background = brush(value, name)?,
         "style.foreground" => node.style.foreground = color(value, name)?,

@@ -722,6 +722,8 @@ pub struct Style {
     pub box_shadow: Option<Shadow>,
     pub foreground: Color,
     pub opacity: f32,
+    /// composite this widget and its descendants before applying opacity.
+    pub composite: bool,
     pub translate_x: f32,
     pub translate_y: f32,
     pub scale_x: f32,
@@ -774,6 +776,7 @@ impl Default for Style {
             box_shadow: None,
             foreground: Color::WHITE,
             opacity: 1.0,
+            composite: false,
             translate_x: 0.0,
             translate_y: 0.0,
             scale_x: 1.0,

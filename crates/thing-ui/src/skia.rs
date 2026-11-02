@@ -376,6 +376,10 @@ impl Scene<'_> {
         let shadows = crate::shadow::ShadowPlan::prepare(&nodes, layout, physical, scale)?;
         let image_effects =
             crate::image_effects::ImageEffectPlan::prepare(&nodes, layout, physical, scale)?;
+        let mut layers = crate::composite::Layers::new(
+            crate::composite::Plan::prepare(&nodes, layout, physical)?,
+            physical,
+        );
         self.images.collect();
         canvas.clear(SkiaColor::TRANSPARENT);
         canvas.reset_matrix();
@@ -384,12 +388,13 @@ impl Scene<'_> {
         self.text.retain(root);
         let mut active_clips = Vec::new();
 
-        for semantic in layout.semantic_placements() {
+        for (index, semantic) in layout.semantic_placements().iter().enumerate() {
+            layers.before(index, canvas, &mut active_clips, &surface_matrix);
             let Some(node) = nodes.get(&semantic.id).copied() else {
                 continue;
             };
             let effects = shadows.nodes.get(&semantic.id);
-            let opacity = semantic.opacity * semantic.disabled_opacity;
+            let opacity = layers.opacity(semantic.opacity * semantic.disabled_opacity);
             if let Some(shadow) = effects.and_then(|effects| effects.box_shadow.as_ref()) {
                 draw_shadow(
                     canvas,
@@ -424,7 +429,7 @@ impl Scene<'_> {
             )?;
             let saved = canvas.save();
             set_surface_transform(canvas, &surface_matrix, placement.transform)?;
-            let opacity = placement.opacity * placement.disabled_opacity;
+            let opacity = layers.opacity(placement.opacity * placement.disabled_opacity);
             let bounds = placement.local_bounds();
             let shape = rounded_rect(bounds, node.style.radius);
             canvas.draw_rrect(
@@ -528,6 +533,7 @@ impl Scene<'_> {
             canvas.restore_to_count(saved);
             drawn?;
         }
+        layers.finish(canvas, &mut active_clips);
         while active_clips.pop().is_some() {
             canvas.restore();
         }
@@ -1465,7 +1471,7 @@ mod tests {
         assert!((165..=175).contains(&pixel.b()));
     }
 
-    fn raster_scene(
+    pub(super) fn raster_scene(
         root: &Node,
         width: i32,
         height: i32,
@@ -2990,3 +2996,7 @@ mod tests {
         assert_eq!(text_alignment_offset(rtl, rtl_width, TextAlign::End), 0.0);
     }
 }
+
+#[cfg(test)]
+#[path = "composite_tests.rs"]
+mod composite_tests;

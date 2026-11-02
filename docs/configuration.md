@@ -1876,6 +1876,7 @@ put layout and paint values in `style`. dimensions use logical pixels.
 | `box_shadow` | none; an outside shadow, described in [shadows](#shadows) |
 | `foreground` | white |
 | `opacity` | `1` |
+| `composite` | `false`; applies opacity to the combined widget and its children |
 | `translate_x`, `translate_y`, `rotation` | `0` |
 | `scale_x`, `scale_y` | `1` |
 | `transform_origin` | `{ x = 0.5, y = 0.5, offset_x = 0, offset_y = 0 }` |
@@ -1888,6 +1889,38 @@ whole branch without compounding it at every descendant.
 `start` and `end` text alignment follow the text direction. other style values do
 not inherit implicitly.
 individual style values can be functions, just like widget properties.
+
+### fading a group
+
+by default, each widget is painted with its inherited opacity. overlapping
+children can therefore look darker during a fade. set `composite = true` to
+paint a widget and its children together, then fade the result once:
+
+```luau
+ui.stack {
+    style = {
+        composite = true,
+        opacity = ui.transition(function()
+            return if open:get() then 1 else 0
+        end, { duration = 200 }),
+    },
+    children = cards,
+}
+```
+
+child opacity still works within the group. disabled opacity joins the same
+group fade, and ancestor clips still apply to its contents and shadows.
+compositing changes painting; it does not change layout or which widget
+receives input. `composite` itself may be a reactive boolean.
+
+a group needs no temporary layer when its inherited opacity is zero or when
+its opacity relative to the enclosing group is one. other groups currently
+reserve a full surface of temporary pixels, even if the widget is small or
+clipped out. the estimate allows 16 bytes per physical pixel, up to 512 mib
+per layer and 1 gib across a frame, with at most eight nested layers and 256
+layers per frame. a reload or output change that exceeds these limits keeps
+the previous frame. use compositing on the group you want to fade rather than
+on every child.
 
 rows, panels, popups, buttons, pointer areas, and stacks have a horizontal main
 axis and a vertical cross axis. columns and vertical scrolls swap those axes.
