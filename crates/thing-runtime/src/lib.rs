@@ -5,6 +5,7 @@
 
 mod bounds;
 mod command;
+mod drag;
 mod geometry;
 mod idle;
 mod modules;
@@ -25,6 +26,12 @@ pub use bounds::{BoundsProvider, BoundsRect, MappedPoint, PresentedBounds, Widge
 pub use command::{
     CallValue, MAX_CALL_DEPTH, MAX_CALL_STRING_BYTES, MAX_CALL_VALUES, MAX_COMMANDS,
     validate_command_name,
+};
+pub use drag::{
+    DragAction, DragActions, DragData, DragOverInput, DragOverOutcome, DragOverPhase, DragRequest,
+    DragResult, DropDataError, DropInput, DropOutcome, DropPosition, MAX_DRAG_FILES,
+    MAX_DRAG_TEXT_BYTES, MAX_FILE_URI_BYTES, MAX_URI_LIST_BYTES, decode_drop_text, decode_uri_list,
+    encode_uri_list, file_uri_path, path_file_uri,
 };
 pub use geometry::{GeometryUpdate, MAX_FEEDBACK_ROUNDS};
 pub use idle::{IdleWatchDefinition, MAX_IDLE_TIMEOUT_MS, MAX_IDLE_WATCHES, MIN_IDLE_TIMEOUT_MS};
@@ -435,6 +442,7 @@ pub struct Runtime {
     event_depth: usize,
     output: Option<OutputContext>,
     mode: ConfigurationMode,
+    drags: drag::Drags,
 }
 
 impl Runtime {
@@ -553,6 +561,7 @@ impl Runtime {
         let ui = install_ui(
             &lua, &timers, &motions, &bounds, &geometry, &services, &commands,
         )?;
+        let drags = drag::Drags::install(&lua, mode)?;
         lua.sandbox(true)?;
         let modules = modules::Modules::default();
         let exported = modules.load(&lua, path)?;
@@ -627,6 +636,7 @@ impl Runtime {
             event_depth: 0,
             output,
             mode,
+            drags,
         };
         runtime.surfaces = runtime.parse_surfaces(exported)?;
         for key in runtime.services.window_state_keys() {
@@ -1487,17 +1497,25 @@ impl Runtime {
         argument.set("ctrl", event.ctrl)?;
         argument.set("alt", event.alt)?;
         argument.set("logo", event.logo)?;
+        argument.set("start_drag", self.drag_start_function())?;
         argument.set_readonly(true);
 
         let checkpoint = self.action_checkpoint();
         self.begin_call();
         self.allow_actions(true);
+        // only a captured primary press or its motion holds the implicit
+        // pointer grab that a wayland drag needs.
+        let drag_scope = matches!(event.phase, PointerPhase::Press | PointerPhase::Move)
+            && event.button == PointerButton::Primary;
+        self.allow_drag_start(drag_scope.then_some(&argument));
         let result = handler.call::<Option<bool>>(argument);
         self.allow_actions(false);
         let result = result.and_then(|handled| {
             self.refresh_at_checked(Instant::now(), validate)
                 .map(|changed| (changed, handled.unwrap_or(false)))
         });
+        let result = result.and_then(|outcome| self.commit_drag_start().map(|()| outcome));
+        self.allow_drag_start(None);
         if result.is_err() {
             self.truncate_actions(checkpoint);
         }
@@ -2607,9 +2625,25 @@ impl Runtime {
         if kind == Kind::PointerArea
             && table.raw_get::<Value>("on_pointer")?.is_nil()
             && table.raw_get::<Value>("on_scroll")?.is_nil()
+            && table.raw_get::<Value>("on_drop")?.is_nil()
         {
             return Err(Error::runtime(
-                "pointer_area requires on_pointer or on_scroll",
+                "pointer_area requires on_pointer, on_scroll, or on_drop",
+            ));
+        }
+        if table.raw_get::<Value>("on_drop")?.is_nil()
+            != table.raw_get::<Value>("on_drag_over")?.is_nil()
+        {
+            return Err(Error::runtime(
+                "on_drag_over and on_drop must be given together",
+            ));
+        }
+        if matches!(self.mode, ConfigurationMode::Lock)
+            && (!table.raw_get::<Value>("on_drop")?.is_nil()
+                || !table.raw_get::<Value>("drop_types")?.is_nil())
+        {
+            return Err(Error::runtime(
+                "drag and drop is unavailable in lock configurations",
             ));
         }
         if depth == 0
@@ -2651,6 +2685,14 @@ impl Runtime {
                     )));
                 }
                 "key" => node.key = Some(properties::string(value, "key")?),
+                "drop_types" => {
+                    if kind != Kind::PointerArea {
+                        return Err(Error::runtime(format!(
+                            "drop_types is not supported on {kind:?}"
+                        )));
+                    }
+                    node.drop_types = parse_drop_types(value)?;
+                }
                 "autofocus" => {
                     let Value::Boolean(value) = value else {
                         return Err(Error::runtime("autofocus must be a static boolean"));
@@ -2659,7 +2701,7 @@ impl Runtime {
                 }
                 "on_click" | "on_middle_click" | "on_secondary_click" | "on_scroll"
                 | "on_change" | "on_pressed" | "on_submit" | "on_hover" | "on_close" | "on_key"
-                | "on_pointer" | "on_link" => {
+                | "on_pointer" | "on_link" | "on_drag_over" | "on_drop" => {
                     if (matches!(
                         key.as_str(),
                         "on_click" | "on_middle_click" | "on_secondary_click"
@@ -2679,6 +2721,8 @@ impl Runtime {
                         || (key == "on_pointer"
                             && !matches!(kind, Kind::Button | Kind::PointerArea))
                         || (key == "on_link" && kind != Kind::Text)
+                        || (matches!(key.as_str(), "on_drag_over" | "on_drop")
+                            && kind != Kind::PointerArea)
                     {
                         return Err(Error::runtime(format!(
                             "{key} is not supported on {kind:?}"
@@ -2700,6 +2744,8 @@ impl Runtime {
                         "on_key" => "on_key",
                         "on_pointer" => "on_pointer",
                         "on_link" => "on_link",
+                        "on_drag_over" => "on_drag_over",
+                        "on_drop" => "on_drop",
                         _ => unreachable!("event name was accepted above"),
                     };
                     if key == "on_link" {
@@ -2709,6 +2755,8 @@ impl Runtime {
                         node.pointer_events = true;
                     } else if key == "on_scroll" {
                         node.scroll_events = true;
+                    } else if key == "on_drop" {
+                        node.drop_events = true;
                     }
                     self.handlers.insert((node.id, name), function);
                 }
@@ -2925,6 +2973,28 @@ fn valid_text_input_event(value: &str) -> bool {
         && !value
             .chars()
             .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
+}
+
+fn parse_drop_types(value: Value) -> Result<Vec<thing_core::DropType>> {
+    let Value::Table(list) = value else {
+        return Err(Error::runtime("drop_types must be a static list"));
+    };
+    let mut types = Vec::new();
+    for value in list.clone().sequence_values::<String>() {
+        let kind = match value?.as_str() {
+            "text" => thing_core::DropType::Text,
+            "files" => thing_core::DropType::Files,
+            other => return Err(Error::runtime(format!("unknown drop type {other:?}"))),
+        };
+        if types.contains(&kind) {
+            return Err(Error::runtime("drop_types must not repeat a type"));
+        }
+        types.push(kind);
+    }
+    if types.is_empty() || list.pairs::<Value, Value>().count() != types.len() {
+        return Err(Error::runtime("drop_types must be a nonempty dense list"));
+    }
+    Ok(types)
 }
 
 fn validate_pointer_event(event: PointerEvent) -> Result<()> {

@@ -1014,8 +1014,30 @@ pub struct Node {
     pub measure_content: bool,
     pub pointer_events: bool,
     pub scroll_events: bool,
+    /// set when a pointer area handles external drag and drop.
+    pub drop_events: bool,
+    /// the data a drop target reads, most preferred first.
+    pub drop_types: Vec<DropType>,
     pub key: Option<String>,
     pub children: Vec<Node>,
+}
+
+/// a kind of data that a drop target can receive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DropType {
+    /// utf-8 text.
+    Text,
+    /// local file paths carried as a `text/uri-list`.
+    Files,
+}
+
+impl DropType {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Files => "files",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1140,6 +1162,8 @@ impl Node {
             measure_content: false,
             pointer_events: false,
             scroll_events: false,
+            drop_events: false,
+            drop_types: Vec::new(),
             key: None,
             children: Vec::new(),
         }
@@ -1308,7 +1332,22 @@ impl Node {
                 self.kind
             )));
         }
-        if self.kind == Kind::PointerArea && !(self.pointer_events || self.scroll_events) {
+        if (self.drop_events || !self.drop_types.is_empty()) && self.kind != Kind::PointerArea {
+            return Err(TreeError(
+                "drop events are available only on pointer_area widgets".into(),
+            ));
+        }
+        if !self.drop_types.is_empty() && !self.drop_events {
+            return Err(TreeError("drop_types requires drop handlers".into()));
+        }
+        if self.drop_types.len() > 2
+            || (self.drop_types.len() == 2 && self.drop_types[0] == self.drop_types[1])
+        {
+            return Err(TreeError("drop_types must not repeat a type".into()));
+        }
+        if self.kind == Kind::PointerArea
+            && !(self.pointer_events || self.scroll_events || self.drop_events)
+        {
             return Err(TreeError("pointer_area requires an event handler".into()));
         }
         let style = &self.style;

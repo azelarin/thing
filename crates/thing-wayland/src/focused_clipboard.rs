@@ -72,7 +72,6 @@ pub(crate) struct FocusedClipboard {
     seat: Option<WlSeat>,
     device: Option<WlDataDevice>,
     selection: Option<WlDataOffer>,
-    drag_offer: Option<WlDataOffer>,
     sources: BTreeMap<u64, RetainedSource>,
     active_writes: BTreeMap<u64, u64>,
     owned_bytes: usize,
@@ -93,7 +92,6 @@ impl FocusedClipboard {
             seat: None,
             device: None,
             selection: None,
-            drag_offer: None,
             sources: BTreeMap::new(),
             active_writes: BTreeMap::new(),
             owned_bytes: 0,
@@ -130,7 +128,6 @@ impl FocusedClipboard {
         self.cancel_paste();
         self.paste_result = None;
         self.destroy_offer();
-        self.destroy_drag_offer();
         self.retire_sources();
         if let Some(device) = self.device.take()
             && device.version() >= 2
@@ -148,37 +145,17 @@ impl FocusedClipboard {
             return;
         }
         self.destroy_offer();
-        if let Some(offer) = &offer
-            && self.drag_offer.as_ref() == Some(offer)
-        {
-            self.drag_offer = None;
-        }
         self.selection = offer;
     }
 
-    pub(crate) fn drag_enter(
-        &mut self,
-        device: &WlDataDevice,
-        serial: u32,
-        offer: Option<WlDataOffer>,
-    ) {
-        if self.device.as_ref() != Some(device) {
-            if let Some(offer) = offer {
-                offer.destroy();
-            }
-            return;
-        }
-        self.destroy_drag_offer();
-        if let Some(offer) = offer {
-            offer.accept(serial, None);
-            self.drag_offer = Some(offer);
-        }
-    }
-
-    pub(crate) fn drag_finished(&mut self, device: &WlDataDevice) {
-        if self.device.as_ref() == Some(device) {
-            self.destroy_drag_offer();
-        }
+    /// the manager, seat, and data device that drag and drop shares. one
+    /// device per seat keeps drag offers from being duplicated.
+    pub(crate) fn binding(&self) -> Option<(WlDataDeviceManager, WlSeat, WlDataDevice)> {
+        Some((
+            self.manager.clone()?,
+            self.seat.clone()?,
+            self.device.clone()?,
+        ))
     }
 
     pub(crate) fn start_paste(&mut self) -> io::Result<PasteId> {
@@ -402,12 +379,6 @@ impl FocusedClipboard {
 
     fn destroy_offer(&mut self) {
         if let Some(offer) = self.selection.take() {
-            offer.destroy();
-        }
-    }
-
-    fn destroy_drag_offer(&mut self) {
-        if let Some(offer) = self.drag_offer.take() {
             offer.destroy();
         }
     }

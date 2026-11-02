@@ -9,12 +9,13 @@ use crate::command::OutputSelection;
 use thing_core::{Node, NodeId, Rect};
 use thing_runtime::{
     Action, ApplicationsSnapshot, AudioSnapshot, AuthenticationSnapshot, BoundsProvider,
-    BoundsRect, CallValue, ClipboardSnapshot, Event, IdleWatchDefinition, KeyInput,
-    ManagedProcessDefinition, ManagedProcessSnapshot, ManagedProcessState, MappedPoint,
-    MediaSnapshot, NiriState, NotificationSnapshot, OutputContext,
-    PointerDispatchOutcome as RuntimePointerOutcome, PointerEvent, PowerSnapshot, PresentedBounds,
-    Runtime, Scalar, ScrollInput, ServiceSnapshot, SleepInhibitorDefinition, SleepInhibitorState,
-    SurfaceKey, SurfaceTree, SystemTraySnapshot, TimerToken, UiAction, UiTarget, WidgetBounds,
+    BoundsRect, CallValue, ClipboardSnapshot, DragOverInput, DragOverOutcome, DragRequest,
+    DragResult, DropInput, Event, IdleWatchDefinition, KeyInput, ManagedProcessDefinition,
+    ManagedProcessSnapshot, ManagedProcessState, MappedPoint, MediaSnapshot, NiriState,
+    NotificationSnapshot, OutputContext, PointerDispatchOutcome as RuntimePointerOutcome,
+    PointerEvent, PowerSnapshot, PresentedBounds, Runtime, Scalar, ScrollInput, ServiceSnapshot,
+    SleepInhibitorDefinition, SleepInhibitorState, SurfaceKey, SurfaceTree, SystemTraySnapshot,
+    TimerToken, UiAction, UiTarget, WidgetBounds,
 };
 use thing_ui::Layout;
 
@@ -1359,6 +1360,115 @@ impl<K: Clone + Eq> Configurations<K> {
                 actions: runtime.take_actions(),
                 ui_actions: runtime.take_ui_actions(),
             },
+        }))
+    }
+
+    fn runtime_for_consumer(&mut self, key: &K, consumer: &str) -> Option<&mut Runtime> {
+        self.instances
+            .iter_mut()
+            .find(|instance| &instance.key == key && instance.consumer == consumer)
+            .map(|instance| &mut instance.runtime)
+    }
+
+    /// whether a captured target still names a drop target in the
+    /// configuration generation `consumer`.
+    pub(crate) fn drop_target_is_current(
+        &self,
+        key: &K,
+        consumer: &str,
+        target: &UiTarget,
+    ) -> bool {
+        self.consumer(key) == Some(consumer)
+            && self
+                .runtime(key)
+                .is_some_and(|runtime| runtime.drop_target_is_current(target))
+    }
+
+    /// runs `on_drag_over` in the configuration generation that owns the target.
+    pub(crate) fn dispatch_drag_over_checked(
+        &mut self,
+        key: &K,
+        consumer: &str,
+        target: &UiTarget,
+        input: DragOverInput,
+        validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
+    ) -> Result<Option<(DragOverOutcome, DispatchOutcome)>, String> {
+        let Some(runtime) = self.runtime_for_consumer(key, consumer) else {
+            return Ok(None);
+        };
+        let Some(outcome) = runtime
+            .dispatch_drag_over_checked(target, input, validate)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            outcome,
+            DispatchOutcome {
+                changed: outcome.changed,
+                actions: runtime.take_actions(),
+                ui_actions: runtime.take_ui_actions(),
+            },
+        )))
+    }
+
+    /// runs `on_drop` with validated data in the generation that owns the target.
+    pub(crate) fn dispatch_drop_checked(
+        &mut self,
+        key: &K,
+        consumer: &str,
+        target: &UiTarget,
+        input: DropInput,
+        validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
+    ) -> Result<Option<(bool, DispatchOutcome)>, String> {
+        let Some(runtime) = self.runtime_for_consumer(key, consumer) else {
+            return Ok(None);
+        };
+        let Some(outcome) = runtime
+            .dispatch_drop_checked(target, input, validate)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            outcome.accepted,
+            DispatchOutcome {
+                changed: outcome.changed,
+                actions: runtime.take_actions(),
+                ui_actions: runtime.take_ui_actions(),
+            },
+        )))
+    }
+
+    /// the outgoing drag a pointer callback in this generation requested.
+    pub(crate) fn take_drag_request(&mut self, key: &K, consumer: &str) -> Option<DragRequest> {
+        self.runtime_for_consumer(key, consumer)?
+            .take_drag_request()
+    }
+
+    /// reports how an outgoing drag ended to the generation that started it.
+    /// a replaced generation or an already finished drag is ignored.
+    pub(crate) fn finish_drag_checked(
+        &mut self,
+        key: &K,
+        consumer: &str,
+        id: u64,
+        result: DragResult,
+        validate: impl Fn(&[SurfaceTree]) -> Result<(), String>,
+    ) -> Result<Option<DispatchOutcome>, String> {
+        let Some(runtime) = self.runtime_for_consumer(key, consumer) else {
+            return Ok(None);
+        };
+        if runtime.active_drag() != Some(id) {
+            return Ok(None);
+        }
+        let changed = runtime
+            .finish_drag_checked(id, result, validate)
+            .map_err(|error| error.to_string())?;
+        Ok(Some(DispatchOutcome {
+            changed,
+            actions: runtime.take_actions(),
+            ui_actions: runtime.take_ui_actions(),
         }))
     }
 

@@ -417,13 +417,27 @@ impl App {
         origin: Option<InputOrigin>,
         prepared: Vec<PreparedOutputLayouts>,
     ) -> Option<(bool, bool)> {
+        // a drag may start only from the capture that is still active after
+        // the callback that requested it.
+        let drag = consumer.clone().and_then(|consumer| {
+            let request = self.configurations.take_drag_request(&output, &consumer)?;
+            let active = result.as_ref().is_ok_and(|outcome| outcome.active);
+            Some((
+                consumer,
+                request,
+                self.pointer_capture.clone().filter(|_| active),
+            ))
+        });
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
                 if let Some(capture) = self.pointer_capture.take() {
                     self.clear_pressed_for_capture(&capture);
                 }
-                self.finish_dispatch(output, consumer, Err(error), origin, prepared);
+                self.finish_dispatch(output.clone(), consumer, Err(error), origin, prepared);
+                if let Some((consumer, request, _)) = drag {
+                    self.start_requested_drag(output, consumer, request, None);
+                }
                 return None;
             }
         };
@@ -433,8 +447,17 @@ impl App {
             self.clear_pressed_for_capture(&capture);
         }
         let result = (outcome.handled, outcome.active);
-        self.finish_dispatch(output, consumer, Ok(outcome.dispatch), origin, prepared)
-            .then_some(result)
+        let finished = self.finish_dispatch(
+            output.clone(),
+            consumer,
+            Ok(outcome.dispatch),
+            origin,
+            prepared,
+        );
+        if let Some((consumer, request, capture)) = drag {
+            self.start_requested_drag(output, consumer, request, capture);
+        }
+        finished.then_some(result)
     }
     pub(super) fn begin_custom_pointer(
         &mut self,
@@ -1269,6 +1292,7 @@ impl App {
             self.error = Some(error);
         }
         self.surfaces.remove(index);
+        self.retire_drags_for_surface(&wl);
         self.configurations
             .forget_presented_geometry(&output, surface_root);
         if let Some(PopupMode::Hover(key) | PopupMode::Automatic(key)) = mode {
@@ -2385,6 +2409,8 @@ impl SeatHandler for App {
             if let Some(clipboard) = &mut self.clipboard {
                 clipboard.detach_seat();
             }
+            // drag objects belong to the seat's data device, so they go first.
+            self.detach_drags();
             self.focused_clipboard.detach_seat();
             self.pending_paste = None;
             if let Some(pointer) = self.pointer.take() {

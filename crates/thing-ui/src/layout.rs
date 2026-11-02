@@ -40,6 +40,8 @@ pub struct Placement {
     pub interactive: bool,
     pub pointer_events: bool,
     pub scroll_events: bool,
+    /// whether this enabled pointer area receives external drags.
+    pub drop_events: bool,
     pub enabled: bool,
     /// the cursor this widget contributes before inheritance.
     pub cursor: Option<thing_core::Cursor>,
@@ -562,6 +564,7 @@ impl Layout {
                 (placement.interactive
                     || placement.pointer_events
                     || placement.scroll_events
+                    || placement.drop_events
                     || region.viewport)
                     .then_some(placement)
                     .filter(|placement| placement.inverse.is_some())
@@ -621,6 +624,28 @@ impl Layout {
                     && self.placement_contains(*index, point, &mut clip_hits)
             })
             .map(|(_, placement)| placement.id)
+    }
+
+    /// the frontmost drop target under a point, after transforms and clipping.
+    /// other widgets inside a drop target do not hide it.
+    pub fn drop_target(&self, point: Point) -> Option<NodeId> {
+        let mut clip_hits = self.clip_hits();
+        self.placements
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(index, placement)| {
+                placement.drop_events
+                    && placement.inverse.is_some()
+                    && self.placement_contains(*index, point, &mut clip_hits)
+            })
+            .map(|(_, placement)| placement.id)
+    }
+
+    /// whether a widget can currently receive drops in this layout.
+    pub fn drop_target_is_eligible(&self, id: NodeId) -> bool {
+        self.get(id)
+            .is_some_and(|placement| placement.drop_events && placement.inverse.is_some())
     }
 
     pub fn focus_order(&self) -> impl Iterator<Item = NodeId> + '_ {
@@ -1144,6 +1169,7 @@ impl Layout {
             interactive: enabled && node.is_interactive(),
             pointer_events: enabled && node.pointer_events,
             scroll_events: enabled && node.scroll_events,
+            drop_events: enabled && node.drop_events,
             enabled,
             cursor: thing_core::own_cursor(node.cursor, node.kind, enabled),
             opacity,
