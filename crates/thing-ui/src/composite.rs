@@ -342,7 +342,12 @@ impl DropShadow {
         }
         Ok(Some(Self {
             filter,
-            clip: placement.shadow_clip_chain,
+            // this layer includes the original content as well as its shadow.
+            // both must keep the ancestor content clips.
+            clip: layout
+                .get(node.id)
+                .ok_or("drop shadow is missing paint geometry")?
+                .decoration_clip_chain,
             excluded,
         }))
     }

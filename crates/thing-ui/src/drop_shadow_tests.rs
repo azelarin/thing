@@ -197,3 +197,22 @@ fn the_offset_follows_rotation_at_fractional_scale() {
     assert_eq!(pixels.get_color((125, 37)), skia_safe::Color::WHITE);
     assert_eq!(pixels.get_color((87, 37)), skia_safe::Color::RED);
 }
+
+#[test]
+fn a_drop_shadow_does_not_let_content_escape_an_ancestors_bounds_clip() {
+    let mut root = stack(1, 160.0, 100.0);
+    root.style.background = Color::WHITE.into();
+    let mut parent = stack(2, 80.0, 80.0);
+    let mut group = stack(3, 40.0, 30.0);
+    group.style.translate_x = 70.0;
+    group.style.translate_y = 20.0;
+    group.style.background = Color([255, 0, 0, 255]).into();
+    group.style.drop_shadow = Some(shadow(-20.0, 0.0, 0.0));
+    parent.children.push(group);
+    root.children.push(parent);
+    let mut surface = raster_scene(&root, 160, 100, 1.0).unwrap();
+    let pixels = surface.peek_pixels().unwrap();
+    assert_eq!(pixels.get_color((60, 30)), skia_safe::Color::BLACK);
+    assert_eq!(pixels.get_color((75, 30)), skia_safe::Color::RED);
+    assert_eq!(pixels.get_color((90, 30)), skia_safe::Color::WHITE);
+}

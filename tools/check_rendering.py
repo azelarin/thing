@@ -723,6 +723,9 @@ def verify_group_shadow(image, stage, scale):
         ((370,70), (half,half,half), "outgoing-only alpha"),
         ((390,70), (dark,dark,dark), "crossfade overlap alpha"),
         ((430,70), (half,half,half), "incoming-only alpha"),
+        ((540,50), (dark,dark,dark), "bounds clip keeps inward shadow"),
+        ((555,50), (255,dark,dark), "bounds clip keeps source"),
+        ((570,50), (255,255,255), "bounds clip contains filtered content"),
         ((530,130), (0,0,255), "following sibling"),
     ):
         expect_color(image,point,scale,expected,label,tolerance=3)

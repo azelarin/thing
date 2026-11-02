@@ -2282,8 +2282,10 @@ both the content and its shadow; `composite = true` is implied while the shadow
 is active. a crossfade's shadow follows its mixed pixels. popups have separate
 surfaces and are excluded.
 
-ancestor clips contain the finished shadow without cutting its source first.
-clips inside the group still shape that source. offsets follow the widget's
+ancestor content clips contain the finished group and its shadow, including
+ordinary bounds clips. pixels outside those clips can still cast inward; the
+source is not cut at the ancestor edge first. clips inside the group shape the
+source itself. offsets follow the widget's
 transform. blur is circular after transformation, using skia's radius mapping;
 nonuniform scale or shear therefore uses an approximation. spread is unsupported.
 

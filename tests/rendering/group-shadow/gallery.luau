@@ -40,6 +40,11 @@ return function(opacity)
                         align='start',justify='start',opacity=opacity,drop_shadow=down},
                     children={box(40,30,'#ff0000'),box(80,30,'#0000ff',20)},
                 },
+                group(480,20,80,80,nil,{
+                    group(70,20,40,30,{color='#000000',offset_x=-20},{
+                        box(40,30,'#ff0000'),
+                    }),
+                },{opacity=1}),
                 box(30,30,'#0000ff',520,120),
             },
         } },
