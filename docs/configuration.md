@@ -2789,6 +2789,52 @@ imports are relative to the file containing the `require` call. use `./` or
 `../`; the `.luau` extension is optional. resolved module paths may be at most
 4,096 bytes.
 
+## accessibility
+
+use `accessibility` to describe a widget independently of its appearance. for
+example, a button can represent a switch while keeping its usual click handler:
+
+```luau
+local muted = ui.state(false)
+
+ui.button {
+    accessibility = {
+        role = 'switch',
+        label = 'mute microphone',
+        checked = function() return muted:get() end,
+    },
+    on_click = function() muted:set(not muted:get()) end,
+    children = { ui.text { text = 'microphone' } },
+}
+```
+
+| field | type | meaning |
+| --- | --- | --- |
+| `label` | reactive string | the widget's spoken name |
+| `description` | reactive string | extra help beyond the name |
+| `role` | static string | a compatible semantic role |
+| `selected` | reactive boolean | selection in a list or menu item |
+| `checked` | reactive boolean or `'mixed'` | a checkbox, radio, or switch state |
+| `expanded` | reactive boolean | whether a button or item has opened its content |
+| `value_text` | reactive string | a readable value for a range or text input |
+| `live` | static `'polite'` or `'assertive'` | how urgently later changes should be announced |
+| `hidden` | reactive boolean | omit decorative text, images, or paths |
+
+`role` and `live` are fixed while a widget loads. the other fields accept
+property functions, and returning `nil` clears an explicit value. strings may
+hold up to 4,096 UTF-8 bytes and must not contain NUL.
+
+container roles are `group`, `toolbar`, `list`, `menu`, and `dialog`. a
+`list_item` may be a container or button; `status` and `alert` may be containers
+or text. `image` applies to images and paths. buttons also accept `menu_item`,
+`menu_item_checkbox`, `menu_item_radio`, `checkbox`, `radio`, and `switch`.
+roles describe existing behavior; they do not add handlers or keyboard controls.
+
+checked states need a checkbox, radio, or switch role, and `'mixed'` is limited
+to checkbox roles. selected states need a list or menu item role. hiding a
+container or interactive control is rejected, including text that handles link
+activation. secret inputs may have a label and description, but no value text.
+
 ## widget bounds
 
 `ui.bounds(widget)` reads the widget's border boxes from the last frame

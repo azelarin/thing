@@ -1,5 +1,6 @@
 //! widget values, geometry, and validation.
 
+mod accessibility;
 mod brush;
 mod color;
 mod cursor;
@@ -9,6 +10,10 @@ mod shadow;
 mod vector;
 mod widget;
 
+pub use accessibility::{
+    Accessibility, AccessibilityChecked, AccessibilityLive, AccessibilityRole,
+    MAX_ACCESSIBILITY_TEXT_BYTES,
+};
 pub use brush::{Brush, GradientPoint, GradientStop, LinearGradient, RadialGradient};
 pub use color::{Color, ParseColorError};
 pub use cursor::{Cursor, own_cursor};

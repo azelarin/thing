@@ -72,7 +72,7 @@ work on the framework, see [contributing](CONTRIBUTING.md).
 - [x] visual translation, scale, and rotation
 - [x] spring animations
 - [x] ui timers
-- [ ] drag and drop
+- [x] drag and drop for text and local files
 - [x] microphone controls
 - [x] per-application audio controls
 - [x] media metadata and playback controls

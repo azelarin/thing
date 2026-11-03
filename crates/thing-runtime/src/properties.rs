@@ -783,6 +783,9 @@ pub(crate) fn apply_animation_frame(node: &mut Node, name: &str, value: Resolved
 }
 
 pub(crate) fn apply(node: &mut Node, name: &str, value: Value) -> Result<()> {
+    if let Some(property) = name.strip_prefix("accessibility.") {
+        return crate::accessibility::apply(node, property, value);
+    }
     match name {
         "progress" if node.kind == Kind::Crossfade => {
             node.crossfade_progress = effect_number(value, name, 0.0, 1.0)?;

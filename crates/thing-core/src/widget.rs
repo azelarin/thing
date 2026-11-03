@@ -978,6 +978,7 @@ pub struct Node {
     pub id: NodeId,
     pub kind: Kind,
     pub style: Style,
+    pub accessibility: crate::Accessibility,
     pub text: String,
     pub placeholder: String,
     pub max_lines: Option<u32>,
@@ -1136,6 +1137,7 @@ impl Node {
             id,
             kind,
             style: Style::default(),
+            accessibility: crate::Accessibility::default(),
             text: String::new(),
             placeholder: String::new(),
             max_lines: None,
@@ -1222,6 +1224,8 @@ impl Node {
                 "widget tree exceeds 64 levels or 10,000 nodes".into(),
             ));
         }
+        self.accessibility
+            .validate(self.kind, self.is_interactive())?;
         if !ids.insert(self.id) {
             return Err(TreeError(format!(
                 "widget {:?} is used more than once; create a fresh widget for each position",
