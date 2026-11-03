@@ -2785,6 +2785,10 @@ to a text widget or `style = theme.button` to a button. changing the table after
 construction does not update existing widgets; use property functions for style
 values that need to follow state.
 
+imports are relative to the file containing the `require` call. use `./` or
+`../`; the `.luau` extension is optional. resolved module paths may be at most
+4,096 bytes.
+
 ## widget bounds
 
 `ui.bounds(widget)` reads the widget's border boxes from the last frame

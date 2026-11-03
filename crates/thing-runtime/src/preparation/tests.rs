@@ -240,3 +240,21 @@ fn a_property_can_catch_a_missing_import_after_the_background_read_fails() {
     assert_eq!(runtime.root().unwrap().children[0].text, "fallback");
     assert_eq!(reader.requests.borrow().len(), 2);
 }
+
+#[test]
+fn invalid_import_paths_never_enter_the_background_source_cache() {
+    let reader = Rc::new(Reader::default());
+    reader.insert("/config/panel.luau", r#"
+        for _,path in ipairs({'./'..string.rep('x',4096),'./'..string.rep('x',4085),'./'..string.char(0)}) do
+            local ok,message=pcall(require,path)
+            assert(not ok)
+            assert(string.find(tostring(message),'module paths'))
+        end
+        return ui.panel {}
+    "#);
+    let mut load = reader.load(Limits::default());
+    assert!(poll(&mut load).is_pending());
+    reader.release();
+    finish(&mut load).unwrap();
+    assert_eq!(reader.requests.borrow().len(), 1);
+}

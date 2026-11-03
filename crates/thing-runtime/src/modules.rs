@@ -9,7 +9,7 @@ use std::{
 };
 
 const MAX_ASSET_FILES: usize = 10_000;
-const MAX_ASSET_PATH_BYTES: usize = 4096;
+const MAX_PATH_BYTES: usize = 4096;
 const CACHE_KEY: &str = "thing.modules";
 
 #[derive(Default)]
@@ -270,7 +270,7 @@ impl Modules {
         if relative.contains('\0') {
             return Err(Error::runtime("asset paths must not contain NUL"));
         }
-        if relative.len() > MAX_ASSET_PATH_BYTES {
+        if relative.len() > MAX_PATH_BYTES {
             return Err(Error::runtime("asset paths must be at most 4096 bytes"));
         }
         let path = resolve_path(parent, relative, PathParents::Normalize)?;
@@ -293,7 +293,7 @@ enum PathParents {
 }
 
 fn resolve_path(parent: &Path, name: &str, parents: PathParents) -> Result<String> {
-    if name.len() > MAX_ASSET_PATH_BYTES || name.contains('\0') {
+    if name.len() > MAX_PATH_BYTES || name.contains('\0') {
         return Err(Error::runtime(
             "paths must be at most 4096 bytes without nul",
         ));
@@ -319,7 +319,7 @@ fn resolve_path(parent: &Path, name: &str, parents: PathParents) -> Result<Strin
         .to_str()
         .ok_or_else(|| Error::runtime("paths must be utf-8"))?
         .to_owned();
-    if path.len() > MAX_ASSET_PATH_BYTES {
+    if path.len() > MAX_PATH_BYTES {
         return Err(Error::runtime("resolved paths must be at most 4096 bytes"));
     }
     Ok(path)
@@ -331,9 +331,20 @@ fn import_path(parent: &Path, relative: &str) -> Result<PathBuf> {
             "require expects a relative path, for example './theme'",
         ));
     }
+    if relative.contains('\0') {
+        return Err(Error::runtime("module paths must not contain NUL"));
+    }
+    if relative.len() > MAX_PATH_BYTES {
+        return Err(Error::runtime("module paths must be at most 4096 bytes"));
+    }
     let mut path = parent.join(relative);
     if path.extension().is_none() {
         path.set_extension("luau");
+    }
+    if path.as_os_str().len() > MAX_PATH_BYTES {
+        return Err(Error::runtime(
+            "resolved module paths must be at most 4096 bytes",
+        ));
     }
     Ok(path)
 }
@@ -352,7 +363,7 @@ mod tests {
                 .to_string()
                 .contains("relative path")
         );
-        let long = format!("./{}", "x".repeat(MAX_ASSET_PATH_BYTES));
+        let long = format!("./{}", "x".repeat(MAX_PATH_BYTES));
         assert!(
             modules
                 .resolve_asset(Path::new("/config"), &long)
