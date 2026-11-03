@@ -83,12 +83,34 @@ fn poll(load: &mut RuntimeLoad) -> Poll<Result<Runtime>> {
 }
 
 fn finish(load: &mut RuntimeLoad) -> Result<Runtime> {
-    for _ in 0..1_000 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
         if let Poll::Ready(result) = poll(load) {
             return result;
         }
+        assert!(Instant::now() < deadline, "configuration did not finish");
+        std::thread::yield_now();
     }
-    panic!("configuration did not finish within 1,000 polls")
+}
+
+fn wait_for_read(load: &mut RuntimeLoad, reader: &Reader, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while reader.requests.borrow().len() < count {
+        // a preparation turn can yield before it reaches the next import.
+        match poll(load) {
+            Poll::Pending => {}
+            Poll::Ready(Err(error)) => {
+                panic!("configuration failed before the expected read: {error}")
+            }
+            Poll::Ready(Ok(_)) => panic!("configuration finished before the expected read"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "configuration never requested its next source"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(reader.requests.borrow().len(), count);
 }
 
 #[test]
@@ -103,7 +125,7 @@ fn imports_suspend_without_publishing_and_reuse_module_results() {
     assert!(poll(&mut load).is_pending());
     assert_eq!(reader.requests.borrow().len(), 1);
     reader.release();
-    assert!(poll(&mut load).is_pending());
+    wait_for_read(&mut load, &reader, 2);
     assert_eq!(reader.requests.borrow().len(), 2);
     reader.release();
     let runtime = finish(&mut load).unwrap();
@@ -115,12 +137,9 @@ fn imports_suspend_without_publishing_and_reuse_module_results() {
 fn waiting_for_io_does_not_spend_the_script_execution_budget() {
     let reader = Rc::new(Reader::default());
     reader.insert("/config/panel.luau", "return ui.panel {}");
-    let mut load = reader.load(Limits {
-        execution_time: Duration::from_millis(30),
-        ..Limits::default()
-    });
+    let mut load = reader.load(Limits::default());
     assert!(poll(&mut load).is_pending());
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(300));
     reader.release();
     finish(&mut load).unwrap();
 }
@@ -129,10 +148,7 @@ fn waiting_for_io_does_not_spend_the_script_execution_budget() {
 fn a_busy_script_yields_to_the_host_and_still_has_a_total_budget() {
     let reader = Rc::new(Reader::default());
     reader.insert("/config/panel.luau", "while true do end");
-    let mut load = reader.load(Limits {
-        execution_time: Duration::from_millis(30),
-        ..Limits::default()
-    });
+    let mut load = reader.load(Limits::default());
     assert!(poll(&mut load).is_pending());
     reader.release();
     let wake = Arc::new(WakeCount::default());
@@ -177,7 +193,7 @@ fn property_functions_can_read_a_module_already_loaded_during_preparation() {
     let mut load = reader.load(Limits::default());
     assert!(poll(&mut load).is_pending());
     reader.release();
-    assert!(poll(&mut load).is_pending());
+    wait_for_read(&mut load, &reader, 2);
     reader.release();
     let runtime = finish(&mut load).unwrap();
     assert_eq!(runtime.root().unwrap().children[0].text, "cached");
@@ -217,7 +233,7 @@ fn a_module_first_required_by_a_property_is_read_asynchronously() {
     let mut load = reader.load(Limits::default());
     assert!(poll(&mut load).is_pending());
     reader.release();
-    assert!(poll(&mut load).is_pending());
+    wait_for_read(&mut load, &reader, 2);
     assert_eq!(reader.requests.borrow().len(), 2);
     reader.release();
     let runtime = finish(&mut load).unwrap();
@@ -234,7 +250,7 @@ fn a_property_can_catch_a_missing_import_after_the_background_read_fails() {
     let mut load = reader.load(Limits::default());
     assert!(poll(&mut load).is_pending());
     reader.release();
-    assert!(poll(&mut load).is_pending());
+    wait_for_read(&mut load, &reader, 2);
     reader.release();
     let runtime = finish(&mut load).unwrap();
     assert_eq!(runtime.root().unwrap().children[0].text, "fallback");
