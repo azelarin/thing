@@ -722,6 +722,7 @@ impl Host {
             pending_window_states: Vec::new(),
             watch,
             reload_at: None,
+            reloads: None,
             hover: HoverStates::default(),
             surfaces: Vec::new(),
             closed_surfaces: Vec::new(),

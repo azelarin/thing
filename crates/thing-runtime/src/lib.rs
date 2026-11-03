@@ -13,6 +13,7 @@ mod modules;
 mod motion;
 mod niri;
 mod notification_expiry;
+mod preparation;
 mod properties;
 mod reconcile;
 mod rich_text;
@@ -44,6 +45,7 @@ pub use niri::{
     NiriAction, NiriCast, NiriCastKind, NiriCastTarget, NiriKeyboardLayouts, NiriLayoutTarget,
     NiriState, NiriWindow, Workspace,
 };
+pub use preparation::{RuntimeLoad, SourceFile, SourceFuture, SourceReader};
 pub use services::{
     Action, ApplicationLaunch, ApplicationsSnapshot, AudioDevice, AudioSnapshot, AudioSource,
     AudioStream, AuthenticationSnapshot, AuthenticationState, ClipboardImageStatus,
@@ -70,7 +72,7 @@ pub use sleep::{
 pub use timer::TimerToken;
 pub use window::{WindowRequest, WindowState};
 
-use mlua::{Error, ErrorContext, Function, Lua, Result, Table, Value, VmState};
+use mlua::{Error, ErrorContext, Function, Lua, Result, Table, Value};
 pub use state::Scalar;
 use state::{Signal, Tracker};
 use std::{
@@ -436,6 +438,7 @@ pub struct Runtime {
     ended_hovers: BTreeSet<NodeId>,
     deadline: Rc<Cell<Instant>>,
     limits: Limits,
+    loading_slice: Rc<Cell<Option<Instant>>>,
     modules: modules::Modules,
     services: services::Services,
     ui: Rc<RefCell<UiContext>>,
@@ -516,20 +519,26 @@ impl Runtime {
         output: Option<OutputContext>,
         mode: ConfigurationMode,
     ) -> Result<Self> {
+        let runtime = Self::create(limits, snapshot, output, mode, modules::Modules::default())?;
+        let exported = runtime.modules.load(&runtime.lua, path)?;
+        runtime.finish_load(exported)
+    }
+
+    fn create(
+        limits: Limits,
+        snapshot: ServiceSnapshot,
+        output: Option<OutputContext>,
+        mode: ConfigurationMode,
+        modules: modules::Modules,
+    ) -> Result<Self> {
         if limits.memory_bytes == 0 || limits.execution_time.is_zero() {
             return Err(Error::runtime("runtime limits must be positive"));
         }
         let lua = Lua::new();
         lua.set_memory_limit(limits.memory_bytes)?;
         let deadline = Rc::new(Cell::new(Instant::now() + limits.execution_time));
-        let interrupt_deadline = deadline.clone();
-        lua.set_interrupt(move |_| {
-            if Instant::now() >= interrupt_deadline.get() {
-                Err(Error::runtime("script exceeded its execution time limit"))
-            } else {
-                Ok(VmState::Continue)
-            }
-        });
+        let loading_slice = Rc::new(Cell::new(None::<Instant>));
+        preparation::install_interrupt(&lua, deadline.clone(), loading_slice.clone());
         let tracker = Rc::new(RefCell::new(Tracker::default()));
         let services = services::Services::install(&lua, tracker.clone())?;
         for (name, value) in snapshot.values {
@@ -568,59 +577,7 @@ impl Runtime {
         )?;
         let drags = drag::Drags::install(&lua, mode)?;
         lua.sandbox(true)?;
-        let modules = modules::Modules::default();
-        let exported = modules.load(&lua, path)?;
-        if matches!(mode, ConfigurationMode::Lock)
-            && services
-                .managed_process_definitions()
-                .iter()
-                .any(|definition| definition.command.is_some())
-        {
-            return Err(Error::runtime(
-                "scheduled processes are unavailable in lock configurations",
-            ));
-        }
-        if matches!(mode, ConfigurationMode::Lock) {
-            if !services.file_watches().borrow().definitions().is_empty() {
-                return Err(Error::runtime(
-                    "file watches are unavailable in lock configurations",
-                ));
-            }
-            if !services.idle_watches().borrow().watches.is_empty() {
-                return Err(Error::runtime(
-                    "idle watches are unavailable in lock configurations",
-                ));
-            }
-            if !services.sleep_inhibitor_definitions().is_empty() {
-                return Err(Error::runtime(
-                    "sleep inhibitors are unavailable in lock configurations",
-                ));
-            }
-            // lock surfaces cannot publish actions, and their state would
-            // otherwise outlive the lock in another process.
-            if !services.shared_states().borrow().definitions().is_empty() {
-                return Err(Error::runtime(
-                    "shared states are unavailable in lock configurations",
-                ));
-            }
-            if !services.window_state_keys().is_empty() {
-                return Err(Error::runtime(
-                    "windows are unavailable in lock configurations",
-                ));
-            }
-            services.forbid_application_launches();
-            // commands would let other local processes drive the lock screen.
-            if !commands.borrow().is_empty() {
-                return Err(Error::runtime(
-                    "commands are unavailable in lock configurations",
-                ));
-            }
-        }
-        commands.borrow_mut().freeze();
-        services.freeze_declarations();
-        timers.borrow_mut().freeze();
-        motions.borrow_mut().freeze();
-        let mut runtime = Self {
+        Ok(Self {
             lua,
             surfaces: Vec::new(),
             tracker,
@@ -635,6 +592,7 @@ impl Runtime {
             ended_hovers: BTreeSet::new(),
             deadline,
             limits,
+            loading_slice,
             modules,
             services,
             ui,
@@ -647,10 +605,76 @@ impl Runtime {
             output,
             mode,
             drags,
-        };
-        runtime.surfaces = runtime.parse_surfaces(exported)?;
-        for key in runtime.services.window_state_keys() {
-            let declared = runtime.surfaces.iter().any(|surface| {
+        })
+    }
+
+    fn finish_load(mut self, exported: Value) -> Result<Self> {
+        if matches!(self.mode, ConfigurationMode::Lock)
+            && self
+                .services
+                .managed_process_definitions()
+                .iter()
+                .any(|definition| definition.command.is_some())
+        {
+            return Err(Error::runtime(
+                "scheduled processes are unavailable in lock configurations",
+            ));
+        }
+        if matches!(self.mode, ConfigurationMode::Lock) {
+            if !self
+                .services
+                .file_watches()
+                .borrow()
+                .definitions()
+                .is_empty()
+            {
+                return Err(Error::runtime(
+                    "file watches are unavailable in lock configurations",
+                ));
+            }
+            if !self.services.idle_watches().borrow().watches.is_empty() {
+                return Err(Error::runtime(
+                    "idle watches are unavailable in lock configurations",
+                ));
+            }
+            if !self.services.sleep_inhibitor_definitions().is_empty() {
+                return Err(Error::runtime(
+                    "sleep inhibitors are unavailable in lock configurations",
+                ));
+            }
+            // lock surfaces cannot publish actions, and their state would
+            // otherwise outlive the lock in another process.
+            if !self
+                .services
+                .shared_states()
+                .borrow()
+                .definitions()
+                .is_empty()
+            {
+                return Err(Error::runtime(
+                    "shared states are unavailable in lock configurations",
+                ));
+            }
+            if !self.services.window_state_keys().is_empty() {
+                return Err(Error::runtime(
+                    "windows are unavailable in lock configurations",
+                ));
+            }
+            self.services.forbid_application_launches();
+            // commands would let other local processes drive the lock screen.
+            if !self.commands.borrow().is_empty() {
+                return Err(Error::runtime(
+                    "commands are unavailable in lock configurations",
+                ));
+            }
+        }
+        self.commands.borrow_mut().freeze();
+        self.services.freeze_declarations();
+        self.timers.borrow_mut().freeze();
+        self.motions.borrow_mut().freeze();
+        self.surfaces = self.parse_surfaces(exported)?;
+        for key in self.services.window_state_keys() {
+            let declared = self.surfaces.iter().any(|surface| {
                 surface.root.kind == Kind::Window && surface.key == SurfaceKey::Named(key.clone())
             });
             if !declared {
@@ -659,16 +683,16 @@ impl Runtime {
                 )));
             }
         }
-        let _ = runtime.sync_ui_targets();
-        runtime.sync_geometry()?;
-        let mut surfaces = std::mem::take(&mut runtime.surfaces);
-        let marked = runtime.mark_measured(&mut surfaces, &runtime.sources);
-        runtime.surfaces = surfaces;
-        let mut geometry = runtime.geometry.borrow_mut();
+        let _ = self.sync_ui_targets();
+        self.sync_geometry()?;
+        let mut surfaces = std::mem::take(&mut self.surfaces);
+        let marked = self.mark_measured(&mut surfaces, &self.sources);
+        self.surfaces = surfaces;
+        let mut geometry = self.geometry.borrow_mut();
         geometry.marks_stale = false;
         geometry.marked = marked;
         drop(geometry);
-        Ok(runtime)
+        Ok(self)
     }
 
     /// arm autostart timers after the host accepts this runtime.

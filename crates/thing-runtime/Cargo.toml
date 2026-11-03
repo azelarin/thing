@@ -8,7 +8,7 @@ license.workspace = true
 
 [dependencies]
 thing-core = { path = "../thing-core" }
-mlua = { version = "0.12.2", features = ["luau"] }
+mlua = { version = "0.12.2", features = ["luau", "async"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

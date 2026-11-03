@@ -20,6 +20,7 @@ use thing_runtime::{
 use thing_ui::Layout;
 
 mod file_watch;
+mod reload;
 mod shared_state;
 #[cfg(test)]
 mod shared_state_tests;
@@ -1513,22 +1514,7 @@ impl<K: Clone + Eq> Configurations<K> {
                 runtime,
             });
         }
-        let definitions = collect_managed_process_definitions(
-            candidates.iter().map(|instance| &instance.runtime),
-        )?;
-        collect_sleep_inhibitor_definitions(candidates.iter().map(|instance| &instance.runtime))?;
-        file_watch::validate(candidates.iter().map(|instance| &instance.runtime))?;
-        let shared = project_replaced(
-            self.services.shared_states(),
-            candidates.iter().map(|instance| &instance.runtime),
-        )?;
-        services.set_shared_states(shared);
-        Ok(PreparedConfigurations {
-            services,
-            instances: candidates,
-            next_consumer,
-            process_definitions: definitions,
-        })
+        self.finish_prepared_reload(services, candidates, next_consumer)
     }
 
     pub(crate) fn commit_reload(&mut self, mut prepared: PreparedConfigurations<K>) {

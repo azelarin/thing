@@ -154,6 +154,18 @@ when you save a configuration, thing prepares a replacement for every output.
 if one fails, all outputs keep their current configuration. a successful reload
 resets each output's local state and closes its popups.
 
+automatic shell reloads read source files in the background and yield between
+chunks of luau setup, so the current shell can keep handling input and timers.
+a newer save discards the pending replacement, and source files are rechecked
+before acceptance. changes to desktop services or
+output settings during loading are included before the replacement is accepted.
+
+reloads retain at most 1,024 source paths and 16 MiB of source text, with the
+existing 1 MiB limit per file. waiting for a source read does not consume the
+script's execution budget. property functions, compilation, and layout still
+run on the ui thread, so expensive setup can delay a frame. initial loads,
+output additions, and lock-screen reloads use the synchronous loader.
+
 ## multiple surfaces
 
 return an array when one output needs independent surfaces, such as a bar and a

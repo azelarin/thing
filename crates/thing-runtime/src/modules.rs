@@ -1,31 +1,36 @@
 use mlua::{Error, Lua, Result, Table, Value};
 use std::{
-    cell::RefCell,
-    collections::BTreeSet,
-    fs::OpenOptions,
-    io::Read,
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::{Component, Path, PathBuf},
+    pin::Pin,
     rc::Rc,
 };
 
 const MAX_ASSET_FILES: usize = 10_000;
 const MAX_ASSET_PATH_BYTES: usize = 4096;
-const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
 const CACHE_KEY: &str = "thing.modules";
 
 #[derive(Default)]
 struct Dependencies {
     modules: BTreeSet<PathBuf>,
+    aliases: BTreeMap<PathBuf, PathBuf>,
     assets: BTreeSet<PathBuf>,
     loading: BTreeSet<PathBuf>,
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct Modules(Rc<RefCell<Dependencies>>);
+pub(crate) struct Modules {
+    dependencies: Rc<RefCell<Dependencies>>,
+    reader: Rc<RefCell<Option<Rc<crate::preparation::SourceCache>>>>,
+    asynchronous: Rc<Cell<bool>>,
+    preparing: Rc<Cell<bool>>,
+}
 
 impl Modules {
     pub fn files(&self) -> Vec<PathBuf> {
-        let dependencies = self.0.borrow();
+        let dependencies = self.dependencies.borrow();
         dependencies
             .modules
             .union(&dependencies.assets)
@@ -33,40 +38,128 @@ impl Modules {
             .collect()
     }
 
+    pub(crate) fn with_reader(reader: Rc<crate::preparation::SourceCache>) -> Self {
+        Self {
+            reader: Rc::new(RefCell::new(Some(reader))),
+            asynchronous: Rc::new(Cell::new(true)),
+            preparing: Rc::new(Cell::new(true)),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn synchronous_properties(&self) {
+        self.asynchronous.set(false);
+    }
+
+    pub(crate) fn finish_loading(&self) {
+        self.preparing.set(false);
+        self.reader.borrow_mut().take();
+        self.dependencies.borrow_mut().aliases.clear();
+    }
+
     pub fn load(&self, lua: &Lua, path: &Path) -> Result<Value> {
-        let path = path
-            .canonicalize()
-            .map_err(|error| Error::runtime(format!("cannot open {}: {error}", path.display())))?;
-        let key = path
-            .to_str()
-            .ok_or_else(|| Error::runtime("configuration paths must be UTF-8"))?;
-        let cache = match lua.named_registry_value::<Table>(CACHE_KEY) {
-            Ok(cache) => cache,
+        let prepared_source = if self.preparing.get() {
+            let reader = self
+                .reader
+                .borrow()
+                .clone()
+                .expect("preparation needs its source cache");
+            Some(reader.synchronous(path)?)
+        } else {
+            None
+        };
+        let path = match &prepared_source {
+            Some(source) => source.path.clone(),
+            None => path.canonicalize().map_err(|error| {
+                Error::runtime(format!("cannot open {}: {error}", path.display()))
+            })?,
+        };
+        let cache = self.cache(lua)?;
+        if let Some(value) = self.begin(&cache, &path)? {
+            return Ok(value);
+        }
+        let result = (|| {
+            let source = match prepared_source {
+                Some(source) => source,
+                None => crate::SourceFile::read_canonical(path.clone()).map_err(Error::runtime)?,
+            };
+            self.chunk(lua, &source)?.call(())
+        })();
+        self.complete(&cache, &path, result)
+    }
+
+    pub(crate) fn load_async(
+        &self,
+        lua: Lua,
+        path: PathBuf,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>>>> {
+        let modules = self.clone();
+        Box::pin(async move {
+            let cache = modules.cache(&lua)?;
+            let alias = modules.dependencies.borrow().aliases.get(&path).cloned();
+            if let Some(alias) = alias {
+                let cached: Value = cache.raw_get(alias.to_string_lossy().as_ref())?;
+                if !cached.is_nil() {
+                    return Ok(cached);
+                }
+            }
+            let reader = modules
+                .reader
+                .borrow()
+                .clone()
+                .expect("async modules need a source cache");
+            let source = reader.read(path.clone()).await?;
+            modules
+                .dependencies
+                .borrow_mut()
+                .aliases
+                .insert(path, source.path.clone());
+            if let Some(value) = modules.begin(&cache, &source.path)? {
+                return Ok(value);
+            }
+            let result = match modules.chunk(&lua, &source) {
+                Ok(chunk) => chunk.call_async::<Value>(()).await,
+                Err(error) => Err(error),
+            };
+            modules.complete(&cache, &source.path, result)
+        })
+    }
+
+    fn cache(&self, lua: &Lua) -> Result<Table> {
+        match lua.named_registry_value::<Table>(CACHE_KEY) {
+            Ok(cache) => Ok(cache),
             Err(_) => {
                 let cache = lua.create_table()?;
                 lua.set_named_registry_value(CACHE_KEY, cache.clone())?;
-                cache
+                Ok(cache)
             }
-        };
+        }
+    }
+
+    fn begin(&self, cache: &Table, path: &Path) -> Result<Option<Value>> {
+        let key = path
+            .to_str()
+            .ok_or_else(|| Error::runtime("configuration paths must be UTF-8"))?;
         let cached: Value = cache.raw_get(key)?;
         if !cached.is_nil() {
-            return Ok(cached);
+            return Ok(Some(cached));
         }
-        {
-            let mut dependencies = self.0.borrow_mut();
-            if dependencies.loading.len() >= 64 {
-                return Err(Error::runtime("imports exceed 64 nested modules"));
-            }
-            if !dependencies.loading.insert(path.clone()) {
-                return Err(Error::runtime(format!(
-                    "circular import: {}",
-                    path.display()
-                )));
-            }
-            dependencies.modules.insert(path.clone());
+        let mut dependencies = self.dependencies.borrow_mut();
+        if dependencies.loading.len() >= 64 {
+            return Err(Error::runtime("imports exceed 64 nested modules"));
         }
-        let result = self.evaluate(lua, &path);
-        self.0.borrow_mut().loading.remove(&path);
+        if !dependencies.loading.insert(path.to_owned()) {
+            return Err(Error::runtime(format!(
+                "circular import: {}",
+                path.display()
+            )));
+        }
+        dependencies.modules.insert(path.to_owned());
+        Ok(None)
+    }
+
+    fn complete(&self, cache: &Table, path: &Path, result: Result<Value>) -> Result<Value> {
+        self.dependencies.borrow_mut().loading.remove(path);
         let result = result?;
         if result.is_nil() {
             return Err(Error::runtime(format!(
@@ -74,68 +167,46 @@ impl Modules {
                 path.display()
             )));
         }
-        cache.raw_set(key, result.clone())?;
+        cache.raw_set(path.to_string_lossy().as_ref(), result.clone())?;
         Ok(result)
     }
 
-    fn evaluate(&self, lua: &Lua, path: &Path) -> Result<Value> {
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // opening a fifo must not wait for a writer before we can inspect
-            // the descriptor. regular files ignore O_NONBLOCK.
-            options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
-        }
-        let file = options.open(path).map_err(Error::external)?;
-        if !file.metadata().map_err(Error::external)?.is_file() {
-            return Err(Error::runtime(format!(
-                "{}: configuration source must be a regular file",
-                path.display()
-            )));
-        }
-        let mut source = Vec::new();
-        file.take(MAX_SOURCE_BYTES + 1)
-            .read_to_end(&mut source)
-            .map_err(Error::external)?;
-        if source.len() as u64 > MAX_SOURCE_BYTES {
-            return Err(Error::runtime(format!(
-                "{} exceeds the 1 MiB source limit",
-                path.display()
-            )));
-        }
-        let source = std::str::from_utf8(&source).map_err(Error::external)?;
+    fn chunk(&self, lua: &Lua, source: &crate::SourceFile) -> Result<mlua::Function> {
         let environment = lua.create_table()?;
         let metatable = lua.create_table()?;
         metatable.set("__index", lua.globals())?;
         environment.set_metatable(Some(metatable))?;
-        let parent = path
+        let parent = source
+            .path
             .parent()
             .ok_or_else(|| Error::runtime("entry file needs a parent directory"))?
             .to_owned();
         environment.set("ui", self.module_ui(lua, &parent)?)?;
         environment.set("services", self.module_services(lua, &parent)?)?;
         let modules = self.clone();
-        environment.set(
-            "require",
+        let require = if self.preparing.get() {
+            lua.create_async_function(move |lua, relative: String| {
+                let modules = modules.clone();
+                let path = import_path(&parent, &relative);
+                async move {
+                    let path = path?;
+                    if modules.asynchronous.get() {
+                        modules.load_async(lua, path).await
+                    } else {
+                        modules.load(&lua, &path)
+                    }
+                }
+            })?
+        } else {
             lua.create_function(move |lua, relative: String| {
-                if !(relative.starts_with("./") || relative.starts_with("../")) {
-                    return Err(Error::runtime(
-                        "require expects a relative path, for example './theme'",
-                    ));
-                }
-                let mut path = parent.join(relative);
-                if path.extension().is_none() {
-                    path.set_extension("luau");
-                }
-                modules.load(lua, &path)
-            })?,
-        )?;
-        lua.load(source)
-            .set_name(format!("@{}", path.display()))
+                modules.load(lua, &import_path(&parent, &relative)?)
+            })?
+        };
+        environment.set("require", require)?;
+        lua.load(source.text.as_ref())
+            .set_name(format!("@{}", source.path.display()))
             .set_environment(environment)
-            .eval()
+            .into_function()
     }
 
     fn module_services(&self, lua: &Lua, parent: &Path) -> Result<Table> {
@@ -203,7 +274,7 @@ impl Modules {
             return Err(Error::runtime("asset paths must be at most 4096 bytes"));
         }
         let path = resolve_path(parent, relative, PathParents::Normalize)?;
-        let mut dependencies = self.0.borrow_mut();
+        let mut dependencies = self.dependencies.borrow_mut();
         if !dependencies.assets.contains(Path::new(&path))
             && dependencies.assets.len() >= MAX_ASSET_FILES
         {
@@ -250,6 +321,19 @@ fn resolve_path(parent: &Path, name: &str, parents: PathParents) -> Result<Strin
         .to_owned();
     if path.len() > MAX_ASSET_PATH_BYTES {
         return Err(Error::runtime("resolved paths must be at most 4096 bytes"));
+    }
+    Ok(path)
+}
+
+fn import_path(parent: &Path, relative: &str) -> Result<PathBuf> {
+    if !(relative.starts_with("./") || relative.starts_with("../")) {
+        return Err(Error::runtime(
+            "require expects a relative path, for example './theme'",
+        ));
+    }
+    let mut path = parent.join(relative);
+    if path.extension().is_none() {
+        path.set_extension("luau");
     }
     Ok(path)
 }
