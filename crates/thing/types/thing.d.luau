@@ -472,7 +472,24 @@ export type ThingCursor =
     | "nwse_resize" | "col_resize" | "row_resize" | "all_scroll"
     | "zoom_in" | "zoom_out"
 
+export type ThingAccessibilityRole = "group" | "toolbar" | "list" | "list_item"
+    | "menu" | "menu_item" | "menu_item_checkbox" | "menu_item_radio"
+    | "dialog" | "status" | "alert" | "checkbox" | "radio" | "switch" | "image"
+export type ThingAccessibilityChecked = boolean | "mixed"
+export type ThingAccessibilityProperties = {
+    label: ThingReactive<string?>?,
+    description: ThingReactive<string?>?,
+    role: ThingAccessibilityRole?,
+    selected: ThingReactive<boolean?>?,
+    checked: ThingReactive<ThingAccessibilityChecked?>?,
+    expanded: ThingReactive<boolean?>?,
+    value_text: ThingReactive<string?>?,
+    live: ("polite" | "assertive")?,
+    hidden: ThingReactive<boolean?>?,
+}
+
 export type ThingPanelProperties = {
+    accessibility: ThingAccessibilityProperties?,
     key: string?,
     visible: ThingReactive<boolean>?,
     cursor: ThingReactive<ThingCursor?>?,
@@ -498,6 +515,7 @@ export type ThingWindowSize = { width: number, height: number }
 -- a compositor-managed toplevel. its size comes from size, the limits, and
 -- the compositor, so style width and height are not accepted.
 export type ThingWindowProperties = {
+    accessibility: ThingAccessibilityProperties?,
     key: string?,
     visible: ThingReactive<boolean>?,
     cursor: ThingReactive<ThingCursor?>?,
@@ -516,6 +534,7 @@ export type ThingWindowProperties = {
 }
 
 export type ThingLockProperties = {
+    accessibility: ThingAccessibilityProperties?,
     visible: ThingReactive<boolean>?,
     cursor: ThingReactive<ThingCursor?>?,
     enabled: ThingReactive<boolean>?,
@@ -525,6 +544,7 @@ export type ThingLockProperties = {
 }
 
 export type ThingContainerProperties = {
+    accessibility: ThingAccessibilityProperties?,
     key: string?,
     visible: ThingReactive<boolean>?,
     cursor: ThingReactive<ThingCursor?>?,
@@ -535,6 +555,7 @@ export type ThingContainerProperties = {
 }
 
 export type ThingScrollProperties = {
+    accessibility: ThingAccessibilityProperties?,
     axis: ThingReactive<ThingScrollAxis>?,
     key: string?,
     visible: ThingReactive<boolean>?,
@@ -561,6 +582,7 @@ export type ThingStyledSpan = {
 export type ThingTextSpan = ThingStyledSpan | string
 
 export type ThingTextProperties = {
+    accessibility: ThingAccessibilityProperties?,
     key: string?,
     visible: ThingReactive<boolean>?,
     cursor: ThingReactive<ThingCursor?>?,
@@ -576,6 +598,7 @@ export type ThingTextProperties = {
 }
 
 export type ThingTextInputProperties = {
+    accessibility: ThingAccessibilityProperties?,
     key: string?,
     autofocus: boolean?,
     visible: ThingReactive<boolean>?,
@@ -590,6 +613,7 @@ export type ThingTextInputProperties = {
 }
 
 export type ThingSecretInputProperties = {
+    accessibility: ThingAccessibilityProperties?,
     key: string?,
     autofocus: boolean?,
     visible: ThingReactive<boolean>?,
@@ -605,6 +629,7 @@ export type ThingCrossfadeProperties = ThingContainerProperties & {
 }
 
 export type ThingImageProperties = {
+    accessibility: ThingAccessibilityProperties?,
     key: string?,
     visible: ThingReactive<boolean>?,
     cursor: ThingReactive<ThingCursor?>?,
@@ -624,6 +649,7 @@ export type ThingImageProperties = {
 }
 
 export type ThingPathProperties = {
+    accessibility: ThingAccessibilityProperties?,
     key: string?,
     visible: ThingReactive<boolean>?,
     cursor: ThingReactive<ThingCursor?>?,
@@ -642,6 +668,7 @@ export type ThingPathProperties = {
 }
 
 export type ThingButtonProperties = {
+    accessibility: ThingAccessibilityProperties?,
     key: string?,
     autofocus: boolean?,
     visible: ThingReactive<boolean>?,
@@ -658,6 +685,7 @@ export type ThingButtonProperties = {
 }
 
 export type ThingPointerAreaProperties = {
+    accessibility: ThingAccessibilityProperties?,
     key: string?,
     visible: ThingReactive<boolean>?,
     cursor: ThingReactive<ThingCursor?>?,
@@ -673,6 +701,7 @@ export type ThingPointerAreaProperties = {
 }
 
 export type ThingSliderProperties = {
+    accessibility: ThingAccessibilityProperties?,
     key: string?,
     autofocus: boolean?,
     visible: ThingReactive<boolean>?,
@@ -688,6 +717,7 @@ export type ThingSliderProperties = {
 }
 
 export type ThingRangeProperties = {
+    accessibility: ThingAccessibilityProperties?,
     key: string?,
     autofocus: boolean?,
     visible: ThingReactive<boolean>?,
@@ -706,6 +736,7 @@ export type ThingRangeProperties = {
 }
 
 export type ThingPopupProperties = {
+    accessibility: ThingAccessibilityProperties?,
     key: string?,
     visible: ThingReactive<boolean>?,
     cursor: ThingReactive<ThingCursor?>?,

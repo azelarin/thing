@@ -3,6 +3,7 @@
 //! a [`Runtime`] owns a loaded configuration and its state. it exposes validated
 //! surface trees to the renderer.
 
+mod accessibility;
 mod bounds;
 mod command;
 mod drag;
@@ -2794,6 +2795,7 @@ impl Runtime {
                     }
                     self.handlers.insert((node.id, name), function);
                 }
+                "accessibility" => accessibility::parse(self, &mut node, value)?,
                 "style" => {
                     let Value::Table(style) = value else {
                         return Err(Error::runtime("style must be a table"));
@@ -2820,6 +2822,13 @@ impl Runtime {
     }
 
     fn property(&mut self, node: &mut Node, property: String, value: Value) -> Result<()> {
+        if matches!(
+            property.as_str(),
+            "accessibility.role" | "accessibility.live"
+        ) && matches!(&value, Value::Function(_) | Value::UserData(_))
+        {
+            return Err(Error::runtime(format!("{property} must be static")));
+        }
         let descriptor = match &value {
             Value::UserData(value) => value
                 .borrow::<transition::Descriptor>()

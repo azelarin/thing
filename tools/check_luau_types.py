@@ -267,6 +267,8 @@ CASES = (
             "Property 'text' is not compatible.",
         ),
     ),
+    Case("valid-accessibility.luau"),
+    Case("invalid-accessibility.luau", ("Property 'role' is not compatible.", "Property 'live' is not compatible.", "Property 'checked' is not compatible.", "Property 'label' is not compatible.")),
     Case("valid-file-watch.luau"),
     Case("invalid-file-watch.luau", ("Property 'path' is not compatible.", "Property 'on_change' is not compatible.")),
     Case("valid-shared-state.luau"),
