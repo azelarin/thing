@@ -68,8 +68,27 @@ impl Fixture {
         }
         seen
     }
+    fn wait_ready(&mut self, count: usize, expected: &str) -> Vec<Delivery<u32>> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let expected = FileWatchSnapshot::Ready(Arc::from(expected));
+        let mut seen = BTreeMap::new();
+        while seen.len() < count {
+            for update in self.monitor.take_deliveries() {
+                if update.snapshot == expected {
+                    let key = (update.output, update.consumer.clone(), update.key.clone());
+                    seen.insert(key, update);
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected file contents were not delivered"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        seen.into_values().collect()
+    }
     fn ready(&mut self, expected: &str) {
-        let updates = self.wait(1);
+        let updates = self.wait_ready(1, expected);
         assert_eq!(updates.len(), 1);
         assert_eq!(
             updates[0].snapshot,
@@ -99,7 +118,7 @@ fn changes_replacements_missing_parents_and_output_subscriptions_share_one_snaps
     );
     fs::create_dir(&parent).unwrap();
     fs::write(&path, "one").unwrap();
-    let first = fixture.wait(2);
+    let first = fixture.wait_ready(2, "one");
     assert_eq!(first.len(), 2);
     let [FileWatchSnapshot::Ready(a), FileWatchSnapshot::Ready(b)] =
         [&first[0].snapshot, &first[1].snapshot]
@@ -112,7 +131,7 @@ fn changes_replacements_missing_parents_and_output_subscriptions_share_one_snaps
     let replacement = parent.join("replacement");
     fs::write(&replacement, "two").unwrap();
     fs::rename(replacement, &path).unwrap();
-    let next = fixture.wait(2);
+    let next = fixture.wait_ready(2, "two");
     assert!(
         next.iter()
             .all(|item| item.snapshot == FileWatchSnapshot::Ready(Arc::from("two")))

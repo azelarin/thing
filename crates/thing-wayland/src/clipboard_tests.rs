@@ -1259,6 +1259,7 @@ fn foreign_selections_with_our_formats_cancel_pending_images() {
         compositor.queue.roundtrip(&mut compositor.state).unwrap();
         compositor.select(&text_formats());
         compositor.settle_encode();
+        compositor.until(|snapshot| snapshot.text.as_deref() == Some("theirs"));
         assert_eq!(
             compositor.published_images(),
             0,

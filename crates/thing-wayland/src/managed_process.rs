@@ -3667,7 +3667,10 @@ mod tests {
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(0)
             + 1;
-        std::fs::write(path, count.to_string()).unwrap();
+        // scheduling assertions read this file while the child is running.
+        let staged = path.with_extension("next");
+        std::fs::write(&staged, count.to_string()).unwrap();
+        std::fs::rename(staged, path).unwrap();
         println!("run={count}");
         std::io::stdout().flush().unwrap();
         thread::sleep(Duration::from_millis(250));
