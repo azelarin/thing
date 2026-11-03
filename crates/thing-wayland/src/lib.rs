@@ -37,6 +37,7 @@ mod render;
 #[cfg(feature = "vulkan")]
 mod skia_vulkan;
 mod sleep;
+mod source;
 mod system_tray;
 mod text_data;
 mod toplevel;

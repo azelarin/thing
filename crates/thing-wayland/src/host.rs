@@ -118,6 +118,7 @@ mod input;
 mod inspection;
 mod launching;
 mod protocol;
+mod reload;
 mod services;
 mod surfaces;
 
@@ -343,6 +344,8 @@ fn run_instance(
     let (file_watch_ping, file_watch_source) =
         calloop::ping::make_ping().map_err(|error| error.to_string())?;
     let file_watches = crate::file_watch::FileWatches::new(file_watch_ping);
+    let (reload_ping, reload_source) =
+        calloop::ping::make_ping().map_err(|error| error.to_string())?;
     let input_method = InputMethod::bind(&globals, &qh);
     let mut event_loop: EventLoop<'static, App> =
         EventLoop::try_new().map_err(|error| error.to_string())?;
@@ -362,6 +365,7 @@ fn run_instance(
         configurations: Configurations::new(entry, services),
         watch: watch.clone(),
         reload_at: None,
+        reloads: Some(reload::Reloads::new(reload_ping)),
         hover: HoverStates::default(),
         audio,
         media,
@@ -499,6 +503,10 @@ fn run_instance(
         .handle()
         .insert_source(file_watch_source, |_, _, app| app.update_file_watches())
         .map_err(|error| error.to_string())?;
+    event_loop
+        .handle()
+        .insert_source(reload_source, |_, _, _| {})
+        .map_err(|error| error.to_string())?;
     WaylandSource::new(connection.clone(), queue)
         .insert(event_loop.handle())
         .map_err(|error| error.to_string())?;
@@ -508,7 +516,7 @@ fn run_instance(
             Generic::new(watch, Interest::READ, Mode::Level),
             |_, watch, app| {
                 if watch.changed()? {
-                    app.reload_at = Some(Instant::now() + Duration::from_millis(80));
+                    app.schedule_reload();
                 }
                 Ok(PostAction::Continue)
             },
@@ -624,8 +632,11 @@ impl App {
             .is_some_and(|deadline| deadline <= Instant::now())
         {
             self.reload_at = None;
-            self.reload(qh)?;
+            if let Err(error) = self.begin_reload() {
+                eprintln!("thing: reload failed; keeping the previous surfaces: {error}");
+            }
         }
+        self.advance_reload(qh)?;
         self.dispatch_due_timers(Instant::now());
         self.publish_window_states();
         if self
@@ -1275,6 +1286,7 @@ pub(crate) struct App {
     pending_ui_actions: Vec<PendingUiAction>,
     watch: Rc<Watch>,
     reload_at: Option<Instant>,
+    reloads: Option<reload::Reloads>,
     hover: HoverStates<SurfaceOwner>,
     surfaces: Vec<Surface>,
     closed_surfaces: Vec<SurfaceOwner>,
@@ -1453,132 +1465,6 @@ impl App {
         self.reconcile_layout_focus();
         self.reconcile_input_method(InputMethodChangeCause::Other);
         self.reconcile_drags();
-    }
-
-    fn reload(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
-        let outputs: Vec<_> = self
-            .outputs
-            .outputs()
-            .filter_map(|output| {
-                self.output_context(&output)
-                    .or_else(|| self.configurations.output(&output).cloned())
-                    .map(|context| (output, context))
-            })
-            .collect();
-        let layer_shell_version = self.layer_shell_version;
-        let entries = outputs
-            .iter()
-            .map(|(output, context)| {
-                self.replacement_layout_validation_entry(output.clone(), context.clone())
-            })
-            .collect();
-        let retired_consumers = self.configurations.consumers();
-        let loop_handle = self.loop_handle.clone();
-        let replacement = (|| {
-            let preflight = LayoutPreflight::new(
-                &mut self.render,
-                layer_shell_version,
-                self.idle_inhibit.active().is_some(),
-                entries,
-            );
-            let mut configurations = self
-                .configurations
-                .prepare_reload_for_checked(outputs, |output, runtime| {
-                    preflight.validate(output, runtime.surfaces())
-                })?;
-            let process_definitions = configurations.managed_process_definitions().to_vec();
-            let projected_processes = project_managed_processes(
-                self.managed_processes.as_ref(),
-                &process_definitions,
-                ManagedProcessScopeChange::Replace,
-            )?;
-            configurations
-                .set_managed_processes(projected_processes.clone(), |output, runtime| {
-                    preflight.validate(output, runtime.surfaces())
-                })?;
-            let activation = prepare_and_commit_managed_processes(
-                &mut self.managed_processes,
-                &loop_handle,
-                &process_definitions,
-                ManagedProcessScopeChange::Replace,
-                projected_processes,
-                |snapshot| {
-                    configurations.set_managed_processes(snapshot, |output, runtime| {
-                        preflight.validate(output, runtime.surfaces())
-                    })
-                },
-            )?;
-            let prepared = preflight.into_prepared();
-            Ok::<_, String>((configurations, activation, prepared))
-        })();
-        let (configurations, activation, prepared) = match replacement {
-            Ok(replacement) => replacement,
-            Err(error) => {
-                eprintln!("thing: reload failed; keeping the previous surfaces: {error}");
-                return Ok(());
-            }
-        };
-        self.configurations.commit_reload(configurations);
-        // a successful reload retires every widget identity; a rejected one
-        // returned above and keeps the highlight.
-        self.clear_highlight();
-        self.reconcile_notification_expiry();
-        self.cancel_pending_text_paste();
-        // the replacement runtimes never inherit an in-flight pointer sequence.
-        if let Some(capture) = self.pointer_capture.take() {
-            self.clear_pressed_for_capture(&capture);
-        }
-        for consumer in retired_consumers {
-            if let Err(error) = release_system_tray_consumer(self.system_tray.as_ref(), &consumer) {
-                eprintln!("thing: {error}");
-            }
-        }
-        // release the previous configuration's glyph atlas and text layouts.
-        let wake = self.image_ping.clone();
-        self.render.reset_painter(move || wake.ping())?;
-        self.hover.clear();
-        self.clear_key_repeat();
-        self.pending_ui_actions.clear();
-        while let Some(index) = self
-            .surfaces
-            .iter()
-            .rposition(|surface| matches!(surface.role, Role::Popup(_)))
-        {
-            self.remove_popup(index, false, false);
-        }
-        self.closed_surfaces.clear();
-        let removed: Vec<_> = self
-            .surfaces
-            .iter()
-            .filter(|surface| {
-                surface.role.is_root() && !self.configurations.contains(&surface.output)
-            })
-            .map(Surface::owner)
-            .collect();
-        for owner in removed {
-            self.remove_root(&owner, false);
-        }
-        let outputs: Vec<_> = self.configurations.keys().cloned().collect();
-        for output in &outputs {
-            self.sync_output_surfaces(output, true, qh)?;
-        }
-        self.install_prepared_layouts(prepared);
-        arm_managed_processes(self.managed_processes.as_ref(), activation);
-        self.reconcile_sleep();
-        self.reconcile_idle_watches();
-        self.reconcile_file_watches();
-        if self
-            .keyboard_surface
-            .as_ref()
-            .is_some_and(|wl| self.index(wl).is_none())
-        {
-            self.clear_keyboard_focus();
-        }
-        self.apply_pending_ui_actions(MissingSurfacePolicy::Expire)?;
-        self.update_watch();
-        self.reconcile_input_method(InputMethodChangeCause::Other);
-        eprintln!("thing: reloaded {}", self.configurations.entry().display());
-        Ok(())
     }
 
     fn invalidate_output(&mut self, output: &wl_output::WlOutput) {

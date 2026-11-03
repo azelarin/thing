@@ -759,6 +759,7 @@ impl Host {
             pending_ui_actions: Vec::new(),
             watch,
             reload_at: None,
+            reloads: None,
             hover: HoverStates::default(),
             surfaces: Vec::new(),
             closed_surfaces: Vec::new(),
@@ -1453,3 +1454,6 @@ fn pointer_events_publish_shared_state_through_the_host() {
 
 #[path = "file_watch_tests.rs"]
 mod file_watch_tests;
+
+#[path = "reload_tests.rs"]
+mod reload_tests;

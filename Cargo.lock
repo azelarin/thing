@@ -1059,6 +1059,7 @@ checksum = "7a7ae6b65bf54b7fdd4cf5b6f44f60862350ebf3fe3779b3a9cc005e7fa14f81"
 dependencies = [
  "bstr",
  "either",
+ "futures-util",
  "libc",
  "mlua-sys",
  "num-traits",
