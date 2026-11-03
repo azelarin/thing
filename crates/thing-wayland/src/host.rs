@@ -113,6 +113,7 @@ use crate::output::{fallback_logical_size, valid_dimensions};
 
 mod dispatch;
 mod drag;
+mod file_watch;
 mod input;
 mod inspection;
 mod launching;
@@ -339,6 +340,9 @@ fn run_instance(
     let (drag_ping, drag_source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
     let drag = drag::HostDrag::new(drag_ping)
         .map_err(|error| format!("cannot start drag and drop support: {error}"))?;
+    let (file_watch_ping, file_watch_source) =
+        calloop::ping::make_ping().map_err(|error| error.to_string())?;
+    let file_watches = crate::file_watch::FileWatches::new(file_watch_ping);
     let input_method = InputMethod::bind(&globals, &qh);
     let mut event_loop: EventLoop<'static, App> =
         EventLoop::try_new().map_err(|error| error.to_string())?;
@@ -376,6 +380,7 @@ fn run_instance(
         input_method,
         launcher,
         managed_processes: None,
+        file_watches: Some(file_watches),
         pending_launches: PendingLaunches::new(),
         pending_ui_actions: Vec::new(),
         surfaces: Vec::new(),
@@ -490,6 +495,10 @@ fn run_instance(
         .handle()
         .insert_source(drag_source, |_, _, app| app.update_drag_drop())
         .map_err(|e| e.to_string())?;
+    event_loop
+        .handle()
+        .insert_source(file_watch_source, |_, _, app| app.update_file_watches())
+        .map_err(|error| error.to_string())?;
     WaylandSource::new(connection.clone(), queue)
         .insert(event_loop.handle())
         .map_err(|error| error.to_string())?;
@@ -595,6 +604,7 @@ impl App {
         arm_managed_processes(self.managed_processes.as_ref(), activation);
         self.reconcile_sleep();
         self.reconcile_idle_watches();
+        self.reconcile_file_watches();
         self.loading_outputs = false;
         self.update_watch();
         Ok(())
@@ -1260,6 +1270,7 @@ pub(crate) struct App {
     input_method: InputMethod,
     launcher: Launcher,
     managed_processes: Option<ProcessManager>,
+    file_watches: Option<crate::file_watch::FileWatches<wl_output::WlOutput>>,
     pending_launches: PendingLaunches<XdgActivationTokenV1, PendingLaunch>,
     pending_ui_actions: Vec<PendingUiAction>,
     watch: Rc<Watch>,
@@ -1555,6 +1566,7 @@ impl App {
         arm_managed_processes(self.managed_processes.as_ref(), activation);
         self.reconcile_sleep();
         self.reconcile_idle_watches();
+        self.reconcile_file_watches();
         if self
             .keyboard_surface
             .as_ref()

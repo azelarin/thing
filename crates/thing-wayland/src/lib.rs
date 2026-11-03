@@ -11,6 +11,7 @@ mod cursor;
 mod data_transfer;
 mod drag_drop;
 mod egl;
+mod file_watch;
 mod focus;
 mod focused_clipboard;
 mod host;

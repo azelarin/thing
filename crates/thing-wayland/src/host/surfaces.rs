@@ -135,6 +135,7 @@ impl App {
             arm_managed_processes(self.managed_processes.as_ref(), activation);
             self.reconcile_sleep();
             self.reconcile_idle_watches();
+            self.reconcile_file_watches();
             self.update_watch();
             return Ok(());
         }

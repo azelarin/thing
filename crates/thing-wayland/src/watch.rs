@@ -22,6 +22,7 @@ const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
 
 pub(crate) struct Watch {
     fd: OwnedFd,
+    mask: u32,
     directories: RefCell<BTreeMap<PathBuf, i32>>,
     files: RefCell<BTreeSet<PathBuf>>,
 }
@@ -34,6 +35,14 @@ impl AsFd for Watch {
 
 impl Watch {
     pub fn new() -> io::Result<Self> {
+        Self::with_mask(WATCH_MASK)
+    }
+
+    pub(crate) fn with_attributes() -> io::Result<Self> {
+        Self::with_mask(WATCH_MASK | libc::IN_ATTRIB)
+    }
+
+    fn with_mask(mask: u32) -> io::Result<Self> {
         // SAFETY: inotify_init1 takes only flags and returns a new owned fd.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
@@ -42,6 +51,7 @@ impl Watch {
         Ok(Self {
             // SAFETY: fd is a successful, uniquely owned inotify descriptor.
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            mask,
             directories: RefCell::default(),
             files: RefCell::default(),
         })
@@ -110,7 +120,7 @@ impl Watch {
             let name = CString::new(path.as_os_str().as_bytes())?;
             // SAFETY: fd remains live; name is nul-terminated and valid for this call.
             let wd =
-                unsafe { libc::inotify_add_watch(self.fd.as_raw_fd(), name.as_ptr(), WATCH_MASK) };
+                unsafe { libc::inotify_add_watch(self.fd.as_raw_fd(), name.as_ptr(), self.mask) };
             if wd >= 0 {
                 installed.insert(wd);
                 after_watch(&path);

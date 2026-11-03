@@ -751,6 +751,7 @@ impl Host {
             input_method: InputMethod::bind(&globals, &qh),
             launcher: Launcher::for_tests(),
             managed_processes: None,
+            file_watches: None,
             pending_launches: match token_wait {
                 Some(wait) => PendingLaunches::with_limits(128, wait),
                 None => PendingLaunches::new(),
@@ -1449,3 +1450,6 @@ fn pointer_events_publish_shared_state_through_the_host() {
         a_pointer_event_publishes_shared_state_and_updates_the_panel,
     );
 }
+
+#[path = "file_watch_tests.rs"]
+mod file_watch_tests;

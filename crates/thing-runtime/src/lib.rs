@@ -6,6 +6,7 @@
 mod bounds;
 mod command;
 mod drag;
+mod file_watch;
 mod geometry;
 mod idle;
 mod modules;
@@ -32,6 +33,10 @@ pub use drag::{
     DragResult, DropDataError, DropInput, DropOutcome, DropPosition, MAX_DRAG_FILES,
     MAX_DRAG_TEXT_BYTES, MAX_FILE_URI_BYTES, MAX_URI_LIST_BYTES, decode_drop_text, decode_uri_list,
     encode_uri_list, file_uri_path, path_file_uri,
+};
+pub use file_watch::{
+    FileWatchDefinition, FileWatchSnapshot, MAX_FILE_WATCH_ERROR_BYTES, MAX_FILE_WATCHES,
+    MAX_WATCHED_FILE_BYTES, MAX_WATCHED_FILE_PATHS,
 };
 pub use geometry::{GeometryUpdate, MAX_FEEDBACK_ROUNDS};
 pub use idle::{IdleWatchDefinition, MAX_IDLE_TIMEOUT_MS, MAX_IDLE_WATCHES, MIN_IDLE_TIMEOUT_MS};
@@ -576,6 +581,11 @@ impl Runtime {
             ));
         }
         if matches!(mode, ConfigurationMode::Lock) {
+            if !services.file_watches().borrow().definitions().is_empty() {
+                return Err(Error::runtime(
+                    "file watches are unavailable in lock configurations",
+                ));
+            }
             if !services.idle_watches().borrow().watches.is_empty() {
                 return Err(Error::runtime(
                     "idle watches are unavailable in lock configurations",

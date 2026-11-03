@@ -154,6 +154,7 @@ impl OutputHandler for App {
             }
             self.reconcile_sleep();
             self.reconcile_idle_watches();
+            self.reconcile_file_watches();
         }
         self.reconcile_notification_expiry();
         self.update_watch();

@@ -1778,6 +1778,7 @@ pub(crate) struct Services {
     // are declared while the configuration loads and frozen afterward.
     managed_process_declarations_open: Rc<Cell<bool>>,
     idle_watches: Rc<RefCell<crate::idle::IdleWatches>>,
+    file_watches: Rc<RefCell<crate::file_watch::FileWatches>>,
     sleep_inhibitors: Rc<RefCell<crate::sleep::SleepInhibitors>>,
     pub(crate) shared_states: Rc<RefCell<crate::shared_state::SharedStateHandles>>,
     window_states: Rc<RefCell<crate::window::WindowStates>>,
@@ -1836,6 +1837,7 @@ impl Services {
             managed_process_signals: Rc::default(),
             managed_process_declarations_open: Rc::new(Cell::new(true)),
             idle_watches: Rc::default(),
+            file_watches: Rc::default(),
             sleep_inhibitors: Rc::default(),
             shared_states: Rc::default(),
             window_states: Rc::default(),
@@ -2530,6 +2532,12 @@ impl Services {
         }
         niri.set_readonly(true);
         clock.set_readonly(true);
+        crate::file_watch::install(
+            lua,
+            &services,
+            result.file_watches.clone(),
+            result.managed_process_declarations_open.clone(),
+        )?;
         crate::idle::install(
             lua,
             &idle,
@@ -2645,6 +2653,10 @@ impl Services {
     pub fn freeze_declarations(&self) {
         self.managed_process_declarations_open.set(false);
         self.shared_states.borrow_mut().finish_loading();
+    }
+
+    pub(crate) fn file_watches(&self) -> &Rc<RefCell<crate::file_watch::FileWatches>> {
+        &self.file_watches
     }
 
     pub(crate) fn idle_watches(&self) -> &Rc<RefCell<crate::idle::IdleWatches>> {

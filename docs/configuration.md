@@ -1628,6 +1628,60 @@ nothing. when an output disconnects, its values stay, so an output that
 returns finds them again, unless keeping them would pass the limits when
 another output connects. lock configurations cannot declare shared state.
 
+## watched files
+
+use `services.watch_file` for data that another program writes to a file:
+
+```luau
+local weather = services.shared_state { key = 'weather', initial = 'no data' }
+
+services.watch_file {
+    key = 'weather-file',
+    path = './weather.txt',
+    on_change = function(event)
+        if event.status == 'ready' then weather:set(event.text) end
+    end,
+}
+
+return ui.panel { children = {
+    ui.text { text = function() return weather:get() end },
+} }
+```
+
+declare watches while the configuration loads. `path` can be absolute or start
+with `./` or `../`, relative to the module that declares it. editing the data
+file calls its handler without resetting the shell. a `key` is unique within
+one output's configuration and uses 1 to 64 ascii letters, digits, `-`, `_`, or
+`.`.
+
+the first event arrives after the configuration is accepted. its read-only
+table has one of three shapes:
+
+| `status` | fields |
+| --- | --- |
+| `ready` | `text`, the file's utf-8 contents |
+| `missing` | no additional fields; the path stays watched for recreation |
+| `failed` | `error`, a description of the read or watch failure |
+
+later events arrive when that result changes. file reads happen in the
+background, and outputs watching the same path share one read. each declaring
+output runs its own callback, so use shared state when they should publish the
+same value. updates can coalesce while callbacks are busy; a watch delivers
+current data rather than a log of every write.
+
+a callback uses the same action and layout checks as an input handler. a
+failed callback keeps the previous ui and discards its queued actions; it waits
+for another changed result or an accepted reload before running again. an
+accepted reload gives the replacement callbacks an initial event, and a rejected
+reload keeps the current watches. retired configurations receive no late events.
+
+watches follow atomic file replacements, missing directories, and symlink
+changes. successful reads use filesystem events without periodic polling. for
+sources that need polling, use a scheduled command instead. data must be a
+regular file with at most 128 KiB of utf-8 text without nul bytes. an instance
+may declare 64 watches across 32 paths. excessively deep paths and symlink
+chains produce a `failed` event. lock configurations cannot declare watches.
+
 ## managed processes
 
 use `services.process` when a configuration needs to read a child process or
